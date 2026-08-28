@@ -136,7 +136,15 @@ def merge_extracted_file_into_ledger(
 
     statement, account = normalize(extraction, record.filename, sender=record.sender)
     if not statement.transactions:
-        return _fail("failed", "Table found but no rows parsed.")
+        # Same reasoning as graph.nodes.ingest_file: a statement whose own
+        # declared opening and closing balance are equal is a real document
+        # correctly read as "nothing happened this period" - a dormant
+        # account, or one opened partway through the cycle - not a parser
+        # failure. Only when the balance actually moved despite zero
+        # extracted rows is this a genuine extraction failure.
+        from ..graph.nodes import _is_genuinely_quiet_period
+        if not _is_genuinely_quiet_period(statement):
+            return _fail("failed", "Table found but no rows parsed.")
 
     if target_month and target_month not in statement_months(
             statement.period_start, statement.period_end):
@@ -221,7 +229,27 @@ def merge_extracted_file_into_ledger(
     # table is rebuilt from the registry (not just this one file), so every
     # previously-processed file's row survives the refresh too.
     payload = _build_payload(state)
-    payload["statements"] = all_statement_rows(db)
+    statement_rows = all_statement_rows(db)
+    payload["statements"] = statement_rows
+    # _build_payload only fills this from state["report"]["brief"], which
+    # only the full graph run (synthesize node) ever populates - retrying one
+    # file from the Coverage grid never goes through that node, so this stayed
+    # {} and the Overview tab's whole Data Quality card went blank the moment
+    # anyone used the single most common recovery action in the app. Built
+    # the same way the Gmail import job builds it, from the FULL registry
+    # rather than just this one file, so it reflects every statement ever
+    # attempted rather than resetting to "1 processed".
+    payload["data_quality"] = {
+        "files_processed": len(statement_rows),
+        "files_reconciled": sum(1 for s in statement_rows if s["status"] == "ok"),
+        "files_unreconciled": sum(1 for s in statement_rows
+                                  if s["status"] == "unreconciled"),
+        "files_failed": sum(1 for s in statement_rows
+                            if s["status"] in {"failed", "needs_password"}),
+        "duplicates_removed": enriched.duplicate_count,
+        "uncategorized_count": enriched.analysis.uncategorized_count,
+        "notes": list(enriched.analysis.notes),
+    }
     run_id = remember_run(str(uuid.uuid4()), payload)
 
     return {

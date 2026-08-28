@@ -13,7 +13,7 @@ import { PREFS, usePrefs } from '../prefs';
 
 export default function Settings() {
   const [categories, setCategories] = useState([]);
-  const [builtins, setBuiltins] = useState(new Set());
+  const [customCategories, setCustomCategories] = useState(new Set());
   const [name, setName] = useState('');
   const [error, setError] = useState(null);
   const [note, setNote] = useState(null);
@@ -27,10 +27,12 @@ export default function Settings() {
 
   useEffect(() => {
     load();
-    // The built-in list is fixed; anything beyond it was added here, and only
-    // those can be removed.
-    api.request('/api/categories').then((all) => {
-      setBuiltins(new Set((all || []).slice(0, 30)));
+    // Asked for directly rather than assumed from position: this used to take
+    // the first 30 entries of /api/categories as "built-in", a count that
+    // happened to match Category's own built-in list today but would have
+    // silently misclassified everything the moment that list ever changed.
+    api.request('/api/categories/custom').then((custom) => {
+      setCustomCategories(new Set(custom || []));
     }).catch(() => {});
   }, [load]);
 
@@ -62,7 +64,8 @@ export default function Settings() {
     }
   }
 
-  const custom = categories.filter((c) => !builtins.has(c));
+  const custom = categories.filter((c) => customCategories.has(c));
+  const builtinCount = categories.length - customCategories.size;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -97,8 +100,8 @@ export default function Settings() {
 
         {!custom.length && (
           <div style={{ color: 'var(--text-3)' }}>
-            None yet. The {builtins.size || 30} built-in categories cover most
-            things; add your own when they do not.
+            None yet. The {builtinCount || categories.length} built-in categories
+            cover most things; add your own when they do not.
           </div>
         )}
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -145,9 +148,9 @@ export default function Settings() {
         ))}
       </Card>
 
-      <Card title="Built-in categories" sub={`${builtins.size} always available`}>
+      <Card title="Built-in categories" sub={`${builtinCount} always available`}>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-          {categories.filter((c) => builtins.has(c)).map((c) => (
+          {categories.filter((c) => !customCategories.has(c)).map((c) => (
             <Chip key={c}>{titleCase(c)}</Chip>
           ))}
         </div>

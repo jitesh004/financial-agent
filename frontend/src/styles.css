@@ -139,15 +139,36 @@ body {
    were simply unreachable - which is how five whole views stayed invisible
    even once they had been added to the tab list. */
 .tabs {
-  display: flex; gap: 2px; flex-wrap: wrap; row-gap: 4px;
-  flex: 1 1 100%; order: 3;
+  display: flex; gap: 4px; align-items: center;
+  flex: 1; margin: 0 16px;
+  overflow-x: auto;
+  white-space: nowrap;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  mask-image: linear-gradient(to right, transparent, black 12px, black calc(100% - 12px), transparent);
+  -webkit-mask-image: linear-gradient(to right, transparent, black 12px, black calc(100% - 12px), transparent);
 }
-@media (min-width: 1500px) { .tabs { flex: 1 1 auto; order: 0; } }
+.tabs::-webkit-scrollbar {
+  display: none;
+}
+@media (min-width: 1500px) { .tabs {
+  display: flex; gap: 4px; align-items: center;
+  flex: 1; margin: 0 16px;
+  overflow-x: auto;
+  white-space: nowrap;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  mask-image: linear-gradient(to right, transparent, black 12px, black calc(100% - 12px), transparent);
+  -webkit-mask-image: linear-gradient(to right, transparent, black 12px, black calc(100% - 12px), transparent);
+}
+.tabs::-webkit-scrollbar {
+  display: none;
+} }
 .tab {
   appearance: none; border: 0; background: transparent; cursor: pointer;
   padding: 7px 13px; border-radius: var(--radius-sm);
   color: var(--text-2); font-size: 13px; font-weight: 500;
-  font-family: inherit; white-space: nowrap;
+  font-family: inherit; white-space: nowrap; flex-shrink: 0;
 }
 .tab:hover { background: var(--surface-2); color: var(--text); }
 .tab[aria-selected="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }

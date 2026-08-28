@@ -194,7 +194,7 @@ export default function Spending({ data }) {
                   {analysis.unusual.map((t) => (
                     <tr key={t.id}>
                       <td className="nowrap">{dateLabel(t.date)}</td>
-                      <td><div className="truncate">{t.description}</div></td>
+                      <td><div style={{ wordBreak: 'break-word', whiteSpace: 'normal', lineHeight: '1.4' }}>{t.description}</div></td>
                       <td><Chip>{titleCase(t.category)}</Chip></td>
                       <td className="right num nowrap">{money(t.amount)}</td>
                       <td style={{ color: 'var(--text-3)', fontSize: 12.5 }}>{t.reason}</td>

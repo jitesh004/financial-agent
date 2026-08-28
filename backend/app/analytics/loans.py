@@ -165,7 +165,17 @@ def project_loan(
         return None
 
     warnings: list[str] = []
-    as_of = as_of or max((t.txn_date for t in transactions), default=date.today())
+    # Excluded rows must not set this - the same reasoning as
+    # analytics.recurring.detect_recurring: a mis-parsed artifact (a
+    # statement's own header row read as a transaction) can carry a garbage
+    # future date, and it is excluded from every total for exactly that
+    # reason. Letting it set "as of" here would silently push a loan's whole
+    # payoff projection forward by however far into the future that garbage
+    # date sits.
+    as_of = as_of or max(
+        (t.txn_date for t in transactions if not t.excluded),
+        default=date.today(),
+    )
 
     outstanding = account.principal_outstanding
     if outstanding is None:

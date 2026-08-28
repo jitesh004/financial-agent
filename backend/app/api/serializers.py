@@ -57,6 +57,10 @@ def account_json(account: Account) -> dict[str, Any]:
         "is_liability": account.is_liability,
         "balance": num(account.balance),
         "current_balance": num(account.current_balance),
+        # Which statement this balance came from, so a user (or the UI) can
+        # tell "current as of last month" from a figure that has gone stale
+        # because a newer statement simply has not been fetched yet.
+        "balance_as_of": account.balance_as_of.isoformat() if account.balance_as_of else None,
         "principal_outstanding": num(account.principal_outstanding),
         "interest_rate": num(account.interest_rate),
         "emi_amount": num(account.emi_amount),

@@ -91,6 +91,25 @@ def plan_ingestion(state: AnalysisState) -> dict:
 # 2. Per-file ingestion (runs in parallel, one branch per file)
 # --------------------------------------------------------------------------
 
+def _is_genuinely_quiet_period(statement: Statement) -> bool:
+    """A statement can legitimately have zero transactions.
+
+    A dormant savings account, or one only opened partway through a
+    statement's cycle, produces a real bank statement whose own letterhead
+    says "No transactions found" with an unchanged balance - that is not a
+    parser failure, it is the correct reading of a real document. The
+    distinguishing signal is that the declared balance did not move: a
+    statement claiming activity (opening != closing) while the parser found
+    no rows is the genuine failure case - the bank says something happened
+    and the parser missed it.
+    """
+    return (
+        statement.opening_balance is not None
+        and statement.closing_balance is not None
+        and statement.opening_balance == statement.closing_balance
+    )
+
+
 def ingest_file(state: FileTask) -> dict:
     """Extract, normalize and reconcile ONE file.
 
@@ -147,9 +166,25 @@ def ingest_file(state: FileTask) -> dict:
     )
 
     if not statement.transactions:
-        result["status"] = "failed"
-        result["message"] = f"{filename}: table found but no rows parsed."
-        return {"statements": [result], "errors": [result["message"]]}
+        # A statement with zero rows is not automatically a parse failure: a
+        # dormant account genuinely has nothing to report some months, and
+        # its own letterhead says so ("No transactions found", opening ==
+        # closing balance). Treating every such statement as "failed" meant
+        # the account itself never made it into merge_ledger's output at
+        # all - not a missing month, a missing ACCOUNT, silently absent from
+        # the accounts list and net worth with no indication anything was
+        # wrong. Only when the declared balance actually MOVED despite no
+        # rows being extracted is this a genuine extraction failure - the
+        # statement is claiming activity the parser could not find.
+        if not _is_genuinely_quiet_period(statement):
+            result["status"] = "failed"
+            result["message"] = f"{filename}: table found but no rows parsed."
+            return {"statements": [result], "errors": [result["message"]]}
+        # Falls through to the normal success path below - reconcile() treats
+        # zero transactions as NOT_APPLICABLE rather than FAILED, so this
+        # statement (and its account) ends up persisted as "ok" with an
+        # accurate "No transactions to reconcile" message, not silently
+        # dropped.
 
     # Carry the content hash onto the statement. The DB's unique index on
     # file_hash then makes an identical re-upload in a later run replace the old
@@ -235,6 +270,31 @@ def retry_extraction(state: AnalysisState) -> dict:
 # 3. Merge into one ledger
 # --------------------------------------------------------------------------
 
+def latest_attempt_per_file(statements: list[ParsedFile]) -> list[ParsedFile]:
+    """Collapse repeat attempts at the same physical file down to the latest.
+
+    `statements` is `Annotated[..., operator.add]` (state.py) so every retry
+    of a file ADDS a fresh ParsedFile entry rather than replacing the one
+    before it - the accumulated list can hold two or three entries for one
+    physical file, one per attempt, each carrying its own freshly minted
+    Statement with its own id. A retry supersedes the attempt before it by
+    definition, so anything that counts, lists, or builds a ledger from
+    "every statement this run touched" needs to see the latest attempt only -
+    keeping every one of them is what let a single file's rows be counted
+    two or three times over (inflated file counts, a filename repeated in a
+    reconciliation warning, transactions from an attempt whose own Statement
+    was never the one actually persisted).
+    """
+    by_file: dict[tuple, dict] = {}
+    for entry in statements:
+        key = (entry.get("file_hash") or entry.get("filepath")
+              or entry.get("filename"))
+        current = by_file.get(key)
+        if current is None or entry.get("attempt", 0) >= current.get("attempt", 0):
+            by_file[key] = entry
+    return list(by_file.values())
+
+
 def merge_ledger(state: AnalysisState) -> dict:
     """Collapse per-file results into one account map and one transaction list.
 
@@ -242,7 +302,7 @@ def merge_ledger(state: AnalysisState) -> dict:
     statements for one card collapse into a single account with one continuous
     ledger - which is what makes cross-account transfer detection work.
     """
-    parsed = [s for s in (state.get("statements") or [])
+    parsed = [s for s in latest_attempt_per_file(state.get("statements") or [])
               if s.get("status") in {"ok", "unreconciled"} and s.get("statement")]
 
     accounts: dict[str, Account] = {}
@@ -289,6 +349,20 @@ def merge_ledger(state: AnalysisState) -> dict:
     if not transactions:
         warnings.append("No usable transactions were produced by any file.")
 
+    # NOT returning "statements" here, on purpose: its channel is declared
+    # `Annotated[list[ParsedFile], operator.add]` (state.py), because the
+    # per-file ingestion fan-out needs every parallel Send to ADD its one
+    # entry rather than clobber the others' - so returning `state["statements"]`
+    # back out of this node does not refresh it, it concatenates the entire
+    # list onto itself. Tried exactly that once: statement and transaction
+    # counts multiplied on every pass through the retry cycle, and by the
+    # time the reconciliation gate finally settled, the ballooned list was
+    # duplicated far enough that later dedup collapsed the ledger to zero
+    # transactions. `statement.id` / `statement.account_id` are still
+    # rewritten in place just above, and that mutation is all downstream
+    # code (_persist, _save_file_registry) actually needs - LangGraph does
+    # not deep-copy state between steps, so the same objects are what a
+    # later node sees whether or not this key is re-returned.
     return {
         "accounts": accounts,
         "transactions": transactions,
@@ -327,20 +401,63 @@ def _account_identity(account: Account) -> tuple:
 def _merge_account_facts(target: Account, incoming: Account) -> None:
     """Keep the most informative version of each account fact.
 
-    Later statements carry fresher loan balances; earlier ones sometimes carry
-    details a later one omits. Preferring non-null on each field independently
-    beats picking one statement wholesale.
+    Most facts here (interest rate, credit limit, holder name) are close to
+    static, so "first non-null wins" is a fine merge rule for them - later
+    statements rarely disagree, and when one omits a detail an earlier
+    statement had, keeping the earlier value is strictly better than losing
+    it. A balance is different: it is a snapshot that is only ever correct as
+    of the statement that reported it, and statements do not necessarily
+    arrive in chronological order (Gmail search, a batch upload, and a
+    single-file retry can all process an old month after a newer one).
+    "First non-null wins" applied to a balance means whichever statement
+    happened to be parsed first locks the account's balance forever - which
+    is exactly what was showing "Assets: 0" on accounts that plainly had
+    money in them, because the very first file ever processed for the
+    account had no stated closing balance and nothing after it was ever
+    allowed to fill it in.
     """
-    for attr in ("holder_name", "product_name", "interest_rate", "emi_amount", "credit_limit",
-                 "principal_outstanding", "current_balance",
-                 "tenure_months_remaining"):
+    for attr in ("holder_name", "product_name", "interest_rate", "emi_amount",
+                 "credit_limit", "tenure_months_remaining"):
         if getattr(target, attr) is None and getattr(incoming, attr) is not None:
             setattr(target, attr, getattr(incoming, attr))
+
+    _prefer_newer_balance(target, incoming)
+
     if target.account_type == AccountType.UNKNOWN:
         target.account_type = incoming.account_type
     # A named institution always beats "Unknown", whichever file it came from.
     if target.institution == "Unknown" and incoming.institution != "Unknown":
         target.institution = incoming.institution
+
+
+def _prefer_newer_balance(target: Account, incoming: Account) -> None:
+    """Keep whichever of the two balances is dated more recently.
+
+    A missing `balance_as_of` on one side is treated as older than any dated
+    value - a statement with no declared or derivable closing balance is not
+    a candidate for "current" no matter when it was processed - and as older
+    than another equally-undated value too, so an account with no balance yet
+    still picks up the first one offered rather than rejecting it forever.
+    """
+    if incoming.current_balance is None and incoming.principal_outstanding is None:
+        return  # nothing to offer
+
+    target_date = target.balance_as_of
+    incoming_date = incoming.balance_as_of
+    target_has_balance = (target.current_balance is not None
+                          or target.principal_outstanding is not None)
+
+    newer = (
+        not target_has_balance
+        or (incoming_date is not None
+            and (target_date is None or incoming_date > target_date))
+    )
+    if not newer:
+        return
+
+    target.current_balance = incoming.current_balance
+    target.principal_outstanding = incoming.principal_outstanding
+    target.balance_as_of = incoming_date
 
 
 # --------------------------------------------------------------------------

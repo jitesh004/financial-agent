@@ -255,6 +255,15 @@ class Account(BaseModel):
     #: which sign convention a number arrived in.
     current_balance: Decimal | None = None
 
+    #: The statement period this balance was read from. Statements do not
+    #: always arrive in chronological order - Gmail search, a batch upload, a
+    #: single-file retry can all process an old month after a newer one - so
+    #: merging two accounts has to compare dates rather than assume whichever
+    #: file was seen first (or last) is the current figure. Without this,
+    #: "first non-null wins" silently locked every account's balance to
+    #: whichever statement happened to be parsed first, however old.
+    balance_as_of: date | None = None
+
     #: Loan-specific, populated from loan statements when present.
     principal_outstanding: Decimal | None = None
     interest_rate: Decimal | None = None
@@ -457,8 +466,13 @@ def derive_flow_role(txn: "Transaction") -> FlowRole:
 
     if txn.category == Category.INVESTMENT:
         return FlowRole.INVESTMENT
-    if txn.category in {Category.TRANSFER, Category.CC_PAYMENT}:
+    if txn.category == Category.TRANSFER:
         return FlowRole.TRANSFER_OUT
+    if txn.category == Category.CC_PAYMENT:
+        # If it reached here, it failed to match any card statement (or none was uploaded).
+        # Without the itemized purchases, the bill payment itself is the only record of 
+        # that spending. Dropping it would artificially deflate the user's spend by lakhs.
+        return FlowRole.EXPENSE
     return FlowRole.EXPENSE
 
 

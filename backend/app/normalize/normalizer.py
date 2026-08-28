@@ -42,6 +42,26 @@ class NormalizationError(Exception):
     """Raised only when no transaction table could be identified at all."""
 
 
+def _apply_balance_to_account(account: Account, account_type: AccountType,
+                              statement: Statement) -> None:
+    """Copy a statement's closing balance onto its account, dated.
+
+    The date is what makes this safe to merge later: statements do not
+    always arrive in chronological order (Gmail search, a batch upload, a
+    single-file retry can all process an old month after a newer one), and
+    `graph.nodes._merge_account_facts` needs to know which of two candidate
+    balances is actually the more recent one rather than assuming whichever
+    file happened to be seen first.
+    """
+    if statement.closing_balance is None:
+        return
+    if account_type in LIABILITY_TYPES:
+        account.principal_outstanding = statement.closing_balance
+    else:
+        account.current_balance = statement.closing_balance
+    account.balance_as_of = statement.period_end
+
+
 def normalize(
     extraction: ExtractionResult,
     filename: str,
@@ -83,12 +103,6 @@ def normalize(
         emi_amount=meta.emi_amount,
         credit_limit=meta.credit_limit,
     )
-    if meta.closing_balance is not None:
-        if account_type in LIABILITY_TYPES:
-            account.principal_outstanding = meta.closing_balance
-        else:
-            account.current_balance = meta.closing_balance
-
     # A statement can legitimately contain nothing. slice sends a monthly
     # statement for a dormant account that says "No transactions found" with
     # every total at zero. Reporting that as a parse FAILURE is wrong: nothing
@@ -98,6 +112,7 @@ def normalize(
         statement.parse_warnings.append(
             "This statement reports no transactions for the period."
         )
+        _apply_balance_to_account(account, account_type, statement)
         return statement, account
 
     candidates = _rank_tables(extraction.tables)
@@ -105,6 +120,7 @@ def normalize(
         statement.parse_warnings.append(
             "No table in this file looked like a transaction list."
         )
+        _apply_balance_to_account(account, account_type, statement)
         return statement, account
 
     best_mapping, chosen = candidates[0]
@@ -126,6 +142,10 @@ def normalize(
 
     _infer_period_from_rows(statement)
     _infer_balances_from_rows(statement, account_type)
+    # After inference, not before it: a statement whose letterhead omits the
+    # closing balance still has one derived from the last row's running
+    # balance, and that derived figure must reach the account too.
+    _apply_balance_to_account(account, account_type, statement)
     return statement, account
 
 

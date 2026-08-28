@@ -49,7 +49,17 @@ export default function ReviewQueue() {
   async function resolve(txn, fields) {
     setBusy(txn.id);
     try {
-      await api.updateTransaction(txn.id, { needs_review: false, ...fields });
+      // TransactionUpdateReq has no `needs_review` field - it isn't
+      // something a user sets directly, it's cleared as a side effect of
+      // recording an actual decision (see pipeline.overrides._apply_one).
+      // Sending only `{needs_review: false}`, as "Looks right" used to,
+      // matched no field on the model, so the whole payload round-tripped
+      // to an empty dict and the row silently never left the queue.
+      // Confirming the flow_role the pipeline already chose *is* the
+      // decision "Looks right" means to record.
+      await api.updateTransaction(txn.id, {
+        flow_role: txn.flow_role, ...fields,
+      });
       setItems((prev) => prev.filter((t) => t.id !== txn.id));
     } catch (e) {
       setError(e.message);
@@ -118,7 +128,7 @@ export default function ReviewQueue() {
                   <tr key={t.id} style={{ opacity: busy === t.id ? 0.45 : 1 }}>
                     <td className="nowrap">{dateLabel(t.date)}</td>
                     <td>
-                      <div className="truncate" title={t.description}>
+                      <div style={{ wordBreak: 'break-word', whiteSpace: 'normal', lineHeight: '1.4' }}>
                         {t.description}
                       </div>
                       <div style={{ marginTop: 4, display: 'flex', gap: 6 }}>

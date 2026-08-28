@@ -140,7 +140,8 @@ RULES: list[Rule] = [
     # which is a bank charge, not a tax payment. Require tax-payment context.
     _r(r"\bINCOME\s+TAX\b|\bTDS\b|\bADVANCE\s+TAX\b|\bSELF\s+ASSESSMENT\b|"
        r"\bPROPERTY\s+TAX\b|\bCHALLAN\b|\bGST\s+PAYMENT\b|\bTAX\s+PAYMENT\b|"
-       r"\bITNS\b|\bDIRECT\s+TAX\b",
+       r"\bITNS\b|\bDIRECT\s+TAX\b|\bCGST\s+ASSESSMENT\b|\bSGST\s+ASSESSMENT\b|"
+       r"\bIGST\s+ASSESSMENT\b|\bGST\s+@\b",
        Category.TAX, 0.93),
 
     # ---- Bank fees ------------------------------------------------------
@@ -325,11 +326,12 @@ def categorize_by_rules(transactions: list[Transaction]) -> int:
 #: before the person-name shape below, because "LAXMI SUGANDHI WOR S" and
 #: "GUPTA COLLECTION" both read as three capitalised words.
 _ORGANISATION_TOKEN = re.compile(
-    r"\b(?:PVT|PRIVATE|LTD|LIMITED|LLP|INC|CORP|CO|COMPANY|ENTERPRISE\w*|"
-    r"TRADERS?|STORES?|SHOP|MART|AGENCY|AGENCIES|ASSOCIATES?|SERVICES?|"
+    r"\b(?:PVT|PRIVATE|LTD|LIMITED|LLP|INC|CORP|CO|COMPANY|COMPAN|ENTERPRISE\w*|ENTERP|"
+    r"TRADERS?|STORES?|SHOP|MART|AGENCY|AGENCIES|ASSOCIATES?|SERVICES?|SERVIC|"
     r"INDUSTRIES|COLLECTION|SOLUTIONS?|TECHNOLOG\w*|FOODS?|WINES|SWEETS|"
-    r"HOTEL|RESTAURANT|MEDICAL|CLINIC|HOSPITAL|BANK|FINANCE|CAPITAL|"
-    r"FOUNDATION|TRUST|SOCIETY|INFOTECH|DIGITAL|RETAIL|COMMUNICATIONS)\b",
+    r"HOTEL|HO|RESTAURANT|MEDICAL|MEDIC|CLINIC|HOSPITAL|BANK|FINANCE|CAPITAL|"
+    r"FOUNDATION|TRUST|SOCIETY|INFOTECH|DIGITAL|RETAIL|COMMUNICATIONS|WORKS|WOR S|"
+    r"FAMILY|FAM LY|MNGL|MSEDCL)\b",
     re.IGNORECASE,
 )
 #: UPI notes the payer types themselves. "Send Money" is the default label the
@@ -438,8 +440,11 @@ def fallback_category(
     """
     if is_self_payment(txn, holder_names):
         return Category.TRANSFER
-    if txn.direction == Direction.CREDIT:
-        return Category.OTHER_INCOME
+        
     if looks_like_person_payment(txn):
         return Category.P2P_TRANSFER
+        
+    if txn.direction == Direction.CREDIT:
+        return Category.OTHER_INCOME
+        
     return Category.UNCATEGORIZED

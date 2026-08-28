@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -127,6 +128,14 @@ def upsert_account(db: Database, account: Account) -> str:
                 """UPDATE accounts SET
                        principal_outstanding = COALESCE(?, principal_outstanding),
                        current_balance       = COALESCE(?, current_balance),
+                       -- Relies on the caller having already resolved which of
+                       -- two candidate balances is newer (see
+                       -- graph.nodes._merge_account_facts) before this runs -
+                       -- by the time an account reaches here its balance
+                       -- fields already reflect the freshest statement seen,
+                       -- so a plain "prefer non-null" is safe rather than
+                       -- needing its own date comparison in SQL.
+                       balance_as_of         = COALESCE(?, balance_as_of),
                        interest_rate         = COALESCE(?, interest_rate),
                        emi_amount            = COALESCE(?, emi_amount),
                        credit_limit          = COALESCE(?, credit_limit),
@@ -136,6 +145,7 @@ def upsert_account(db: Database, account: Account) -> str:
                        institution           = COALESCE(?, institution)
                    WHERE id = ?""",
                 (_txt(account.principal_outstanding), _txt(account.current_balance),
+                 account.balance_as_of.isoformat() if account.balance_as_of else None,
                  _txt(account.interest_rate), _txt(account.emi_amount),
                  _txt(account.credit_limit), account.holder_name,
                  account.product_name or "", better_institution, account_id),
@@ -147,9 +157,10 @@ def upsert_account(db: Database, account: Account) -> str:
         conn.execute(
             """INSERT INTO accounts
                (id, institution, account_type, account_number_masked, product_name,
-                holder_name, currency, current_balance, principal_outstanding,
-                interest_rate, emi_amount, tenure_months_remaining, credit_limit)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                holder_name, currency, current_balance, balance_as_of,
+                principal_outstanding, interest_rate, emi_amount,
+                tenure_months_remaining, credit_limit)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             # An empty string, never NULL, for the same reason
             # account_number_masked is never NULL: SQLite's UNIQUE constraint
             # treats every NULL as distinct from every other NULL, so two
@@ -160,6 +171,7 @@ def upsert_account(db: Database, account: Account) -> str:
             (account_id, account.institution, account.account_type.value,
              account.account_number_masked, account.product_name or "",
              account.holder_name, account.currency, _txt(account.current_balance),
+             account.balance_as_of.isoformat() if account.balance_as_of else None,
              _txt(account.principal_outstanding), _txt(account.interest_rate),
              _txt(account.emi_amount), account.tenure_months_remaining,
              _txt(account.credit_limit)),
@@ -184,6 +196,7 @@ def _row_to_account(row) -> Account:
         holder_name=row["holder_name"],
         currency=row["currency"],
         current_balance=_dec(row["current_balance"]),
+        balance_as_of=_d(_col(row, "balance_as_of")),
         principal_outstanding=_dec(row["principal_outstanding"]),
         interest_rate=_dec(row["interest_rate"]),
         emi_amount=_dec(row["emi_amount"]),
@@ -289,11 +302,36 @@ def save_transactions(db: Database, transactions: Sequence[Transaction]) -> int:
         ))
 
     placeholders = ",".join(["?"] * len(_TXN_COLUMNS.split(",")))
+    stmt = f"INSERT OR REPLACE INTO transactions ({_TXN_COLUMNS}) VALUES ({placeholders})"
     with db.connection() as conn:
-        conn.executemany(
-            f"INSERT OR REPLACE INTO transactions ({_TXN_COLUMNS}) VALUES ({placeholders})",
-            rows,
-        )
+        try:
+            conn.executemany(stmt, rows)
+        except sqlite3.IntegrityError:
+            # executemany gives no way to tell which of N rows was the
+            # offender - every previous fix for a FOREIGN KEY failure here
+            # (a dangling account_id, then a dangling statement_id) was found
+            # by guesswork against a bare error naming neither the row nor
+            # the column. Falling back to one row at a time trades speed
+            # (only taken on the rare row that actually violates something)
+            # for a diagnosis this specific, and for not losing the other
+            # 2000+ perfectly good rows in the same batch to one bad one.
+            known_accounts = {r["id"] for r in conn.execute("SELECT id FROM accounts")}
+            known_statements = {r["id"] for r in conn.execute("SELECT id FROM statements")}
+            saved = 0
+            for row, txn in zip(rows, transactions):
+                try:
+                    conn.execute(stmt, row)
+                    saved += 1
+                except sqlite3.IntegrityError as exc:
+                    log.error(
+                        "dropping transaction %s (%s %r) - %s. account_id=%r "
+                        "(known=%s), statement_id=%r (known=%s)",
+                        txn.id, txn.txn_date, txn.raw_description[:60], exc,
+                        txn.account_id, txn.account_id in known_accounts,
+                        txn.statement_id, (txn.statement_id in known_statements
+                                          if txn.statement_id else "n/a - was None"),
+                    )
+            return saved
     return len(rows)
 
 
@@ -793,6 +831,48 @@ def save_profile(db: Database, profile) -> None:
         )
 
 
+def get_recurring_series(db: Database) -> list[dict[str, Any]]:
+    """Every recurring series, with the user's own edits already applied.
+
+    `recurring_series` itself is pipeline output, fully rewritten by
+    `save_recurring_series` on every full analysis - so baking an override
+    into that table only shows up after the next reanalyze. Rename, mute or
+    delete a series from the Recurring tab in between, and the plain
+    `SELECT * FROM recurring_series` this used to be would keep showing the
+    machine-picked label, `is_active` and category, and a "deleted" series
+    right where it always was, until something eventually reprocessed
+    everything. Merging live here, the same way `save_recurring_series`
+    already merges before writing, means an edit is visible on the very next
+    read instead of the next full reprocess.
+    """
+    with db.connection() as conn:
+        rows = conn.execute(
+            """SELECT s.*, o.label AS o_label, o.category AS o_category,
+                      o.is_active AS o_is_active, o.deleted AS o_deleted
+               FROM recurring_series s
+               LEFT JOIN recurring_series_overrides o ON o.series_id = s.id
+               ORDER BY s.is_active DESC, s.median_amount DESC"""
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        o_label = d.pop("o_label")
+        o_category = d.pop("o_category")
+        o_is_active = d.pop("o_is_active")
+        if d.pop("o_deleted"):
+            continue
+        if o_label is not None:
+            d["label"] = o_label
+        if o_category is not None:
+            d["category"] = o_category
+        if o_is_active is not None:
+            d["is_active"] = o_is_active
+        if "median_amount" in d:
+            d["median_amount"] = _dec(d["median_amount"])
+        out.append(d)
+    return out
+
+
 def save_recurring_series(db: Database, series: Sequence[Any]) -> int:
     with db.connection() as conn:
         overrides = {r["series_id"]: r for r in conn.execute("SELECT * FROM recurring_series_overrides").fetchall()}
@@ -1014,109 +1094,6 @@ def prune_analysis_runs(db: Database, keep: int = 20) -> int:
         return cur.rowcount
 
 
-from dataclasses import dataclass
-from decimal import Decimal
-from datetime import date
-
-@dataclass
-class TransactionSplit:
-    id: str
-    parent_fingerprint: str
-    amount: Decimal
-    category: str | None
-    flow_role: str | None
-    note: str
-    position: int
-
-def save_splits(db, txn_fingerprint: str, parts: list) -> None:
-    with db.connection() as conn:
-        conn.execute("DELETE FROM transaction_splits WHERE parent_fingerprint = ?", (txn_fingerprint,))
-        rows = [(p.id, p.parent_fingerprint, _txt(p.amount), p.category, p.flow_role, p.note, p.position) for p in parts]
-        conn.executemany("INSERT INTO transaction_splits VALUES (?,?,?,?,?,?,?)", rows)
-
-@dataclass
-class Claim:
-    id: str
-    direction: str
-    counterparty: str
-    origin_fingerprint: str
-    amount: Decimal
-    settled_amount: Decimal
-    status: str
-    basis: str
-    opened_on: date
-    closed_on: date | None = None
-    note: str = ""
-
-@dataclass
-class ClaimSettlement:
-    id: str
-    claim_id: str
-    method: str
-    amount: Decimal
-    settled_on: date
-    txn_fingerprint: str
-    note: str = ""
-
-def save_claim(db, claim) -> None:
-    with db.connection() as conn:
-        conn.execute("INSERT OR REPLACE INTO claims VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
-            claim.id, claim.direction, claim.counterparty, claim.origin_fingerprint,
-            _txt(claim.amount), _txt(claim.settled_amount), claim.status, claim.basis,
-            claim.opened_on.isoformat(), claim.closed_on.isoformat() if claim.closed_on else None, claim.note
-        ))
-
-def get_claims(db) -> list:
-    with db.connection() as conn:
-        rows = conn.execute("SELECT * FROM claims").fetchall()
-    out = []
-    for r in rows:
-        c = Claim(
-            id=r["id"], direction=r["direction"], counterparty=r["counterparty"],
-            origin_fingerprint=r["origin_fingerprint"], amount=_dec(r["amount"]),
-            settled_amount=_dec(r["settled_amount"]), status=r["status"], basis=r["basis"],
-            opened_on=_d(r["opened_on"]), closed_on=_d(r["closed_on"]), note=r["note"]
-        )
-        out.append(c)
-        return out
-
-def settle_claim(db, claim_id: str, settlement: ClaimSettlement) -> None:
-    with db.connection() as conn:
-        conn.execute("INSERT INTO claim_settlements VALUES (?,?,?,?,?,?,?)", (
-            settlement.id, settlement.claim_id, settlement.method, _txt(settlement.amount),
-            settlement.settled_on.isoformat(), settlement.txn_fingerprint, settlement.note
-        ))
-        claim_row = conn.execute("SELECT amount, settled_amount FROM claims WHERE id = ?", (claim_id,)).fetchone()
-        if claim_row:
-            new_settled = _dec(claim_row["settled_amount"]) + settlement.amount
-            status = "closed" if new_settled >= _dec(claim_row["amount"]) else "open"
-            closed_on = settlement.settled_on.isoformat() if status == "closed" else None
-            conn.execute("UPDATE claims SET settled_amount = ?, status = ?, closed_on = ? WHERE id = ?", (_txt(new_settled), status, closed_on, claim_id))
-
-def get_confirmed_groups(db) -> list[dict]:
-    with db.connection() as conn:
-        groups = conn.execute("SELECT * FROM settlement_groups WHERE confirmed = 1").fetchall()
-        if not groups: return []
-        group_ids = [g["id"] for g in groups]
-        placeholders = ",".join(["?"] * len(group_ids))
-        legs = conn.execute(f"SELECT * FROM settlement_group_legs WHERE group_id IN ({placeholders})", group_ids).fetchall()
-    legs_by_group = {}
-    for leg in legs:
-        legs_by_group.setdefault(leg["group_id"], []).append({"fingerprint": leg["fingerprint"], "side": leg["side"]})
-    out = []
-    for g in groups:
-        d = dict(g)
-        d["total_amount"] = _dec(d["total_amount"])
-        d["residual"] = _dec(d["residual"])
-        d["legs"] = legs_by_group.get(d["id"], [])
-        out.append(d)
-    return out
-
-def get_confirmed_fingerprints(db) -> set[str]:
-    with db.connection() as conn:
-        rows = conn.execute("SELECT l.fingerprint FROM settlement_group_legs l JOIN settlement_groups g ON l.group_id = g.id WHERE g.confirmed = 1").fetchall()
-    return {r["fingerprint"] for r in rows}
-
 def confirm_group(db, group_id: str) -> None:
     with db.connection() as conn:
         conn.execute("UPDATE settlement_groups SET confirmed = 1 WHERE id = ?", (group_id,))
@@ -1177,20 +1154,58 @@ def get_claim(db, claim_id: str) -> dict:
         d['settled_amount'] = _dec(d['settled_amount'])
         return d
 
-def settle_claim(db, claim_id: str, method: str, amount, settled_on: str) -> str:
+def settle_claim(db, claim_id: str, method: str, amount, settled_on: str,
+                 note: str = "", txn_fingerprint: str = "") -> str:
+    """Record how a claim was resolved.
+
+    `write_off` is not like the other five methods: choosing it means the
+    money is confirmed never coming back, which converts the original
+    purchase into a real expense rather than recovering it. Every other
+    method means money genuinely returned, so the origin transaction rightly
+    stays excluded from spending forever. Conflating the two - which the
+    first version of this function did, by treating "write off" as just
+    another way to fully settle a claim - left the purchase permanently
+    invisible to spending even though nothing was ever actually recovered.
+    """
     settlement_id = str(uuid.uuid4())
     with db.connection() as conn:
-        conn.execute("INSERT INTO claim_settlements (id, claim_id, method, amount, settled_on, txn_fingerprint, note) VALUES (?,?,?,?,?,?,?)", (
-            settlement_id, claim_id, method, _txt(amount), settled_on, "", ""
-        ))
-        
-        claim_row = conn.execute("SELECT amount, settled_amount FROM claims WHERE id = ?", (claim_id,)).fetchone()
-        if claim_row:
+        conn.execute(
+            "INSERT INTO claim_settlements (id, claim_id, method, amount, settled_on, txn_fingerprint, note) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (settlement_id, claim_id, method, _txt(amount), settled_on, txn_fingerprint or "", note or ""))
+
+        claim_row = conn.execute(
+            "SELECT amount, settled_amount, origin_fingerprint FROM claims WHERE id = ?",
+            (claim_id,)).fetchone()
+        if not claim_row:
+            return settlement_id
+
+        if method == "write_off":
+            # No money moved, so settled_amount is untouched - whatever
+            # portion (if any) was genuinely recovered earlier stays on
+            # record as recovered, and the rest is simply written off.
+            conn.execute(
+                "UPDATE claims SET status = 'written_off', closed_on = ? WHERE id = ?",
+                (settled_on, claim_id))
+        else:
             new_settled = _dec(claim_row["settled_amount"]) + amount
-            status = "closed" if new_settled >= _dec(claim_row["amount"]) else "partial" if new_settled > 0 else "open"
-            status = "settled" if status == "closed" else status
-            closed_on = settled_on if status == "settled" else None
-            conn.execute("UPDATE claims SET settled_amount = ?, status = ?, closed_on = ? WHERE id = ?", (_txt(new_settled), status, closed_on, claim_id))
+            if new_settled >= _dec(claim_row["amount"]):
+                status, closed_on = "settled", settled_on
+            elif new_settled > 0:
+                status, closed_on = "partial", None
+            else:
+                status, closed_on = "open", None
+            conn.execute(
+                "UPDATE claims SET settled_amount = ?, status = ?, closed_on = ? WHERE id = ?",
+                (_txt(new_settled), status, closed_on, claim_id))
+
+    if method == "write_off" and claim_row["origin_fingerprint"]:
+        # Let the automatic value take over again rather than force
+        # `excluded = false`: if the purchase is re-parsed from scratch it
+        # should be judged like any other row, not permanently pinned either
+        # way by a decision made at write-off time.
+        clear_override_field(db, claim_row["origin_fingerprint"], "excluded")
+
     return settlement_id
 
 def get_claim_settlements(db, claim_id: str) -> list:
@@ -1218,11 +1233,24 @@ def get_claims(db, status: str = None) -> list:
             out.append(d)
         return out
 
-def save_splits(db, parent_fingerprint: str, parent_amount, splits: list) -> list:
-    total = sum(s["amount"] for s in splits)
-    if total != parent_amount:
+def save_splits(db, parent_fingerprint: str, parent_amount, splits: list,
+                origin_key: tuple[str, str, str, str] | None = None) -> list:
+    # Rounded before comparing rather than compared exactly: a JSON number
+    # for something like 450.30 can arrive as a float with binary rounding
+    # noise, and Decimal preserves whatever noise it was handed rather than
+    # correcting it - an exact != would reject a split a person would look at
+    # and call correct.
+    total = sum(s["amount"] for s in splits).quantize(Decimal("0.01"))
+    if total != Decimal(str(parent_amount)).quantize(Decimal("0.01")):
         raise ValueError(f"Splits sum to {total}, expected {parent_amount}")
-        
+
+    # The parent's loose key (pipeline.fingerprint.loose_key), stored so
+    # `pipeline.overrides.apply_splits` can recover this split if the parent's
+    # strict fingerprint later moves - an account being re-identified across a
+    # reprocess, the same event `user_overrides` already tolerates.
+    origin_date, origin_amount, origin_direction, origin_desc_hash = (
+        origin_key if origin_key else ("", "", "", ""))
+
     ids = []
     with db.connection() as conn:
         conn.execute("DELETE FROM transaction_splits WHERE parent_fingerprint = ?", (parent_fingerprint,))
@@ -1230,9 +1258,44 @@ def save_splits(db, parent_fingerprint: str, parent_amount, splits: list) -> lis
         for i, s in enumerate(splits):
             split_id = str(uuid.uuid4())
             ids.append(split_id)
-            rows.append((split_id, parent_fingerprint, _txt(s["amount"]), s.get("category"), s.get("flow_role"), s.get("note", ""), i))
-        conn.executemany("INSERT INTO transaction_splits (id, parent_fingerprint, amount, category, flow_role, note, position) VALUES (?,?,?,?,?,?,?)", rows)
+            # `.get("note") or ""`, not `.get("note", "")`: the key is always
+            # present here (main.py's split_transaction always sends it), just
+            # sometimes None when the caller left it blank - a default that
+            # only fires on a *missing* key would never catch that and the
+            # column's NOT NULL constraint would reject the insert.
+            rows.append((split_id, parent_fingerprint, _txt(s["amount"]), s.get("category"), s.get("flow_role"), s.get("note") or "", i,
+                        origin_date, origin_amount, origin_direction, origin_desc_hash))
+        conn.executemany(
+            "INSERT INTO transaction_splits (id, parent_fingerprint, amount, category, flow_role, note, position, "
+            "origin_date, origin_amount, origin_direction, origin_desc_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
     return ids
+
+
+def repoint_splits(db: Database, old_fingerprint: str, new_fingerprint: str) -> None:
+    """Move a split onto the fingerprint its parent transaction now has.
+
+    Mirrors `repoint_override` for the same reason: found by the loose key
+    because the strict fingerprint had shifted, most often because the
+    account it belongs to was re-identified. Without this the same recovery
+    would have to happen on every subsequent run instead of just once.
+    """
+    if old_fingerprint == new_fingerprint:
+        return
+    with db.connection() as conn:
+        # The destination may already have its own splits if two parents
+        # collapsed onto one identity. Those are the more recent decision, so
+        # they win and the stale rows under the old fingerprint are dropped
+        # rather than merged.
+        exists = conn.execute(
+            "SELECT 1 FROM transaction_splits WHERE parent_fingerprint = ?",
+            (new_fingerprint,)).fetchone()
+        if exists:
+            conn.execute("DELETE FROM transaction_splits WHERE parent_fingerprint = ?",
+                        (old_fingerprint,))
+        else:
+            conn.execute(
+                "UPDATE transaction_splits SET parent_fingerprint = ? WHERE parent_fingerprint = ?",
+                (new_fingerprint, old_fingerprint))
 
 def get_splits(db, parent_fingerprint: str) -> list:
     with db.connection() as conn:
@@ -1244,6 +1307,27 @@ def get_splits(db, parent_fingerprint: str) -> list:
             if 'settled_amount' in d: d['settled_amount'] = _dec(d['settled_amount'])
             out.append(d)
         return out
+
+
+def get_all_splits(db) -> dict[str, list[dict]]:
+    """Every split, grouped by the fingerprint of the row it divides.
+
+    One query for the whole ledger rather than one per transaction - this
+    runs on every enrichment pass, so it has to stay cheap even when most
+    transactions have no splits at all.
+    """
+    from collections import defaultdict
+
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM transaction_splits ORDER BY parent_fingerprint, position"
+        ).fetchall()
+    out: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        d = dict(r)
+        d["amount"] = _dec(d["amount"])
+        out[d["parent_fingerprint"]].append(d)
+    return dict(out)
 
 def save_settlement_group(db, group_id: str, kind: str, total_amount, residual, confidence: float, note: str, legs: list) -> None:
     with db.connection() as conn:

@@ -109,8 +109,44 @@ def enrich_ledger(
         result.warnings.append("No usable transactions were produced by any file.")
         return result
 
+    # 1b. Drop parser artifacts (header rows mistaken as transactions).
+    #
+    # These are not real transactions that the user might want to exclude
+    # from their totals - they never happened at all. A credit card
+    # statement's own column-header line ("PaymentDueDate Min.AmountDue
+    # ChequeNo Date Bank Amount") gets misread as a data row often enough to
+    # need this. Marking one `excluded = True` and keeping it in the ledger
+    # was the wrong shape: it still occupied a real database row with a
+    # garbage date and amount, still showed up in the Transactions table
+    # (just with a badge), and anything downstream that forgot to check
+    # `excluded` - `detect_recurring` did, until this same session - still
+    # saw it as real activity. Three of these landing roughly a month apart
+    # with a near-identical amount is exactly the shape recurring detection
+    # looks for, and it showed up as its own bogus "recurring series"
+    # sitting next to the user's actual subscriptions and EMIs. Dropped from
+    # the ledger the same way an exact duplicate is, above - never
+    # persisted, never displayed, never counted by anything.
+    phase("Filtering parser artifacts")
+    is_artifact = lambda t: (  # noqa: E731
+        "Min.AmountDue" in (t.raw_description or "")
+        or "PaymentDueDate" in (t.raw_description or "")
+    )
+    artifact_count = sum(1 for t in transactions if is_artifact(t))
+    if artifact_count:
+        transactions = [t for t in transactions if not is_artifact(t)]
+        result.transactions = transactions
+        result.warnings.append(f"Dropped {artifact_count} parser artifact(s).")
+
     # 2. Content identity, before anything wants to look a decision up by it.
     stamp_fingerprints(transactions, accounts)
+
+    # 2b. Expand any split transaction into its parts, keyed by the
+    # fingerprint just stamped above. Done this early so every later step -
+    # transfers, categorization, analysis - sees ordinary rows and needs no
+    # special case for "this one used to be several things".
+    from .overrides import apply_splits
+    transactions = apply_splits(db, transactions)
+    result.transactions = transactions
 
     # 3. Transfers first - see the module docstring.
     phase("Matching transfers between accounts")

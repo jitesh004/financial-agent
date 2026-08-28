@@ -22,6 +22,24 @@ export default function DataManager() {
   const [pending, setPending] = useState(null);   // scope awaiting confirmation
   const [typed, setTyped] = useState('');
   const [busy, setBusy] = useState(false);
+  const [expandedPreview, setExpandedPreview] = useState(null);
+  const [previewData, setPreviewData] = useState(null);
+  const [rebuildMonths, setRebuildMonths] = useState(0);
+
+  async function loadPreview(scope) {
+    if (expandedPreview === scope) {
+      setExpandedPreview(null);
+      return;
+    }
+    setExpandedPreview(scope);
+    setPreviewData(null);
+    try {
+      const data = await api.previewData(scope);
+      setPreviewData(data);
+    } catch(e) {
+      setPreviewData({ error: [{ error: e.message || "Failed to load preview. Please restart the backend." }] });
+    }
+  }
 
   const load = useCallback(() => {
     api.inventory().then(setInv).catch((e) => setError(e.message));
@@ -59,6 +77,35 @@ export default function DataManager() {
     try {
       await api.restoreSnapshot(name);
       setNote(`Restored ${name}. The state before this restore was snapshotted too.`);
+      load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteSnapshot(name) {
+    if (!window.confirm(`Are you sure you want to permanently delete snapshot ${name}?`)) return;
+    setBusy(true);
+    try {
+      await api.deleteSnapshot(name);
+      setNote(`Deleted snapshot ${name}.`);
+      load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function reanalyzeAll() {
+    const label = rebuildMonths === 0 ? 'ALL' : `last ${rebuildMonths} months of`;
+    if (!window.confirm(`This will wipe all parsed data and rebuild the ${label} statements from existing files. It runs in the background and may take a few minutes. Proceed?`)) return;
+    setBusy(true);
+    try {
+      const res = await api.reanalyze(rebuildMonths || null);
+      setNote(`Rebuild started (Run ID: ${res.run_id}). Rebuilding ${res.file_count} file(s). Refresh in a couple of minutes.`);
       load();
     } catch (e) {
       setError(e.message);
@@ -107,7 +154,7 @@ export default function DataManager() {
 
       <Card title="Clearing actions" sub="Ordered by what it costs to get the data back">
         {(inv.actions || []).map((a) => (
-          <div key={a.scope} className="file-row">
+          <div key={a.scope} className="file-row" style={{ flexWrap: 'wrap' }}>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontWeight: 600, display: 'flex', gap: 8, alignItems: 'center' }}>
                 {a.label}
@@ -122,7 +169,7 @@ export default function DataManager() {
                 ))}
               </div>
             </div>
-            <div style={{ textAlign: 'right' }}>
+            <div style={{ textAlign: 'right', display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-end' }}>
               <button
                 className={`btn ${a.destructive ? 'danger' : ''}`}
                 disabled={busy}
@@ -130,9 +177,57 @@ export default function DataManager() {
               >
                 {a.label}
               </button>
+              {['ai_inferences', 'parsed_data', 'decisions', 'files'].includes(a.scope) && (
+                  <button className="btn" style={{ fontSize: 12, padding: '2px 8px' }} onClick={() => loadPreview(a.scope)}>
+                    {expandedPreview === a.scope ? 'Hide preview' : 'Preview data'}
+                  </button>
+              )}
             </div>
 
-            {pending === a.scope && (
+            {expandedPreview === a.scope && (
+              <div style={{ flexBasis: '100%', marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--surface-2)' }}>
+                {previewData ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 24, paddingBottom: 12 }}>
+                    {Object.entries(previewData).map(([tableName, rows]) => (
+                      <div key={tableName}>
+                        <div style={{ marginBottom: 8, fontWeight: 600, color: 'var(--text-1)', textTransform: 'capitalize' }}>
+                          {tableName.replace(/_/g, ' ')} <span style={{ color: 'var(--text-3)', fontWeight: 'normal' }}>({rows.length}{rows.length === 500 ? '+' : ''} rows)</span>
+                        </div>
+                        {rows.length === 0 ? (
+                          <div style={{ color: 'var(--text-3)', fontSize: 13, fontStyle: 'italic' }}>Table is empty.</div>
+                        ) : (
+                          <div className="table-wrap scroll-y" style={{ maxHeight: 400 }}>
+                            <table>
+                              <thead>
+                                <tr>
+                                  {Object.keys(rows[0]).map(k => (
+                                    <th key={k} style={{ textTransform: 'capitalize' }}>{k.replace(/_/g, ' ')}</th>
+                                  ))}
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {rows.map((r, i) => (
+                                  <tr key={i}>
+                                    {Object.values(r).map((v, j) => (
+                                      <td key={j} style={{ whiteSpace: 'nowrap', maxWidth: 250, overflow: 'hidden', textOverflow: 'ellipsis' }} title={String(v)}>
+                                        {v === null ? <span style={{ color: 'var(--text-3)' }}>null</span> : String(v)}
+                                      </td>
+                                    ))}
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="spinner" style={{ fontSize: 13, color: 'var(--text-3)' }}> Loading preview...</div>
+                )}
+              </div>
+            )}
+                        {pending === a.scope && (
               <div style={{
                 flexBasis: '100%', marginTop: 12, paddingTop: 12,
                 borderTop: '1px solid var(--surface-2)',
@@ -170,6 +265,44 @@ export default function DataManager() {
         ))}
       </Card>
 
+      <Card title="System Actions" sub="Run full system rebuilds">
+        <div className="file-row" style={{ flexWrap: 'wrap', gap: 12 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontWeight: 600 }}>Rebuild ledger from statements</div>
+            <div style={{ color: 'var(--text-2)', fontSize: 13, marginTop: 2 }}>
+              Drop all parsed data and re-run existing statement files through the full pipeline. Use after a parsing rule change.
+            </div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                Scope
+              </label>
+              <select
+                value={rebuildMonths}
+                onChange={(e) => setRebuildMonths(Number(e.target.value))}
+                disabled={busy}
+                style={{
+                  padding: '5px 8px', fontSize: 13, borderRadius: 6,
+                  border: '1px solid var(--border)', background: 'var(--surface-2)',
+                  color: 'var(--text-1)', cursor: 'pointer',
+                }}
+              >
+                <option value={0}>All time</option>
+                <option value={3}>Last 3 months</option>
+                <option value={6}>Last 6 months</option>
+                <option value={12}>Last 12 months</option>
+                <option value={24}>Last 24 months</option>
+              </select>
+            </div>
+            <button className="btn primary" disabled={busy} onClick={reanalyzeAll}
+              style={{ alignSelf: 'flex-end' }}>
+              Start Rebuild
+            </button>
+          </div>
+        </div>
+      </Card>
+      
       <Card
         title="Snapshots"
         sub="Taken automatically before anything destructive"
@@ -180,16 +313,21 @@ export default function DataManager() {
           </div>
         )}
         {(inv.snapshots || []).map((s) => (
-          <div key={s.name} className="file-row">
+          <div key={s.name} className="file-row" style={{ flexWrap: 'wrap' }}>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div className="truncate file-name">{s.name}</div>
               <div style={{ color: 'var(--text-3)', fontSize: 12 }}>
                 {s.created_at} · {formatBytes(s.size_bytes)}
               </div>
             </div>
-            <button className="btn" disabled={busy} onClick={() => restore(s.name)}>
-              Restore
-            </button>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button className="btn" disabled={busy} onClick={() => restore(s.name)}>
+                Restore
+              </button>
+              <button className="btn danger" disabled={busy} onClick={() => deleteSnapshot(s.name)}>
+                Delete
+              </button>
+            </div>
           </div>
         ))}
       </Card>

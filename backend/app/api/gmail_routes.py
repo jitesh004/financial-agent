@@ -498,14 +498,23 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
 
             statement, account = normalize(extraction, name, sender=entry.get("sender", ""))
             if not statement.transactions:
-                progress.item(name, "failed", "no rows parsed")
-                record_file(
-                    "failed", "Table found but no rows parsed.",
-                    file_hash=digest, size_bytes=size_bytes,
-                    password=resolved_password, password_status=password_status,
-                    institution=account.institution,
-                    account_type=account.account_type.value)
-                continue
+                # Same reasoning as graph.nodes.ingest_file: a statement
+                # whose own declared opening and closing balance are equal -
+                # a dormant account, or one opened partway through the cycle
+                # - is a real document correctly read as "nothing happened",
+                # not a parser failure. Falls through to the normal success
+                # path below when true, so the account still shows up with
+                # its (unchanged) balance instead of vanishing silently.
+                from ..graph.nodes import _is_genuinely_quiet_period
+                if not _is_genuinely_quiet_period(statement):
+                    progress.item(name, "failed", "no rows parsed")
+                    record_file(
+                        "failed", "Table found but no rows parsed.",
+                        file_hash=digest, size_bytes=size_bytes,
+                        password=resolved_password, password_status=password_status,
+                        institution=account.institution,
+                        account_type=account.account_type.value)
+                    continue
 
             statement.file_hash = digest
             recon = reconcile(statement, account.account_type)

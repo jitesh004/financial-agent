@@ -223,7 +223,7 @@ export default function Recurring() {
                           <tr key={t.id}>
                             <td className="nowrap">{dateLabel(t.date)}</td>
                             <td>
-                              <div className="truncate" title={t.description}>
+                              <div style={{ wordBreak: 'break-word', whiteSpace: 'normal', lineHeight: '1.4' }}>
                                 {t.description}
                               </div>
                             </td>

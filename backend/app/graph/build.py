@@ -60,7 +60,12 @@ def synthesize(state: AnalysisState) -> dict:
         return {"narrative": {}, "report": {}, "status": "failed",
                 "errors": ["Analysis produced no result to summarize."]}
 
-    statements = state.get("statements") or []
+    # Deduplicated the same way merge_ledger builds the ledger itself - a
+    # file retried after a failed reconciliation left every attempt in
+    # "statements" (an additive channel), so without this the file count and
+    # the reconciliation/parse-failure notes below counted and named a
+    # retried file two or three times over.
+    statements = nodes.latest_attempt_per_file(state.get("statements") or [])
     unreconciled = [s for s in statements if s.get("status") == "unreconciled"]
     failed = [s for s in statements if s.get("status") == "failed"]
 

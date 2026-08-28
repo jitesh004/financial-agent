@@ -154,7 +154,7 @@ export default function TransactionsTable({
     setSaving(txn.id);
     try {
       await api.claimTransaction(txn.id, {
-        counterparty: who, direction: 'owed_to_me',
+        counterparty: who, direction: 'owed_to_me', amount: txn.amount,
       });
       setRows((prev) => prev.map(
         (r) => (r.id === txn.id ? { ...r, excluded: true } : r)));
@@ -444,7 +444,7 @@ export default function TransactionsTable({
                     </td>
                     <td className="nowrap">{dateLabel(t.date)}</td>
                     <td>
-                      <div className="truncate" title={t.description}>{t.description}</div>
+                      <div style={{ wordBreak: 'break-word', whiteSpace: 'normal', lineHeight: '1.4' }}>{t.description}</div>
                       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 4 }}>
                         {t.is_internal_transfer && (
                           <Chip tone="accent">

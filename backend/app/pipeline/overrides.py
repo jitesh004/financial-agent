@@ -163,3 +163,98 @@ def record_decision(db, txn, accounts=None, **fields) -> None:
     )
     repo.save_override(db, record)
     _apply_one(record, txn)
+
+
+def apply_splits(db, transactions: list) -> list:
+    """Replace a split transaction with its constituent parts.
+
+    A split exists once the user has said one row was really several things -
+    a grocery bill half paid by a flatmate, a card charge that was partly a
+    gift. Analytics has no notion of "one row, several categories", so the
+    row is expanded into ordinary Transaction objects here, before anything
+    else in the pipeline runs. That is what lets every existing view -
+    spending by category, monthly totals, the review queue, recurring
+    detection - handle a split correctly with no changes of its own: as far
+    as they can tell, it is just several ordinary transactions.
+
+    Splits were previously write-only: `save_splits` stored rows, `get_splits`
+    could read them back, and nothing else in the application ever called
+    either one. Dividing a transaction had no effect on a single number
+    anywhere - the parent kept counting its full original amount under its
+    original category, exactly as if the split had never happened.
+    """
+    by_parent = repo.get_all_splits(db)
+    if not by_parent:
+        return transactions
+
+    by_fingerprint = {t.fingerprint: t for t in transactions if t.fingerprint}
+    # Built lazily, same as apply_overrides - only needed when a strict
+    # fingerprint lookup misses.
+    loose_index: dict[tuple, list] | None = None
+
+    out = []
+    handled_ids: set[int] = set()
+    for parent_fingerprint, parts in by_parent.items():
+        txn = by_fingerprint.get(parent_fingerprint)
+        repaired = False
+
+        if txn is None:
+            first = parts[0]
+            origin_key = (first.get("origin_date", ""), first.get("origin_amount", ""),
+                         first.get("origin_direction", ""), first.get("origin_desc_hash", ""))
+            if any(origin_key):
+                if loose_index is None:
+                    loose_index = {}
+                    for t in transactions:
+                        loose_index.setdefault(loose_key(t), []).append(t)
+
+                # Only an unambiguous recovery is accepted - same rule as
+                # apply_overrides. Two rows sharing a date/amount/direction/
+                # description leave no honest way to tell which one a split
+                # made months ago was meant for.
+                candidates = loose_index.get(origin_key, [])
+                if len(candidates) == 1:
+                    txn = candidates[0]
+                    repaired = True
+
+        if txn is None:
+            continue  # the statement this split belongs to hasn't been re-parsed yet
+        handled_ids.add(id(txn))
+
+        if repaired:
+            repo.repoint_splits(db, parent_fingerprint, txn.fingerprint)
+
+        for i, part in enumerate(parts):
+            child = txn.model_copy(deep=True)
+            child.id = f"{txn.id}:split:{i}"
+            child.fingerprint = f"{txn.fingerprint}:split:{i}"
+            child.amount = part["amount"]
+
+            # An explicit category on the split is the user's own decision
+            # for that portion, as authoritative as any other correction. A
+            # part left blank keeps whatever the parent already had (its own
+            # rule/model result, or UNCATEGORIZED to be settled independently
+            # by the categorizer downstream like any other row).
+            if part.get("category"):
+                child.category = part["category"]
+                child.category_source = ConfidenceSource.USER
+                child.category_confidence = 1.0
+            if part.get("flow_role"):
+                child.flow_role = part["flow_role"]
+            if part.get("note"):
+                child.note = f"{child.note} {part['note']}".strip()
+            if part.get("claim_id"):
+                # This portion is itself a claim against someone else -
+                # excluded the same way a whole-transaction claim is.
+                child.excluded = True
+
+            out.append(child)
+
+    # Everything not claimed by a split above passes through unchanged. Order
+    # doesn't need to match the input exactly - every step downstream of here
+    # (transfer/settlement matching, categorization, analysis) works on the
+    # set of transactions, not their sequence - but re-sorting by date keeps
+    # the result no more scrambled than `enrich_ledger`'s own initial sort.
+    out.extend(t for t in transactions if id(t) not in handled_ids)
+    out.sort(key=lambda t: (t.txn_date, t.account_id or ""))
+    return out

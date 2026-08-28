@@ -191,7 +191,7 @@ export default function MonthView({ data }) {
                   <tr key={r.id}>
                     <td className="nowrap">{dateLabel(r.date)}</td>
                     <td>
-                      <div className="truncate" title={r.description}>
+                      <div style={{ wordBreak: 'break-word', whiteSpace: 'normal', lineHeight: '1.4' }}>
                         {r.description}
                       </div>
                       {r.note && (

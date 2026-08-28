@@ -89,6 +89,13 @@ CREATE TABLE IF NOT EXISTS accounts (
     holder_name           TEXT,
     currency              TEXT NOT NULL DEFAULT 'INR',
     current_balance       TEXT,
+    -- The statement period this balance was read from. Without it, merging
+    -- statements that arrive out of chronological order (Gmail search, a
+    -- batch upload, a single-file retry) has no way to tell a fresher
+    -- balance from a stale one, and "whichever file was processed first"
+    -- silently won forever - which is how a savings account with real money
+    -- in it ended up reporting a balance of zero.
+    balance_as_of         TEXT,
     principal_outstanding TEXT,
     interest_rate         TEXT,
     emi_amount            TEXT,
@@ -421,7 +428,17 @@ CREATE TABLE IF NOT EXISTS transaction_splits (
     flow_role          TEXT,
     claim_id           TEXT REFERENCES claims(id) ON DELETE SET NULL,
     note               TEXT NOT NULL DEFAULT '',
-    position           INTEGER NOT NULL DEFAULT 0
+    position           INTEGER NOT NULL DEFAULT 0,
+    -- The parent's own loose key (see pipeline.fingerprint), stored so a
+    -- split survives its parent's strict fingerprint moving underneath it -
+    -- the same recovery `user_overrides` gets, and for the same reason: an
+    -- account being re-identified across a reprocess is routine, not a bug,
+    -- and a split resolved by parent_fingerprint alone would simply stop
+    -- applying the moment that happened.
+    origin_date        TEXT NOT NULL DEFAULT '',
+    origin_amount      TEXT NOT NULL DEFAULT '',
+    origin_direction   TEXT NOT NULL DEFAULT '',
+    origin_desc_hash   TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_splits_parent
@@ -516,7 +533,8 @@ class Database:
         current column list rather than catching the duplicate-column error.
         """
         for table, columns in (
-            ("accounts", (("current_balance", "TEXT"), ("product_name", "TEXT"))),
+            ("accounts", (("current_balance", "TEXT"), ("product_name", "TEXT"),
+                         ("balance_as_of", "TEXT"))),
             ("user_profile", (("excluded_senders", "TEXT NOT NULL DEFAULT '[]'"),)),
             ("source_files", (("period_hint", "TEXT"),)),
             ("transactions", (
@@ -528,6 +546,12 @@ class Database:
                 ("flow_role", "TEXT NOT NULL DEFAULT ''"),
                 ("excluded", "INTEGER NOT NULL DEFAULT 0"),
                 ("note", "TEXT NOT NULL DEFAULT ''"),
+            )),
+            ("transaction_splits", (
+                ("origin_date", "TEXT NOT NULL DEFAULT ''"),
+                ("origin_amount", "TEXT NOT NULL DEFAULT ''"),
+                ("origin_direction", "TEXT NOT NULL DEFAULT ''"),
+                ("origin_desc_hash", "TEXT NOT NULL DEFAULT ''"),
             )),
         ):
             existing = {
@@ -601,6 +625,7 @@ class Database:
                         holder_name           TEXT,
                         currency              TEXT NOT NULL DEFAULT 'INR',
                         current_balance       TEXT,
+                        balance_as_of         TEXT,
                         principal_outstanding TEXT,
                         interest_rate         TEXT,
                         emi_amount            TEXT,
@@ -610,11 +635,14 @@ class Database:
                         UNIQUE (institution, account_type, account_number_masked, product_name)
                     );
                     INSERT INTO accounts_new (id, institution, account_type, account_number_masked,
-                        product_name, holder_name, currency, current_balance,
+                        product_name, holder_name, currency, current_balance, balance_as_of,
                         principal_outstanding, interest_rate, emi_amount,
                         tenure_months_remaining, credit_limit, created_at)
                     SELECT id, institution, account_type, account_number_masked,
                         product_name, holder_name, currency, current_balance,
+                        -- balance_as_of postdates this migration, so a database still
+                        -- taking this path never had the column to carry over.
+                        NULL,
                         principal_outstanding, interest_rate, emi_amount,
                         tenure_months_remaining, credit_limit, created_at
                     FROM accounts;
@@ -756,6 +784,23 @@ class Database:
                 conn.execute(f"DELETE FROM {table}")
                 if before:
                     removed[table] = before
+            
+            # If we wipe the ledger, the source_files that generated it should
+            # Revert ALL file statuses to 'pending' so the file grid reflects
+            # reality after a ledger clear. Failed / needs_password files get
+            # reset too - clearing the ledger is a fresh start, and the user
+            # should be able to see which files still need attention on the
+            # next parse pass.
+            if scope in ("parsed_data", "everything"):
+                conn.execute("""
+                    UPDATE source_files 
+                    SET parse_status = 'pending', 
+                        transaction_count = 0, 
+                        error_message = '',
+                        account_id = NULL,
+                        statement_id = NULL
+                    WHERE parse_status != 'pending'
+                """)
         log.info("cleared scope=%s removed=%s", scope, removed)
         return removed
 

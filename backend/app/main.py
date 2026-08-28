@@ -46,6 +46,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("financial-agent")
 
+# Suppress noisy third-party PDF library warnings that are harmless for
+# Indian bank statements. pdfminer warns about missing FontBBox values in
+# non-standard fonts; pypdf warns about /Perms signature verification on
+# password-protected files it has already decrypted successfully. Neither
+# affects text extraction quality.
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
+logging.getLogger("pypdf").setLevel(logging.ERROR)
+
+
 ROOT = Path(__file__).resolve().parents[2]
 UPLOAD_DIR = ROOT / "data" / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -171,7 +180,7 @@ CLEAR_ACTIONS: tuple[ClearAction, ...] = (
     ),
     ClearAction(
         scope="parsed_data",
-        label="Re-parse statements",
+        label="Clear parsed ledger",
         description="Drop the parsed ledger and rebuild it from the statement "
                     "files. Use this after a parsing fix.",
         clears=("transactions", "accounts", "statements"),
@@ -409,18 +418,58 @@ def _persist(state: dict[str, Any]) -> None:
         graph_id_to_db_id[graph_id] = db_id
         account.id = db_id
 
+    # Which statement ids actually got a row written, so a transaction
+    # pointing at one that didn't (its account resolved to nothing above, or
+    # the statement carried no id at all) can be caught before it reaches
+    # SQLite - `statement_id` is a foreign key too, and a dangling one fails
+    # exactly as unhelpfully as a dangling account_id did.
+    persisted_statement_ids: set[str] = set()
     for entry in state.get("statements") or []:
         statement = entry.get("statement")
         if statement is None:
             continue
         db_account_id = graph_id_to_db_id.get(statement.account_id or "")
         if db_account_id:
-            repo.save_statement(db, statement, db_account_id,
-                                entry.get("reconciliation"))
+            saved_id = repo.save_statement(db, statement, db_account_id,
+                                           entry.get("reconciliation"))
+            persisted_statement_ids.add(saved_id)
 
     transactions = state.get("transactions") or []
     for txn in transactions:
         txn.account_id = graph_id_to_db_id.get(txn.account_id or "", txn.account_id)
+        # Unlike account_id, this column allows NULL - "which statement this
+        # came from" is useful attribution, not a fact the transaction needs
+        # to exist. Dropping a stale reference loses that attribution for the
+        # rows it affects; refusing to save any transaction over it would
+        # lose those rows entirely, which is far worse.
+        if txn.statement_id and txn.statement_id not in persisted_statement_ids:
+            log.warning(
+                "transaction %s referenced statement %s which was never "
+                "persisted this run - clearing the reference rather than "
+                "failing the whole save", txn.id, txn.statement_id)
+            txn.statement_id = None
+
+    # Every transaction's account_id was just remapped through the SAME
+    # dict the accounts loop above resolved into real database ids, so this
+    # can only be non-empty if a transaction referenced an account that never
+    # went through that loop at all - a bug upstream, not something SQLite's
+    # bare "FOREIGN KEY constraint failed" (no row, no column, no account id)
+    # gives any way to diagnose. Caught here with the actual offending ids
+    # and a sample row, instead of a full run failing on an error that names
+    # nothing.
+    known_ids = set(graph_id_to_db_id.values())
+    orphaned = [t for t in transactions if t.account_id not in known_ids]
+    if orphaned:
+        samples = "; ".join(
+            f"{t.txn_date} {t.raw_description[:40]!r} (acct={t.account_id})"
+            for t in orphaned[:5]
+        )
+        raise RuntimeError(
+            f"{len(orphaned)} transaction(s) reference an account that was "
+            f"never persisted this run - refusing to write them rather than "
+            f"hit an undiagnosable FOREIGN KEY error. Sample: {samples}"
+        )
+
     if transactions:
         repo.save_transactions(db, transactions)
 
@@ -453,8 +502,29 @@ def _save_file_registry(state: dict[str, Any], source: str) -> None:
     query, and a solved password is forgotten the moment the run ends.
     """
     db = get_db()
-    for entry in state.get("statements") or []:
+    # Called after _persist, which is the only place a statement actually
+    # gets a row written - and only for statements whose account resolved.
+    # A statement here can still carry an id from the graph (merge_ledger
+    # mints one for every statement it sees) without ever having been
+    # persisted, so checking against the id alone is not enough; this is the
+    # same dangling-foreign-key shape _persist itself guards against, one
+    # table over.
+    from .graph.nodes import latest_attempt_per_file
+
+    with db.connection() as conn:
+        persisted_statement_ids = {
+            r["id"] for r in conn.execute("SELECT id FROM statements").fetchall()
+        }
+    # Same reasoning as merge_ledger and synthesize: a retried file left
+    # every attempt in "statements" (an additive channel), and
+    # upsert_source_file's own content-hash dedup would otherwise leave the
+    # registry holding whichever attempt happened to be recorded last rather
+    # than whichever attempt actually reflects the final outcome.
+    for entry in latest_attempt_per_file(state.get("statements") or []):
         statement = entry.get("statement")
+        statement_id = statement.id if statement else None
+        if statement_id and statement_id not in persisted_statement_ids:
+            statement_id = None
         record = repo.SourceFileRecord(
             id=str(uuid.uuid4()),
             filename=entry.get("filename") or "",
@@ -469,7 +539,7 @@ def _save_file_registry(state: dict[str, Any], source: str) -> None:
                                if entry.get("account") else ""),
             account_type_guess=(entry.get("account").account_type.value
                                 if entry.get("account") else ""),
-            statement_id=statement.id if statement else None,
+            statement_id=statement_id,
             transaction_count=entry.get("transaction_count") or 0,
             error_message=entry.get("message") or "",
         )
@@ -478,8 +548,14 @@ def _save_file_registry(state: dict[str, Any], source: str) -> None:
 
 
 def _build_payload(state: dict[str, Any]) -> dict[str, Any]:
+    from .graph.nodes import latest_attempt_per_file
+
     accounts = state.get("accounts") or {}
-    statements = state.get("statements") or []
+    # Deduplicated the same way merge_ledger and synthesize do - a file
+    # retried after a failed reconciliation left every attempt in
+    # "statements" (an additive channel), so without this the Files/Coverage
+    # tabs showed a retried file two or three times over.
+    statements = latest_attempt_per_file(state.get("statements") or [])
 
     return {
         "analysis": ser.analysis_json(state.get("analysis")),
@@ -593,19 +669,34 @@ def _rebuild_from_persisted_data(db) -> str:
 
 @app.post("/api/reanalyze")
 def reanalyze(background: BackgroundTasks, horizon_months: int = 6,
-              use_llm: bool = True) -> dict[str, Any]:
-    """Re-parse every statement file this workspace knows about."""
-    # Driven by the file registry rather than by globbing the uploads
-    # directory. The registry is the only place that knows about files which
-    # arrived from Gmail, and it also survives the file being moved - globbing
-    # one directory silently re-analysed a subset and called it "everything".
+              use_llm: bool = True, months: int | None = None) -> dict[str, Any]:
+    """Re-parse every statement file this workspace knows about.
+
+    `months`: if given, only files whose period_hint falls within the last
+    N calendar months are included. Files with no period_hint are always
+    included so they are not silently dropped.
+    """
+    from datetime import date
+    from dateutil.relativedelta import relativedelta
+
     db = get_db()
+
+    # Compute cutoff month string (YYYY-MM) when scoping by months
+    cutoff_month: str | None = None
+    if months:
+        cutoff = date.today() - relativedelta(months=months)
+        cutoff_month = f"{cutoff.year:04d}-{cutoff.month:02d}"
+
     tasks = []
     for record in repo.list_source_files(db):
         if not record.filepath:
             continue
         path = Path(record.filepath)
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS or not path.exists():
+            continue
+        # Apply month filter when requested. Files with no period_hint always pass
+        # through — we don't know when they are from, so we can't safely exclude them.
+        if cutoff_month and record.period_hint and record.period_hint < cutoff_month:
             continue
         tasks.append({"path": str(path), "filename": record.filename})
 
@@ -630,10 +721,6 @@ def reanalyze(background: BackgroundTasks, horizon_months: int = 6,
 
     run_id = str(uuid.uuid4())
     runs.create(run_id, len(tasks))
-    # Snapshot BEFORE clearing, so a re-parse that goes wrong - a file that no
-    # longer opens, a crash halfway through - is recoverable. Previously this
-    # cleared the ledger up front and the old rows were simply gone whether or
-    # not anything replaced them.
     db = get_db()
     db.snapshot("pre-reanalyze")
     db.clear("parsed_data")
@@ -811,6 +898,17 @@ def list_categories() -> list[str]:
         custom = [r["name"] for r in conn.execute("SELECT name FROM custom_categories").fetchall()]
     return builtins + custom
 
+@app.get("/api/categories/custom")
+def list_custom_categories() -> list[str]:
+    """Just the user-added names, so a caller can tell them apart from the
+    built-ins without guessing - Settings.jsx used to assume the first 30
+    entries of /api/categories were built-in, a count that happens to match
+    today but silently breaks the moment a built-in category is ever added
+    or removed."""
+    db = get_db()
+    with db.connection() as conn:
+        return [r["name"] for r in conn.execute("SELECT name FROM custom_categories").fetchall()]
+
 class CustomCategoryReq(BaseModel):
     name: str
     color: str = "#6b7280"
@@ -857,6 +955,24 @@ def data_inventory() -> dict[str, Any]:
         ],
     }
 
+
+
+@app.get("/api/data/preview/{scope}")
+def preview_data(scope: str) -> dict[str, Any]:
+    db = get_db()
+    preview = {}
+    with db.connection() as conn:
+        if scope == "ai_inferences":
+            preview["merchant_categories"] = [dict(row) for row in conn.execute("SELECT merchant_key, category, hit_count, updated_at FROM merchant_categories LIMIT 500").fetchall()]
+            preview["ai_inferences"] = [dict(row) for row in conn.execute("SELECT cache_key, kind, provider, model, created_at, hit_count FROM ai_inferences LIMIT 500").fetchall()]
+        elif scope == "decisions":
+            preview["user_overrides"] = [dict(row) for row in conn.execute("SELECT fingerprint, category, flow_role, note, excluded, updated_at FROM user_overrides LIMIT 500").fetchall()]
+        elif scope == "parsed_data":
+            preview["transactions"] = [dict(row) for row in conn.execute("SELECT id, txn_date, amount, merchant, category, flow_role FROM transactions LIMIT 500").fetchall()]
+            preview["accounts"] = [dict(row) for row in conn.execute("SELECT product_name, account_number_masked, account_type, institution FROM accounts LIMIT 500").fetchall()]
+        elif scope == "files":
+            preview["source_files"] = [dict(row) for row in conn.execute("SELECT filename, size_bytes, parse_status, transaction_count FROM source_files LIMIT 500").fetchall()]
+    return preview
 
 @app.post("/api/data/clear/{scope}")
 def clear_data(scope: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -918,6 +1034,27 @@ def restore_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(404, str(exc))
     runs.clear()
     return {"status": "restored", "name": name}
+
+@app.delete("/api/data/snapshots/{name}")
+def delete_snapshot(name: str) -> dict[str, Any]:
+    """Delete a specific snapshot file."""
+    db = get_db()
+    backups = db.path.parent / "backups"
+    target = backups / name
+    
+    # Path traversal protection - ensure it's in the backups dir
+    try:
+        if not target.resolve().is_relative_to(backups.resolve()):
+            raise HTTPException(400, "Invalid snapshot name")
+    except ValueError:
+        pass # python < 3.9 might not have is_relative_to, but 3.12 does
+        
+    if not target.exists():
+        raise HTTPException(404, "Snapshot not found")
+        
+    target.unlink()
+    return {"status": "deleted"}
+
 
 
 @app.post("/api/reset")
@@ -1134,20 +1271,43 @@ class SplitReq(BaseModel):
 
 @app.post("/api/transactions/{txn_id}/split")
 def split_transaction(txn_id: str, payload: SplitReq) -> dict[str, Any]:
-    import uuid
+    """Divide one transaction into parts, each free to carry its own
+    category, flow role and note.
+
+    Persists the split and nothing else - `pipeline.overrides.apply_splits`
+    is what turns the stored rows into actual accounting effect on the next
+    enrichment pass, the same way a category correction is stored here and
+    applied by the pipeline rather than computed inline.
+    """
     db = get_db()
     matches = [t for t in repo.get_transactions(db) if t.id == txn_id]
     if not matches:
         raise HTTPException(404, f"No transaction with id {txn_id}")
     txn = matches[0]
-    
-    total = sum(p.amount for p in payload.splits)
-    if total != txn.amount:
-        raise HTTPException(400, f"Splits sum to {total}, expected {txn.amount}")
-        
-    splits = [{"amount": p.amount, "category": p.category, "flow_role": p.flow_role, "note": p.note} for p in payload.splits]
-    repo.save_splits(db, txn.fingerprint, txn.amount, splits)
-    return {"status": "ok"}
+    if not payload.splits:
+        raise HTTPException(400, "At least one split part is required.")
+
+    # Rounded before comparing: a JSON number like 450.30 can arrive as a
+    # float with binary rounding noise, and an exact != would reject a split
+    # a person looking at it would call correct.
+    cent = Decimal("0.01")
+    total = sum((p.amount for p in payload.splits), Decimal("0")).quantize(cent)
+    if total != txn.amount.quantize(cent):
+        raise HTTPException(
+            400, f"Splits sum to {total}, expected {txn.amount}")
+
+    splits = [{"amount": p.amount, "category": p.category,
+              "flow_role": p.flow_role, "note": p.note}
+             for p in payload.splits]
+    from .pipeline.fingerprint import loose_key
+    ids = repo.save_splits(db, txn.fingerprint, txn.amount, splits,
+                           origin_key=loose_key(txn))
+
+    # Same reasoning as every other transaction edit: the cached dashboard
+    # payload was computed before this split existed.
+    runs.clear()
+
+    return {"status": "ok", "split_ids": ids}
 
 class ClaimReq(BaseModel):
     amount: Decimal
@@ -1157,13 +1317,37 @@ class ClaimReq(BaseModel):
 
 @app.post("/api/transactions/{txn_id}/claim")
 def create_claim(txn_id: str, payload: ClaimReq) -> dict[str, Any]:
-    import uuid
+    """Mark a transaction as not really the user's - the start of a claim.
+
+    Every claim opens on ACCRUAL basis, the only one exposed today: the
+    schema's own comment on the column is explicit that accrual "leaves the
+    month the purchase happened in" - immediately, not when the money
+    eventually comes back. Creating the claim record without touching the
+    transaction it names would leave the purchase counting as the user's own
+    spending forever, which defeats the entire point of marking it in the
+    first place - a claim that exists only in the Owed tab and nowhere in
+    the numbers is not a fix, it just moves the bug somewhere less visible.
+    """
     db = get_db()
     matches = [t for t in repo.get_transactions(db) if t.id == txn_id]
     if not matches:
         raise HTTPException(404, f"No transaction with id {txn_id}")
     txn = matches[0]
-    
+
+    # record_decision stamps txn.fingerprint if it was ever empty (a row
+    # saved before fingerprinting existed, or - as this session's own tests
+    # found - one saved by a path that skips the pipeline). That has to
+    # happen BEFORE origin_fingerprint is read below: read in the other
+    # order, the claim remembers the stale empty value while the row's own
+    # persisted fingerprint becomes the freshly-stamped one, and settling the
+    # claim later can never find its way back to this transaction.
+    from .pipeline.overrides import record_decision
+    accounts = {a.id: a for a in repo.get_accounts(db) if a.id}
+    note = f"Not my expense - claimed against {payload.counterparty}"
+    if payload.note:
+        note += f" ({payload.note})"
+    record_decision(db, txn, accounts, excluded=True, note=note)
+
     claim_id = repo.save_claim(
         db,
         direction=payload.direction,
@@ -1172,6 +1356,12 @@ def create_claim(txn_id: str, payload: ClaimReq) -> dict[str, Any]:
         amount=payload.amount,
         opened_on=txn.txn_date.isoformat()
     )
+    repo.update_transaction_categories(db, [txn])
+
+    # Same reasoning as every other transaction edit: the cached dashboard
+    # payload was computed before this exclusion existed.
+    runs.clear()
+
     return {"status": "ok", "claim_id": claim_id}
 
 @app.get("/api/claims")
@@ -1183,19 +1373,48 @@ class SettleClaimReq(BaseModel):
     method: str
     txn_fingerprint: str | None = None
     note: str = ""
-    date: date
+    settled_on: date
 
 @app.post("/api/claims/{claim_id}/settle")
 def settle_claim(claim_id: str, payload: SettleClaimReq) -> dict[str, Any]:
-    import uuid
+    """Record how a claim was resolved.
+
+    Every method but `write_off` means real money moved, so the origin
+    purchase rightly stays excluded forever - somebody else already paid for
+    it. `write_off` means the opposite: the money is confirmed never coming
+    back, which makes it the user's own expense after all, so the exclusion
+    that `create_claim` applied has to be reversed here the same explicit way
+    it was applied - `repo.settle_claim` alone only updates the `claims` row
+    and the durable override; without this, whichever run computed the
+    dashboard the user is currently looking at would keep showing the
+    purchase as excluded until the next full re-enrichment noticed.
+    """
     db = get_db()
+    claim = repo.get_claim(db, claim_id)
+    if claim is None:
+        raise HTTPException(404, f"No claim with id {claim_id}")
     repo.settle_claim(
         db,
         claim_id=claim_id,
         method=payload.method,
         amount=payload.amount,
-        settled_on=payload.date.isoformat()
+        settled_on=payload.settled_on.isoformat(),
+        note=payload.note,
+        txn_fingerprint=payload.txn_fingerprint or "",
     )
+
+    if payload.method == "write_off" and claim.get("origin_fingerprint"):
+        matches = [t for t in repo.get_transactions(db)
+                  if t.fingerprint == claim["origin_fingerprint"]]
+        if matches:
+            from .pipeline.overrides import record_decision
+            accounts = {a.id: a for a in repo.get_accounts(db) if a.id}
+            record_decision(db, matches[0], accounts, excluded=False,
+                            note=f"Written off {payload.settled_on.isoformat()} - "
+                                 f"never recovered, counted as a real expense")
+            repo.update_transaction_categories(db, matches)
+
+    runs.clear()
     return {"status": "ok"}
 
 
@@ -1207,15 +1426,7 @@ class RecurringUpdateReq(BaseModel):
 
 @app.get("/api/recurring")
 def get_recurring_series() -> list[dict[str, Any]]:
-    db = get_db()
-    with db.connection() as conn:
-        rows = conn.execute("SELECT * FROM recurring_series ORDER BY is_active DESC, median_amount DESC").fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            if 'median_amount' in d: d['median_amount'] = repo._dec(d['median_amount'])
-            out.append(d)
-        return out
+    return repo.get_recurring_series(get_db())
 
 @app.patch("/api/recurring/{series_id}")
 def update_recurring(series_id: str, payload: RecurringUpdateReq) -> dict[str, Any]:
@@ -1231,13 +1442,17 @@ def update_recurring(series_id: str, payload: RecurringUpdateReq) -> dict[str, A
             if category and category not in valid_categories:
                 raise HTTPException(400, f"'{update_args['category']}' is not a valid category.")
             update_args["category"] = category
-            
+
         repo.update_recurring_series_override(db, series_id, update_args)
+        # /api/recurring reads live, but the cached dashboard payload embeds
+        # its own recurring list computed before this edit.
+        runs.clear()
     return {"status": "ok"}
 
 @app.delete("/api/recurring/{series_id}")
 def delete_recurring(series_id: str) -> dict[str, Any]:
     repo.update_recurring_series_override(get_db(), series_id, {"deleted": 1})
+    runs.clear()
     return {"status": "ok"}
 
 @app.exception_handler(Exception)

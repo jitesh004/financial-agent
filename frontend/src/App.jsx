@@ -57,7 +57,6 @@ export default function App() {
   const [showProfile, setShowProfile] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [busy, setBusy] = useState(false);
   const [reviewCount, setReviewCount] = useState(0);
   const [theme, setTheme] = useState(
     () => localStorage.getItem('fa-theme')
@@ -94,35 +93,31 @@ export default function App() {
     setTab('overview');
   };
 
-  async function reset() {
-    if (!window.confirm(
-      'This permanently deletes every uploaded statement and all analyzed data. Continue?',
-    )) return;
-    setBusy(true);
-    try {
-      await api.reset();
-      setData(null);
-      setError(null);
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
   const hasData = Boolean(data?.analysis?.totals);
 
   return (
     <div className="app">
       <header className="header">
-        <div className="brand">
-          <div className="brand-mark" />
-          Financial Agent
+        <div className="brand" style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '18px', fontWeight: 600, color: 'var(--text-1)' }}>
+          <img src="/favicon.svg" alt="Prism Logo" style={{ width: 20, height: 20, display: 'block' }} />
+          Prism
         </div>
 
-        {hasData && (
-          <nav className="tabs" role="tablist">
-            {TABS.map(([key, label]) => (
+        <nav className="tabs" role="tablist">
+          {!hasData && (
+            <button
+              className="tab"
+              role="tab"
+              aria-selected={!['settings', 'data-manager', 'file-registry'].includes(tab)}
+              onClick={() => setTab('overview')}
+            >
+              Upload
+            </button>
+          )}
+          {TABS.map(([key, label]) => {
+            const isDataTab = !['settings', 'data-manager', 'file-registry'].includes(key);
+            if (!hasData && isDataTab) return null;
+            return (
               <button
                 key={key}
                 className="tab"
@@ -140,18 +135,15 @@ export default function App() {
                   </span>
                 )}
               </button>
-            ))}
-          </nav>
-        )}
+            );
+          })}
+        </nav>
 
         <div className="header-spacer" />
 
         <button className="btn" onClick={() => setShowProfile(true)}>Profile</button>
         {hasData && (
-          <>
-            <button className="btn" onClick={() => setData(null)}>Upload more</button>
-            <button className="btn danger" onClick={reset} disabled={busy}>Reset</button>
-          </>
+          <button className="btn" onClick={() => setData(null)}>Upload more</button>
         )}
         <ThemeToggle theme={theme} onToggle={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))} />
       </header>
@@ -163,7 +155,7 @@ export default function App() {
           <div style={{ display: 'flex', gap: 10, alignItems: 'center', padding: 40 }}>
             <div className="spinner" /> Loading…
           </div>
-        ) : !hasData ? (
+        ) : !hasData && !['settings', 'data-manager', 'file-registry'].includes(tab) ? (
           <>
             <div style={{ maxWidth: 760, margin: '0 auto 22px', textAlign: 'center' }}>
               <h1 style={{ fontSize: 26, fontWeight: 660, letterSpacing: '-.6px', margin: '18px 0 8px' }}>
@@ -197,7 +189,7 @@ export default function App() {
         ) : (
           <>
             {error && <Callout tone="warn">{error}</Callout>}
-            <WorkflowNav onNavigate={setTab} />
+            {hasData && <WorkflowNav onNavigate={setTab} />}
             {tab === 'overview' && <Overview data={data} />}
             {tab === 'spending' && <Spending data={data} />}
             {tab === 'debt' && <Debt data={data} />}

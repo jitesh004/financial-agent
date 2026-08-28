@@ -141,10 +141,12 @@ def build_coverage(
     rows = []
 
     for account in accounts:
-        parsed_months: dict[str, Any] = {}  # month -> statement_id
+        parsed_months: dict[str, Any] = {}  # month -> dict
         for stmt in statements_by_account.get(account.id, []):
+            file_record = next((f for f in files_by_account.get(account.id, []) if f.statement_id == stmt.id), None)
+            file_id = file_record.id if file_record else None
             for month in statement_months(stmt.period_start, stmt.period_end):
-                parsed_months[month] = stmt.id
+                parsed_months[month] = {"statement_id": stmt.id, "file_id": file_id}
 
         failed_months: dict[str, Any] = {}  # month -> file record
         earliest = None
@@ -173,7 +175,7 @@ def build_coverage(
         for month in month_range(earliest, max(earliest, current_month)):
             if month in parsed_months:
                 months.append({"month": month, "status": "parsed",
-                               "statement_id": parsed_months[month], "file_id": None})
+                               "statement_id": parsed_months[month]["statement_id"], "file_id": parsed_months[month]["file_id"]})
             elif month in failed_months:
                 rec = failed_months[month]
                 months.append({"month": month, "status": "failed",

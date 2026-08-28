@@ -16,7 +16,7 @@ const STATUS_STYLE = {
  * ever found for this month - click to search Gmail for just it), or a dim
  * cell before the account's own history begins.
  */
-export default function CoverageGrid() {
+export default function CoverageGrid({ onSelectFile }) {
   const [rows, setRows] = useState(null);
   const [error, setError] = useState(null);
   const [busyCell, setBusyCell] = useState(null); // "accountId:month" mid-fetch/retry
@@ -36,7 +36,7 @@ export default function CoverageGrid() {
     if (!rows) return [];
     const set = new Set();
     rows.forEach((r) => r.months.forEach((m) => set.add(m.month)));
-    return [...set].sort();
+    return [...set].sort((a,b) => b.localeCompare(a));
   }, [rows]);
 
   const cellFor = (row, month) => row.months.find((m) => m.month === month);
@@ -139,7 +139,7 @@ export default function CoverageGrid() {
         </div>
 
         <div className="table-wrap">
-          <table style={{ borderSpacing: 3, borderCollapse: 'separate' }}>
+          <div className="scroll-x" style={{ overflowX: "auto", paddingBottom: 8 }}><table style={{ borderSpacing: 3, borderCollapse: 'separate' }}>
             <thead>
               <tr>
                 <th style={{ position: 'sticky', left: 0, background: 'var(--surface)', zIndex: 1 }}>
@@ -167,7 +167,7 @@ export default function CoverageGrid() {
                     const style = STATUS_STYLE[status];
                     const key = `${row.account_id}:${month}`;
                     const isBusy = busyCell === key;
-                    const clickable = cell && (status === 'failed' || status === 'missing') && !isBusy;
+                    const clickable = cell && (status === 'failed' || status === 'missing' || (status === 'parsed' && onSelectFile)) && !isBusy;
 
                     return (
                       <td key={month} style={{ padding: 2, textAlign: 'center' }}>
@@ -177,15 +177,16 @@ export default function CoverageGrid() {
                             ? `${row.display_name} · ${monthLabel(month)} · ${style.label}`
                             : `${row.display_name} · ${monthLabel(month)} · before this account's history`}
                           onClick={() => {
-                            if (!cell) return;
-                            if (status === 'failed') retryCell(cell.file_id, key);
-                            else if (status === 'missing') fetchCell(row.account_id, month, key, row.display_name);
-                          }}
+                              if (!cell) return;
+                              if (status === 'failed') retryCell(cell.file_id, key);
+                              else if (status === 'missing') fetchCell(row.account_id, month, key, row.display_name);
+                              else if (status === 'parsed' && onSelectFile) onSelectFile(cell.file_id);
+                            }}
                           style={{
                             width: 22, height: 22, borderRadius: 5, border: 'none',
                             background: style.background,
                             opacity: status === 'na' ? 0.35 : 1,
-                            cursor: clickable ? 'pointer' : (status === 'na' ? 'default' : 'default'),
+                            cursor: clickable ? 'pointer' : 'default',
                             display: 'flex', alignItems: 'center', justifyContent: 'center',
                             padding: 0,
                           }}
@@ -198,7 +199,7 @@ export default function CoverageGrid() {
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table></div>
         </div>
       </Card>
 

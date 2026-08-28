@@ -94,7 +94,39 @@ export default function FilesAndPasswords() {
     }
   }
 
-  if (error) return <Callout tone="neg">{error}</Callout>;
+  
+  async function handleSelectFile(fileId) {
+    console.log("handleSelectFile called with:", fileId);
+    setFilter('all');
+    const file = files?.find(f => f.id === fileId);
+    console.log("File found in list?", !!file);
+    if (!file) return;
+    
+    if (expanded !== fileId) {
+      console.log("Expanding...");
+      setExpanded(fileId);
+      setDrill('loading');
+      try {
+        const res = await api.fileTransactions(fileId);
+        console.log("API response:", res);
+        setDrill(res);
+      } catch (e) {
+        console.error("API error:", e);
+        setDrill(null);
+        setError(e.message);
+      }
+    } else {
+      console.log("Already expanded!");
+    }
+    
+    setTimeout(() => {
+      const el = document.getElementById(`file-row-${fileId}`);
+      console.log("Scroll target el:", el);
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 500); // 500ms instead of 100ms just to be safe with React re-renders!
+  }
+
+if (error) return <Callout tone="neg">{error}</Callout>;
   if (!files) {
     return (
       <div style={{ display: 'flex', gap: 10, alignItems: 'center', padding: 24 }}>
@@ -108,7 +140,7 @@ export default function FilesAndPasswords() {
 
   return (
     <>
-      <CoverageGrid />
+      <CoverageGrid onSelectFile={handleSelectFile} />
 
       <div className="section-title" style={{ marginTop: 26 }}>Files & Passwords</div>
 
@@ -153,7 +185,7 @@ export default function FilesAndPasswords() {
                 const canDrill = f.parse_status === 'parsed' || f.parse_status === 'unreconciled';
                 return (
                   <React.Fragment key={f.id}>
-                    <tr>
+                    <tr id={`file-row-${f.id}`}>
                       <td>
                         <div className="truncate" style={{ maxWidth: 260 }} title={f.filename}>
                           {f.filename}
@@ -237,7 +269,7 @@ export default function FilesAndPasswords() {
                                   {drill.transactions.map((t) => (
                                     <tr key={t.id}>
                                       <td className="nowrap">{dateLabel(t.date)}</td>
-                                      <td className="truncate" style={{ maxWidth: 320 }} title={t.description}>
+                                      <td style={{ wordBreak: 'break-word', whiteSpace: 'normal', lineHeight: '1.4' }}>
                                         {t.description}
                                       </td>
                                       <td><Chip>{titleCase(t.category)}</Chip></td>

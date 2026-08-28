@@ -40,7 +40,9 @@ MIN_CONFIDENCE = 0.25
 #: Utilities drift a lot month to month; a subscription barely moves.
 AMOUNT_VARIANCE_TOLERANCE = 0.35
 
-_SIGNATURE_NOISE = re.compile(r"\b\d+\b|\b[A-Z]{2}\d+\b")
+_MONTHS = r'\b(?:JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER|JAN|FEB|MAR|APR|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\b'
+_RAILS = r'\b(?:UPI|NEFT|RTGS|IMPS|ACH|CMS|MMT|NA)\b'
+_SIGNATURE_NOISE = re.compile(rf'\b\d+\b|\b[A-Z0-9]*\d[A-Z0-9]*\b|{_MONTHS}|{_RAILS}', re.IGNORECASE)
 
 
 @dataclass
@@ -78,6 +80,9 @@ def _signature(txn: Transaction) -> str:
     remains - the merchant words - is what makes NETFLIX in January the same
     series as NETFLIX in February.
     """
+    if txn.category == Category.SALARY:
+        return "SALARY"
+
     base = txn.normalized_description or txn.raw_description or ""
     base = _SIGNATURE_NOISE.sub("", base.upper())
     words = [w for w in re.split(r"[^A-Z]+", base) if len(w) > 2]
@@ -112,13 +117,35 @@ def detect_recurring(transactions: list[Transaction]) -> list[RecurringSeries]:
         # really the user paying their own card.
         if txn.is_mirror_leg:
             continue
+        # A row excluded from every total (a known parser artifact - a
+        # statement's own column-header line misread as a transaction - or a
+        # user's own "leave this out" decision) is not a real recurring
+        # charge either. A credit card's header row landing three months
+        # running with a near-identical amount is exactly the shape this
+        # function looks for, and without this check it showed up as its
+        # own "recurring series" - a phantom entry nobody could act on,
+        # sitting in the same list as their actual subscriptions and EMIs.
+        if txn.excluded:
+            continue
         sig = _signature(txn)
         if not sig:
             continue
         groups[(txn.account_id, txn.direction, sig)].append(txn)
 
     series: list[RecurringSeries] = []
-    today = max((t.txn_date for t in transactions), default=date.today())
+    # Excluded rows specifically must not set this: a single mis-parsed row -
+    # a credit card statement's own column-header line ("PaymentDueDate
+    # Min.AmountDue ChequeNo Date Bank Amount") landing in the ledger with a
+    # garbage date, already excluded from every total for exactly that
+    # reason - still counted here as "the most recent activity in the whole
+    # ledger" and pushed `today` weeks past every real transaction. Every
+    # series measured its own last occurrence against that phantom date, so
+    # a salary that was two or three weeks overdue read as two or three
+    # MONTHS overdue and dropped out of "active" entirely.
+    today = max(
+        (t.txn_date for t in transactions if not t.excluded),
+        default=date.today(),
+    )
 
     for (account_id, direction, sig), members in groups.items():
         if len(members) < MIN_OCCURRENCES:
@@ -201,6 +228,9 @@ def _label_for(members: list[Transaction], fallback: str) -> str:
     Shortest tends to be the cleanest - longer variants carry extra reference
     junk that survived normalization.
     """
+    if _dominant_category(members) == Category.SALARY:
+        return "Salary"
+        
     descriptions = [t.raw_description for t in members if t.raw_description]
     if not descriptions:
         return fallback.title()

@@ -104,7 +104,7 @@ export const api = {
   // from the transactions table was 404ing.
   recategorize: (id, category) => api.updateTransaction(id, { category }),
 
-  reanalyze: () => request('/api/reanalyze', { method: 'POST' }),
+  reanalyze: (months) => request(`/api/reanalyze${months ? `?months=${months}` : ''}`, { method: 'POST' }),
   reset: () => request('/api/reset', { method: 'POST' }),
 
   files: () => request('/api/files'),
@@ -164,9 +164,11 @@ api.deleteCategory = (name) =>
 
 api.workflow = () => request('/api/workflow');
 api.inventory = () => request('/api/data/inventory');
+api.previewData = (scope) => request(`/api/data/preview/${scope}`);
 api.clearData = (scope, confirm) =>
   jsonPost(`/api/data/clear/${scope}`, confirm ? { confirm } : {});
 api.restoreSnapshot = (name) => jsonPost('/api/data/restore', { name });
+api.deleteSnapshot = (name) => request(`/api/data/snapshots/${name}`, { method: 'DELETE' });
 
 api.profile = () => request('/api/profile');
 api.saveProfile = (profile) => request('/api/profile', {

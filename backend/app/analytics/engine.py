@@ -13,6 +13,7 @@ it rather than re-deriving the rule.
 from __future__ import annotations
 
 import statistics
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -102,6 +103,17 @@ class SalaryFlow:
 
 
 @dataclass
+
+@dataclass
+class P2PBalance:
+    counterparty: str
+    sent: Decimal
+    received: Decimal
+    net_owed_to_me: Decimal
+    transaction_count: int
+    last_activity: date
+
+@dataclass
 class AnalysisResult:
     period_start: date | None = None
     period_end: date | None = None
@@ -131,6 +143,7 @@ class AnalysisResult:
     by_group: dict[str, Decimal] = field(default_factory=dict)
     top_merchants: list[MerchantSpend] = field(default_factory=list)
     salary_flows: list[SalaryFlow] = field(default_factory=list)
+    p2p_balances: list[P2PBalance] = field(default_factory=list)
 
     income_sources: list[tuple[str, Decimal, int]] = field(default_factory=list)
     net_worth: dict[str, Decimal] = field(default_factory=dict)
@@ -148,6 +161,44 @@ class AnalysisResult:
 # --------------------------------------------------------------------------
 # Core analysis
 # --------------------------------------------------------------------------
+
+
+def _p2p_balances(txns: list[Transaction]) -> list[P2PBalance]:
+    from ..categorize.rules import _payee_field
+    from collections import defaultdict
+    
+    buckets: dict[str, list[Transaction]] = defaultdict(list)
+    for t in txns:
+        if t.category == Category.P2P_TRANSFER:
+            # Try to extract exact counterparty name
+            name = _payee_field(t)
+            # Fallback to normalized description if regex fails
+            if not name:
+                name = (t.normalized_description or t.raw_description)[:40].strip()
+            # Clean up UPI string prefixes if present
+            name = re.sub(r'^(UPI[/_]|VPA[/_])', '', name, flags=re.IGNORECASE)
+            name = name.split('/')[0].split('@')[0].strip().title()
+            if name:
+                buckets[name].append(t)
+                
+    out = []
+    for name, members in buckets.items():
+        sent = sum((t.amount for t in members if t.direction == Direction.DEBIT), ZERO)
+        received = sum((t.amount for t in members if t.direction == Direction.CREDIT), ZERO)
+        net = sent - received
+        
+        out.append(P2PBalance(
+            counterparty=name,
+            sent=q(sent),
+            received=q(received),
+            net_owed_to_me=q(net),
+            transaction_count=len(members),
+            last_activity=max(t.txn_date for t in members)
+        ))
+        
+    # Sort by absolute outstanding balance
+    out.sort(key=lambda b: -abs(b.net_owed_to_me))
+    return out
 
 def analyze(
     transactions: list[Transaction],
@@ -206,15 +257,15 @@ def analyze(
     # what was really a cancelled or borrowed purchase.
     offset_txns = [t for t in txns if t.role in CONTRA_EXPENSE_ROLES]
 
-    result.total_income = q(sum((t.amount for t in income_txns), ZERO))
-    result.gross_spend = q(sum((t.amount for t in spend_txns), ZERO))
-    result.total_offsets = q(sum((t.amount for t in offset_txns), ZERO))
+    result.total_income = q(sum((_income_val(t) for t in income_txns), ZERO))
+    result.gross_spend = q(sum((_spend_val(t) for t in spend_txns), ZERO))
+    result.total_offsets = q(sum((_income_val(t) for t in offset_txns), ZERO))
     # Reported net, with the gross figure kept alongside it: a user who is
     # reimbursed heavily needs to see both what they laid out and what it
     # actually cost them, and showing only one of those is misleading either
     # way round.
     result.total_spend = q(result.gross_spend - result.total_offsets)
-    result.total_invested = q(sum((t.amount for t in invested_txns), ZERO))
+    result.total_invested = q(sum((_spend_val(t) for t in invested_txns), ZERO))
     result.internal_transfer_total = q(
         sum((t.amount for t in txns
              if t.is_internal_transfer and not t.is_mirror_leg), ZERO)
@@ -232,16 +283,17 @@ def analyze(
         result.average_monthly_spend = q(result.total_spend / divisor)
 
     result.monthly = _monthly_flows(txns)
-    result.monthly_by_category = _monthly_by_category(spend_txns)
-    result.by_category = _category_breakdown(spend_txns, result.months_covered)
+    result.monthly_by_category = _monthly_by_category(spend_txns + offset_txns)
+    result.by_category = _category_breakdown(spend_txns + offset_txns, result.months_covered)
     result.by_group = _group_totals(result.by_category)
-    result.top_merchants = _merchant_spend(spend_txns)
+    result.top_merchants = _merchant_spend(spend_txns + offset_txns)
     result.income_sources = _income_sources(income_txns)
     result.salary_flows = _salary_flows(txns)
+    result.p2p_balances = _p2p_balances(txns)
     result.net_worth = _net_worth(accounts)
 
     result.largest_expenses = sorted(spend_txns, key=lambda t: -t.amount)[:15]
-    result.unusual = _find_unusual(spend_txns, result.by_category)
+    result.unusual = _find_unusual(spend_txns + offset_txns, result.by_category)
 
     uncategorized = [t for t in spend_txns if t.category == Category.UNCATEGORIZED]
     result.uncategorized_total = q(sum((t.amount for t in uncategorized), ZERO))
@@ -256,6 +308,12 @@ def _count_months(start: date | None, end: date | None) -> int:
         return 0
     return max(1, (end.year - start.year) * 12 + (end.month - start.month) + 1)
 
+
+def _income_val(t: Transaction) -> Decimal:
+    return t.amount if t.direction == Direction.CREDIT else -t.amount
+
+def _spend_val(t: Transaction) -> Decimal:
+    return t.amount if t.direction == Direction.DEBIT else -t.amount
 
 def _monthly_flows(txns: list[Transaction]) -> list[MonthlyFlow]:
     buckets: dict[str, dict[str, Decimal | int]] = defaultdict(
@@ -273,18 +331,14 @@ def _monthly_flows(txns: list[Transaction]) -> list[MonthlyFlow]:
 
         role = t.role
         if role == FlowRole.EXPENSE:
-            b["spend"] = b["spend"] + t.amount
+            b["spend"] = b["spend"] + _spend_val(t)
         elif role == FlowRole.INCOME:
-            b["income"] = b["income"] + t.amount
+            b["income"] = b["income"] + _income_val(t)
         elif role in CONTRA_EXPENSE_ROLES:
-            # Nets against the month's spending rather than adding to income.
-            b["offsets"] = b["offsets"] + t.amount
-        elif role == FlowRole.INVESTMENT and t.direction == Direction.DEBIT:
-            b["invested"] = b["invested"] + t.amount
+            b["offsets"] = b["offsets"] + _income_val(t)
+        elif role == FlowRole.INVESTMENT:
+            b["invested"] = b["invested"] + _spend_val(t)
 
-        # Cash actually leaving the user's accounts this month, whether or not
-        # it was spending. The mirror leg of a transfer is the receiving
-        # account's record of money already counted on the way out.
         if (t.direction == Direction.DEBIT and not t.is_mirror_leg
                 and role not in {FlowRole.EXCLUDED, FlowRole.CARD_SETTLEMENT}):
             b["outflow"] = b["outflow"] + t.amount
@@ -307,27 +361,27 @@ def _monthly_flows(txns: list[Transaction]) -> list[MonthlyFlow]:
     return out
 
 
-def _monthly_by_category(spend_txns: list[Transaction]) -> dict[str, dict[str, Decimal]]:
+def _monthly_by_category(txns: list[Transaction]) -> dict[str, dict[str, Decimal]]:
     """Actual per-month spend per category."""
     out: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(lambda: ZERO))
-    for t in spend_txns:
+    for t in txns:
         bucket = out[t.accounting_month or _month_key(t.txn_date)]
-        bucket[t.category] = bucket[t.category] + t.amount
+        bucket[t.category] = bucket[t.category] + _spend_val(t)
     return {month: {c: q(v) for c, v in cats.items()} for month, cats in out.items()}
 
 
 def _category_breakdown(
-    spend_txns: list[Transaction], months: int
+    txns: list[Transaction], months: int
 ) -> list[CategoryBreakdown]:
-    total = sum((t.amount for t in spend_txns), ZERO)
+    total = sum((_spend_val(t) for t in txns), ZERO)
     groups = {c: g for g, cats in CATEGORY_GROUPS.items() for c in cats}
     buckets: dict[Category, list[Transaction]] = defaultdict(list)
-    for t in spend_txns:
+    for t in txns:
         buckets[t.category].append(t)
 
     out: list[CategoryBreakdown] = []
     for category, members in buckets.items():
-        subtotal = sum((t.amount for t in members), ZERO)
+        subtotal = sum((_spend_val(t) for t in members), ZERO)
         largest = max(members, key=lambda t: t.amount)
         out.append(CategoryBreakdown(
             category=category,
@@ -351,16 +405,16 @@ def _group_totals(breakdown: list[CategoryBreakdown]) -> dict[str, Decimal]:
     return dict(sorted(totals.items(), key=lambda kv: -kv[1]))
 
 
-def _merchant_spend(spend_txns: list[Transaction], limit: int = 25) -> list[MerchantSpend]:
+def _merchant_spend(txns: list[Transaction], limit: int = 25) -> list[MerchantSpend]:
     buckets: dict[str, list[Transaction]] = defaultdict(list)
-    for t in spend_txns:
+    for t in txns:
         key = (t.merchant or t.normalized_description or t.raw_description)[:40].strip()
         if key:
             buckets[key].append(t)
 
     out = []
     for merchant, members in buckets.items():
-        total = sum((m.amount for m in members), ZERO)
+        total = sum((_spend_val(m) for m in members), ZERO)
         dates = [m.txn_date for m in members]
         out.append(MerchantSpend(
             merchant=merchant,
@@ -383,7 +437,7 @@ def _income_sources(income_txns: list[Transaction]) -> list[tuple[str, Decimal, 
         buckets[key].append(t)
 
     out = [
-        (key, q(sum((m.amount for m in members), ZERO)), len(members))
+        (key, q(sum((_income_val(m) for m in members), ZERO)), len(members))
         for key, members in buckets.items()
     ]
     out.sort(key=lambda row: -row[1])
@@ -437,7 +491,8 @@ def _salary_flows(txns: list[Transaction]) -> list[SalaryFlow]:
     for i, salary in enumerate(merged):
         window_start = salary.txn_date
         window_end = (merged[i + 1].txn_date if i + 1 < len(merged)
-                      else max(t.txn_date for t in txns) + timedelta(days=1))
+                      else max((t.txn_date for t in txns if not t.excluded),
+                              default=salary.txn_date) + timedelta(days=1))
 
         in_window = [t for t in outflows + committed
                      if window_start <= t.txn_date < window_end]
