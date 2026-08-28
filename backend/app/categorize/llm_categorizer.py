@@ -43,8 +43,33 @@ Rules:
 """
 
 
-def _prompt(items: list[tuple[int, str, str]]) -> str:
-    allowed = ", ".join(c.value for c in Category)
+def allowed_categories(db: Database | None = None) -> list[str]:
+    """Every category a transaction may be assigned, built-in or user-made.
+
+    `Category` used to be an Enum and is now a plain class with named string
+    constants, so iterating it raises rather than yielding members. That went
+    unnoticed because the only caller sits inside a broad try/except in the
+    pipeline: every attempt to categorise with a model threw here, was
+    swallowed as "merchant categorization skipped", and the tail of unknown
+    merchants was never resolved by anything. On this ledger that left 476
+    rows worth 1,090,451 permanently uncategorized with a working API key
+    configured.
+    """
+    names = list(Category.all_builtins())
+    if db is not None:
+        try:
+            with db.connection() as conn:
+                names += [r["name"] for r in
+                          conn.execute("SELECT name FROM custom_categories")]
+        except Exception:  # pragma: no cover - a missing table must not block
+            log.debug("custom categories unavailable", exc_info=True)
+    # Deduplicated, order preserved, so the prompt is stable between runs and
+    # the model is not offered the same label twice.
+    return list(dict.fromkeys(names))
+
+
+def _prompt(items: list[tuple[int, str, str]], allowed_names: list[str] | None = None) -> str:
+    allowed = ", ".join(allowed_names or Category.all_builtins())
     lines = [f'{i}. [{direction}] "{merchant}"' for i, merchant, direction in items]
     return (
         f"Allowed categories: {allowed}\n\n"
@@ -97,6 +122,9 @@ def categorize_with_llm(
     learned: dict[str, tuple[Category, float, str]] = {}
     from_model = 0
 
+    allowed_names = allowed_categories(db)
+    allowed_set = {n.lower() for n in allowed_names}
+
     for start in range(0, len(unresolved), BATCH_SIZE):
         batch = unresolved[start:start + BATCH_SIZE]
         items = [
@@ -105,7 +133,8 @@ def categorize_with_llm(
         ]
 
         try:
-            answers = client.complete_json(_prompt(items), system=SYSTEM)
+            answers = client.complete_json(
+                _prompt(items, allowed_names), system=SYSTEM)
         except Exception as exc:
             # One failed batch must not lose the batches that succeeded.
             log.warning("LLM categorization batch failed: %s", exc)
@@ -126,6 +155,13 @@ def categorize_with_llm(
             if not 0 <= index < len(batch):
                 continue
             if category == Category.UNCATEGORIZED:
+                continue
+            # A category outside the offered set is a hallucination, and
+            # storing it would invent a bucket nothing else knows about.
+            # Dropped rather than coerced: leaving the row uncategorized is
+            # honest, guessing which real category was meant is not.
+            if category not in allowed_set:
+                log.debug("discarding invented category %r", category)
                 continue
 
             confidence = _clamp(answer.get("confidence", 0.6))

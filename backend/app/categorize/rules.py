@@ -264,6 +264,13 @@ RULES: list[Rule] = [
 ]
 
 
+#: A leading timestamp and/or "EMI" marker, ahead of the actual merchant.
+#: Matches "22:01 EMI INFINITIRETAILLIMITEDMumbai" and "EMI Riders Choice".
+#: Anchored, so an "EMI" appearing mid-description is left alone - only a
+#: prefix is a conversion marker rather than part of the payee's name.
+_EMI_PREFIX = re.compile(r"^\s*(?:\d{1,2}:\d{2}\s*)?EMI[\s\-]+", re.IGNORECASE)
+
+
 def apply_rules(txn: Transaction) -> tuple[Category, float, str] | None:
     """Return (category, confidence, rule_label) for the first matching rule.
 
@@ -272,6 +279,18 @@ def apply_rules(txn: Transaction) -> tuple[Category, float, str] | None:
     prefix is the only marker that a row is an ATM withdrawal).
     """
     haystacks = [txn.raw_description or "", txn.normalized_description or ""]
+
+    # A purchase converted to instalments still names its merchant, and that
+    # is what decides the category. HDFC prefixes any converted purchase with
+    # "EMI" (often behind a timestamp), and the EMI rule was deliberately
+    # narrowed so it would stop hijacking those rows from the merchant rules -
+    # but nothing then put the merchant back within reach, so the whole family
+    # fell through to uncategorized instead. On this ledger that was 41 rows
+    # worth 441,755: Eduspark, Empire Foundation, Infiniti Retail, Panchjanya
+    # Automobile - all obviously classifiable by name.
+    for stripped in (_EMI_PREFIX.sub("", h) for h in list(haystacks)):
+        if stripped and stripped not in haystacks:
+            haystacks.append(stripped)
 
     for rule in RULES:
         if rule.direction is not None and rule.direction != txn.direction:

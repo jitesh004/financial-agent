@@ -541,7 +541,12 @@ def save_merchant_categories(
     """
     if not mapping:
         return 0
-    rows = [(k, c.value, src, conf) for k, (c, conf, src) in mapping.items()]
+    # Categories used to be an Enum and are now plain strings. `getattr` so
+    # this keeps working either way rather than raising on one of them - the
+    # same change silently broke the model categoriser's prompt builder, and
+    # a broad try/except upstream hid it for the whole of that run.
+    rows = [(k, getattr(c, "value", c), src, conf)
+            for k, (c, conf, src) in mapping.items()]
     with db.connection() as conn:
         conn.executemany(
             """INSERT INTO merchant_categories
