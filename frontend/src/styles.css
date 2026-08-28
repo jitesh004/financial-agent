@@ -117,7 +117,9 @@ body {
 
 .header {
   position: sticky; top: 0; z-index: 20;
-  display: flex; align-items: center; gap: 16px;
+  /* Wraps so a long tab bar moves to its own row rather than pushing the
+     Profile/Reset controls off the edge. */
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
   padding: 12px 24px;
   background: color-mix(in srgb, var(--surface) 88%, transparent);
   backdrop-filter: blur(12px);
@@ -132,11 +134,15 @@ body {
 
 /* Scrollable at narrow widths, but without a visible scrollbar sitting under
    the tabs — it reads as a broken layout rather than an affordance. */
+/* Wraps rather than scrolling. With eighteen tabs a horizontal scroller
+   whose scrollbar is hidden gives no hint that more exist, so the last few
+   were simply unreachable - which is how five whole views stayed invisible
+   even once they had been added to the tab list. */
 .tabs {
-  display: flex; gap: 2px; overflow-x: auto;
-  scrollbar-width: none; -ms-overflow-style: none;
+  display: flex; gap: 2px; flex-wrap: wrap; row-gap: 4px;
+  flex: 1 1 100%; order: 3;
 }
-.tabs::-webkit-scrollbar { display: none; }
+@media (min-width: 1500px) { .tabs { flex: 1 1 auto; order: 0; } }
 .tab {
   appearance: none; border: 0; background: transparent; cursor: pointer;
   padding: 7px 13px; border-radius: var(--radius-sm);

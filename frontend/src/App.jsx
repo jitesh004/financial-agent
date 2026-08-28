@@ -21,6 +21,8 @@ import WorkflowNav from './components/WorkflowNav';
 import ReviewQueue from './components/ReviewQueue';
 import Claims from './components/Claims';
 import Recurring from './components/Recurring';
+import Categorize from './components/Categorize';
+import Settings from './components/Settings';
 import MonthView from './components/MonthView';
 
 
@@ -34,6 +36,7 @@ const TABS = [
   ['spending', 'Spending'],
   ['recurring', 'Recurring'],
   ['review-queue', 'Review'],
+  ['categorize', 'Categorize'],
   ['claims', 'Owed'],
   ['debt', 'Debt'],
   ['emi', 'EMI Payments'],
@@ -45,6 +48,7 @@ const TABS = [
   ['files', 'Files & quality'],
   ['file-registry', 'Files & Passwords'],
   ['data-manager', 'Data'],
+  ['settings', 'Settings'],
 ];
 
 export default function App() {
@@ -207,6 +211,8 @@ export default function App() {
             {tab === 'file-registry' && <FilesAndPasswords />}
             {tab === 'data-manager' && <DataManager />}
             {tab === 'review-queue' && <ReviewQueue />}
+            {tab === 'categorize' && <Categorize />}
+            {tab === 'settings' && <Settings />}
             {tab === 'claims' && <Claims />}
             {tab === 'recurring' && <Recurring />}
             {tab === 'month-view' && <MonthView data={data} />}

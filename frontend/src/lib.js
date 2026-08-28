@@ -134,7 +134,10 @@ const jsonPatch = (path, body) => request(path, {
 // Every field the user can override. Sent as a partial patch, so changing a
 // note never disturbs a category correction made earlier.
 api.updateTransaction = (id, fields) => jsonPatch(`/api/transactions/${id}`, fields);
-api.bulkUpdate = (ids, fields) => jsonPatch('/api/transactions/bulk', { ids, ...fields });
+// The request model names this `txn_ids`; sending `ids` silently updated
+// nothing, because the field was simply absent from the parsed payload.
+api.bulkUpdate = (txn_ids, fields) =>
+  jsonPatch('/api/transactions/bulk', { txn_ids, ...fields });
 api.splitTransaction = (id, parts) =>
   jsonPost(`/api/transactions/${id}/split`, { parts });
 api.claimTransaction = (id, body) =>

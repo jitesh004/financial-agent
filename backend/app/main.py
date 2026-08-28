@@ -698,46 +698,22 @@ class TransactionUpdateReq(BaseModel):
     flow_role: str | None = None
     excluded: bool | None = None
 
-@app.patch("/api/transactions/{txn_id}")
-def update_transaction(txn_id: str, payload: TransactionUpdateReq) -> dict[str, Any]:
-    """Apply user corrections to a transaction."""
-    db = get_db()
-    
-    if payload.category is not None:
-        category = payload.category.strip().lower()
-        valid_categories = set(Category.all_builtins())
-        with db.connection() as conn:
-            for r in conn.execute("SELECT name FROM custom_categories").fetchall():
-                valid_categories.add(r["name"])
-        
-        if category and category not in valid_categories:
-            raise HTTPException(400, f"'{payload.category}' is not a valid category.")
-        payload.category = category
-
-    matches = [t for t in repo.get_transactions(db) if t.id == txn_id]
-    if not matches:
-        raise HTTPException(404, f"No transaction with id {txn_id}")
-
-    from .pipeline.overrides import record_decision
-
-    txn = matches[0]
-    update_args = payload.model_dump(exclude_unset=True)
-    if update_args:
-        accounts = {a.id: a for a in repo.get_accounts(db) if a.id}
-        record_decision(db, txn, accounts, **update_args)
-        if "category" in update_args and update_args["category"] is not None:
-            from .categorize.llm_categorizer import record_user_correction
-            record_user_correction(db, txn, update_args["category"])
-        repo.update_transaction_categories(db, [txn])
-        
-    return {"status": "ok", "transaction": ser.transaction_json(txn)}
-
+# Defined above its endpoint on purpose: FastAPI resolves the annotation
+# when the route is registered, and with the class declared later the
+# name did not exist yet - so `payload` was treated as a scalar QUERY
+# parameter and every request failed validation with 422.
 class BulkTransactionUpdateReq(BaseModel):
     txn_ids: list[str]
     category: str | None = None
     note: str | None = None
     flow_role: str | None = None
     excluded: bool | None = None
+
+
+# Declared BEFORE /api/transactions/{txn_id}. FastAPI matches routes in
+# declaration order, so with the parameterised route first every request
+# to /bulk was resolved as a transaction whose id is the literal string
+# "bulk" and answered 404 - the endpoint existed and was never reachable.
 
 @app.patch("/api/transactions/bulk")
 def bulk_update_transactions(payload: BulkTransactionUpdateReq) -> dict[str, Any]:
@@ -772,7 +748,54 @@ def bulk_update_transactions(payload: BulkTransactionUpdateReq) -> dict[str, Any
     if targets:
         repo.update_transaction_categories(db, targets)
         
+    # The dashboard payload is a snapshot of figures computed from
+    # rows that were just edited, and /api/dashboard returns it verbatim
+    # without revalidating - so leaving it cached shows the user totals
+    # that no longer reflect their own correction.
+    runs.clear()
+
     return {"status": "ok", "updated": len(targets)}
+
+
+@app.patch("/api/transactions/{txn_id}")
+def update_transaction(txn_id: str, payload: TransactionUpdateReq) -> dict[str, Any]:
+    """Apply user corrections to a transaction."""
+    db = get_db()
+    
+    if payload.category is not None:
+        category = payload.category.strip().lower()
+        valid_categories = set(Category.all_builtins())
+        with db.connection() as conn:
+            for r in conn.execute("SELECT name FROM custom_categories").fetchall():
+                valid_categories.add(r["name"])
+        
+        if category and category not in valid_categories:
+            raise HTTPException(400, f"'{payload.category}' is not a valid category.")
+        payload.category = category
+
+    matches = [t for t in repo.get_transactions(db) if t.id == txn_id]
+    if not matches:
+        raise HTTPException(404, f"No transaction with id {txn_id}")
+
+    from .pipeline.overrides import record_decision
+
+    txn = matches[0]
+    update_args = payload.model_dump(exclude_unset=True)
+    if update_args:
+        accounts = {a.id: a for a in repo.get_accounts(db) if a.id}
+        record_decision(db, txn, accounts, **update_args)
+        if "category" in update_args and update_args["category"] is not None:
+            from .categorize.llm_categorizer import record_user_correction
+            record_user_correction(db, txn, update_args["category"])
+        repo.update_transaction_categories(db, [txn])
+        
+    # The dashboard payload is a snapshot of figures computed from
+    # rows that were just edited, and /api/dashboard returns it verbatim
+    # without revalidating - so leaving it cached shows the user totals
+    # that no longer reflect their own correction.
+    runs.clear()
+
+    return {"status": "ok", "transaction": ser.transaction_json(txn)}
 
 
 @app.get("/api/statements")

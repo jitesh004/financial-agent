@@ -357,3 +357,75 @@ def test_routine_scopes_never_reach_a_user_decision():
     for scope in ("derived", "parsed_data", "files"):
         overlap = set(CLEAR_SCOPES[scope]) & protected
         assert not overlap, f"{scope} would destroy {sorted(overlap)}"
+
+
+# --------------------------------------------------------------------------
+# Route registration order
+# --------------------------------------------------------------------------
+
+def test_bulk_endpoint_is_not_shadowed_by_the_id_route():
+    """FastAPI matches routes in declaration order, so a literal segment must
+    be declared before the parameterised one that would swallow it.
+
+    With /{txn_id} first, every request to /bulk resolved as a transaction
+    whose id is the string "bulk" and answered 404. The endpoint existed,
+    was tested at the function level, and was unreachable over HTTP.
+    """
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    # An empty id list is a no-op, so this asserts reachability rather than
+    # relying on any particular row existing.
+    res = client.patch("/api/transactions/bulk",
+                       json={"txn_ids": [], "category": "shopping"})
+    assert res.status_code != 404, "the /bulk route is shadowed by /{txn_id}"
+    assert res.status_code == 200, res.text
+
+
+def test_bulk_endpoint_reads_its_body_not_the_query_string():
+    """The request model has to be defined ABOVE its endpoint. FastAPI
+    resolves the annotation when the route is registered; with the class
+    declared later the name did not exist yet, so `payload` was treated as a
+    scalar query parameter and every call failed validation with 422."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    res = client.patch("/api/transactions/bulk",
+                       json={"txn_ids": [], "note": "probe"})
+    assert res.status_code != 422, (
+        "the body was not recognised as a model - check declaration order")
+
+
+def test_bulk_update_actually_changes_the_named_rows(tmp_path):
+    """Reachability is necessary but not sufficient - the rows have to move."""
+    from fastapi.testclient import TestClient
+    import app.db.database as db_module
+    from app.db import repository as repo
+    from app import main as main_module
+    from app.models.schemas import Account, AccountType
+
+    previous = db_module._db
+    try:
+        db_module._db = Database(tmp_path / "bulk.db")
+        db = db_module._db
+        repo.upsert_account(db, Account(
+            id="acc-bulk", institution="Axis Bank",
+            account_type=AccountType.CREDIT_CARD,
+            account_number_masked="XXXX1111", product_name="Test"))
+        account_id = repo.get_accounts(db)[0].id
+
+        repo.save_transactions(db, [Transaction(
+            id="bulk-1", account_id=account_id, txn_date=date(2026, 3, 4),
+            raw_description="VSCHINCHWAD PUNE", amount=Decimal("500"),
+            direction=Direction.DEBIT, category=Category.UNCATEGORIZED)])
+
+        res = TestClient(main_module.app).patch(
+            "/api/transactions/bulk",
+            json={"txn_ids": ["bulk-1"], "category": "shopping"})
+        assert res.status_code == 200, res.text
+        assert res.json()["updated"] == 1
+        assert repo.get_transactions(db)[0].category == "shopping"
+    finally:
+        db_module._db = previous

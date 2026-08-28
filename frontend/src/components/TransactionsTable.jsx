@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, dateLabel, money, titleCase } from '../lib';
+import { downloadCsv, toCsv, usePrefs } from '../prefs';
 import { Callout, Card, Chip, Empty } from './ui';
 
 const PAGE = 100;
@@ -63,6 +64,13 @@ export default function TransactionsTable({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [saving, setSaving] = useState(null);
+  // Row selection for bulk edits. Distinct from `selected`, which is the
+  // set of ACCOUNTS in scope for this view.
+  const [picked, setPicked] = useState(() => new Set());
+  const [bulkCat, setBulkCat] = useState('');
+  const [prefs] = usePrefs();
+  const pageSize = Number(prefs.pageSize) || PAGE;
+  const compact = prefs.density === 'compact';
 
   useEffect(() => { api.categories().then(setCategories).catch(() => {}); }, []);
 
@@ -80,6 +88,10 @@ export default function TransactionsTable({
 
   useEffect(() => { setPage(0); }, [accountParam, category, rail, sortBy, sortDir]);
 
+  // A named loader, so a bulk edit can refresh without duplicating the query.
+  const [reloadToken, setReloadToken] = useState(0);
+  const load = useCallback(() => setReloadToken((n) => n + 1), []);
+
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -88,7 +100,7 @@ export default function TransactionsTable({
       category: fixedCategory || category || undefined,
       rail: fixedRail || rail || undefined,
       sort_by: sortBy, sort_dir: sortDir,
-      limit: PAGE, offset: page * PAGE,
+      limit: pageSize, offset: page * pageSize,
     })
       .then((res) => {
         if (cancelled) return;
@@ -99,17 +111,19 @@ export default function TransactionsTable({
       .catch((e) => !cancelled && setError(e.message))
       .finally(() => !cancelled && setLoading(false));
     return () => { cancelled = true; };
-  }, [accountParam, category, rail, sortBy, sortDir, page, fixedCategory, fixedRail]);
+  }, [accountParam, category, rail, sortBy, sortDir, page, fixedCategory,
+      fixedRail, pageSize, reloadToken]);
 
   // Search filters the loaded page only. Pushing it server-side would be the
   // next step; for now the UI says so rather than pretending it searched all.
   const visible = useMemo(() => {
-    if (!search.trim()) return rows;
+    const base = prefs.hideExcluded ? rows.filter((r) => !r.excluded) : rows;
+    if (!search.trim()) return base;
     const needle = search.toLowerCase();
-    return rows.filter((r) =>
+    return base.filter((r) =>
       r.description.toLowerCase().includes(needle) ||
       (r.merchant || '').toLowerCase().includes(needle));
-  }, [rows, search]);
+  }, [rows, search, prefs.hideExcluded]);
 
   // One place for every per-row edit, so the optimistic update and the error
   // handling are not written out once per action.
@@ -151,6 +165,48 @@ export default function TransactionsTable({
     }
   }
 
+  function togglePicked(id) {
+    setPicked((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  async function applyBulk(fields) {
+    const ids = [...picked];
+    if (!ids.length) return;
+    setSaving('bulk');
+    try {
+      await api.bulkUpdate(ids, fields);
+      // Re-fetched rather than patched in place: a bulk category change also
+      // teaches the merchant cache, which can move rows this view is
+      // filtering on.
+      setPicked(new Set());
+      setBulkCat('');
+      load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSaving(null);
+    }
+  }
+
+  function exportCsv() {
+    const columns = [
+      ['date', 'Date'],
+      ['description', 'Description'],
+      [(r) => accountName(r.account_id), 'Account'],
+      ['category', 'Category'],
+      ['flow_role', 'Counts as'],
+      [(r) => (r.direction === 'credit' ? r.amount : -r.amount), 'Amount'],
+      ['balance_after', 'Balance'],
+      ['note', 'Note'],
+    ];
+    downloadCsv(`transactions-${new Date().toISOString().slice(0, 10)}.csv`,
+                toCsv(visible, columns));
+  }
+
   async function recategorize(txn, cat) {
     if (cat === txn.category) return;
     setSaving(txn.id);
@@ -172,7 +228,7 @@ export default function TransactionsTable({
     });
   }
 
-  const pages = Math.ceil(total / PAGE) || 1;
+  const pages = Math.ceil(total / pageSize) || 1;
   const accountName = (id) => accounts.find((a) => a.id === id)?.display_name || '—';
   const allSelected = selected.size === accounts.length;
 
@@ -257,6 +313,15 @@ export default function TransactionsTable({
             style={{ flex: 1, minWidth: 180 }}
           />
 
+          <button
+            className="btn"
+            onClick={exportCsv}
+            disabled={!visible.length}
+            title="Download what is currently shown, as CSV"
+          >
+            Export
+          </button>
+
           {(category || rail || search || !allSelected) && (
             <button
               className="btn"
@@ -281,22 +346,102 @@ export default function TransactionsTable({
         ) : visible.length === 0 ? (
           <Empty title="No transactions match">{emptyHint}</Empty>
         ) : (
+          // Fragment: this branch renders the bulk bar AND the table, and a
+          // ternary arm takes one expression.
+          <>
+          {/* Appears only with a selection, so it costs no space otherwise. */}
+          {picked.size > 0 && (
+            <div
+              className="card"
+              style={{
+                display: 'flex', gap: 10, alignItems: 'center',
+                flexWrap: 'wrap', padding: 10, marginBottom: 10,
+                background: 'var(--accent-soft, var(--surface-2))',
+              }}
+            >
+              <strong>{picked.size} selected</strong>
+              <select
+                value={bulkCat}
+                onChange={(e) => { setBulkCat(e.target.value);
+                                   applyBulk({ category: e.target.value }); }}
+                disabled={saving === 'bulk'}
+              >
+                <option value="">Set category…</option>
+                {categories.map((c) => (
+                  <option key={c} value={c}>{titleCase(c)}</option>
+                ))}
+              </select>
+              <button
+                className="btn"
+                disabled={saving === 'bulk'}
+                onClick={() => applyBulk({ excluded: true })}
+              >
+                Exclude from totals
+              </button>
+              <button
+                className="btn"
+                disabled={saving === 'bulk'}
+                onClick={() => applyBulk({ excluded: false })}
+              >
+                Include
+              </button>
+              <button
+                className="btn"
+                disabled={saving === 'bulk'}
+                onClick={() => {
+                  const note = window.prompt('Note for all selected');
+                  if (note !== null) applyBulk({ note });
+                }}
+              >
+                Add note
+              </button>
+              <div style={{ flex: 1 }} />
+              <button className="btn" onClick={() => setPicked(new Set())}>
+                Clear selection
+              </button>
+            </div>
+          )}
+
           <div className="table-wrap">
             <table>
               <thead>
                 <tr>
+                  <th style={{ width: 28 }}>
+                    <input
+                      type="checkbox"
+                      aria-label="Select every row on this page"
+                      checked={visible.length > 0 && picked.size === visible.length}
+                      onChange={(e) => setPicked(
+                        e.target.checked ? new Set(visible.map((r) => r.id)) : new Set())}
+                    />
+                  </th>
                   <th>Date</th>
                   <th>Description</th>
                   <th>Account</th>
                   <th>Category</th>
+                  {prefs.showRole && <th>Counts as</th>}
                   <th className="right">Amount</th>
-                  <th className="right">Balance</th>
+                  {prefs.showBalance && <th className="right">Balance</th>}
                   <th className="right">Edit</th>
                 </tr>
               </thead>
               <tbody>
                 {visible.map((t) => (
-                  <tr key={t.id} style={{ opacity: t.excluded ? 0.45 : 1 }}>
+                  <tr
+                    key={t.id}
+                    style={{
+                      opacity: t.excluded ? 0.45 : 1,
+                      lineHeight: compact ? 1.15 : undefined,
+                    }}
+                  >
+                    <td>
+                      <input
+                        type="checkbox"
+                        aria-label={`Select ${t.description}`}
+                        checked={picked.has(t.id)}
+                        onChange={() => togglePicked(t.id)}
+                      />
+                    </td>
                     <td className="nowrap">{dateLabel(t.date)}</td>
                     <td>
                       <div className="truncate" title={t.description}>{t.description}</div>
@@ -330,20 +475,31 @@ export default function TransactionsTable({
                             <option key={c} value={c}>{titleCase(c)}</option>
                           ))}
                         </select>
-                        <Chip tone={SOURCE_TONE[t.category_source]}>
-                          {SOURCE_LABEL[t.category_source] || t.category_source}
-                        </Chip>
+                        {prefs.showSource && (
+                          <Chip tone={SOURCE_TONE[t.category_source]}>
+                            {SOURCE_LABEL[t.category_source] || t.category_source}
+                          </Chip>
+                        )}
                       </div>
                     </td>
+                    {prefs.showRole && (
+                      <td className="nowrap">
+                        <Chip>
+                          {titleCase((t.flow_role || 'unclassified').replace(/_/g, ' '))}
+                        </Chip>
+                      </td>
+                    )}
                     <td className="right num nowrap" style={{
                       color: t.direction === 'credit' ? 'var(--positive)' : 'inherit',
                       fontWeight: 550,
                     }}>
                       {t.direction === 'credit' ? '+' : '−'}{money(t.amount, true)}
                     </td>
-                    <td className="right num nowrap" style={{ color: 'var(--text-3)' }}>
-                      {t.balance_after != null ? money(t.balance_after) : '—'}
-                    </td>
+                    {prefs.showBalance && (
+                      <td className="right num nowrap" style={{ color: 'var(--text-3)' }}>
+                        {t.balance_after != null ? money(t.balance_after) : '—'}
+                      </td>
+                    )}
                     <td className="right nowrap">
                       <button
                         className="btn icon"
@@ -379,6 +535,7 @@ export default function TransactionsTable({
               </tbody>
             </table>
           </div>
+          </>
         )}
 
         {pages > 1 && (
