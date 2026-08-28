@@ -658,6 +658,8 @@ def list_transactions(
     sort_dir: str = "asc",
     limit: int = 200,
     offset: int = 0,
+    needs_review: bool | None = None,
+    accounting_month: str | None = None,
 ) -> dict[str, Any]:
     db = get_db()
     # Multiple accounts (or categories) come in as one comma-separated param -
@@ -672,6 +674,8 @@ def list_transactions(
         end=date.fromisoformat(end) if end else None,
         statement_id=statement_id,
         rail=rail,
+        needs_review=needs_review,
+        accounting_month=accounting_month,
     )
     txns = repo.get_transactions(
         db, **filters, sort_by=sort_by, sort_dir=sort_dir,

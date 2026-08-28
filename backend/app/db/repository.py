@@ -347,6 +347,8 @@ def _transaction_filters(
     category: str | Sequence[str] | None,
     statement_id: str | None,
     rail: str | None,
+    needs_review: bool | None = None,
+    accounting_month: str | None = None,
 ) -> tuple[list[str], list[Any]]:
     """Shared WHERE-clause builder, so a filtered count matches its list.
 
@@ -397,6 +399,18 @@ def _transaction_filters(
     elif rail == "non_upi":
         clauses.append("(raw_description NOT LIKE 'UPI%' AND raw_description NOT LIKE 'upi%')")
 
+    if needs_review is not None:
+        clauses.append("needs_review = ?")
+        params.append(1 if needs_review else 0)
+
+    # The reporting period a row belongs to, which is not always the calendar
+    # month of its date - see analytics.periods. Filtering on txn_date instead
+    # would put a salary paid on 1-Sep in September even when the ledger
+    # counts it as August's.
+    if accounting_month:
+        clauses.append("accounting_month = ?")
+        params.append(accounting_month)
+
     return clauses, params
 
 
@@ -412,9 +426,12 @@ def get_transactions(
     sort_dir: str = "asc",
     limit: int | None = None,
     offset: int = 0,
+    needs_review: bool | None = None,
+    accounting_month: str | None = None,
 ) -> list[Transaction]:
     clauses, params = _transaction_filters(
-        account_id, start, end, category, statement_id, rail)
+        account_id, start, end, category, statement_id, rail,
+        needs_review, accounting_month)
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     column = _SORTABLE_COLUMNS.get(sort_by, "txn_date")
@@ -439,9 +456,12 @@ def count_transactions(
     category: str | Sequence[str] | None = None,
     statement_id: str | None = None,
     rail: str | None = None,
+    needs_review: bool | None = None,
+    accounting_month: str | None = None,
 ) -> int:
     clauses, params = _transaction_filters(
-        account_id, start, end, category, statement_id, rail)
+        account_id, start, end, category, statement_id, rail,
+        needs_review, accounting_month)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with db.connection() as conn:
         return conn.execute(

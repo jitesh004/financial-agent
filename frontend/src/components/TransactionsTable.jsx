@@ -111,6 +111,46 @@ export default function TransactionsTable({
       (r.merchant || '').toLowerCase().includes(needle));
   }, [rows, search]);
 
+  // One place for every per-row edit, so the optimistic update and the error
+  // handling are not written out once per action.
+  async function patch(txn, fields) {
+    setSaving(txn.id);
+    try {
+      const res = await api.updateTransaction(txn.id, fields);
+      const updated = res.transaction || { ...txn, ...fields };
+      setRows((prev) => prev.map((r) => (r.id === txn.id ? updated : r)));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSaving(null);
+    }
+  }
+
+  async function addNote(txn) {
+    const note = window.prompt('Note for this transaction', txn.note || '');
+    if (note === null) return;
+    await patch(txn, { note });
+  }
+
+  async function markNotMine(txn) {
+    const who = window.prompt(
+      'Whose expense was this? It stops counting as your spending and appears '
+      + 'under Owed until it comes back.', '');
+    if (who === null) return;
+    setSaving(txn.id);
+    try {
+      await api.claimTransaction(txn.id, {
+        counterparty: who, direction: 'owed_to_me',
+      });
+      setRows((prev) => prev.map(
+        (r) => (r.id === txn.id ? { ...r, excluded: true } : r)));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSaving(null);
+    }
+  }
+
   async function recategorize(txn, cat) {
     if (cat === txn.category) return;
     setSaving(txn.id);
@@ -251,18 +291,28 @@ export default function TransactionsTable({
                   <th>Category</th>
                   <th className="right">Amount</th>
                   <th className="right">Balance</th>
+                  <th className="right">Edit</th>
                 </tr>
               </thead>
               <tbody>
                 {visible.map((t) => (
-                  <tr key={t.id}>
+                  <tr key={t.id} style={{ opacity: t.excluded ? 0.45 : 1 }}>
                     <td className="nowrap">{dateLabel(t.date)}</td>
                     <td>
                       <div className="truncate" title={t.description}>{t.description}</div>
-                      {t.is_internal_transfer && (
-                        <Chip tone="accent">
-                          {t.is_mirror_leg ? 'transfer (mirror)' : 'transfer'}
-                        </Chip>
+                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 4 }}>
+                        {t.is_internal_transfer && (
+                          <Chip tone="accent">
+                            {t.is_mirror_leg ? 'transfer (mirror)' : 'transfer'}
+                          </Chip>
+                        )}
+                        {t.excluded && <Chip tone="warn">excluded</Chip>}
+                        {t.needs_review && <Chip tone="warn">needs review</Chip>}
+                      </div>
+                      {t.note && (
+                        <div style={{ color: 'var(--text-3)', fontSize: 12, marginTop: 2 }}>
+                          {t.note}
+                        </div>
                       )}
                     </td>
                     <td className="nowrap" style={{ color: 'var(--text-3)', fontSize: 12 }}>
@@ -293,6 +343,36 @@ export default function TransactionsTable({
                     </td>
                     <td className="right num nowrap" style={{ color: 'var(--text-3)' }}>
                       {t.balance_after != null ? money(t.balance_after) : '—'}
+                    </td>
+                    <td className="right nowrap">
+                      <button
+                        className="btn icon"
+                        title={t.note ? 'Edit note' : 'Add a note'}
+                        disabled={saving === t.id}
+                        onClick={() => addNote(t)}
+                      >
+                        {t.note ? '✎' : '+'}
+                      </button>
+                      <button
+                        className="btn icon"
+                        title={t.excluded
+                          ? 'Put this back in your totals'
+                          : 'Leave this out of every total'}
+                        disabled={saving === t.id}
+                        onClick={() => patch(t, { excluded: !t.excluded })}
+                      >
+                        {t.excluded ? '↺' : '⊘'}
+                      </button>
+                      {t.direction === 'debit' && !t.is_internal_transfer && (
+                        <button
+                          className="btn icon"
+                          title="This purchase was not mine - track it as owed to me"
+                          disabled={saving === t.id}
+                          onClick={() => markNotMine(t)}
+                        >
+                          ⇄
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))}

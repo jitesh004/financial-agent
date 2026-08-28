@@ -99,11 +99,10 @@ export const api = {
     return request('/api/upload', { method: 'POST', body: form });
   },
 
-  recategorize: (id, category) => request(`/api/transactions/${id}/category`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ category }),
-  }),
+  // PATCH /api/transactions/{id} - the per-field endpoint. This used to
+  // target .../category, which no longer exists, so every category change
+  // from the transactions table was 404ing.
+  recategorize: (id, category) => api.updateTransaction(id, { category }),
 
   reanalyze: () => request('/api/reanalyze', { method: 'POST' }),
   reset: () => request('/api/reset', { method: 'POST' }),
@@ -119,7 +118,52 @@ export const api = {
   coverage: () => request('/api/coverage'),
   fetchMonth: (accountId, month) => jsonPost(`/api/coverage/${accountId}/${month}/fetch`),
   fetchAllMissing: () => jsonPost('/api/coverage/fetch-all-missing'),
+
+  // Escape hatch for anything not yet given a named method.
+  request,
 };
+
+const jsonPatch = (path, body) => request(path, {
+  method: 'PATCH',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(body ?? {}),
+});
+
+/* ---------- Editing a transaction ---------- */
+
+// Every field the user can override. Sent as a partial patch, so changing a
+// note never disturbs a category correction made earlier.
+api.updateTransaction = (id, fields) => jsonPatch(`/api/transactions/${id}`, fields);
+api.bulkUpdate = (ids, fields) => jsonPatch('/api/transactions/bulk', { ids, ...fields });
+api.splitTransaction = (id, parts) =>
+  jsonPost(`/api/transactions/${id}/split`, { parts });
+api.claimTransaction = (id, body) =>
+  jsonPost(`/api/transactions/${id}/claim`, body);
+
+/* ---------- Review, claims, recurring ---------- */
+
+api.reviewQueue = (params = {}) =>
+  api.transactions({ needs_review: true, limit: 200, ...params });
+api.claims = (status) => request(`/api/claims${status ? `?status=${status}` : ''}`);
+api.settleClaim = (id, body) => jsonPost(`/api/claims/${id}/settle`, body);
+
+api.recurring = () => request('/api/recurring');
+api.updateSeries = (id, fields) => jsonPatch(`/api/recurring/${id}`, fields);
+api.deleteSeries = (id) => request(`/api/recurring/${id}`, { method: 'DELETE' });
+
+/* ---------- Categories ---------- */
+
+api.addCategory = (name) => jsonPost('/api/categories', { name });
+api.deleteCategory = (name) =>
+  request(`/api/categories/${encodeURIComponent(name)}`, { method: 'DELETE' });
+
+/* ---------- Workflow & data lifecycle ---------- */
+
+api.workflow = () => request('/api/workflow');
+api.inventory = () => request('/api/data/inventory');
+api.clearData = (scope, confirm) =>
+  jsonPost(`/api/data/clear/${scope}`, confirm ? { confirm } : {});
+api.restoreSnapshot = (name) => jsonPost('/api/data/restore', { name });
 
 api.profile = () => request('/api/profile');
 api.saveProfile = (profile) => request('/api/profile', {

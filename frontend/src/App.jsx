@@ -24,9 +24,17 @@ import Recurring from './components/Recurring';
 import MonthView from './components/MonthView';
 
 
+// Ordered by how often they are used, not by when they were built. The five
+// views added with the accounting model existed as components and render
+// branches for a while but were never listed here, which meant there was no
+// way to reach any of them.
 const TABS = [
   ['overview', 'Overview'],
+  ['month-view', 'Months'],
   ['spending', 'Spending'],
+  ['recurring', 'Recurring'],
+  ['review-queue', 'Review'],
+  ['claims', 'Owed'],
   ['debt', 'Debt'],
   ['emi', 'EMI Payments'],
   ['forecast', 'Forecast'],
@@ -36,6 +44,7 @@ const TABS = [
   ['upi', 'UPI Transactions'],
   ['files', 'Files & quality'],
   ['file-registry', 'Files & Passwords'],
+  ['data-manager', 'Data'],
 ];
 
 export default function App() {
@@ -45,6 +54,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [reviewCount, setReviewCount] = useState(0);
   const [theme, setTheme] = useState(
     () => localStorage.getItem('fa-theme')
       || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'),
@@ -61,6 +71,11 @@ export default function App() {
       const dashboard = await api.dashboard();
       setData(dashboard.status === 'ok' ? dashboard : null);
       setError(dashboard.status === 'stale' ? dashboard.message : null);
+      // Badge on the Review tab. Failing to count is not worth surfacing -
+      // the tab still works, it just shows no number.
+      api.workflow()
+        .then((w) => setReviewCount(w?.counts?.needs_review || 0))
+        .catch(() => setReviewCount(0));
     } catch (e) {
       setError(e.message);
     } finally {
@@ -112,6 +127,14 @@ export default function App() {
                 onClick={() => setTab(key)}
               >
                 {label}
+                {key === 'review-queue' && reviewCount > 0 && (
+                  <span
+                    className="chip warn"
+                    style={{ marginLeft: 6, padding: '0 6px' }}
+                  >
+                    {reviewCount}
+                  </span>
+                )}
               </button>
             ))}
           </nav>
@@ -170,6 +193,7 @@ export default function App() {
         ) : (
           <>
             {error && <Callout tone="warn">{error}</Callout>}
+            <WorkflowNav onNavigate={setTab} />
             {tab === 'overview' && <Overview data={data} />}
             {tab === 'spending' && <Spending data={data} />}
             {tab === 'debt' && <Debt data={data} />}
@@ -181,11 +205,11 @@ export default function App() {
             {tab === 'upi' && <UpiTransactions data={data} />}
             {tab === 'files' && <Files data={data} />}
             {tab === 'file-registry' && <FilesAndPasswords />}
-            {tab === 'data-manager' && <><WorkflowNav /><DataManager /></>}
+            {tab === 'data-manager' && <DataManager />}
             {tab === 'review-queue' && <ReviewQueue />}
             {tab === 'claims' && <Claims />}
             {tab === 'recurring' && <Recurring />}
-            {tab === 'month-view' && <MonthView />}
+            {tab === 'month-view' && <MonthView data={data} />}
           </>
         )}
       </main>
