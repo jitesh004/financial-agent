@@ -1,0 +1,410 @@
+"""Detect money that moved between the user's own accounts.
+
+This is the module that decides whether the app tells the truth.
+
+A user uploads a bank statement and a credit card statement. The card bill
+payment appears as a debit in the bank AND as a payment credit on the card.
+Sum the debits naively and you have inflated their spending by the entire bill.
+The same applies to self-transfers, SIP debits matched against an investment
+statement, and EMI debits matched against a loan statement.
+
+Nothing here deletes a transaction. Both legs stay in the ledger - they really
+did happen - but they get flagged so the analytics layer can exclude them from
+"spending". Deleting would break the reconciliation gate, which must continue to
+tie out against the original statement.
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import timedelta
+from decimal import Decimal
+
+from ..models.schemas import (Account, AccountType, Category, ConfidenceSource,
+                              Direction, LIABILITY_TYPES, Transaction)
+
+log = logging.getLogger(__name__)
+
+#: How many days apart the two legs of one transfer may be. NEFT/IMPS settle
+#: same-day, but a weekend or a card issuer's posting lag can stretch it.
+MAX_DAY_GAP = 4
+
+#: Amounts must match this closely. Transfers move an exact figure; anything
+#: looser starts pairing unrelated transactions of similar size.
+AMOUNT_TOLERANCE = Decimal("0.01")
+
+
+@dataclass
+class TransferPair:
+    pair_id: str
+    debit_txn_id: str
+    credit_txn_id: str
+    amount: Decimal
+    day_gap: int
+    from_account: str
+    to_account: str
+    kind: str  # "cc_payment" | "investment" | "loan_repayment" | "self_transfer"
+    confidence: float
+
+
+@dataclass
+class TransferReport:
+    pairs: list[TransferPair] = field(default_factory=list)
+    total_amount: Decimal = Decimal("0")
+    #: Money that would have been double counted as spending without this pass.
+    double_count_avoided: Decimal = Decimal("0")
+    notes: list[str] = field(default_factory=list)
+
+
+def _classify(
+    from_account: Account | None,
+    to_account: Account | None,
+) -> tuple[str, Category]:
+    """Name the transfer by what the receiving account is."""
+    to_type = to_account.account_type if to_account else AccountType.UNKNOWN
+
+    if to_type == AccountType.CREDIT_CARD:
+        return "cc_payment", Category.CC_PAYMENT
+    if to_type == AccountType.INVESTMENT:
+        return "investment", Category.INVESTMENT
+    if to_type in {AccountType.HOME_LOAN, AccountType.PERSONAL_LOAN, AccountType.AUTO_LOAN}:
+        return "loan_repayment", Category.EMI
+    return "self_transfer", Category.TRANSFER
+
+
+def detect_transfers(
+    transactions: list[Transaction],
+    accounts: dict[str, Account],
+) -> TransferReport:
+    """Pair debits in one account against credits in another.
+
+    Matching is greedy over an index keyed by rounded amount, which keeps this
+    near-linear rather than comparing every debit to every credit. With a decade
+    of statements loaded that difference matters.
+    """
+    report = TransferReport()
+    if len(accounts) < 2:
+        report.notes.append(
+            "Only one account was supplied, so no cross-account transfers could "
+            "be detected. Upload the matching card/loan statements to avoid "
+            "double counting transfers as spending."
+        )
+        return report
+
+    # Index credits by exact amount for O(1) candidate lookup.
+    credits_by_amount: dict[Decimal, list[Transaction]] = defaultdict(list)
+    for txn in transactions:
+        if txn.direction == Direction.CREDIT and not txn.is_internal_transfer:
+            credits_by_amount[txn.amount].append(txn)
+
+    claimed: set[int] = set()  # id() of credit legs already paired
+
+    debits = [t for t in transactions
+              if t.direction == Direction.DEBIT and not t.is_internal_transfer]
+    # Largest first: a big EMI or card payment is the highest-value match to get
+    # right, and claiming it early stops a small coincidental row stealing it.
+    debits.sort(key=lambda t: -t.amount)
+
+    for debit in debits:
+        candidates = _find_candidates(debit, credits_by_amount, claimed)
+        if not candidates:
+            continue
+
+        best = min(candidates, key=lambda c: (abs((c.txn_date - debit.txn_date).days),
+                                              c.account_id or ""))
+        gap = abs((best.txn_date - debit.txn_date).days)
+
+        from_account = accounts.get(debit.account_id or "")
+        to_account = accounts.get(best.account_id or "")
+        kind, category = _classify(from_account, to_account)
+
+        pair_id = str(uuid.uuid4())
+        for leg, cat in ((debit, category), (best, category)):
+            leg.is_internal_transfer = True
+            leg.transfer_pair_id = pair_id
+            leg.category = cat
+            leg.category_source = ConfidenceSource.RULE
+            leg.category_confidence = 0.95
+
+        # The debit is the cash actually leaving; the credit is the receiving
+        # account's record of the same money. Cashflow must count the first and
+        # ignore the second, or a 38,420 EMI shows up as 76,840 committed.
+        debit.is_mirror_leg = False
+        best.is_mirror_leg = True
+
+        claimed.add(id(best))
+        report.pairs.append(TransferPair(
+            pair_id=pair_id,
+            debit_txn_id=debit.id or "",
+            credit_txn_id=best.id or "",
+            amount=debit.amount,
+            day_gap=gap,
+            from_account=from_account.display_name() if from_account else "unknown",
+            to_account=to_account.display_name() if to_account else "unknown",
+            kind=kind,
+            confidence=0.95 if gap <= 1 else 0.8,
+        ))
+        report.total_amount += debit.amount
+        report.double_count_avoided += debit.amount
+
+    _pair_investment_mirrors(transactions, accounts, report, claimed)
+    _pair_card_payment_mirrors(transactions, accounts, report, claimed)
+
+    if report.pairs:
+        report.notes.append(
+            f"Matched {len(report.pairs)} transfers between your own accounts "
+            f"totalling {report.total_amount:,.2f}. These are excluded from "
+            f"spending totals - without this, that amount would be counted twice."
+        )
+    return report
+
+
+def _pair_card_payment_mirrors(
+    transactions: list[Transaction],
+    accounts: dict[str, Account],
+    report: TransferReport,
+    claimed: set[int],
+) -> None:
+    """Pair a bank bill payment against the card's own record of it.
+
+    The debit/credit matcher only sees a payment when the card statement books
+    it as a CREDIT. In practice the card row is often parsed as a debit - card
+    layouts mark a payment with a bare "+" or "CR" glyph that does not always
+    survive extraction - and the pair is missed entirely. Both legs then count
+    as spending, and the same rupees are charged to the user twice.
+
+    Matching is deliberately tight: identical amount, one side a card and the
+    other a cash account, within a few days. The bank leg is kept as the real
+    cash movement; the card leg is flagged as the mirror.
+    """
+    card_ids = {
+        aid for aid, acct in accounts.items()
+        if acct.account_type == AccountType.CREDIT_CARD
+    }
+    cash_ids = {
+        aid for aid, acct in accounts.items()
+        if acct.account_type in {AccountType.SAVINGS, AccountType.CURRENT,
+                                 AccountType.WALLET}
+    }
+    if not card_ids or not cash_ids:
+        return
+
+    cash_debits: dict[Decimal, list[Transaction]] = defaultdict(list)
+    for txn in transactions:
+        if (txn.direction == Direction.DEBIT
+                and not txn.is_internal_transfer
+                and txn.account_id in cash_ids):
+            cash_debits[txn.amount].append(txn)
+
+    for txn in transactions:
+        if txn.account_id not in card_ids or txn.is_internal_transfer:
+            continue
+
+        candidates = [
+            c for c in cash_debits.get(txn.amount, ())
+            if id(c) not in claimed
+            and not c.is_internal_transfer
+            and abs((c.txn_date - txn.txn_date).days) <= MAX_DAY_GAP
+        ]
+        if not candidates:
+            continue
+
+        cash_leg = min(candidates, key=lambda c: abs((c.txn_date - txn.txn_date).days))
+        gap = abs((cash_leg.txn_date - txn.txn_date).days)
+        pair_id = str(uuid.uuid4())
+
+        for leg in (cash_leg, txn):
+            leg.is_internal_transfer = True
+            leg.transfer_pair_id = pair_id
+            leg.category = Category.CC_PAYMENT
+            leg.category_source = ConfidenceSource.RULE
+            leg.category_confidence = 0.85
+        # The bank is where the money actually moved.
+        cash_leg.is_mirror_leg = False
+        txn.is_mirror_leg = True
+
+        claimed.add(id(cash_leg))
+        report.pairs.append(TransferPair(
+            pair_id=pair_id,
+            debit_txn_id=cash_leg.id or "",
+            credit_txn_id=txn.id or "",
+            amount=txn.amount,
+            day_gap=gap,
+            from_account=(accounts[cash_leg.account_id].display_name()
+                          if cash_leg.account_id in accounts else "unknown"),
+            to_account=(accounts[txn.account_id].display_name()
+                        if txn.account_id in accounts else "unknown"),
+            kind="cc_payment",
+            confidence=0.85 if gap <= 1 else 0.7,
+        ))
+        report.total_amount += txn.amount
+        report.double_count_avoided += txn.amount
+
+
+def _pair_investment_mirrors(
+    transactions: list[Transaction],
+    accounts: dict[str, Account],
+    report: TransferReport,
+    claimed: set[int],
+) -> None:
+    """Pair a bank SIP debit against the same purchase on a fund statement.
+
+    The debit/credit matcher cannot see these, because both legs are debits: the
+    bank shows money going out, and the fund statement also shows a purchase
+    (money in, from the fund's point of view, but rendered in the debit column
+    of a holdings statement). Left unpaired, a 25,000 SIP is counted as 50,000
+    invested the moment a user uploads both statements - and the more diligent
+    the user is about uploading everything, the more wrong the number gets.
+
+    The bank leg is kept as the real cash outflow; the fund leg is flagged as
+    the mirror, so uploading the fund statement alone still counts correctly.
+    """
+    investment_ids = {
+        aid for aid, acct in accounts.items()
+        if acct.account_type == AccountType.INVESTMENT
+    }
+    if not investment_ids:
+        return
+
+    cash_debits: dict[Decimal, list[Transaction]] = defaultdict(list)
+    for txn in transactions:
+        if (txn.direction == Direction.DEBIT
+                and not txn.is_internal_transfer
+                and txn.account_id not in investment_ids):
+            cash_debits[txn.amount].append(txn)
+
+    for txn in transactions:
+        if txn.account_id not in investment_ids:
+            continue
+        if txn.is_internal_transfer or txn.direction != Direction.DEBIT:
+            continue
+
+        candidates = [
+            c for c in cash_debits.get(txn.amount, ())
+            if id(c) not in claimed
+            and abs((c.txn_date - txn.txn_date).days) <= MAX_DAY_GAP
+        ]
+        if not candidates:
+            continue
+
+        cash_leg = min(candidates, key=lambda c: abs((c.txn_date - txn.txn_date).days))
+        gap = abs((cash_leg.txn_date - txn.txn_date).days)
+        pair_id = str(uuid.uuid4())
+
+        # Only the fund-side leg is marked internal. The bank leg stays a real
+        # outflow categorized as INVESTMENT, which is what the cashflow view wants.
+        txn.is_internal_transfer = True
+        txn.is_mirror_leg = True
+        txn.transfer_pair_id = pair_id
+        txn.category = Category.INVESTMENT
+        txn.category_source = ConfidenceSource.RULE
+        txn.category_confidence = 0.9
+
+        cash_leg.transfer_pair_id = pair_id
+        cash_leg.category = Category.INVESTMENT
+        cash_leg.category_source = ConfidenceSource.RULE
+        cash_leg.category_confidence = 0.9
+
+        claimed.add(id(cash_leg))
+        report.pairs.append(TransferPair(
+            pair_id=pair_id,
+            debit_txn_id=cash_leg.id or "",
+            credit_txn_id=txn.id or "",
+            amount=txn.amount,
+            day_gap=gap,
+            from_account=(accounts.get(cash_leg.account_id or "").display_name()
+                          if accounts.get(cash_leg.account_id or "") else "unknown"),
+            to_account=(accounts.get(txn.account_id or "").display_name()
+                        if accounts.get(txn.account_id or "") else "unknown"),
+            kind="investment",
+            confidence=0.9 if gap <= 1 else 0.75,
+        ))
+        report.total_amount += txn.amount
+        report.double_count_avoided += txn.amount
+
+
+def _find_candidates(
+    debit: Transaction,
+    credits_by_amount: dict[Decimal, list[Transaction]],
+    claimed: set[int],
+) -> list[Transaction]:
+    """Credits that could be the far leg of this debit."""
+    out: list[Transaction] = []
+    for credit in credits_by_amount.get(debit.amount, ()):
+        if id(credit) in claimed:
+            continue
+        if credit.account_id == debit.account_id:
+            continue  # a transfer must cross accounts
+        if abs((credit.txn_date - debit.txn_date).days) > MAX_DAY_GAP:
+            continue
+        out.append(credit)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Duplicate statement detection
+# --------------------------------------------------------------------------
+
+def find_duplicate_transactions(transactions: list[Transaction]) -> list[Transaction]:
+    """Find transactions that appear more than once within the same account.
+
+    Users upload overlapping statements constantly - a monthly and a quarterly
+    covering the same weeks, or the same file twice under different names.
+    Content hashing catches identical files; this catches identical *rows*,
+    which is the case content hashing misses.
+
+    Returns the extra copies (the first occurrence of each group is kept).
+    """
+    groups: dict[tuple, list[Transaction]] = defaultdict(list)
+    for txn in sorted(transactions, key=lambda t: (t.txn_date, t.raw_description)):
+        groups[(txn.account_id, txn.txn_date, txn.amount, txn.direction)].append(txn)
+
+    duplicates: list[Transaction] = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        # Keep the longest description: when two extractions of the same row
+        # disagree it is because one was truncated, and the longer one carries
+        # the full bank reference.
+        kept: list[Transaction] = []
+        for txn in sorted(members, key=lambda t: -len(t.normalized_description or "")):
+            if any(_is_same_row(txn, other) for other in kept):
+                duplicates.append(txn)
+            else:
+                kept.append(txn)
+
+    return duplicates
+
+
+def _balances_agree(a: Transaction, b: Transaction) -> bool:
+    """A genuine repeat moves the running balance; a duplicate does not."""
+    if a.balance_after is not None and b.balance_after is not None:
+        return a.balance_after == b.balance_after
+    return a.balance_after is None and b.balance_after is None
+
+
+def _is_same_row(a: Transaction, b: Transaction) -> bool:
+    """Whether two rows of identical account/date/amount/direction are one row.
+
+    A genuine repeat (two identical chai payments in one afternoon) is entirely
+    possible, so the running balance has to agree as well.
+
+    Beyond an exact match, one description being a strict PREFIX of the other
+    means a single row that two extractions cut at different lengths - the
+    monthly and the quarterly statement both cover October, and one clipped
+    "IBL897436BA0A5D47C88E89B68A0EBCA9" to "...E89B68". Two real transactions
+    would carry different bank references, so neither could prefix the other.
+    The 18-character floor keeps a short, generic narration from swallowing an
+    unrelated row.
+    """
+    if not _balances_agree(a, b):
+        return False
+    da = (a.normalized_description or "").strip()
+    db = (b.normalized_description or "").strip()
+    if da[:60] == db[:60]:
+        return True
+    short, long_ = (da, db) if len(da) <= len(db) else (db, da)
+    return len(short) >= 18 and long_.startswith(short)

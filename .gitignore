@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+node_modules/
+frontend/dist/
+
+.pytest_cache/
+credentials.json
+data
+.claude/scheduled_tasks.lock

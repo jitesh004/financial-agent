@@ -1,0 +1,366 @@
+/* Design tokens.
+   Light and dark are both defined up front so the whole palette swaps from one
+   place. Financial dashboards get stared at for long stretches, so the surface
+   colours are low-contrast and the accent colours are reserved for data. */
+
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #fbfbfd;
+  --border: #e3e6ec;
+  --border-strong: #ccd2dc;
+
+  --text: #15181d;
+  --text-2: #5a6472;
+  --text-3: #8a94a3;
+
+  --accent: #3b5bdb;
+  --accent-soft: #eaeeff;
+
+  --positive: #10897b;
+  --positive-soft: #e6f5f2;
+  --negative: #d8453f;
+  --negative-soft: #fdecec;
+  --warn: #b7791f;
+  --warn-soft: #fdf6e3;
+
+  /* Categorical series. Ordered so neighbours stay distinguishable, and
+     checked to hold up in both themes rather than only on white. */
+  --c1: #3b5bdb; --c2: #10897b; --c3: #d97706; --c4: #b5179e;
+  --c5: #0891b2; --c6: #7048e8; --c7: #d8453f; --c8: #5c940d;
+  --c9: #e8590c; --c10: #1098ad; --c11: #862e9c; --c12: #495057;
+
+  --radius: 10px;
+  --radius-sm: 6px;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 1px 3px rgba(16, 24, 40, .06);
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+}
+
+[data-theme="dark"] {
+  --bg: #0e1117;
+  --surface: #161b23;
+  --surface-2: #1b212b;
+  --border: #262d38;
+  --border-strong: #333c4a;
+
+  --text: #e7ebf0;
+  --text-2: #9aa5b4;
+  --text-3: #6b7787;
+
+  --accent: #6b8afd;
+  --accent-soft: #1c2440;
+
+  --positive: #35c9b1;
+  --positive-soft: #10302c;
+  --negative: #f8736c;
+  --negative-soft: #33191a;
+  --warn: #e0a94a;
+  --warn-soft: #2e2616;
+
+  --c1: #6b8afd; --c2: #35c9b1; --c3: #f0a03c; --c4: #e879c9;
+  --c5: #38bdd8; --c6: #9d7bff; --c7: #f8736c; --c8: #8ec63f;
+  --c9: #fb923c; --c10: #4dd0e1; --c11: #c084fc; --c12: #94a3b8;
+
+  --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 1px 3px rgba(0, 0, 0, .25);
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- Scrollbars ----------
+   The OS default is a wide, opaque bar that reads as a seam across the layout,
+   and on a dark theme it stays stubbornly light. These are slim, themed, and
+   fade back until hovered, so a scrollable panel looks like part of the page
+   rather than a browser artefact.
+
+   Both syntaxes are needed: `scrollbar-*` for Firefox, `::-webkit-scrollbar`
+   for Chromium and Safari. Neither is a superset of the other. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+  /* Transparent border + background-clip insets the thumb, so it reads as a
+     slim pill rather than a bar wedged against the content edge. */
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--text-3); background-clip: content-box; }
+::-webkit-scrollbar-thumb:active { background: var(--text-2); background-clip: content-box; }
+
+/* Tabular figures everywhere money appears: columns of numbers that don't
+   align are genuinely harder to scan and read as sloppy. */
+.num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
+
+.app { display: flex; flex-direction: column; min-height: 100%; }
+
+/* ---------- Header ---------- */
+
+.header {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: 16px;
+  padding: 12px 24px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+}
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 650; letter-spacing: -.2px; }
+.brand-mark {
+  width: 26px; height: 26px; border-radius: 7px; flex: none;
+  background: linear-gradient(135deg, var(--accent), var(--c2));
+}
+.header-spacer { flex: 1; }
+
+/* Scrollable at narrow widths, but without a visible scrollbar sitting under
+   the tabs — it reads as a broken layout rather than an affordance. */
+.tabs {
+  display: flex; gap: 2px; overflow-x: auto;
+  scrollbar-width: none; -ms-overflow-style: none;
+}
+.tabs::-webkit-scrollbar { display: none; }
+.tab {
+  appearance: none; border: 0; background: transparent; cursor: pointer;
+  padding: 7px 13px; border-radius: var(--radius-sm);
+  color: var(--text-2); font-size: 13px; font-weight: 500;
+  font-family: inherit; white-space: nowrap;
+}
+.tab:hover { background: var(--surface-2); color: var(--text); }
+.tab[aria-selected="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+
+/* ---------- Layout ---------- */
+
+.main { flex: 1; padding: 22px 24px 60px; max-width: 1440px; width: 100%; margin: 0 auto; }
+
+.grid { display: grid; gap: 14px; }
+.grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.grid.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 1080px) { .grid.cols-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 900px)  { .grid.cols-3, .grid.cols-2 { grid-template-columns: 1fr; } }
+@media (max-width: 640px)  { .grid.cols-4 { grid-template-columns: 1fr; } .main { padding: 16px 12px 40px; } }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px 18px;
+  min-width: 0;
+}
+.card-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 14px; }
+.card-title { font-size: 13px; font-weight: 650; letter-spacing: -.1px; }
+.card-sub { font-size: 12px; color: var(--text-3); margin-left: auto; }
+
+.section-title {
+  font-size: 12px; font-weight: 650; text-transform: uppercase;
+  letter-spacing: .07em; color: var(--text-3);
+  margin: 26px 0 10px;
+}
+.section-title:first-child { margin-top: 0; }
+
+/* ---------- Stat tiles ---------- */
+
+.stat { display: flex; flex-direction: column; gap: 5px; }
+.stat-label { font-size: 12px; color: var(--text-2); font-weight: 500; }
+.stat-value { font-size: 25px; font-weight: 640; letter-spacing: -.6px; line-height: 1.15; }
+.stat-note { font-size: 12px; color: var(--text-3); }
+.stat-value.pos { color: var(--positive); }
+.stat-value.neg { color: var(--negative); }
+
+/* ---------- Tables ---------- */
+
+.table-wrap { overflow-x: auto; margin: 0 -18px -16px; padding: 0 18px 16px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th {
+  text-align: left; font-weight: 600; font-size: 11px;
+  text-transform: uppercase; letter-spacing: .05em; color: var(--text-3);
+  padding: 7px 10px; border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; background: var(--surface);
+}
+td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+tr:last-child td { border-bottom: 0; }
+tbody tr:hover td { background: var(--surface-2); }
+.right { text-align: right; }
+.nowrap { white-space: nowrap; }
+.truncate { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- Chips & badges ---------- */
+
+.chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px; border-radius: 999px;
+  font-size: 11px; font-weight: 550; white-space: nowrap;
+  background: var(--surface-2); color: var(--text-2);
+  border: 1px solid var(--border);
+}
+.chip.pos { background: var(--positive-soft); color: var(--positive); border-color: transparent; }
+.chip.neg { background: var(--negative-soft); color: var(--negative); border-color: transparent; }
+.chip.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.chip.accent { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+
+/* ---------- Buttons & inputs ---------- */
+
+.btn {
+  appearance: none; cursor: pointer; font-family: inherit;
+  font-size: 13px; font-weight: 550;
+  padding: 8px 15px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong); background: var(--surface); color: var(--text);
+  transition: background .12s ease, border-color .12s ease;
+}
+.btn:hover:not(:disabled) { background: var(--surface-2); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
+.btn.danger { color: var(--negative); border-color: var(--negative); background: transparent; }
+.btn.icon { padding: 7px 9px; }
+
+/* A clickable chip used as a multi-select pill (account/card pickers). Same
+   shape as the read-only .chip, but interactive with a clear selected state. */
+.chip-toggle {
+  appearance: none; cursor: pointer; font-family: inherit;
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 12px; border-radius: 999px;
+  font-size: 12px; font-weight: 550; white-space: nowrap;
+  background: var(--surface); color: var(--text-3);
+  border: 1px solid var(--border);
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+.chip-toggle:hover { border-color: var(--border-strong); color: var(--text-2); }
+.chip-toggle.selected {
+  background: var(--accent-soft); color: var(--accent); border-color: transparent;
+  font-weight: 620;
+}
+
+/* A small segmented control (All / UPI / Other, etc.) - a fixed set of
+   mutually exclusive choices, styled distinctly from a free multi-select. */
+.seg {
+  display: inline-flex; border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); overflow: hidden;
+}
+.seg-btn {
+  appearance: none; cursor: pointer; font-family: inherit;
+  font-size: 12px; font-weight: 550; padding: 7px 12px;
+  border: none; border-right: 1px solid var(--border-strong);
+  background: var(--surface); color: var(--text-2);
+}
+.seg-btn:last-child { border-right: none; }
+.seg-btn:hover { background: var(--surface-2); }
+.seg-btn.active { background: var(--accent); color: #fff; }
+
+select, input[type="text"], input[type="search"] {
+  font-family: inherit; font-size: 13px; color: var(--text);
+  padding: 7px 10px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong); background: var(--surface);
+}
+select:focus, input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+/* ---------- Dropzone ---------- */
+
+.dropzone {
+  border: 1.5px dashed var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 44px 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .15s ease, background .15s ease;
+}
+.dropzone:hover, .dropzone.over { border-color: var(--accent); background: var(--accent-soft); }
+.dropzone h3 { margin: 0 0 6px; font-size: 16px; font-weight: 620; }
+.dropzone p { margin: 0; color: var(--text-2); font-size: 13px; }
+
+.file-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); background: var(--surface);
+  font-size: 13px;
+}
+.file-row + .file-row { margin-top: 6px; }
+.file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- Progress ---------- */
+
+.bar { height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+.bar > span { display: block; height: 100%; background: var(--accent); transition: width .3s ease; }
+
+.spinner {
+  width: 15px; height: 15px; flex: none;
+  border: 2px solid var(--border-strong); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- Callouts ---------- */
+
+.callout {
+  border-radius: var(--radius); padding: 12px 14px;
+  border: 1px solid var(--border); background: var(--surface-2);
+  font-size: 13px; color: var(--text-2);
+}
+.callout + .callout { margin-top: 8px; }
+.callout.warn { background: var(--warn-soft); border-color: transparent; color: var(--warn); }
+.callout.neg { background: var(--negative-soft); border-color: transparent; color: var(--negative); }
+.callout.pos { background: var(--positive-soft); border-color: transparent; color: var(--positive); }
+.callout strong { color: inherit; }
+
+/* ---------- Narrative ---------- */
+
+.headline { font-size: 19px; font-weight: 620; letter-spacing: -.35px; line-height: 1.35; margin: 0 0 8px; }
+.prose { color: var(--text-2); font-size: 14px; line-height: 1.65; }
+.prose p { margin: 0 0 10px; }
+
+.finding { display: flex; gap: 11px; padding: 11px 0; border-bottom: 1px solid var(--border); }
+.finding:last-child { border-bottom: 0; }
+.finding-body { flex: 1; min-width: 0; }
+.finding-title { font-weight: 600; font-size: 13.5px; margin-bottom: 3px; }
+.finding-detail { color: var(--text-2); font-size: 13px; }
+.finding-mech { color: var(--text-3); font-size: 12.5px; margin-top: 5px; font-style: italic; }
+
+/* ---------- Category bars ---------- */
+
+.catrow { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+.catrow-label { width: 132px; flex: none; font-size: 12.5px; text-transform: capitalize; }
+.catrow-track { flex: 1; height: 8px; border-radius: 4px; background: var(--surface-2); overflow: hidden; }
+.catrow-fill { height: 100%; border-radius: 4px; }
+.catrow-value { width: 100px; flex: none; text-align: right; font-size: 12.5px; }
+.catrow-pct { width: 46px; flex: none; text-align: right; font-size: 12px; color: var(--text-3); }
+
+/* ---------- Misc ---------- */
+
+.empty { text-align: center; padding: 56px 20px; color: var(--text-3); }
+.empty h3 { color: var(--text-2); font-weight: 600; margin: 0 0 6px; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 10px 16px; margin-top: 10px; font-size: 12px; color: var(--text-2); }
+.legend-item { display: flex; align-items: center; gap: 6px; }
+
+.tooltip {
+  background: var(--surface); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); padding: 9px 11px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.12); font-size: 12.5px;
+}
+.tooltip-label { font-weight: 620; margin-bottom: 5px; }
+.tooltip-row { display: flex; align-items: center; gap: 7px; justify-content: space-between; }
+.tooltip-row span:last-child { font-variant-numeric: tabular-nums; }
+
+.scroll-y { max-height: 420px; overflow-y: auto; }
