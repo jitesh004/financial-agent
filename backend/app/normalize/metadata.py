@@ -617,6 +617,50 @@ def extract_metadata(text: str, filename: str = "", sender: str = "") -> Stateme
     if re.search(r"\bUSD\b|\$", text) and not re.search(r"\bINR\b|₹|\bRs\.?\b", text):
         meta.currency = "USD"
 
+
+    # LLM Fallback for identity fields
+    if meta.institution == "Unknown" or meta.account_type == AccountType.UNKNOWN:
+        from ..llm.client import get_client, LLMUnavailable
+        from ..db.repository import get_ai_inference, save_ai_inference
+        from ..api.dependencies import get_db
+        import hashlib
+        
+        # Only use the letterhead slice!
+        slice_to_send = head if head else text[:1000]
+        
+        fingerprint = hashlib.sha256(slice_to_send.encode()).hexdigest()
+        db = get_db()
+        
+        cached = get_ai_inference(db, fingerprint)
+        if cached:
+            meta.institution = cached.get("institution", meta.institution)
+            if cached.get("account_type"):
+                try:
+                    meta.account_type = AccountType(cached["account_type"])
+                except Exception:
+                    pass
+            meta.product_name = cached.get("product_name", meta.product_name)
+        else:
+            try:
+                client = get_client()
+                if client.available:
+                    prompt = f"""Extract bank name, account type, and product name from this statement letterhead.
+Return JSON: {{"institution": "...", "account_type": "savings|credit_card|current|...", "product_name": "..."}}
+Letterhead: {slice_to_send}"""
+                    resp = client.complete_json(prompt, system="You return JSON only.", max_tokens=100)
+                    save_ai_inference(db, fingerprint, resp)
+                    
+                    meta.institution = resp.get("institution", meta.institution)
+                    if resp.get("account_type"):
+                        try:
+                            meta.account_type = AccountType(resp["account_type"])
+                        except Exception:
+                            pass
+                    meta.product_name = resp.get("product_name", meta.product_name)
+            except (LLMUnavailable, Exception) as e:
+                import logging
+                logging.getLogger(__name__).warning("LLM fallback failed: %s", e)
+
     if meta.opening_balance is None and meta.closing_balance is None:
         meta.notes.append(
             "Statement declared no opening/closing balance, so the balance "

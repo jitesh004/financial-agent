@@ -19,8 +19,8 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
 from ..models.schemas import (Account, AccountType, CATEGORY_GROUPS, Category,
-                              Direction, INCOME_CATEGORIES, LIABILITY_TYPES,
-                              Transaction)
+                              CONTRA_EXPENSE_ROLES, Direction, FlowRole,
+                              INCOME_CATEGORIES, LIABILITY_TYPES, Transaction)
 
 CENT = Decimal("0.01")
 ZERO = Decimal("0")
@@ -48,6 +48,7 @@ def _pct(part: Decimal, whole: Decimal) -> float:
 class MonthlyFlow:
     month: str
     income: Decimal
+    #: Net of anything that came back against it - see AnalysisResult.
     spend: Decimal
     invested: Decimal
     #: Every rupee of cash that actually left this month: spending PLUS
@@ -58,6 +59,9 @@ class MonthlyFlow:
     net: Decimal
     savings_rate: float
     transaction_count: int
+    #: What was laid out this month before offsets, and what came back.
+    gross_spend: Decimal = ZERO
+    offsets: Decimal = ZERO
 
 
 @dataclass
@@ -104,7 +108,14 @@ class AnalysisResult:
     months_covered: int = 0
 
     total_income: Decimal = ZERO
+    #: What spending actually cost, after money that came back against it.
     total_spend: Decimal = ZERO
+    #: What was laid out before any of it came back. Reported alongside
+    #: `total_spend` rather than instead of it: someone who is reimbursed
+    #: heavily needs to see both, and either figure alone misleads.
+    gross_spend: Decimal = ZERO
+    #: Refunds and repayments of expenses that were never the user's.
+    total_offsets: Decimal = ZERO
     total_invested: Decimal = ZERO
     net_savings: Decimal = ZERO
     savings_rate: float = 0.0
@@ -141,8 +152,17 @@ class AnalysisResult:
 def analyze(
     transactions: list[Transaction],
     accounts: dict[str, Account] | None = None,
+    *,
+    start: date | None = None,
+    end: date | None = None,
 ) -> AnalysisResult:
-    """Compute the full picture from a categorized, reconciled ledger."""
+    """Compute the full picture from a categorized, reconciled ledger.
+
+    When `start` and/or `end` are provided, only transactions within that
+    range are included.  The resulting `period_start` / `period_end` are set
+    to the explicit bounds so the caller can distinguish "no data" from
+    "data that happens to start later".
+    """
     result = AnalysisResult()
     accounts = accounts or {}
 
@@ -151,29 +171,53 @@ def analyze(
         return result
 
     txns = sorted(transactions, key=lambda t: t.txn_date)
-    result.period_start = txns[0].txn_date
-    result.period_end = txns[-1].txn_date
+    if start or end:
+        s = start or txns[0].txn_date
+        e = end or txns[-1].txn_date
+        txns = [t for t in txns if s <= t.txn_date <= e]
+        if not txns:
+            result.notes.append(
+                f"No transactions in the requested range "
+                f"{s.isoformat()} – {e.isoformat()}."
+            )
+            return result
+        result.period_start = s
+        result.period_end = e
+    else:
+        result.period_start = txns[0].txn_date
+        result.period_end = txns[-1].txn_date
     result.transaction_count = len(txns)
 
-    spend_txns = [t for t in txns if t.is_spend]
-    income_txns = [
-        t for t in txns
-        if t.direction == Direction.CREDIT
-        and not t.is_internal_transfer
-        and t.category in INCOME_CATEGORIES
-    ]
-    invested_txns = [
-        t for t in txns
-        if t.category == Category.INVESTMENT
-        and t.direction == Direction.DEBIT
-        and not t.is_internal_transfer
-    ]
+    # Every total below is a sum over ONE role, so the sets are disjoint by
+    # construction and no rupee can land in two of them. The previous version
+    # built each figure from its own overlapping predicate, which is how
+    # `total_invested` and the monthly `invested` column came to disagree -
+    # one excluded internal transfers, the other excluded mirror legs.
+    by_role: dict[FlowRole, list[Transaction]] = defaultdict(list)
+    for txn in txns:
+        by_role[txn.role].append(txn)
+
+    spend_txns = by_role[FlowRole.EXPENSE]
+    income_txns = by_role[FlowRole.INCOME]
+    invested_txns = by_role[FlowRole.INVESTMENT]
+    # Money coming back against an expense already counted as spending: a
+    # merchant refund, or someone repaying a purchase that was never the
+    # user's. Booking these as income inflates both sides of the ledger for
+    # what was really a cancelled or borrowed purchase.
+    offset_txns = [t for t in txns if t.role in CONTRA_EXPENSE_ROLES]
 
     result.total_income = q(sum((t.amount for t in income_txns), ZERO))
-    result.total_spend = q(sum((t.amount for t in spend_txns), ZERO))
+    result.gross_spend = q(sum((t.amount for t in spend_txns), ZERO))
+    result.total_offsets = q(sum((t.amount for t in offset_txns), ZERO))
+    # Reported net, with the gross figure kept alongside it: a user who is
+    # reimbursed heavily needs to see both what they laid out and what it
+    # actually cost them, and showing only one of those is misleading either
+    # way round.
+    result.total_spend = q(result.gross_spend - result.total_offsets)
     result.total_invested = q(sum((t.amount for t in invested_txns), ZERO))
     result.internal_transfer_total = q(
-        sum((t.amount for t in txns if t.is_internal_transfer), ZERO)
+        sum((t.amount for t in txns
+             if t.is_internal_transfer and not t.is_mirror_leg), ZERO)
     )
 
     # Savings = what came in, minus what was consumed. Money moved into
@@ -216,31 +260,46 @@ def _count_months(start: date | None, end: date | None) -> int:
 def _monthly_flows(txns: list[Transaction]) -> list[MonthlyFlow]:
     buckets: dict[str, dict[str, Decimal | int]] = defaultdict(
         lambda: {"income": ZERO, "spend": ZERO, "invested": ZERO,
-                 "outflow": ZERO, "count": 0}
+                 "outflow": ZERO, "offsets": ZERO, "count": 0}
     )
 
     for t in txns:
-        b = buckets[_month_key(t.txn_date)]
+        # Bucketed by accounting month, which is the calendar month of
+        # txn_date except where the period engine moved it - a salary paid on
+        # the last working day lands on the 31st one month and the 1st two
+        # months later, double-counting one month and emptying another.
+        b = buckets[t.accounting_month or _month_key(t.txn_date)]
         b["count"] = int(b["count"]) + 1
-        if t.is_spend:
+
+        role = t.role
+        if role == FlowRole.EXPENSE:
             b["spend"] = b["spend"] + t.amount
-        elif (t.direction == Direction.CREDIT and not t.is_internal_transfer
-              and t.category in INCOME_CATEGORIES):
+        elif role == FlowRole.INCOME:
             b["income"] = b["income"] + t.amount
-        if (t.category == Category.INVESTMENT and t.direction == Direction.DEBIT
-                and not t.is_mirror_leg):
+        elif role in CONTRA_EXPENSE_ROLES:
+            # Nets against the month's spending rather than adding to income.
+            b["offsets"] = b["offsets"] + t.amount
+        elif role == FlowRole.INVESTMENT and t.direction == Direction.DEBIT:
             b["invested"] = b["invested"] + t.amount
+
+        # Cash actually leaving the user's accounts this month, whether or not
+        # it was spending. The mirror leg of a transfer is the receiving
+        # account's record of money already counted on the way out.
         if (t.direction == Direction.DEBIT and not t.is_mirror_leg
-                and t.category != Category.CC_PAYMENT):
+                and role not in {FlowRole.EXCLUDED, FlowRole.CARD_SETTLEMENT}):
             b["outflow"] = b["outflow"] + t.amount
 
     out = []
     for month in sorted(buckets):
         b = buckets[month]
-        income, spend = q(b["income"]), q(b["spend"])
+        income = q(b["income"])
+        gross = q(b["spend"])
+        offsets = q(b["offsets"])
+        spend = q(gross - offsets)
         net = q(income - spend)
         out.append(MonthlyFlow(
-            month=month, income=income, spend=spend,
+            month=month, income=income, spend=spend, gross_spend=gross,
+            offsets=offsets,
             invested=q(b["invested"]), total_outflow=q(b["outflow"]), net=net,
             savings_rate=_pct(net, income),
             transaction_count=int(b["count"]),
@@ -252,8 +311,8 @@ def _monthly_by_category(spend_txns: list[Transaction]) -> dict[str, dict[str, D
     """Actual per-month spend per category."""
     out: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(lambda: ZERO))
     for t in spend_txns:
-        bucket = out[_month_key(t.txn_date)]
-        bucket[t.category.value] = bucket[t.category.value] + t.amount
+        bucket = out[t.accounting_month or _month_key(t.txn_date)]
+        bucket[t.category] = bucket[t.category] + t.amount
     return {month: {c: q(v) for c, v in cats.items()} for month, cats in out.items()}
 
 
@@ -271,7 +330,7 @@ def _category_breakdown(
         subtotal = sum((t.amount for t in members), ZERO)
         largest = max(members, key=lambda t: t.amount)
         out.append(CategoryBreakdown(
-            category=category.value,
+            category=category,
             group=groups.get(category, "Other"),
             total=q(subtotal),
             share_pct=_pct(subtotal, total),
@@ -308,7 +367,7 @@ def _merchant_spend(spend_txns: list[Transaction], limit: int = 25) -> list[Merc
             total=q(total),
             count=len(members),
             average=q(total / Decimal(len(members))),
-            category=members[0].category.value,
+            category=members[0].category,
             first_seen=min(dates),
             last_seen=max(dates),
         ))
@@ -387,7 +446,7 @@ def _salary_flows(txns: list[Transaction]) -> list[SalaryFlow]:
 
         by_category: dict[str, Decimal] = defaultdict(lambda: ZERO)
         for t in in_window:
-            by_category[t.category.value] = by_category[t.category.value] + t.amount
+            by_category[t.category] = by_category[t.category] + t.amount
 
         spent = sum(by_category.values(), ZERO)
         allocations = sorted(
@@ -474,7 +533,7 @@ def _find_unusual(
                 flagged.append((
                     t,
                     f"{t.amount:,.0f} is well above the typical "
-                    f"{category.value.replace('_', ' ')} spend of ~{median:,.0f}.",
+                    f"{category.replace('_', ' ')} spend of ~{median:,.0f}.",
                 ))
 
     flagged.sort(key=lambda pair: -pair[0].amount)

@@ -45,7 +45,11 @@ _TIER_FILES = ("source_files",)
 _TIER_AI = ("ai_inferences", "merchant_categories")
 
 #: Authored by a human. Cannot be regenerated from any input at any price.
-_TIER_DECISIONS = ("user_overrides",)
+#: `claims` is listed before `claim_settlements` and `transaction_splits`
+#: only for readability - both cascade from it anyway.
+_TIER_DECISIONS = ("user_overrides", "claim_settlements", "transaction_splits",
+                   "claims", "split_rules", "settlement_group_legs",
+                   "settlement_groups")
 
 _TIER_IDENTITY = ("user_profile",)
 
@@ -162,6 +166,22 @@ CREATE TABLE IF NOT EXISTS transactions (
     -- there on the next run.
     excluded               INTEGER NOT NULL DEFAULT 0,
     note                   TEXT NOT NULL DEFAULT ''
+);
+
+-- User-defined custom categories
+CREATE TABLE IF NOT EXISTS custom_categories (
+    name        TEXT PRIMARY KEY,
+    color       TEXT NOT NULL DEFAULT '#6b7280',
+    icon        TEXT NOT NULL DEFAULT 'Tag',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS recurring_series_overrides (
+    series_id   TEXT PRIMARY KEY,
+    is_active   INTEGER,
+    label       TEXT,
+    category    TEXT,
+    deleted     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_txn_date     ON transactions(txn_date);
@@ -330,6 +350,121 @@ CREATE TABLE IF NOT EXISTS ai_inferences (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ai_kind ON ai_inferences(kind);
+
+-- ---------------------------------------------------------------------------
+-- Claims: expenses that were never really the user's.
+--
+-- Amount matching cannot solve this, and cash proves why. If someone repays a
+-- card purchase in cash there is no ledger row anywhere, so no algorithm can
+-- find it. And when one 62,000 card payment covers 50,000 that was somebody
+-- else's plus 12,000 of the user's own spending, the figures never line up.
+--
+-- So the primary act is marking the PURCHASE - the thing the user knows for
+-- certain - and repayment becomes a separate, optionally invisible event.
+-- Tier 0: nothing can regenerate these.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS claims (
+    id                 TEXT PRIMARY KEY,
+    direction          TEXT NOT NULL,   -- owed_to_me | owed_by_me
+    counterparty       TEXT NOT NULL DEFAULT '',
+    -- The transaction that created the claim, by content fingerprint so it
+    -- survives re-parsing the statement it came from.
+    origin_fingerprint TEXT NOT NULL DEFAULT '',
+    amount             TEXT NOT NULL,
+    settled_amount     TEXT NOT NULL DEFAULT '0',
+    status             TEXT NOT NULL DEFAULT 'open',  -- open|partial|settled|written_off
+    -- accrual: the expense was never the user's, so it leaves the month the
+    -- purchase happened in. cash: it counts until the money actually comes
+    -- back, and the offset lands in the month of settlement.
+    basis              TEXT NOT NULL DEFAULT 'accrual',
+    opened_on          TEXT NOT NULL,
+    closed_on          TEXT,
+    note               TEXT NOT NULL DEFAULT '',
+    updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_claims_origin ON claims(origin_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_claims_status ON claims(status);
+
+CREATE TABLE IF NOT EXISTS claim_settlements (
+    id              TEXT PRIMARY KEY,
+    claim_id        TEXT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+    -- cash and write_off have no ledger row at all, which is exactly why a
+    -- claim must be closeable by hand rather than only by matching.
+    method          TEXT NOT NULL,
+    amount          TEXT NOT NULL,
+    settled_on      TEXT NOT NULL,
+    txn_fingerprint TEXT NOT NULL DEFAULT '',
+    note            TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_claim_settlements_claim
+    ON claim_settlements(claim_id);
+CREATE INDEX IF NOT EXISTS idx_claim_settlements_txn
+    ON claim_settlements(txn_fingerprint) WHERE txn_fingerprint != '';
+
+-- One transaction divided into parts with different owners or categories: a
+-- grocery bill that was half a flatmate's, a card purchase only partly the
+-- user's. Invariant enforced on write: the parts sum to the parent.
+CREATE TABLE IF NOT EXISTS transaction_splits (
+    id                 TEXT PRIMARY KEY,
+    parent_fingerprint TEXT NOT NULL,
+    amount             TEXT NOT NULL,
+    category           TEXT,
+    flow_role          TEXT,
+    claim_id           TEXT REFERENCES claims(id) ON DELETE SET NULL,
+    note               TEXT NOT NULL DEFAULT '',
+    position           INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_splits_parent
+    ON transaction_splits(parent_fingerprint);
+
+-- A recurring shared cost - rent split with a flatmate - as a rule rather
+-- than a chore to repeat every month.
+CREATE TABLE IF NOT EXISTS split_rules (
+    id           TEXT PRIMARY KEY,
+    label        TEXT NOT NULL DEFAULT '',
+    match_text   TEXT NOT NULL,
+    account_key  TEXT NOT NULL DEFAULT '',
+    mine_pct     TEXT NOT NULL DEFAULT '100',
+    counterparty TEXT NOT NULL DEFAULT '',
+    category     TEXT,
+    active       INTEGER NOT NULL DEFAULT 1,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ---------------------------------------------------------------------------
+-- Settlement groups the user has CONFIRMED.
+--
+-- Only confirmed ones are stored. Inferred groups are recomputed on every run
+-- and held in memory - persisting a guess would make it look like a decision.
+-- Storing the confirmations is what stops the app asking the same question
+-- after every re-parse. Replaces transfer_pairs, which was written on every
+-- run and never read by anything.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS settlement_groups (
+    id            TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL DEFAULT 'card_settlement',
+    total_amount  TEXT NOT NULL DEFAULT '0',
+    residual      TEXT NOT NULL DEFAULT '0',
+    confidence    REAL NOT NULL DEFAULT 1.0,
+    confirmed     INTEGER NOT NULL DEFAULT 1,
+    note          TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS settlement_group_legs (
+    group_id    TEXT NOT NULL REFERENCES settlement_groups(id) ON DELETE CASCADE,
+    fingerprint TEXT NOT NULL,
+    side        TEXT NOT NULL,   -- outflow (funding) | inflow (settled)
+    PRIMARY KEY (group_id, fingerprint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_settlement_legs_fp
+    ON settlement_group_legs(fingerprint);
 """
 
 

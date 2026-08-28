@@ -44,6 +44,7 @@ class EnrichmentResult:
     accounts: dict = field(default_factory=dict)
     duplicate_count: int = 0
     transfer_report: Any = None
+    settlement_report: Any = None
     recurring: list = field(default_factory=list)
     analysis: Any = None
     loan_projections: list = field(default_factory=list)
@@ -66,6 +67,7 @@ def enrich_ledger(
     horizon_months: int = 6,
     progress: Callable[[str], None] | None = None,
     run_analysis: bool = True,
+    statements_by_account: dict | None = None,
 ) -> EnrichmentResult:
     """Deduplicate, classify, apply user decisions, and analyse.
 
@@ -73,10 +75,12 @@ def enrich_ledger(
     can report where it is without this module knowing anything about jobs.
     """
     from ..analytics.engine import analyze
+    from ..analytics.periods import assign_accounting_months
     from ..analytics.recurring import detect_recurring
     from ..analytics import forecast as forecast_mod
     from ..analytics import loans as loans_mod
     from ..categorize.rules import categorize_by_rules, fallback_category
+    from ..reconcile.settlement import match_settlements
     from ..reconcile.transfers import detect_transfers, find_duplicate_transactions
 
     def phase(label: str) -> None:
@@ -114,11 +118,22 @@ def enrich_ledger(
     if result.transfer_report is not None:
         result.warnings.extend(result.transfer_report.notes)
 
-    # 4. Deterministic rules. Skips anything already decided.
+    # 4. Settlement matching — card bill payments, multi-leg CRED, etc.
+    #    Runs after transfer detection so self-transfers are already claimed
+    #    and won't be double-matched as settlements.
+    phase("Matching card settlements")
+    result.settlement_report = match_settlements(
+        transactions, accounts, db,
+        statements_by_account=statements_by_account,
+    )
+    if result.settlement_report is not None:
+        result.warnings.extend(result.settlement_report.notes)
+
+    # 5. Deterministic rules. Skips anything already decided.
     phase("Categorizing")
     result.rules_settled = categorize_by_rules(transactions)
 
-    # 5. The learned merchant cache, and the model for whatever is left. This
+    # 6. The learned merchant cache, and the model for whatever is left. This
     #    is also the only path that reads back a category the user corrected
     #    on a merchant, which is why it must run on EVERY route rather than
     #    just the upload one.
@@ -137,7 +152,7 @@ def enrich_ledger(
             result.warnings.append(
                 "Learned-category lookup was unavailable for this run.")
 
-    # 6. Last-resort bucket. Without this an unrecognised CREDIT stays
+    # 7. Last-resort bucket. Without this an unrecognised CREDIT stays
     #    uncategorized, and since only income categories count towards
     #    money-in, an entire salary history can silently vanish from the
     #    dashboard.
@@ -157,18 +172,29 @@ def enrich_ledger(
             f"{fell_back} transaction(s) had no matching rule and were placed "
             f"in a default category.")
 
-    # 7. The user's own decisions, over the top of everything inferred above.
+    # 8. The user's own decisions, over the top of everything inferred above.
     phase("Applying your saved decisions")
     result.override_report = apply_overrides(db, transactions, accounts)
     result.warnings.extend(result.override_report.notes)
 
+    # 9. Stamp flow_role explicitly on every transaction. This runs AFTER
+    #    overrides so the stored role includes user decisions. Derived roles
+    #    still work for rows that predate this step, but having an explicit
+    #    value in the DB makes queries and debugging far simpler.
+    from ..models.schemas import derive_flow_role
+    for txn in transactions:
+        if not txn.flow_role:
+            txn.flow_role = derive_flow_role(txn).value
+
     if not run_analysis:
         return result
 
-    # 8. Recurring series and 9. the analysis proper.
-    phase("Detecting recurring commitments")
+    # 10. Period attribution — accounting_month, salary drift.
+    phase("Assigning accounting periods")
     result.recurring = detect_recurring(transactions)
+    assign_accounting_months(transactions, result.recurring)
 
+    # 11. The analysis proper.
     phase("Computing analysis")
     result.analysis = analyze(transactions, accounts)
 

@@ -15,9 +15,11 @@ import shutil
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from pydantic import BaseModel
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -686,34 +688,87 @@ def list_transactions(
     }
 
 
-@app.patch("/api/transactions/{txn_id}/category")
-def recategorize(txn_id: str, payload: dict[str, str]) -> dict[str, Any]:
-    """Apply a user correction and teach the merchant cache.
+class TransactionUpdateReq(BaseModel):
+    category: str | None = None
+    note: str | None = None
+    flow_role: str | None = None
+    excluded: bool | None = None
 
-    The correction is permanent: the cache records source='user', which no
-    later model guess is allowed to overwrite.
-    """
-    raw = (payload or {}).get("category", "")
-    try:
-        category = Category(raw.strip().lower())
-    except ValueError:
-        raise HTTPException(
-            400,
-            f"'{raw}' is not a valid category. Valid: "
-            f"{', '.join(c.value for c in Category)}",
-        )
-
+@app.patch("/api/transactions/{txn_id}")
+def update_transaction(txn_id: str, payload: TransactionUpdateReq) -> dict[str, Any]:
+    """Apply user corrections to a transaction."""
     db = get_db()
+    
+    if payload.category is not None:
+        category = payload.category.strip().lower()
+        valid_categories = set(Category.all_builtins())
+        with db.connection() as conn:
+            for r in conn.execute("SELECT name FROM custom_categories").fetchall():
+                valid_categories.add(r["name"])
+        
+        if category and category not in valid_categories:
+            raise HTTPException(400, f"'{payload.category}' is not a valid category.")
+        payload.category = category
+
     matches = [t for t in repo.get_transactions(db) if t.id == txn_id]
     if not matches:
         raise HTTPException(404, f"No transaction with id {txn_id}")
 
-    from .categorize.llm_categorizer import record_user_correction
+    from .pipeline.overrides import record_decision
 
     txn = matches[0]
-    record_user_correction(db, txn, category)
-    repo.update_transaction_categories(db, [txn])
+    update_args = payload.model_dump(exclude_unset=True)
+    if update_args:
+        accounts = {a.id: a for a in repo.get_accounts(db) if a.id}
+        record_decision(db, txn, accounts, **update_args)
+        if "category" in update_args and update_args["category"] is not None:
+            from .categorize.llm_categorizer import record_user_correction
+            record_user_correction(db, txn, update_args["category"])
+        repo.update_transaction_categories(db, [txn])
+        
     return {"status": "ok", "transaction": ser.transaction_json(txn)}
+
+class BulkTransactionUpdateReq(BaseModel):
+    txn_ids: list[str]
+    category: str | None = None
+    note: str | None = None
+    flow_role: str | None = None
+    excluded: bool | None = None
+
+@app.patch("/api/transactions/bulk")
+def bulk_update_transactions(payload: BulkTransactionUpdateReq) -> dict[str, Any]:
+    db = get_db()
+    update_args = payload.model_dump(exclude_unset=True, exclude={"txn_ids"})
+    
+    if not update_args or not payload.txn_ids:
+        return {"status": "ok", "updated": 0}
+
+    if "category" in update_args and update_args["category"] is not None:
+        category = update_args["category"].strip().lower()
+        valid_categories = set(Category.all_builtins())
+        with db.connection() as conn:
+            for r in conn.execute("SELECT name FROM custom_categories").fetchall():
+                valid_categories.add(r["name"])
+        if category and category not in valid_categories:
+            raise HTTPException(400, f"'{update_args['category']}' is not a valid category.")
+        update_args["category"] = category
+
+    all_txns = repo.get_transactions(db)
+    targets = [t for t in all_txns if t.id in set(payload.txn_ids)]
+    
+    from .pipeline.overrides import record_decision
+    accounts = {a.id: a for a in repo.get_accounts(db) if a.id}
+    
+    for txn in targets:
+        record_decision(db, txn, accounts, **update_args)
+        if "category" in update_args and update_args["category"] is not None:
+            from .categorize.llm_categorizer import record_user_correction
+            record_user_correction(db, txn, update_args["category"])
+        
+    if targets:
+        repo.update_transaction_categories(db, targets)
+        
+    return {"status": "ok", "updated": len(targets)}
 
 
 @app.get("/api/statements")
@@ -723,7 +778,26 @@ def list_statements() -> list[dict[str, Any]]:
 
 @app.get("/api/categories")
 def list_categories() -> list[str]:
-    return [c.value for c in Category]
+    db = get_db()
+    builtins = Category.all_builtins()
+    with db.connection() as conn:
+        custom = [r["name"] for r in conn.execute("SELECT name FROM custom_categories").fetchall()]
+    return builtins + custom
+
+class CustomCategoryReq(BaseModel):
+    name: str
+    color: str = "#6b7280"
+    icon: str = "Tag"
+
+@app.post("/api/categories")
+def create_category(payload: CustomCategoryReq) -> dict[str, str]:
+    repo.add_custom_category(get_db(), payload.name, payload.color, payload.icon)
+    return {"status": "ok"}
+
+@app.delete("/api/categories/{name}")
+def delete_category(name: str) -> dict[str, str]:
+    repo.delete_custom_category(get_db(), name)
+    return {"status": "ok"}
 
 
 @app.get("/api/data/inventory")
@@ -1001,6 +1075,123 @@ def health() -> dict[str, Any]:
         "supported_formats": sorted(SUPPORTED_EXTENSIONS),
     }
 
+
+class SplitPartReq(BaseModel):
+    amount: Decimal
+    category: str | None = None
+    flow_role: str | None = None
+    note: str | None = None
+
+class SplitReq(BaseModel):
+    splits: list[SplitPartReq]
+
+@app.post("/api/transactions/{txn_id}/split")
+def split_transaction(txn_id: str, payload: SplitReq) -> dict[str, Any]:
+    import uuid
+    db = get_db()
+    matches = [t for t in repo.get_transactions(db) if t.id == txn_id]
+    if not matches:
+        raise HTTPException(404, f"No transaction with id {txn_id}")
+    txn = matches[0]
+    
+    total = sum(p.amount for p in payload.splits)
+    if total != txn.amount:
+        raise HTTPException(400, f"Splits sum to {total}, expected {txn.amount}")
+        
+    splits = [{"amount": p.amount, "category": p.category, "flow_role": p.flow_role, "note": p.note} for p in payload.splits]
+    repo.save_splits(db, txn.fingerprint, txn.amount, splits)
+    return {"status": "ok"}
+
+class ClaimReq(BaseModel):
+    amount: Decimal
+    direction: str
+    counterparty: str
+    note: str = ""
+
+@app.post("/api/transactions/{txn_id}/claim")
+def create_claim(txn_id: str, payload: ClaimReq) -> dict[str, Any]:
+    import uuid
+    db = get_db()
+    matches = [t for t in repo.get_transactions(db) if t.id == txn_id]
+    if not matches:
+        raise HTTPException(404, f"No transaction with id {txn_id}")
+    txn = matches[0]
+    
+    claim_id = repo.save_claim(
+        db,
+        direction=payload.direction,
+        counterparty=payload.counterparty,
+        origin_fingerprint=txn.fingerprint,
+        amount=payload.amount,
+        opened_on=txn.txn_date.isoformat()
+    )
+    return {"status": "ok", "claim_id": claim_id}
+
+@app.get("/api/claims")
+def list_claims() -> list[dict]:
+    return repo.get_claims(get_db())
+
+class SettleClaimReq(BaseModel):
+    amount: Decimal
+    method: str
+    txn_fingerprint: str | None = None
+    note: str = ""
+    date: date
+
+@app.post("/api/claims/{claim_id}/settle")
+def settle_claim(claim_id: str, payload: SettleClaimReq) -> dict[str, Any]:
+    import uuid
+    db = get_db()
+    repo.settle_claim(
+        db,
+        claim_id=claim_id,
+        method=payload.method,
+        amount=payload.amount,
+        settled_on=payload.date.isoformat()
+    )
+    return {"status": "ok"}
+
+
+class RecurringUpdateReq(BaseModel):
+    is_active: bool | None = None
+    label: str | None = None
+    category: str | None = None
+
+
+@app.get("/api/recurring")
+def get_recurring_series() -> list[dict[str, Any]]:
+    db = get_db()
+    with db.connection() as conn:
+        rows = conn.execute("SELECT * FROM recurring_series ORDER BY is_active DESC, median_amount DESC").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            if 'median_amount' in d: d['median_amount'] = repo._dec(d['median_amount'])
+            out.append(d)
+        return out
+
+@app.patch("/api/recurring/{series_id}")
+def update_recurring(series_id: str, payload: RecurringUpdateReq) -> dict[str, Any]:
+    db = get_db()
+    update_args = payload.model_dump(exclude_unset=True)
+    if update_args:
+        if "category" in update_args and update_args["category"] is not None:
+            category = update_args["category"].strip().lower()
+            valid_categories = set(Category.all_builtins())
+            with db.connection() as conn:
+                for r in conn.execute("SELECT name FROM custom_categories").fetchall():
+                    valid_categories.add(r["name"])
+            if category and category not in valid_categories:
+                raise HTTPException(400, f"'{update_args['category']}' is not a valid category.")
+            update_args["category"] = category
+            
+        repo.update_recurring_series_override(db, series_id, update_args)
+    return {"status": "ok"}
+
+@app.delete("/api/recurring/{series_id}")
+def delete_recurring(series_id: str) -> dict[str, Any]:
+    repo.update_recurring_series_override(get_db(), series_id, {"deleted": 1})
+    return {"status": "ok"}
 
 @app.exception_handler(Exception)
 async def unhandled(request, exc):  # pragma: no cover

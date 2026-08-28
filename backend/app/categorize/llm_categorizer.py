@@ -120,7 +120,7 @@ def categorize_with_llm(
                 continue
             try:
                 index = int(answer.get("i", -1))
-                category = Category(str(answer.get("category", "")).strip().lower())
+                category = str(answer.get("category", "")).strip().lower()
             except (ValueError, TypeError):
                 continue  # a hallucinated category is discarded, not coerced
             if not 0 <= index < len(batch):
@@ -160,7 +160,7 @@ def _clamp(value, low: float = 0.0, high: float = 1.0) -> float:
 def record_user_correction(
     db: Database,
     txn: Transaction,
-    category: Category,
+    category: str,
 ) -> None:
     """Persist a user's manual recategorization.
 

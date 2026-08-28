@@ -1,4 +1,4 @@
-"""Anthropic client wrapper.
+"""LLM client wrapper.
 
 Two responsibilities beyond calling the API:
 
@@ -16,21 +16,28 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from typing import Any
 
+from ..config import config
+from .providers import Provider, GeminiProvider, AzureOpenAIProvider
+
 log = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-sonnet-5"
-#: Narrative work benefits from the stronger model; categorization does not.
-NARRATIVE_MODEL = "claude-opus-5"
+DEFAULT_MODEL = "fast"
+NARRATIVE_MODEL = "strong"
 
 _LONG_DIGITS = re.compile(r"\b\d(?:[ -]?\d){8,17}\b")
 _PAN = re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b")
 _EMAIL = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b")
 _PHONE = re.compile(r"\b(?:\+91[-\s]?)?[6-9]\d{9}\b")
 
+# Simple address patterns to strip
+_ADDRESS_PATTERNS = re.compile(
+    r"\b(?:plot|flat|door|block|sector|phase|nagar|road|street|colony|apartment|floor|bhavan|marg)\b.*", 
+    re.IGNORECASE
+)
+_PINCODE = re.compile(r"\b\d{6}\b")
 
 def redact(text: str) -> str:
     """Strip identifiers that have no analytical value but real leak cost."""
@@ -42,7 +49,19 @@ def redact(text: str) -> str:
     text = _PAN.sub("[PAN]", text)
     text = _EMAIL.sub("[EMAIL]", text)
     text = _PHONE.sub("[PHONE]", text)
-    return text
+    
+    # Aggressively mask common name and address prefixes
+    lines = []
+    for line in text.split("\n"):
+        if _ADDRESS_PATTERNS.search(line):
+            continue
+        if _PINCODE.search(line):
+            continue
+        # simple heuristic for "Name: John Doe" or "Mr. John Doe"
+        line = re.sub(r"\b(?:Mr\.|Mrs\.|Ms\.|Name:)\s+[A-Za-z\s]+", "[NAME]", line, flags=re.IGNORECASE)
+        lines.append(line)
+        
+    return "\n".join(lines)
 
 
 class LLMUnavailable(RuntimeError):
@@ -50,24 +69,15 @@ class LLMUnavailable(RuntimeError):
 
 
 class LLMClient:
-    """Minimal wrapper over the Anthropic Messages API."""
+    """Minimal wrapper over LLM Providers."""
 
-    def __init__(self, api_key: str | None = None, model: str = DEFAULT_MODEL):
-        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-        self.model = model
-        self._client: Any = None
+    def __init__(self, provider: Provider | None = None, tier: str = DEFAULT_MODEL):
+        self._provider = provider
+        self.tier = tier
 
     @property
     def available(self) -> bool:
-        return bool(self.api_key)
-
-    def _get_client(self):
-        if self._client is None:
-            if not self.api_key:
-                raise LLMUnavailable("ANTHROPIC_API_KEY is not set")
-            from anthropic import Anthropic
-            self._client = Anthropic(api_key=self.api_key)
-        return self._client
+        return self._provider is not None and self._provider.available
 
     def complete(
         self,
@@ -77,17 +87,14 @@ class LLMClient:
         model: str | None = None,
         temperature: float = 0.0,
     ) -> str:
-        """Single-turn completion. Temperature defaults to 0 for reproducibility."""
-        client = self._get_client()
-        response = client.messages.create(
-            model=model or self.model,
+        if not self.available:
+            raise LLMUnavailable("No LLM Provider is configured or available.")
+        return self._provider.complete(
+            prompt=redact(prompt),
+            system=system,
             max_tokens=max_tokens,
-            temperature=temperature,
-            system=system or "You are a precise financial data assistant.",
-            messages=[{"role": "user", "content": redact(prompt)}],
-        )
-        return "".join(
-            block.text for block in response.content if getattr(block, "type", "") == "text"
+            tier=model or self.tier,
+            temperature=temperature
         )
 
     def complete_json(
@@ -97,49 +104,30 @@ class LLMClient:
         max_tokens: int = 4096,
         model: str | None = None,
     ) -> Any:
-        """Completion that must return JSON.
-
-        Models occasionally wrap JSON in prose or a code fence even when told
-        not to, so the fence is stripped and the first balanced object/array is
-        recovered rather than failing the whole batch on a formatting slip.
-        """
-        raw = self.complete(
-            prompt,
-            system=system or "You return only valid JSON. No prose, no code fences.",
+        if not self.available:
+            raise LLMUnavailable("No LLM Provider is configured or available.")
+        return self._provider.complete_json(
+            prompt=redact(prompt),
+            system=system,
             max_tokens=max_tokens,
-            model=model,
+            tier=model or self.tier
         )
-        return _parse_json_loose(raw)
 
 
-def _parse_json_loose(raw: str) -> Any:
-    text = (raw or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    for opener, closer in (("{", "}"), ("[", "]")):
-        start = text.find(opener)
-        end = text.rfind(closer)
-        if start != -1 and end > start:
-            try:
-                return json.loads(text[start:end + 1])
-            except json.JSONDecodeError:
-                continue
-
-    raise ValueError(f"Model did not return parseable JSON: {raw[:200]!r}")
-
-
-_client: LLMClient | None = None
+_clients: dict[str, LLMClient] = {}
 
 
 def get_client(model: str = DEFAULT_MODEL) -> LLMClient:
-    global _client
-    if _client is None:
-        _client = LLMClient(model=model)
-    return _client
+    global _clients
+    
+    if model not in _clients:
+        provider = None
+        if config.LLM_PROVIDER == "gemini":
+            provider = GeminiProvider()
+        elif config.LLM_PROVIDER == "azure":
+            provider = AzureOpenAIProvider()
+        
+        # fallback if requested provider isn't available, but it's set in config
+        _clients[model] = LLMClient(provider=provider, tier=model)
+        
+    return _clients[model]

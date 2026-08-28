@@ -279,7 +279,7 @@ def save_transactions(db: Database, transactions: Sequence[Transaction]) -> int:
             txn.value_date.isoformat() if txn.value_date else None,
             txn.raw_description, txn.normalized_description, txn.merchant,
             _txt(txn.amount), txn.direction.value, _txt(txn.balance_after),
-            txn.currency, txn.category.value, txn.category_source.value,
+            txn.currency, txn.category, txn.category_source.value,
             txn.category_confidence, int(txn.is_internal_transfer),
             int(txn.is_mirror_leg),
             txn.transfer_pair_id, txn.recurring_series_id, txn.reference,
@@ -307,7 +307,7 @@ def update_transaction_categories(db: Database, transactions: Iterable[Transacti
     and every reloaded row claimed to be the leg that counts.
     """
     rows = [
-        (t.category.value, t.category_source.value, t.category_confidence,
+        (t.category, t.category_source.value, t.category_confidence,
          int(t.is_internal_transfer), int(t.is_mirror_leg), t.transfer_pair_id,
          t.merchant, t.fingerprint, t.accounting_month, int(t.needs_review),
          t.review_reason, t.flow_role, int(t.excluded), t.note, t.id)
@@ -462,7 +462,7 @@ def _row_to_transaction(row) -> Transaction:
         direction=Direction(row["direction"]),
         balance_after=_dec(row["balance_after"]),
         currency=row["currency"],
-        category=Category(row["category"]),
+        category=row["category"],
         category_source=ConfidenceSource(row["category_source"]),
         category_confidence=row["category_confidence"],
         is_internal_transfer=bool(row["is_internal_transfer"]),
@@ -505,9 +505,9 @@ def lookup_merchants(db: Database, keys: Sequence[str]) -> dict[str, tuple[Categ
             ).fetchall()
             for r in rows:
                 out[r["merchant_key"]] = (
-                    Category(r["category"]), r["confidence"], r["source"]
+                    r["category"], r["confidence"], r["source"]
                 )
-    return out
+        return out
 
 
 def save_merchant_categories(
@@ -769,22 +769,18 @@ def save_profile(db: Database, profile) -> None:
 
 
 def save_recurring_series(db: Database, series: Sequence[Any]) -> int:
-    rows = [(s.id, s.account_id, s.label, s.category.value, s.direction.value,
-             _txt(s.median_amount), s.cadence_days, s.occurrences,
-             s.first_seen.isoformat() if s.first_seen else None,
-             s.last_seen.isoformat() if s.last_seen else None,
-             s.next_expected.isoformat() if s.next_expected else None,
-             int(s.is_active), s.confidence) for s in series]
     with db.connection() as conn:
+        overrides = {r["series_id"]: r for r in conn.execute("SELECT * FROM recurring_series_overrides").fetchall()}
+        rows = []
+        for s in series:
+            o = overrides.get(s.id)
+            if o and o["deleted"]: continue
+            label = o["label"] if o and o["label"] is not None else s.label
+            category = o["category"] if o and o["category"] is not None else s.category
+            is_active = o["is_active"] if o and o["is_active"] is not None else int(s.is_active)
+            rows.append((s.id, s.account_id, label, category, s.direction.value, _txt(s.median_amount), s.cadence_days, s.occurrences, s.first_seen.isoformat() if s.first_seen else None, s.last_seen.isoformat() if s.last_seen else None, s.next_expected.isoformat() if s.next_expected else None, is_active, s.confidence))
         conn.execute("DELETE FROM recurring_series")
-        conn.executemany(
-            """INSERT INTO recurring_series
-               (id, account_id, label, category, direction, median_amount,
-                cadence_days, occurrences, first_seen, last_seen, next_expected,
-                is_active, confidence)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            rows,
-        )
+        conn.executemany("INSERT INTO recurring_series (id, account_id, label, category, direction, median_amount, cadence_days, occurrences, first_seen, last_seen, next_expected, is_active, confidence) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     return len(rows)
 
 
@@ -991,3 +987,290 @@ def prune_analysis_runs(db: Database, keep: int = 20) -> int:
             (keep,),
         )
         return cur.rowcount
+
+
+from dataclasses import dataclass
+from decimal import Decimal
+from datetime import date
+
+@dataclass
+class TransactionSplit:
+    id: str
+    parent_fingerprint: str
+    amount: Decimal
+    category: str | None
+    flow_role: str | None
+    note: str
+    position: int
+
+def save_splits(db, txn_fingerprint: str, parts: list) -> None:
+    with db.connection() as conn:
+        conn.execute("DELETE FROM transaction_splits WHERE parent_fingerprint = ?", (txn_fingerprint,))
+        rows = [(p.id, p.parent_fingerprint, _txt(p.amount), p.category, p.flow_role, p.note, p.position) for p in parts]
+        conn.executemany("INSERT INTO transaction_splits VALUES (?,?,?,?,?,?,?)", rows)
+
+@dataclass
+class Claim:
+    id: str
+    direction: str
+    counterparty: str
+    origin_fingerprint: str
+    amount: Decimal
+    settled_amount: Decimal
+    status: str
+    basis: str
+    opened_on: date
+    closed_on: date | None = None
+    note: str = ""
+
+@dataclass
+class ClaimSettlement:
+    id: str
+    claim_id: str
+    method: str
+    amount: Decimal
+    settled_on: date
+    txn_fingerprint: str
+    note: str = ""
+
+def save_claim(db, claim) -> None:
+    with db.connection() as conn:
+        conn.execute("INSERT OR REPLACE INTO claims VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
+            claim.id, claim.direction, claim.counterparty, claim.origin_fingerprint,
+            _txt(claim.amount), _txt(claim.settled_amount), claim.status, claim.basis,
+            claim.opened_on.isoformat(), claim.closed_on.isoformat() if claim.closed_on else None, claim.note
+        ))
+
+def get_claims(db) -> list:
+    with db.connection() as conn:
+        rows = conn.execute("SELECT * FROM claims").fetchall()
+    out = []
+    for r in rows:
+        c = Claim(
+            id=r["id"], direction=r["direction"], counterparty=r["counterparty"],
+            origin_fingerprint=r["origin_fingerprint"], amount=_dec(r["amount"]),
+            settled_amount=_dec(r["settled_amount"]), status=r["status"], basis=r["basis"],
+            opened_on=_d(r["opened_on"]), closed_on=_d(r["closed_on"]), note=r["note"]
+        )
+        out.append(c)
+        return out
+
+def settle_claim(db, claim_id: str, settlement: ClaimSettlement) -> None:
+    with db.connection() as conn:
+        conn.execute("INSERT INTO claim_settlements VALUES (?,?,?,?,?,?,?)", (
+            settlement.id, settlement.claim_id, settlement.method, _txt(settlement.amount),
+            settlement.settled_on.isoformat(), settlement.txn_fingerprint, settlement.note
+        ))
+        claim_row = conn.execute("SELECT amount, settled_amount FROM claims WHERE id = ?", (claim_id,)).fetchone()
+        if claim_row:
+            new_settled = _dec(claim_row["settled_amount"]) + settlement.amount
+            status = "closed" if new_settled >= _dec(claim_row["amount"]) else "open"
+            closed_on = settlement.settled_on.isoformat() if status == "closed" else None
+            conn.execute("UPDATE claims SET settled_amount = ?, status = ?, closed_on = ? WHERE id = ?", (_txt(new_settled), status, closed_on, claim_id))
+
+def get_confirmed_groups(db) -> list[dict]:
+    with db.connection() as conn:
+        groups = conn.execute("SELECT * FROM settlement_groups WHERE confirmed = 1").fetchall()
+        if not groups: return []
+        group_ids = [g["id"] for g in groups]
+        placeholders = ",".join(["?"] * len(group_ids))
+        legs = conn.execute(f"SELECT * FROM settlement_group_legs WHERE group_id IN ({placeholders})", group_ids).fetchall()
+    legs_by_group = {}
+    for leg in legs:
+        legs_by_group.setdefault(leg["group_id"], []).append({"fingerprint": leg["fingerprint"], "side": leg["side"]})
+    out = []
+    for g in groups:
+        d = dict(g)
+        d["total_amount"] = _dec(d["total_amount"])
+        d["residual"] = _dec(d["residual"])
+        d["legs"] = legs_by_group.get(d["id"], [])
+        out.append(d)
+    return out
+
+def get_confirmed_fingerprints(db) -> set[str]:
+    with db.connection() as conn:
+        rows = conn.execute("SELECT l.fingerprint FROM settlement_group_legs l JOIN settlement_groups g ON l.group_id = g.id WHERE g.confirmed = 1").fetchall()
+    return {r["fingerprint"] for r in rows}
+
+def confirm_group(db, group_id: str) -> None:
+    with db.connection() as conn:
+        conn.execute("UPDATE settlement_groups SET confirmed = 1 WHERE id = ?", (group_id,))
+
+def save_settlement_groups(db, groups: list, legs: list) -> None:
+    with db.connection() as conn:
+        conn.execute("DELETE FROM settlement_group_legs WHERE group_id IN (SELECT id FROM settlement_groups WHERE confirmed = 0)")
+        conn.execute("DELETE FROM settlement_groups WHERE confirmed = 0")
+        g_rows = [(g.group_id, g.kind, _txt(g.total_amount), _txt(g.residual), g.confidence, int(g.confirmed)) for g in groups if not g.confirmed]
+        if g_rows:
+            conn.executemany("INSERT INTO settlement_groups VALUES (?,?,?,?,?,?)", g_rows)
+        l_rows = [(l["group_id"], l["fingerprint"], l["side"]) for l in legs]
+        if l_rows:
+            conn.executemany("INSERT INTO settlement_group_legs VALUES (?,?,?)", l_rows)
+
+def get_custom_categories(db) -> list[dict]:
+    with db.connection() as conn:
+        rows = conn.execute("SELECT * FROM custom_categories ORDER BY name ASC").fetchall()
+    return [dict(r) for r in rows]
+
+def add_custom_category(db, name: str, color: str = "#6b7280", icon: str = "Tag") -> None:
+    with db.connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO custom_categories (name, color, icon) VALUES (?, ?, ?)", (name.strip().lower(), color, icon))
+
+def delete_custom_category(db, name: str) -> None:
+    with db.connection() as conn:
+        conn.execute("DELETE FROM custom_categories WHERE name = ?", (name.strip().lower(),))
+
+def update_recurring_series_override(db, series_id: str, payload: dict) -> None:
+    with db.connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO recurring_series_overrides (series_id) VALUES (?)", (series_id,))
+        updates = []
+        params = []
+        for k, v in payload.items():
+            if k in {"is_active", "label", "category", "deleted"}:
+                updates.append(f"{k} = ?")
+                params.append(v)
+        if updates:
+            params.append(series_id)
+            conn.execute(f"UPDATE recurring_series_overrides SET {', '.join(updates)} WHERE series_id = ?", params)
+
+import uuid
+
+def save_claim(db, direction: str, counterparty: str, origin_fingerprint: str, amount, opened_on: str) -> str:
+    claim_id = str(uuid.uuid4())
+    with db.connection() as conn:
+        conn.execute("INSERT INTO claims (id, direction, counterparty, origin_fingerprint, amount, settled_amount, status, basis, opened_on, closed_on, note) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
+            claim_id, direction, counterparty, origin_fingerprint, _txt(amount), "0", "open", "accrual", opened_on, None, ""
+        ))
+    return claim_id
+
+def get_claim(db, claim_id: str) -> dict:
+    with db.connection() as conn:
+        r = conn.execute("SELECT * FROM claims WHERE id = ?", (claim_id,)).fetchone()
+        if not r: return None
+        d = dict(r)
+        d['amount'] = _dec(d['amount'])
+        d['settled_amount'] = _dec(d['settled_amount'])
+        return d
+
+def settle_claim(db, claim_id: str, method: str, amount, settled_on: str) -> str:
+    settlement_id = str(uuid.uuid4())
+    with db.connection() as conn:
+        conn.execute("INSERT INTO claim_settlements (id, claim_id, method, amount, settled_on, txn_fingerprint, note) VALUES (?,?,?,?,?,?,?)", (
+            settlement_id, claim_id, method, _txt(amount), settled_on, "", ""
+        ))
+        
+        claim_row = conn.execute("SELECT amount, settled_amount FROM claims WHERE id = ?", (claim_id,)).fetchone()
+        if claim_row:
+            new_settled = _dec(claim_row["settled_amount"]) + amount
+            status = "closed" if new_settled >= _dec(claim_row["amount"]) else "partial" if new_settled > 0 else "open"
+            status = "settled" if status == "closed" else status
+            closed_on = settled_on if status == "settled" else None
+            conn.execute("UPDATE claims SET settled_amount = ?, status = ?, closed_on = ? WHERE id = ?", (_txt(new_settled), status, closed_on, claim_id))
+    return settlement_id
+
+def get_claim_settlements(db, claim_id: str) -> list:
+    with db.connection() as conn:
+        rows = conn.execute("SELECT * FROM claim_settlements WHERE claim_id = ?", (claim_id,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            if 'amount' in d: d['amount'] = _dec(d['amount'])
+            if 'settled_amount' in d: d['settled_amount'] = _dec(d['settled_amount'])
+            out.append(d)
+        return out
+
+def get_claims(db, status: str = None) -> list:
+    with db.connection() as conn:
+        if status:
+            rows = conn.execute("SELECT * FROM claims WHERE status = ?", (status,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM claims").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            if 'amount' in d: d['amount'] = _dec(d['amount'])
+            if 'settled_amount' in d: d['settled_amount'] = _dec(d['settled_amount'])
+            out.append(d)
+        return out
+
+def save_splits(db, parent_fingerprint: str, parent_amount, splits: list) -> list:
+    total = sum(s["amount"] for s in splits)
+    if total != parent_amount:
+        raise ValueError(f"Splits sum to {total}, expected {parent_amount}")
+        
+    ids = []
+    with db.connection() as conn:
+        conn.execute("DELETE FROM transaction_splits WHERE parent_fingerprint = ?", (parent_fingerprint,))
+        rows = []
+        for i, s in enumerate(splits):
+            split_id = str(uuid.uuid4())
+            ids.append(split_id)
+            rows.append((split_id, parent_fingerprint, _txt(s["amount"]), s.get("category"), s.get("flow_role"), s.get("note", ""), i))
+        conn.executemany("INSERT INTO transaction_splits (id, parent_fingerprint, amount, category, flow_role, note, position) VALUES (?,?,?,?,?,?,?)", rows)
+    return ids
+
+def get_splits(db, parent_fingerprint: str) -> list:
+    with db.connection() as conn:
+        rows = conn.execute("SELECT * FROM transaction_splits WHERE parent_fingerprint = ?", (parent_fingerprint,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            if 'amount' in d: d['amount'] = _dec(d['amount'])
+            if 'settled_amount' in d: d['settled_amount'] = _dec(d['settled_amount'])
+            out.append(d)
+        return out
+
+def save_settlement_group(db, group_id: str, kind: str, total_amount, residual, confidence: float, note: str, legs: list) -> None:
+    with db.connection() as conn:
+        conn.execute("DELETE FROM settlement_group_legs WHERE group_id = ?", (group_id,))
+        conn.execute("DELETE FROM settlement_groups WHERE id = ?", (group_id,))
+        
+        conn.execute("INSERT INTO settlement_groups (id, kind, total_amount, residual, confidence, note, confirmed) VALUES (?,?,?,?,?,?,1)", (
+            group_id, kind, _txt(total_amount), _txt(residual), confidence, note
+        ))
+        
+        l_rows = [(group_id, l[0], l[1]) for l in legs]
+        if l_rows:
+            conn.executemany("INSERT INTO settlement_group_legs (group_id, fingerprint, side) VALUES (?,?,?)", l_rows)
+
+def get_confirmed_groups(db) -> list:
+    with db.connection() as conn:
+        groups = conn.execute("SELECT * FROM settlement_groups WHERE confirmed = 1").fetchall()
+        if not groups: return []
+        group_ids = [g["id"] for g in groups]
+        placeholders = ",".join(["?"] * len(group_ids))
+        legs = conn.execute(f"SELECT * FROM settlement_group_legs WHERE group_id IN ({placeholders})", group_ids).fetchall()
+    
+    legs_by_group = {}
+    for leg in legs:
+        legs_by_group.setdefault(leg["group_id"], []).append(leg["fingerprint"]) # or dict
+        
+    out = []
+    for g in groups:
+        d = dict(g)
+        d["total_amount"] = _dec(d["total_amount"])
+        d["residual"] = _dec(d["residual"])
+        d["legs"] = legs_by_group.get(d["id"], [])
+        out.append(d)
+    return out
+
+def get_confirmed_fingerprints(db) -> set:
+    with db.connection() as conn:
+        rows = conn.execute("SELECT l.fingerprint FROM settlement_group_legs l JOIN settlement_groups g ON l.group_id = g.id WHERE g.confirmed = 1").fetchall()
+    return {r["fingerprint"] for r in rows}
+
+import json
+
+def get_ai_inference(db, fingerprint: str) -> dict | None:
+    with db.connection() as conn:
+        r = conn.execute("SELECT result_json FROM ai_inferences WHERE fingerprint = ?", (fingerprint,)).fetchone()
+        if r:
+            try:
+                return json.loads(r["result_json"])
+            except json.JSONDecodeError:
+                pass
+        return None
+
+def save_ai_inference(db, fingerprint: str, result: dict) -> None:
+    with db.connection() as conn:
+        conn.execute("INSERT OR REPLACE INTO ai_inferences (fingerprint, result_json) VALUES (?, ?)", (fingerprint, json.dumps(result)))

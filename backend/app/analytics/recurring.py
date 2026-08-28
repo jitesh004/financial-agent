@@ -48,7 +48,7 @@ class RecurringSeries:
     id: str
     account_id: str | None
     label: str
-    category: Category
+    category: str
     direction: Direction
     median_amount: Decimal
     cadence_days: int
@@ -150,8 +150,12 @@ def detect_recurring(transactions: list[Transaction]) -> list[RecurringSeries]:
             min(1.0, cadence_confidence * (1 - variance) * min(1.0, len(members) / 6)), 3
         )
 
+        import hashlib
+        id_str = f"{account_id}|{direction.value}|{sig}"
+        series_id = hashlib.sha256(id_str.encode("utf-8")).hexdigest()[:16]
+
         series.append(RecurringSeries(
-            id=str(uuid.uuid4()),
+            id=series_id,
             account_id=account_id,
             label=_label_for(members, sig),
             category=_dominant_category(members),

@@ -75,7 +75,7 @@ def transaction_json(txn: Transaction) -> dict[str, Any]:
         "direction": txn.direction.value,
         "signed_amount": num(txn.signed_amount),
         "balance_after": num(txn.balance_after),
-        "category": txn.category.value,
+        "category": txn.category,
         "category_source": txn.category_source.value,
         "category_confidence": round(txn.category_confidence, 2),
         "is_internal_transfer": txn.is_internal_transfer,
@@ -83,6 +83,13 @@ def transaction_json(txn: Transaction) -> dict[str, Any]:
         "is_spend": txn.is_spend,
         "recurring_series_id": txn.recurring_series_id,
         "reference": txn.reference,
+        "fingerprint": txn.fingerprint,
+        "flow_role": txn.role.value,
+        "accounting_month": txn.accounting_month or None,
+        "needs_review": txn.needs_review,
+        "review_reason": txn.review_reason or None,
+        "excluded": txn.excluded,
+        "note": txn.note or None,
     }
 
 
@@ -247,7 +254,7 @@ def recurring_json(series: Any) -> dict[str, Any]:
         "id": series.id,
         "account_id": series.account_id,
         "label": series.label,
-        "category": series.category.value,
+        "category": series.category,
         "direction": series.direction.value,
         "amount": num(series.median_amount),
         "monthly_equivalent": num(series.monthly_equivalent),
@@ -259,6 +266,7 @@ def recurring_json(series: Any) -> dict[str, Any]:
         "next_expected": series.next_expected.isoformat() if series.next_expected else None,
         "is_active": series.is_active,
         "confidence": series.confidence,
+        "transaction_ids": series.transaction_ids,
     }
 
 

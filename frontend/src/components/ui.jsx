@@ -28,8 +28,8 @@ export function Stat({ label, value, note, tone, precise = false }) {
   );
 }
 
-export function Chip({ children, tone = '' }) {
-  return <span className={`chip ${tone}`}>{children}</span>;
+export function Chip({ children, tone = '', className = '', style, ...rest }) {
+  return <span className={`chip ${tone} ${className}`} style={style} {...rest}>{children}</span>;
 }
 
 export function Empty({ title, children }) {
@@ -41,8 +41,8 @@ export function Empty({ title, children }) {
   );
 }
 
-export function Callout({ tone = '', children }) {
-  return <div className={`callout ${tone}`}>{children}</div>;
+export function Callout({ tone = '', children, className = '', style, ...rest }) {
+  return <div className={`callout ${tone} ${className}`} style={style} {...rest}>{children}</div>;
 }
 
 /* Recharts' default tooltip cannot format Indian currency, so every chart

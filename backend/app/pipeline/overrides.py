@@ -112,15 +112,9 @@ def apply_overrides(db, transactions, accounts) -> OverrideReport:
 def _apply_one(record, txn) -> None:
     """Copy one stored decision onto one transaction."""
     if record.category is not None:
-        try:
-            txn.category = Category(record.category)
-        except ValueError:
-            # A category that no longer exists in the enum. Skip the category
-            # but keep the rest of the decision rather than dropping it whole.
-            log.warning("stored override names unknown category %r", record.category)
-        else:
-            txn.category_source = ConfidenceSource.USER
-            txn.category_confidence = 1.0
+        txn.category = record.category
+        txn.category_source = ConfidenceSource.USER
+        txn.category_confidence = 1.0
 
     if record.flow_role is not None:
         txn.flow_role = record.flow_role

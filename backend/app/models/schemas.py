@@ -65,7 +65,7 @@ class Direction(str, Enum):
     DEBIT = "debit"    # money out
 
 
-class Category(str, Enum):
+class Category:
     """Deliberately coarse. A person can reason about 25 buckets, not 200.
 
     TRANSFER and CC_PAYMENT are not spending. They exist so the analytics layer
@@ -110,6 +110,13 @@ class Category(str, Enum):
     CC_PAYMENT = "cc_payment"      # bank -> own credit card
     UNCATEGORIZED = "uncategorized"
 
+    @classmethod
+    def all_builtins(cls) -> list[str]:
+        return [
+            v for k, v in cls.__dict__.items()
+            if not k.startswith("_") and isinstance(v, str)
+        ]
+
 
 INCOME_CATEGORIES = {
     Category.SALARY,
@@ -124,6 +131,57 @@ NON_SPEND_CATEGORIES = {
     Category.CC_PAYMENT,
     Category.INVESTMENT,
 }
+
+class FlowRole(str, Enum):
+    """Which side of the books a transaction lands on.
+
+    Category says what money was spent ON; this says whether it was spent at
+    all. The two are genuinely independent, and conflating them is what let a
+    credit-card bill payment - money moving between two of the user's own
+    accounts - be counted as income the moment the matching bank statement
+    happened to be missing.
+
+    Exactly one role per transaction, so every figure on the dashboard is a
+    sum over a disjoint set rather than a sequence of overlapping filters.
+    """
+
+    #: Money that genuinely entered the user's net worth.
+    INCOME = "income"
+    #: Money that genuinely left it.
+    EXPENSE = "expense"
+    #: The funding leg of a move between the user's own accounts.
+    TRANSFER_OUT = "transfer_out"
+    #: The receiving account's record of that same money. Real, but already
+    #: counted once on the way out.
+    TRANSFER_IN = "transfer_in"
+    #: A "payment received" on a card statement: settles a liability, and is
+    #: never income no matter who funded it.
+    CARD_SETTLEMENT = "card_settlement"
+    #: Money coming back against an expense that was never the user's -
+    #: someone repaying a purchase made on their card. A contra-expense, not
+    #: income: the purchase it offsets is already counted as spending, so
+    #: subtracting here nets the pair to zero.
+    CLAIM_SETTLEMENT = "claim_settlement"
+    #: Moved into an investment. Still the user's money, so not spending.
+    INVESTMENT = "investment"
+    #: A merchant giving money back. Also a contra-expense - counting it as
+    #: income inflates both sides of the ledger for what was really a
+    #: cancelled purchase.
+    REFUND = "refund"
+    #: The user explicitly took this row out of every total.
+    EXCLUDED = "excluded"
+
+
+#: Roles that reduce spending rather than adding to income. Both offset an
+#: expense that is already in the totals, so they net against it.
+CONTRA_EXPENSE_ROLES = {FlowRole.CLAIM_SETTLEMENT, FlowRole.REFUND}
+
+#: Roles that are not a flow of the user's own money in either direction.
+NEUTRAL_ROLES = {
+    FlowRole.TRANSFER_OUT, FlowRole.TRANSFER_IN,
+    FlowRole.CARD_SETTLEMENT, FlowRole.EXCLUDED,
+}
+
 
 #: Human-facing grouping used by the dashboard.
 CATEGORY_GROUPS: dict[str, list[Category]] = {
@@ -230,7 +288,7 @@ class Transaction(BaseModel):
     balance_after: Decimal | None = None
     currency: str = "INR"
 
-    category: Category = Category.UNCATEGORIZED
+    category: str = Category.UNCATEGORIZED
     category_source: ConfidenceSource = ConfidenceSource.DEFAULT
     category_confidence: float = 0.0
 
@@ -298,17 +356,79 @@ class Transaction(BaseModel):
         return self.amount if self.direction == Direction.CREDIT else -self.amount
 
     @property
+    def role(self) -> FlowRole:
+        """The stored role, or one derived from what else is known.
+
+        `flow_role` is only populated once the accounting pass has run (or the
+        user has set it by hand). Deriving it on demand keeps every reader
+        working against rows that predate that pass, including anything loaded
+        from a database written by an older version.
+        """
+        if self.flow_role:
+            try:
+                return FlowRole(self.flow_role)
+            except ValueError:
+                pass  # an unknown stored value falls through to derivation
+        return derive_flow_role(self)
+
+    @property
     def is_spend(self) -> bool:
-        """True only for money that genuinely left the user's net worth."""
-        return (
-            self.direction == Direction.DEBIT
-            # A row the user explicitly took out of their totals is out of
-            # every total, unconditionally - this check comes first because
-            # an explicit human decision outranks anything inferred.
-            and not self.excluded
-            and not self.is_internal_transfer
-            and self.category not in NON_SPEND_CATEGORIES
-        )
+        """True only for money that genuinely left the user's net worth.
+
+        Kept as the compatibility surface over `role` - a good deal of the
+        analytics layer is written in terms of it - but the role is now the
+        thing that decides.
+        """
+        return self.role == FlowRole.EXPENSE
+
+
+def derive_flow_role(txn: "Transaction") -> FlowRole:
+    """Work out which side of the books a transaction belongs on.
+
+    Ordered most-authoritative first, and the order is the substance:
+
+    1. An explicit human exclusion beats everything. It is the only signal
+       here that someone actually looked at the row.
+    2. Transfer pairing beats category text. Cross-account evidence that a
+       debit funded a card payment is far stronger than any narration, and it
+       is what stops a bill payment being read as spending on one side and
+       income on the other.
+    3. A "payment received" on a CARD is never income, however it was funded.
+       This is the specific fix for someone else paying the user's card and
+       the app booking it as their salary: it reaches this branch whether or
+       not a matching bank debit was ever found.
+    4. Only then does the category get a say.
+    """
+    if txn.excluded:
+        return FlowRole.EXCLUDED
+
+    if txn.is_internal_transfer:
+        return FlowRole.TRANSFER_IN if txn.is_mirror_leg else FlowRole.TRANSFER_OUT
+
+    if txn.direction == Direction.CREDIT:
+        if txn.category == Category.CC_PAYMENT:
+            # A credit categorised as a card payment is the card's own record
+            # of its bill being settled. Unmatched only means the funding
+            # statement is missing or somebody else paid - never that money
+            # arrived from nowhere.
+            return FlowRole.CARD_SETTLEMENT
+        if txn.category == Category.REFUND:
+            return FlowRole.REFUND
+        if txn.category in INCOME_CATEGORIES:
+            return FlowRole.INCOME
+        if txn.category in {Category.TRANSFER, Category.INVESTMENT}:
+            return FlowRole.TRANSFER_IN
+        # An unexplained credit. Treated as income deliberately: the
+        # alternative silently removes real money from the user's income, and
+        # a figure that is too high is visible where one that is too low is
+        # not. The review queue is what narrows these down.
+        return FlowRole.INCOME
+
+    if txn.category == Category.INVESTMENT:
+        return FlowRole.INVESTMENT
+    if txn.category in {Category.TRANSFER, Category.CC_PAYMENT}:
+        return FlowRole.TRANSFER_OUT
+    return FlowRole.EXPENSE
 
 
 class ReconciliationStatus(str, Enum):

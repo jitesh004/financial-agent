@@ -16,6 +16,14 @@ import UpiTransactions from './components/UpiTransactions';
 import { Callout, Empty, ThemeToggle } from './components/ui';
 import { api } from './lib';
 
+import DataManager from './components/DataManager';
+import WorkflowNav from './components/WorkflowNav';
+import ReviewQueue from './components/ReviewQueue';
+import Claims from './components/Claims';
+import Recurring from './components/Recurring';
+import MonthView from './components/MonthView';
+
+
 const TABS = [
   ['overview', 'Overview'],
   ['spending', 'Spending'],
@@ -173,6 +181,11 @@ export default function App() {
             {tab === 'upi' && <UpiTransactions data={data} />}
             {tab === 'files' && <Files data={data} />}
             {tab === 'file-registry' && <FilesAndPasswords />}
+            {tab === 'data-manager' && <><WorkflowNav /><DataManager /></>}
+            {tab === 'review-queue' && <ReviewQueue />}
+            {tab === 'claims' && <Claims />}
+            {tab === 'recurring' && <Recurring />}
+            {tab === 'month-view' && <MonthView />}
           </>
         )}
       </main>

@@ -1236,7 +1236,7 @@ def test_compound_salary_narration_categorises_as_salary():
         txn = Transaction(txn_date=date(2025, 1, 1), raw_description=description,
                           amount=Decimal("1"), direction=Direction.CREDIT)
         match = apply_rules(txn)
-        return match[0].value if match else None
+        return match[0] if match else None
 
     assert category_of("PRIVATELIMI-JITESHSALNOV25//CMS3-XXXX4909") == "salary"
     assert category_of("NEFT-CR-ACME CORP SALARY") == "salary"
@@ -1267,7 +1267,7 @@ def test_card_issued_emi_conversion_is_not_the_emi_category():
                           normalized_description=normalize_description(description),
                           amount=Decimal("1"), direction=Direction.DEBIT)
         match = apply_rules(txn)
-        return match[0].value if match else None
+        return match[0] if match else None
 
     # Card-issued "convert to EMI" purchases - each falls through to what the
     # purchase actually was, not to EMI.

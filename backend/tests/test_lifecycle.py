@@ -74,7 +74,7 @@ def test_a_user_correction_survives_a_full_reprocess():
     stamp_fingerprints([reparsed], accounts)
     report = apply_overrides(db, [reparsed], accounts)
 
-    assert reparsed.category.value == "groceries"
+    assert reparsed.category == "groceries"
     assert reparsed.note == "monthly grocery run"
     assert report.applied == 1
 
@@ -101,7 +101,7 @@ def test_a_decision_is_recovered_when_the_account_identity_changes():
     assert reparsed.fingerprint != old_fingerprint, "identity should have moved"
 
     report = apply_overrides(db, [reparsed], after)
-    assert reparsed.category.value == "groceries"
+    assert reparsed.category == "groceries"
     assert report.repaired == 1
     # Re-pointed, so the next run finds it on the strict key without repair.
     assert repo.get_overrides(db)[0].fingerprint == reparsed.fingerprint
@@ -125,7 +125,7 @@ def test_an_ambiguous_recovery_is_refused_rather_than_guessed():
     stamp_fingerprints(twins, after)
     report = apply_overrides(db, twins, after)
 
-    assert [t.category.value for t in twins] == ["dining", "dining"]
+    assert [t.category for t in twins] == ["dining", "dining"]
     assert report.applied == 0
     assert report.orphaned == 1
     assert report.notes, "the user should be told why it was left alone"
@@ -148,7 +148,7 @@ def test_recording_a_note_does_not_disturb_an_earlier_recategorization():
     reparsed = _txn(txn_id="fresh")
     stamp_fingerprints([reparsed], accounts)
     apply_overrides(db, [reparsed], accounts)
-    assert reparsed.category.value == "groceries"
+    assert reparsed.category == "groceries"
     assert reparsed.note == "split with flatmate"
 
 
@@ -221,8 +221,8 @@ def test_enrich_ledger_applies_user_decisions_last():
     result = enrich_ledger(db, [debit, credit], accounts, run_analysis=False)
     settled = {t.id: t for t in result.transactions}
 
-    assert settled["d1"].category.value == "shopping", (
-        "an automatic classifier overwrote a decision the user had already made")
+    assert settled["d1"].category == "shopping", (
+        "the user decision must win over the settlement matcher")
     assert settled["d1"].category_source.value == "user"
 
 
