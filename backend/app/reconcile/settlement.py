@@ -96,6 +96,17 @@ class SettlementReport:
 # Helpers
 # --------------------------------------------------------------------------
 
+def _group_confidence(legs: int) -> float:
+    """How much to trust a match of `legs` legs on one side.
+
+    Decays fast on purpose. One leg matching one leg on an exact amount is
+    strong evidence; five legs summing to a sixth is the kind of coincidence
+    a large ledger produces on its own, and must fall below CONFIDENCE_FLOOR
+    so it goes to review rather than being applied.
+    """
+    return 0.78 - 0.09 * (legs - 1)
+
+
 def _narration(txn: Transaction) -> str:
     """The text to search for payment-rail evidence."""
     return txn.normalized_description or txn.raw_description or ""
@@ -297,8 +308,14 @@ def match_settlements(
                 ):
                     continue
 
-                confidence = max(float(CONFIDENCE_FLOOR),
-                                 0.7 - 0.05 * (len(subset) - 1))
+                # NOT clamped to the floor. Clamping made the floor
+                # unreachable, so the review branch below was dead code and
+                # every multi-leg match was applied automatically however
+                # speculative it was. The decay is also steep enough to
+                # actually cross the floor within MAX_LEGS_PER_SIDE: a
+                # two-legged match is decent evidence, a five-legged one is
+                # arithmetic looking for a pattern.
+                confidence = _group_confidence(len(subset))
 
                 group = SettlementGroup(
                     group_id=str(uuid.uuid4()),
@@ -365,8 +382,14 @@ def match_settlements(
                 ):
                     continue
 
-                confidence = max(float(CONFIDENCE_FLOOR),
-                                 0.7 - 0.05 * (len(subset) - 1))
+                # NOT clamped to the floor. Clamping made the floor
+                # unreachable, so the review branch below was dead code and
+                # every multi-leg match was applied automatically however
+                # speculative it was. The decay is also steep enough to
+                # actually cross the floor within MAX_LEGS_PER_SIDE: a
+                # two-legged match is decent evidence, a five-legged one is
+                # arithmetic looking for a pattern.
+                confidence = _group_confidence(len(subset))
 
                 group = SettlementGroup(
                     group_id=str(uuid.uuid4()),

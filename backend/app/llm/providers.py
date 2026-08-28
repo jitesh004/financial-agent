@@ -74,8 +74,15 @@ class AzureOpenAIProvider(Provider):
     def complete(self, prompt: str, system: str = "", max_tokens: int = 4096, tier: str = "fast", temperature: float = 0.0) -> str:
         deployment = config.AZURE_OPENAI_DEPLOYMENT_FAST if tier == "fast" else config.AZURE_OPENAI_DEPLOYMENT_STRONG
         base_url = config.AZURE_OPENAI_ENDPOINT.rstrip('/')
-        url = f"{base_url}/openai/deployments/{deployment}/chat/completions?api-version={config.AZURE_OPENAI_API_VERSION}"
-        
+        if config.AZURE_OPENAI_USE_CLASSIC:
+            # The original per-deployment surface.
+            url = (f"{base_url}/openai/deployments/{deployment}/chat/completions"
+                   f"?api-version={config.AZURE_OPENAI_API_VERSION}")
+        else:
+            # The OpenAI-compatible surface, where the deployment is named in
+            # the body as `model` rather than in the path.
+            url = f"{base_url}/openai/v1/chat/completions"
+
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -86,8 +93,11 @@ class AzureOpenAIProvider(Provider):
             "temperature": temperature,
             "max_tokens": max_tokens
         }
-        
-        headers = {"api-key": config.AZURE_OPENAI_API_KEY}
+        if not config.AZURE_OPENAI_USE_CLASSIC:
+            payload["model"] = deployment
+
+        headers = {"api-key": config.AZURE_OPENAI_API_KEY,
+                   "Authorization": f"Bearer {config.AZURE_OPENAI_API_KEY}"}
         
         with httpx.Client(timeout=30.0) as client:
             resp = client.post(url, json=payload, headers=headers)

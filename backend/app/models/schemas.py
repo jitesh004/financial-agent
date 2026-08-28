@@ -132,6 +132,24 @@ NON_SPEND_CATEGORIES = {
     Category.INVESTMENT,
 }
 
+#: Categories that describe money going OUT. A credit carrying one of these
+#: is a reversal of that spending - a returned purchase, a cancelled booking,
+#: a refunded fee - and nets against it rather than counting as income.
+#:
+#: Deliberately excludes UNCATEGORIZED and P2P_TRANSFER: a credit from a named
+#: individual, or one nothing could classify, is genuinely ambiguous. Those
+#: stay income (the safe direction - never silently erase real money) and go
+#: to the review queue instead.
+SPENDING_CATEGORIES = {
+    Category.GROCERIES, Category.DINING, Category.TRANSPORT, Category.FUEL,
+    Category.SHOPPING, Category.UTILITIES, Category.RENT, Category.HEALTHCARE,
+    Category.INSURANCE, Category.EDUCATION, Category.ENTERTAINMENT,
+    Category.SUBSCRIPTIONS, Category.TRAVEL, Category.PERSONAL_CARE,
+    Category.HOUSEHOLD, Category.GIFTS_DONATIONS, Category.EMI,
+    Category.LOAN_INTEREST, Category.TAX, Category.FEES_CHARGES,
+    Category.CASH_WITHDRAWAL,
+}
+
 class FlowRole(str, Enum):
     """Which side of the books a transaction lands on.
 
@@ -418,10 +436,23 @@ def derive_flow_role(txn: "Transaction") -> FlowRole:
             return FlowRole.INCOME
         if txn.category in {Category.TRANSFER, Category.INVESTMENT}:
             return FlowRole.TRANSFER_IN
-        # An unexplained credit. Treated as income deliberately: the
-        # alternative silently removes real money from the user's income, and
-        # a figure that is too high is visible where one that is too low is
-        # not. The review queue is what narrows these down.
+        if txn.category in SPENDING_CATEGORIES:
+            # Money coming back under a category that describes SPENDING - a
+            # returned purchase, a cancelled booking, a reversed fee. It is
+            # the same event as a refund, just labelled by merchant rather
+            # than recognised as a reversal, so it nets against the spending
+            # it undoes rather than counting as earnings.
+            #
+            # On a real ledger this was 22 rows worth 85,208: a 48,181
+            # "education" credit is a fee reversal, not income. Booking those
+            # as earnings inflated income AND left the original spending
+            # standing, overstating net savings by the whole amount.
+            return FlowRole.REFUND
+        # A genuinely unexplained credit - uncategorized, or from a named
+        # individual. Treated as income deliberately: the alternative
+        # silently removes real money from the user's income, and a figure
+        # that is too high is visible where one that is too low is not. The
+        # review queue is what narrows these down.
         return FlowRole.INCOME
 
     if txn.category == Category.INVESTMENT:

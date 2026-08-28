@@ -47,7 +47,13 @@ _TIER_AI = ("ai_inferences", "merchant_categories")
 #: Authored by a human. Cannot be regenerated from any input at any price.
 #: `claims` is listed before `claim_settlements` and `transaction_splits`
 #: only for readability - both cascade from it anyway.
+#: `custom_categories` and `recurring_series_overrides` belong here as much as
+#: any other decision - a category someone invented and a series they renamed
+#: cannot be regenerated from any statement. Leaving them out of every scope
+#: meant a factory reset silently left them behind, so the workspace did not
+#: actually return to its first-run state.
 _TIER_DECISIONS = ("user_overrides", "claim_settlements", "transaction_splits",
+                   "custom_categories", "recurring_series_overrides",
                    "claims", "split_rules", "settlement_group_legs",
                    "settlement_groups")
 

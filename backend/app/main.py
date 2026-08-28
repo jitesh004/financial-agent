@@ -1063,6 +1063,22 @@ def workflow() -> dict[str, Any]:
     }
 
 
+def _llm_status() -> tuple[str, bool]:
+    """Which provider is selected, and whether it could actually be called."""
+    try:
+        from .config import config
+
+        provider = config.LLM_PROVIDER
+        if provider == "gemini":
+            return provider, bool(config.GEMINI_API_KEY)
+        if provider == "azure":
+            return provider, bool(config.AZURE_OPENAI_ENDPOINT
+                                  and config.AZURE_OPENAI_API_KEY)
+        return provider, False
+    except Exception:  # pragma: no cover - health must never 500
+        return "unknown", False
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     import os
@@ -1071,7 +1087,11 @@ def health() -> dict[str, Any]:
         "status": "ok",
         "database": str(db.path),
         "transactions_stored": repo.count_transactions(db),
-        "llm_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        # Reports the provider actually in use. This checked
+        # ANTHROPIC_API_KEY, which nothing reads any more, so health said
+        # "no model configured" however carefully the user had set one up.
+        "llm_provider": _llm_status()[0],
+        "llm_configured": _llm_status()[1],
         "supported_formats": sorted(SUPPORTED_EXTENSIONS),
     }
 

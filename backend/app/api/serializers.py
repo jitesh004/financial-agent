@@ -132,6 +132,11 @@ def analysis_json(analysis: Any) -> dict[str, Any]:
         "totals": {
             "income": num(analysis.total_income),
             "spend": num(analysis.total_spend),
+            # Gross and net side by side. Someone who is reimbursed heavily
+            # needs to see both what they laid out and what it actually cost
+            # them; either figure on its own misleads, in opposite directions.
+            "gross_spend": num(analysis.gross_spend),
+            "offsets": num(analysis.total_offsets),
             "invested": num(analysis.total_invested),
             "net_savings": num(analysis.net_savings),
             "savings_rate": analysis.savings_rate,
@@ -142,6 +147,7 @@ def analysis_json(analysis: Any) -> dict[str, Any]:
         },
         "monthly": [
             {"month": m.month, "income": num(m.income), "spend": num(m.spend),
+             "gross_spend": num(m.gross_spend), "offsets": num(m.offsets),
              "invested": num(m.invested), "total_outflow": num(m.total_outflow),
              "net": num(m.net), "savings_rate": m.savings_rate,
              "transaction_count": m.transaction_count}

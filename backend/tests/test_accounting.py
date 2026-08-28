@@ -536,14 +536,18 @@ def test_collision_guard_flags_duplicate():
     transactions = [t1, t2, t3]
     assign_accounting_months(transactions, [series])
 
-    # Check that collision guard marked at least one for review.
-    months = [t.accounting_month for t in transactions]
+    # Asserted unconditionally. This was previously guarded by `if dupes:`,
+    # which meant the test passed whether or not the guard worked - the
+    # assertion simply never ran when no duplicate appeared, and never ran
+    # when the guard failed to produce one either.
     from collections import Counter
-    dupes = {m for m, c in Counter(months).items() if c > 1}
-    if dupes:
-        # If there are duplicates, at least one should be flagged.
-        flagged = [t for t in transactions if t.needs_review]
-        assert len(flagged) >= 1
+
+    months = Counter(t.accounting_month for t in transactions)
+    dupes = {m for m, c in months.items() if c > 1}
+    assert not dupes, (
+        f"a series contributed twice to {sorted(dupes)}: {dict(months)}")
+    assert len(months) == len(transactions), (
+        "each occurrence should hold its own accounting month")
 
 
 # ==========================================================================

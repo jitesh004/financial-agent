@@ -84,10 +84,13 @@ def assign_accounting_months(
         anchor = circular_median_day([m.txn_date for m in members])
         allocated: dict[str, list[tuple[int, Transaction]]] = {}
 
+        calendar_month: dict[str, str] = {}
+
         for txn in members:
             y, m = txn.txn_date.year, txn.txn_date.month
             day = txn.txn_date.day
             original_month = txn.accounting_month
+            calendar_month[id(txn)] = original_month
 
             delta = 0
             if anchor >= 24 and day <= 6:
@@ -113,10 +116,40 @@ def assign_accounting_months(
                 allocated[txn.accounting_month] = []
             allocated[txn.accounting_month].append((dist, txn))
 
-        # 3. Collision guard
-        for acc_month, items in allocated.items():
-            if len(items) > 1:
-                items.sort(key=lambda x: x[0])
-                for _, dup_txn in items[1:]:
+        # 3. Collision guard.
+        #
+        # A series must never contribute twice to one accounting month - that
+        # is the whole point of the exercise, since the failure being
+        # prevented is exactly "two salaries in one month and none in the
+        # next". Drift correction can CREATE that collision rather than cure
+        # it: with pay on 31-Aug and again on 1-Sep, shifting the September
+        # payment back lands both in August and empties September, which is
+        # worse than leaving them alone.
+        #
+        # So a losing occurrence is put back in its own calendar month, not
+        # merely annotated. Flagging without moving left the double count
+        # standing and only described it.
+        for acc_month in list(allocated):
+            items = allocated[acc_month]
+            if len(items) <= 1:
+                continue
+            # Nearest the anchor keeps the month; it is the one the series
+            # genuinely belongs to.
+            items.sort(key=lambda pair: pair[0])
+            for _, dup_txn in items[1:]:
+                reverted = calendar_month[id(dup_txn)]
+                if reverted != dup_txn.accounting_month:
+                    logger.info(
+                        "Reverted %s on %s to %s - %s already held an "
+                        "occurrence closer to the anchor",
+                        series.label, dup_txn.txn_date, reverted, acc_month,
+                    )
+                    dup_txn.accounting_month = reverted
+                else:
+                    # Two genuine payments in the same calendar month, which
+                    # no shift can separate. Surfaced rather than hidden.
                     dup_txn.needs_review = True
-                    dup_txn.review_reason = "Duplicate in accounting month after drift correction"
+                    dup_txn.review_reason = (
+                        f"Two {series.label} payments fall in {acc_month}; "
+                        f"check whether one belongs to another month."
+                    )

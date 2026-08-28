@@ -122,6 +122,19 @@ def enrich_ledger(
     #    Runs after transfer detection so self-transfers are already claimed
     #    and won't be double-matched as settlements.
     phase("Matching card settlements")
+    if statements_by_account is None:
+        # Loaded here rather than left to the caller. Every one of the three
+        # entry points omitted it, so it defaulted to None, so the coverage
+        # check inside always answered "no coverage" and the distinction it
+        # exists to draw - somebody else funded this, versus the funding
+        # statement simply is not loaded - never actually happened.
+        try:
+            from ..db import repository as _repo
+            statements_by_account = _repo.get_statement_periods_by_account(db)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("statement periods unavailable for coverage gate: %s", exc)
+            statements_by_account = {}
+
     result.settlement_report = match_settlements(
         transactions, accounts, db,
         statements_by_account=statements_by_account,
@@ -181,10 +194,32 @@ def enrich_ledger(
     #    overrides so the stored role includes user decisions. Derived roles
     #    still work for rows that predate this step, but having an explicit
     #    value in the DB makes queries and debugging far simpler.
-    from ..models.schemas import derive_flow_role
+    from ..models.schemas import FlowRole, derive_flow_role
+    from ..categorize.rules import looks_like_person_payment
+
     for txn in transactions:
         if not txn.flow_role:
             txn.flow_role = derive_flow_role(txn).value
+
+        # A credit carrying a spending category nets against that spending -
+        # a returned purchase, a reversed fee. That is unambiguous when the
+        # counterparty is a merchant ("AMAZON PAY ... -549" against an Amazon
+        # charge), but not when it is a person: "UPI/POOJA ROHA/.../school
+        # fee/" could be someone reimbursing a fee the user paid, or simply
+        # money given to them. Netting is the more likely reading and is what
+        # gets applied, but it is never applied silently.
+        #
+        # Note this only moves the income/expense SPLIT - net savings is
+        # identical either way - so a wrong guess here is visible and cheap,
+        # which is why a default plus review beats blocking the figure.
+        if (txn.flow_role == FlowRole.REFUND.value
+                and not txn.needs_review
+                and looks_like_person_payment(txn)):
+            txn.needs_review = True
+            txn.review_reason = (
+                "Credit from a person against a spending category - counted "
+                "as money back rather than income. Confirm or flip."
+            )
 
     if not run_analysis:
         return result

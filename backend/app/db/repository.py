@@ -1274,3 +1274,30 @@ def get_ai_inference(db, fingerprint: str) -> dict | None:
 def save_ai_inference(db, fingerprint: str, result: dict) -> None:
     with db.connection() as conn:
         conn.execute("INSERT OR REPLACE INTO ai_inferences (fingerprint, result_json) VALUES (?, ?)", (fingerprint, json.dumps(result)))
+
+
+def get_statement_periods_by_account(db: Database) -> dict[str, list[Any]]:
+    """Each account's statement periods, keyed by account id.
+
+    Just the period bounds, not full Statement objects - both callers only
+    need to answer "is there a parsed statement covering this date?".
+
+    Used by the coverage grid and, more importantly, by settlement matching:
+    an unmatched card payment means "somebody else funded it" ONLY if the
+    funding account's statement for that period is actually present. Without
+    that check a missing bank statement makes every card payment that month
+    look third-party-funded, and spending collapses.
+    """
+    from collections import defaultdict
+    from types import SimpleNamespace
+
+    by_account: dict[str, list[Any]] = defaultdict(list)
+    for row in get_statements(db):
+        if not row.get("account_id"):
+            continue
+        by_account[row["account_id"]].append(SimpleNamespace(
+            id=row["id"],
+            period_start=_d(row.get("period_start")),
+            period_end=_d(row.get("period_end")),
+        ))
+    return by_account
