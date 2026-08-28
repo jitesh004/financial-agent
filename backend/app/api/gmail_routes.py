@@ -594,7 +594,7 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
             "loan_projections": loan_projections, "forecast": forecast,
             "duplicate_count": enriched.duplicate_count,
         }
-        from ..main import _persist, _build_payload, runs
+        from ..main import _persist, _build_payload, remember_run
         _persist(state)
         for record in file_records:
             repo.upsert_source_file(db, record)
@@ -613,7 +613,7 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
         }
 
         # Make it the dashboard's current view, same as an upload run.
-        run = runs.create_from_payload(job.id, payload)
+        run = remember_run(job.id, payload)
         progress.complete(
             result={"statements": statement_rows,
                     "transaction_count": len(transactions),

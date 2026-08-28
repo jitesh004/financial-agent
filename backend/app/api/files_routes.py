@@ -194,7 +194,7 @@ def merge_extracted_file_into_ledger(
         "forecast": enriched.forecast,
     }
 
-    from ..main import _build_payload, _persist, runs
+    from ..main import _build_payload, _persist, remember_run
     _persist(state)
 
     ok = recon.status != ReconciliationStatus.FAILED
@@ -222,7 +222,7 @@ def merge_extracted_file_into_ledger(
     # previously-processed file's row survives the refresh too.
     payload = _build_payload(state)
     payload["statements"] = all_statement_rows(db)
-    run_id = runs.create_from_payload(str(uuid.uuid4()), payload)
+    run_id = remember_run(str(uuid.uuid4()), payload)
 
     return {
         "status": "ok" if ok else "unreconciled",

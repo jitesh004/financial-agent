@@ -14,6 +14,7 @@ import logging
 import shutil
 import threading
 import uuid
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from . import storage
 from .api import files_routes, gmail_routes
 from .api import serializers as ser
 from .db.database import get_db
@@ -119,8 +121,105 @@ class RunStore:
     def _order_latest(self, run_id: str) -> None:
         self._latest = run_id
 
+    def clear(self) -> None:
+        """Forget every cached run.
+
+        Called after any clearing action. The dashboard payload is a snapshot
+        of figures computed from rows that may have just been deleted, and
+        `/api/dashboard` returns it verbatim without revalidating - so leaving
+        it in place shows the user totals for a ledger that no longer exists.
+        """
+        with self._lock:
+            self._runs.clear()
+            self._latest = None
+
 
 runs = RunStore()
+
+
+@dataclass(frozen=True)
+class ClearAction:
+    """One clearing scope, described in terms of what it costs the user.
+
+    The ordering is by cost of reacquisition, not by how much is deleted:
+    parsed rows are pure CPU to rebuild, statement files cost network and
+    Gmail quota (and are unrecoverable if the user no longer has the
+    original), AI inference costs actual money, and a human decision cannot be
+    regenerated at any price.
+    """
+
+    scope: str
+    label: str
+    description: str
+    clears: tuple[str, ...]
+    preserves: tuple[str, ...]
+    destructive: bool = False
+    removes_files: bool = False
+    confirm_phrase: str = ""
+
+
+CLEAR_ACTIONS: tuple[ClearAction, ...] = (
+    ClearAction(
+        scope="derived",
+        label="Refresh dashboard",
+        description="Recompute totals, recurring series and forecasts from the "
+                    "transactions already stored.",
+        clears=("dashboard aggregates", "recurring series", "run history"),
+        preserves=("transactions", "statement files", "AI inference", "your decisions"),
+    ),
+    ClearAction(
+        scope="parsed_data",
+        label="Re-parse statements",
+        description="Drop the parsed ledger and rebuild it from the statement "
+                    "files. Use this after a parsing fix.",
+        clears=("transactions", "accounts", "statements"),
+        preserves=("statement files", "AI inference", "your decisions", "your profile"),
+    ),
+    ClearAction(
+        scope="files",
+        label="Clear downloaded files",
+        description="Remove the statement files themselves along with the "
+                    "ledger built from them. Files you uploaded by hand cannot "
+                    "be re-downloaded and will be gone for good.",
+        clears=("statement files", "file registry", "transactions", "accounts"),
+        preserves=("AI inference", "your decisions", "your profile"),
+        destructive=True,
+        removes_files=True,
+        # The only non-factory-reset scope that can destroy something
+        # unrecoverable: a manually uploaded statement exists nowhere else.
+        confirm_phrase="DELETE FILES",
+    ),
+    ClearAction(
+        scope="ai_inferences",
+        label="Clear AI inference",
+        description="Discard every cached model answer and learned merchant "
+                    "category. These cost real money to produce and will be "
+                    "re-billed if they are needed again.",
+        clears=("cached model answers", "learned merchant categories"),
+        preserves=("transactions", "statement files", "your decisions", "your profile"),
+        destructive=True,
+    ),
+    ClearAction(
+        scope="decisions",
+        label="Clear my decisions",
+        description="Discard every correction, note and exclusion you have "
+                    "made. Nothing can regenerate these.",
+        clears=("category corrections", "notes", "exclusions"),
+        preserves=("transactions", "statement files", "AI inference", "your profile"),
+        destructive=True,
+    ),
+    ClearAction(
+        scope="everything",
+        label="Factory reset",
+        description="Delete everything, including your profile. The workspace "
+                    "returns to its first-run state.",
+        clears=("everything",),
+        preserves=(),
+        destructive=True,
+        removes_files=True,
+        confirm_phrase="DELETE EVERYTHING",
+    ),
+)
 
 
 # --------------------------------------------------------------------------
@@ -176,7 +275,13 @@ async def upload(
             continue
         seen_hashes.add(digest)
 
-        tasks.append({"path": str(target), "filename": name})
+        # Move it into the durable, content-addressed store and work from
+        # there. The per-run directory is staging only: a manually uploaded
+        # statement can be the only copy in existence, and it must not live
+        # somewhere that clearing a derived ledger would delete.
+        durable = storage.adopt(target, digest, remove_source=True)
+
+        tasks.append({"path": str(durable), "filename": name})
 
     if not tasks:
         raise HTTPException(
@@ -256,6 +361,7 @@ def _run_analysis(
             result=payload,
         )
         runs.set_latest(run_id)
+        remember_run(run_id, payload)
         log.info("run %s complete: %d transactions", run_id,
                  len(state.get("transactions") or []))
 
@@ -263,6 +369,30 @@ def _run_analysis(
         log.exception("run %s failed", run_id)
         runs.update(run_id, status="failed", progress="Failed",
                     errors=[f"{type(exc).__name__}: {exc}"])
+
+
+def remember_run(run_id: str, payload: dict[str, Any]) -> str:
+    """Register a completed run in memory AND on disk.
+
+    The on-disk half is what makes the dashboard survive a restart intact.
+    Recomputing it from the stored rows is possible but lossy - no narrative,
+    no transfer report - so a restart used to quietly downgrade the dashboard
+    rather than restore it.
+    """
+    runs.create_from_payload(run_id, payload)
+    try:
+        db = get_db()
+        repo.save_analysis_run(
+            db, run_id, "complete",
+            file_count=len(payload.get("statements") or []),
+            payload=payload,
+        )
+        # Each payload is a whole dashboard, so the history is capped rather
+        # than allowed to grow without bound.
+        repo.prune_analysis_runs(db)
+    except Exception as exc:  # a history write must never fail a run
+        log.warning("could not store run %s: %s", run_id, exc)
+    return run_id
 
 
 def _persist(state: dict[str, Any]) -> None:
@@ -390,16 +520,25 @@ def dashboard() -> dict[str, Any]:
     if run and run.get("result"):
         return {"status": "ok", "run_id": run["run_id"], **run["result"]}
 
-    # Nothing in memory - the server restarted since the last upload or Gmail
-    # process. Every transaction already carries its computed category and
-    # transfer flags (they were persisted, not just held in memory), so the
-    # dashboard can be rebuilt straight from the database instead of asking
-    # the user to re-parse every PDF just to see figures that already exist.
     db = get_db()
     if repo.count_transactions(db) == 0:
         return {"status": "empty",
                 "message": "No statements have been analyzed yet."}
 
+    # The last completed run's payload, stored verbatim. Preferred over
+    # recomputing because the rebuild below is lossy - it produces no
+    # narrative and no transfer report - so a restart used to silently
+    # downgrade the dashboard rather than restore it.
+    stored = repo.get_latest_analysis_run(db)
+    if stored:
+        run_id, payload = stored
+        runs.create_from_payload(run_id, payload)
+        return {"status": "ok", "run_id": run_id, **payload}
+
+    # No stored run either (an older workspace, or the run table was
+    # cleared). Every transaction still carries its computed category and
+    # transfer flags, so the figures can be recomputed rather than asking the
+    # user to re-parse every PDF.
     run_id = _rebuild_from_persisted_data(db)
     rebuilt = runs.get(run_id)
     return {"status": "ok", "run_id": run_id, **rebuilt["result"]}
@@ -447,19 +586,37 @@ def _rebuild_from_persisted_data(db) -> str:
     }
     payload = _build_payload(state)
     payload["statements"] = all_statement_rows(db)
-    return runs.create_from_payload(str(uuid.uuid4()), payload)
+    return remember_run(str(uuid.uuid4()), payload)
 
 
 @app.post("/api/reanalyze")
 def reanalyze(background: BackgroundTasks, horizon_months: int = 6,
               use_llm: bool = True) -> dict[str, Any]:
-    """Re-run analysis over every file already uploaded in this workspace."""
-    tasks = [
-        {"path": str(p), "filename": p.name}
-        for run_dir in sorted(UPLOAD_DIR.iterdir()) if run_dir.is_dir()
-        for p in sorted(run_dir.iterdir())
-        if p.suffix.lower() in SUPPORTED_EXTENSIONS
-    ]
+    """Re-parse every statement file this workspace knows about."""
+    # Driven by the file registry rather than by globbing the uploads
+    # directory. The registry is the only place that knows about files which
+    # arrived from Gmail, and it also survives the file being moved - globbing
+    # one directory silently re-analysed a subset and called it "everything".
+    db = get_db()
+    tasks = []
+    for record in repo.list_source_files(db):
+        if not record.filepath:
+            continue
+        path = Path(record.filepath)
+        if path.suffix.lower() not in SUPPORTED_EXTENSIONS or not path.exists():
+            continue
+        tasks.append({"path": str(path), "filename": record.filename})
+
+    # Anything still sitting in the legacy per-run upload folders, for a
+    # workspace that predates the durable store.
+    if UPLOAD_DIR.is_dir():
+        for run_dir in sorted(UPLOAD_DIR.iterdir()):
+            if not run_dir.is_dir():
+                continue
+            for p in sorted(run_dir.iterdir()):
+                if p.suffix.lower() in SUPPORTED_EXTENSIONS:
+                    tasks.append({"path": str(p), "filename": p.name})
+
     if not tasks:
         raise HTTPException(400, "No previously uploaded files were found.")
 
@@ -471,7 +628,13 @@ def reanalyze(background: BackgroundTasks, horizon_months: int = 6,
 
     run_id = str(uuid.uuid4())
     runs.create(run_id, len(tasks))
-    get_db().reset()
+    # Snapshot BEFORE clearing, so a re-parse that goes wrong - a file that no
+    # longer opens, a crash halfway through - is recoverable. Previously this
+    # cleared the ledger up front and the old rows were simply gone whether or
+    # not anything replaced them.
+    db = get_db()
+    db.snapshot("pre-reanalyze")
+    db.clear("parsed_data")
     background.add_task(_run_analysis, run_id, tasks, use_llm, horizon_months)
     return {"run_id": run_id, "file_count": len(tasks), "status": "queued"}
 
@@ -563,13 +726,111 @@ def list_categories() -> list[str]:
     return [c.value for c in Category]
 
 
+@app.get("/api/data/inventory")
+def data_inventory() -> dict[str, Any]:
+    """What exists right now, and what each clearing action would cost.
+
+    The old UI had one unlabelled "Reset" button that deleted the ledger, the
+    file registry AND every uploaded file. Someone clearing a bad parse lost
+    the only copy of the statement that produced it. Showing the real counts
+    against each scope is the point: the user should be able to see that
+    re-parsing keeps their files and their corrections before they click it.
+    """
+    db = get_db()
+    counts: dict[str, int] = {}
+    with db.connection() as conn:
+        for table in ("transactions", "accounts", "statements", "source_files",
+                      "ai_inferences", "merchant_categories", "user_overrides"):
+            counts[table] = conn.execute(
+                f"SELECT COUNT(*) c FROM {table}").fetchone()["c"]
+
+    return {
+        "counts": counts,
+        "files": storage.store_stats(),
+        "snapshots": db.list_snapshots(),
+        "actions": [
+            {"scope": s.scope, "label": s.label, "description": s.description,
+             "clears": list(s.clears), "preserves": list(s.preserves),
+             "destructive": s.destructive, "confirm_phrase": s.confirm_phrase}
+            for s in CLEAR_ACTIONS
+        ],
+    }
+
+
+@app.post("/api/data/clear/{scope}")
+def clear_data(scope: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Clear exactly one tier of data. See CLEAR_ACTIONS for the tiers."""
+    action = next((a for a in CLEAR_ACTIONS if a.scope == scope), None)
+    if action is None:
+        raise HTTPException(
+            400, f"Unknown scope '{scope}'. "
+                 f"Valid: {', '.join(a.scope for a in CLEAR_ACTIONS)}")
+
+    # The widest scope is the only one that can destroy something a human
+    # authored, so it is the only one that asks the user to type the word.
+    if action.confirm_phrase:
+        typed = str((payload or {}).get("confirm", "")).strip()
+        if typed != action.confirm_phrase:
+            raise HTTPException(
+                400, f"This action needs confirmation. Send "
+                     f'{{"confirm": "{action.confirm_phrase}"}} to proceed.')
+
+    db = get_db()
+    snapshot = db.snapshot(f"pre-{scope}")
+    removed = db.clear(scope) if action.scope != "derived" else db.clear("derived")
+
+    files_removed = 0
+    if action.removes_files:
+        for path in storage.stored_files():
+            try:
+                path.unlink()
+                files_removed += 1
+            except OSError:
+                pass
+        if UPLOAD_DIR.is_dir():
+            for run_dir in UPLOAD_DIR.iterdir():
+                if run_dir.is_dir():
+                    shutil.rmtree(run_dir, ignore_errors=True)
+
+    # The in-memory dashboard describes data that may no longer exist.
+    runs.clear()
+
+    return {
+        "status": "cleared",
+        "scope": scope,
+        "removed": removed,
+        "files_removed": files_removed,
+        "snapshot": snapshot.name,
+    }
+
+
+@app.post("/api/data/restore")
+def restore_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    """Roll the database back to a snapshot taken before a clearing action."""
+    name = str((payload or {}).get("name", "")).strip()
+    if not name:
+        raise HTTPException(400, "Which snapshot? Send {\"name\": \"...\"}.")
+    db = get_db()
+    try:
+        db.restore(name)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    runs.clear()
+    return {"status": "restored", "name": name}
+
+
 @app.post("/api/reset")
 def reset() -> dict[str, str]:
-    """Delete all stored data. The user's 'start over' button."""
-    get_db().reset()
-    for run_dir in UPLOAD_DIR.iterdir():
-        if run_dir.is_dir():
-            shutil.rmtree(run_dir, ignore_errors=True)
+    """Deprecated: clears the parsed ledger only.
+
+    Kept so an older frontend build does not 404, but it no longer deletes
+    statement files, AI inference or user decisions - the three things it had
+    no business deleting. New callers should use /api/data/clear/{scope}.
+    """
+    db = get_db()
+    db.snapshot("pre-reset")
+    db.clear("parsed_data")
+    runs.clear()
     return {"status": "reset"}
 
 
@@ -619,6 +880,112 @@ def put_profile(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "status": "saved",
         "password_candidates": len(derive_passwords(profile)),
+    }
+
+
+@app.get("/api/workflow")
+def workflow() -> dict[str, Any]:
+    """Where this workspace stands, derived fresh from what is stored.
+
+    Deliberately computed on every request rather than tracked as a "current
+    step" pointer. A stored pointer is a second source of truth about state
+    the database already knows, and the two drift the moment anything happens
+    out of band - a file retried from the coverage grid, a server restart
+    mid-import, a decision recorded from the transactions table. Every stage
+    stays reachable at all times; this only reports what is done and what is
+    blocking the next thing.
+    """
+    db = get_db()
+    profile = repo.get_profile(db)
+    files = repo.list_source_files(db)
+    accounts = repo.get_accounts(db)
+
+    by_status: dict[str, int] = {}
+    for record in files:
+        by_status[record.parse_status] = by_status.get(record.parse_status, 0) + 1
+
+    txn_count = repo.count_transactions(db)
+    with db.connection() as conn:
+        review_count = conn.execute(
+            "SELECT COUNT(*) c FROM transactions WHERE needs_review = 1"
+        ).fetchone()["c"]
+        override_count = conn.execute(
+            "SELECT COUNT(*) c FROM user_overrides").fetchone()["c"]
+
+    gmail_connected = bool(gmail_routes._client()
+                           and gmail_routes._client().is_authorized())
+
+    # Coverage is the honest measure of "have I collected everything?" - it
+    # knows which months each account is missing, which a file count cannot.
+    missing_months = 0
+    try:
+        coverage = files_routes.get_coverage()["accounts"]
+        missing_months = sum(
+            1 for row in coverage for cell in row.get("months", [])
+            if cell.get("status") == "missing"
+        )
+    except Exception:  # a coverage failure must not break the whole view
+        coverage = []
+
+    stages = [
+        {
+            "id": "profile",
+            "label": "Profile",
+            "complete": profile.has_password_material(),
+            "detail": ("Ready" if profile.has_password_material() else
+                       "Add your name and date of birth so locked statements "
+                       "can be opened."),
+        },
+        {
+            "id": "sources",
+            "label": "Sources",
+            "complete": gmail_connected or bool(files),
+            "detail": (f"{len(files)} file(s) known"
+                       + (", Gmail connected" if gmail_connected else "")),
+        },
+        {
+            "id": "collect",
+            "label": "Collect",
+            "complete": bool(files) and missing_months == 0,
+            "detail": (f"{missing_months} month(s) still missing"
+                       if missing_months else "Every known month is present"),
+        },
+        {
+            "id": "parse",
+            "label": "Parse",
+            "complete": bool(txn_count) and not by_status.get("failed")
+            and not by_status.get("needs_password"),
+            "detail": ", ".join(
+                f"{count} {status}" for status, count in sorted(by_status.items())
+            ) or "Nothing parsed yet",
+        },
+        {
+            "id": "review",
+            "label": "Review",
+            "complete": review_count == 0,
+            "detail": (f"{review_count} item(s) awaiting your decision"
+                       if review_count else "Nothing needs review"),
+        },
+        {
+            "id": "analyze",
+            "label": "Analyze",
+            "complete": txn_count > 0,
+            "detail": (f"{txn_count} transaction(s) across {len(accounts)} account(s)"
+                       if txn_count else "No transactions yet"),
+        },
+    ]
+
+    return {
+        "stages": stages,
+        "counts": {
+            "files": len(files),
+            "files_by_status": by_status,
+            "accounts": len(accounts),
+            "transactions": txn_count,
+            "needs_review": review_count,
+            "decisions": override_count,
+            "missing_months": missing_months,
+        },
     }
 
 

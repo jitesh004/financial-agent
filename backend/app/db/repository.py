@@ -934,3 +934,60 @@ def repoint_override(db: Database, old_fingerprint: str, new_fingerprint: str,
             "UPDATE user_overrides SET fingerprint = ?, account_key = ? "
             "WHERE fingerprint = ?",
             (new_fingerprint, account_key, old_fingerprint))
+
+
+# --------------------------------------------------------------------------
+# Analysis runs
+#
+# The completed dashboard payload, stored so it survives a restart intact.
+# Without it a restarted server had to recompute the whole dashboard from the
+# stored rows, and that path is lossy: it produces no narrative, no transfer
+# report, and (before is_mirror_leg was persisted) different totals.
+# --------------------------------------------------------------------------
+
+def save_analysis_run(db: Database, run_id: str, status: str, file_count: int,
+                      payload: dict | None = None, error: str = "") -> None:
+    with db.connection() as conn:
+        conn.execute(
+            """INSERT INTO analysis_runs (id, status, file_count, summary_json, error)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET
+                   status       = excluded.status,
+                   file_count   = excluded.file_count,
+                   summary_json = COALESCE(excluded.summary_json, analysis_runs.summary_json),
+                   error        = excluded.error""",
+            (run_id, status, file_count,
+             json.dumps(payload, default=str) if payload is not None else None,
+             error),
+        )
+
+
+def get_latest_analysis_run(db: Database) -> tuple[str, dict] | None:
+    """The most recent completed run and its payload, or None."""
+    with db.connection() as conn:
+        row = conn.execute(
+            """SELECT id, summary_json FROM analysis_runs
+                WHERE status = 'complete' AND summary_json IS NOT NULL
+                ORDER BY created_at DESC, rowid DESC LIMIT 1"""
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        return row["id"], json.loads(row["summary_json"])
+    except (ValueError, TypeError):
+        # A payload we cannot read is not worth crashing the dashboard over;
+        # the caller falls back to recomputing from the stored rows.
+        log.warning("stored analysis run %s has an unreadable payload", row["id"])
+        return None
+
+
+def prune_analysis_runs(db: Database, keep: int = 20) -> int:
+    """Keep the newest `keep` runs. Each payload is a full dashboard."""
+    with db.connection() as conn:
+        cur = conn.execute(
+            """DELETE FROM analysis_runs WHERE id NOT IN (
+                   SELECT id FROM analysis_runs
+                    ORDER BY created_at DESC, rowid DESC LIMIT ?)""",
+            (keep,),
+        )
+        return cur.rowcount

@@ -518,8 +518,17 @@ class Database:
             # sqlite3's own backup API rather than a file copy: it takes a
             # read lock and captures a consistent image even if a WAL write is
             # in flight, where copying the file alone could miss the -wal.
-            with sqlite3.connect(target) as dest:
+            #
+            # Closed explicitly, not via `with`: sqlite3's context manager
+            # commits the transaction but does NOT close the connection, so
+            # the destination stayed open and held a lock on the file it had
+            # just written. On Windows that made every snapshot undeletable,
+            # and pruning failed silently for all of them.
+            dest = sqlite3.connect(target)
+            try:
                 conn.backup(dest)
+            finally:
+                dest.close()
 
         self._prune_snapshots(backups)
         log.info("snapshot written: %s", target.name)
@@ -572,8 +581,14 @@ class Database:
             raise ValueError(f"no such snapshot: {name}")
 
         self.snapshot("pre-restore")
-        with sqlite3.connect(source) as src, self.connection() as conn:
-            src.backup(conn)
+        # Closed explicitly - see the note in `snapshot` about sqlite3's
+        # context manager not closing the connection.
+        src = sqlite3.connect(source)
+        try:
+            with self.connection() as conn:
+                src.backup(conn)
+        finally:
+            src.close()
         log.info("restored from snapshot: %s", name)
 
     def clear(self, scope: str) -> dict[str, int]:
