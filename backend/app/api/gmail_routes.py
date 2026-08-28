@@ -24,8 +24,8 @@ from ..db.database import get_db
 from ..db import repository as repo
 from ..ingestion.gmail_source import (PERIOD_OPTIONS, FoundAttachment,
                                       GoogleGmailClient, build_query,
-                                      classify_sender, download_to_cache,
-                                      find_statements, institution_for_sender)
+                                      download_to_cache, find_statements,
+                                      institution_for_sender)
 from ..ingestion.passwords import (derive_passwords, password_hint,
                                    profile_can_satisfy, redact_candidate,
                                    resolve_password_status)
@@ -359,19 +359,11 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
     job = jobs.get(job_id)
     progress = JobProgress(job)
     try:
-        from ..analytics.engine import analyze
-        from ..analytics.recurring import detect_recurring
-        from ..analytics import forecast as forecast_mod
-        from ..analytics import loans as loans_mod
-        from ..categorize.rules import categorize_by_rules
         from ..graph.nodes import _account_identity, _merge_account_facts
         from ..ingestion import router as ingest_router
-        from ..models.schemas import AccountType, LIABILITY_TYPES
         from ..normalize.normalizer import normalize
         from ..normalize.parsers import extract_merchant
         from ..reconcile.balance_check import reconcile
-        from ..reconcile.transfers import (detect_transfers,
-                                           find_duplicate_transactions)
         import uuid as _uuid
 
         db = get_db()
@@ -568,68 +560,31 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
             return
 
         # ---- Shared enrichment + analysis ------------------------------
-        progress.phase("Removing duplicates")
-        duplicates = find_duplicate_transactions(transactions)
-        dupe_ids = {id(d) for d in duplicates}
-        if duplicates:
-            transactions = [t for t in transactions if id(t) not in dupe_ids]
-        transactions.sort(key=lambda t: (t.txn_date, t.account_id or ""))
+        # One implementation, shared with the upload and file-retry routes.
+        # This path used to spell the sequence out itself, which is how it
+        # ended up accepting `use_llm` and never reading it, and never
+        # consulting the learned merchant cache at all.
+        from ..pipeline.enrich import enrich_ledger
 
-        progress.phase("Matching transfers between accounts")
-        transfer_report = detect_transfers(transactions, accounts)
-
-        progress.phase("Categorizing")
-        categorize_by_rules(transactions)
-
-        # Anything the rules could not place still needs a bucket. Without this
-        # an unrecognised CREDIT stays "uncategorized", and since only income
-        # categories count towards money-in, a whole salary history silently
-        # vanishes from the dashboard: 37 lakh of credits sat uncategorised
-        # while money-in read 56,000.
-        from ..categorize.rules import fallback_category
-        from ..models.schemas import Category, ConfidenceSource
-        # The holder's own name turns "UPI/Jitesh Muk/..." from spending into a
-        # transfer between the user's own accounts.
-        holder_names = [n for n in (profile.full_name,) if n]
-        fell_back = 0
-        for txn in transactions:
-            if txn.category != Category.UNCATEGORIZED:
-                continue
-            guess = fallback_category(txn, holder_names)
-            if guess != Category.UNCATEGORIZED:
-                txn.category = guess
-                txn.category_source = ConfidenceSource.DEFAULT
-                txn.category_confidence = 0.3
-                fell_back += 1
-        if fell_back:
+        enriched = enrich_ledger(
+            db, transactions, accounts,
+            use_llm=use_llm,
+            # The holder's own name turns "UPI/Jitesh Muk/..." from spending
+            # into a transfer between the user's own accounts.
+            holder_names=[n for n in (profile.full_name,) if n],
+            progress=progress.phase,
+        )
+        transactions = enriched.transactions
+        transfer_report = enriched.transfer_report
+        recurring = enriched.recurring
+        analysis = enriched.analysis
+        loan_projections = enriched.loan_projections
+        forecast = enriched.forecast
+        if enriched.fell_back:
             progress.warn(
-                f"{fell_back} transaction(s) had no matching rule and were "
-                f"placed in a default category."
+                f"{enriched.fell_back} transaction(s) had no matching rule and "
+                f"were placed in a default category."
             )
-
-        progress.phase("Detecting recurring commitments")
-        recurring = detect_recurring(transactions)
-
-        progress.phase("Computing analysis")
-        analysis = analyze(transactions, accounts)
-
-        loan_projections = []
-        for account_id, account in accounts.items():
-            account_txns = [t for t in transactions if t.account_id == account_id]
-            projection = loans_mod.project_loan(account, account_txns)
-            if projection:
-                loan_projections.append(projection)
-
-        opening = sum(
-            (a.current_balance or 0) for a in accounts.values()
-            if a.account_type in {AccountType.SAVINGS, AccountType.CURRENT,
-                                  AccountType.WALLET}
-        )
-        forecast = forecast_mod.forecast(
-            monthly=analysis.monthly, series=recurring,
-            opening_balance=opening, horizon_months=6,
-            as_of=analysis.period_end,
-        )
 
         progress.phase("Saving")
         state = {
@@ -637,7 +592,7 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
             "transfer_report": transfer_report, "recurring": recurring,
             "statements": parsed_entries, "analysis": analysis,
             "loan_projections": loan_projections, "forecast": forecast,
-            "duplicate_count": len(duplicates),
+            "duplicate_count": enriched.duplicate_count,
         }
         from ..main import _persist, _build_payload, runs
         _persist(state)
@@ -652,7 +607,7 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
             "files_unreconciled": sum(1 for s in statement_rows if s["status"] == "unreconciled"),
             "files_failed": sum(1 for s in statement_rows
                                 if s["status"] in {"failed", "needs_password"}),
-            "duplicates_removed": len(duplicates),
+            "duplicates_removed": enriched.duplicate_count,
             "uncategorized_count": analysis.uncategorized_count,
             "notes": list(analysis.notes),
         }

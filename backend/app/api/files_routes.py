@@ -103,19 +103,12 @@ def merge_extracted_file_into_ledger(
     Gmail search can turn up a plausible-looking but wrong-month attachment,
     and merging that silently would be worse than reporting "not found".
     """
-    from ..analytics import forecast as forecast_mod
-    from ..analytics import loans as loans_mod
     from ..analytics.coverage import statement_months
-    from ..analytics.engine import analyze
-    from ..analytics.recurring import detect_recurring
-    from ..categorize.rules import categorize_by_rules, fallback_category
     from ..graph.nodes import _account_identity, _merge_account_facts
-    from ..models.schemas import (AccountType, Category, ConfidenceSource,
-                                  ReconciliationStatus)
+    from ..models.schemas import ReconciliationStatus
     from ..normalize.normalizer import normalize
     from ..normalize.parsers import extract_merchant
     from ..reconcile.balance_check import reconcile
-    from ..reconcile.transfers import detect_transfers, find_duplicate_transactions
 
     def _fail(status: str, message: str) -> dict[str, Any]:
         # upsert_source_file resolves identity by content hash FIRST - if this
@@ -182,46 +175,23 @@ def merge_extracted_file_into_ledger(
 
     profile = repo.get_profile(db)
     existing_txns = repo.get_transactions(db)
-    combined = existing_txns + new_txns
 
-    duplicates = find_duplicate_transactions(combined)
-    dupe_ids = {id(d) for d in duplicates}
-    combined = [t for t in combined if id(t) not in dupe_ids]
-    combined.sort(key=lambda t: (t.txn_date, t.account_id or ""))
+    from ..pipeline.enrich import enrich_ledger
 
-    transfer_report = detect_transfers(combined, existing_accounts)
-    categorize_by_rules(combined)  # only touches rows still UNCATEGORIZED
-    holder_names = [profile.full_name] if profile.full_name else []
-    for txn in combined:
-        if txn.category == Category.UNCATEGORIZED:
-            guess = fallback_category(txn, holder_names)
-            if guess != Category.UNCATEGORIZED:
-                txn.category = guess
-                txn.category_source = ConfidenceSource.DEFAULT
-                txn.category_confidence = 0.3
-
-    recurring = detect_recurring(combined)
-    analysis = analyze(combined, existing_accounts)
-    loan_projections = []
-    for aid, acct in existing_accounts.items():
-        acct_txns = [t for t in combined if t.account_id == aid]
-        projection = loans_mod.project_loan(acct, acct_txns)
-        if projection:
-            loan_projections.append(projection)
-    opening = sum(
-        (a.current_balance or 0) for a in existing_accounts.values()
-        if a.account_type in {AccountType.SAVINGS, AccountType.CURRENT, AccountType.WALLET}
+    enriched = enrich_ledger(
+        db,
+        existing_txns + new_txns,
+        existing_accounts,
+        holder_names=[profile.full_name] if profile.full_name else [],
     )
-    forecast = forecast_mod.forecast(
-        monthly=analysis.monthly, series=recurring, opening_balance=opening,
-        horizon_months=6, as_of=analysis.period_end,
-    )
+    combined = enriched.transactions
 
     state = {
         "accounts": existing_accounts, "transactions": combined,
-        "transfer_report": transfer_report, "recurring": recurring,
+        "transfer_report": enriched.transfer_report, "recurring": enriched.recurring,
         "statements": [{"statement": statement, "account": account, "reconciliation": recon}],
-        "analysis": analysis, "loan_projections": loan_projections, "forecast": forecast,
+        "analysis": enriched.analysis, "loan_projections": enriched.loan_projections,
+        "forecast": enriched.forecast,
     }
 
     from ..main import _build_payload, _persist, runs

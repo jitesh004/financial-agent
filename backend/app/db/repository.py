@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Iterable, Sequence
@@ -46,6 +47,22 @@ def _d(value: Any) -> date | None:
 
 def _new_id() -> str:
     return str(uuid.uuid4())
+
+
+def _col(row, name: str, default: Any = None) -> Any:
+    """Read a column that a given query may not have selected.
+
+    `sqlite3.Row` raises IndexError rather than returning None for an absent
+    key. Every caller here selects `*` against a migrated schema, so the
+    columns are present in practice - this keeps a partial SELECT, or a
+    database opened before its migration ran, from raising instead of simply
+    falling back to the field default.
+    """
+    try:
+        value = row[name]
+    except (IndexError, KeyError):
+        return default
+    return default if value is None else value
 
 
 # --------------------------------------------------------------------------
@@ -246,7 +263,9 @@ _TXN_COLUMNS = (
     "id, account_id, statement_id, txn_date, value_date, raw_description, "
     "normalized_description, merchant, amount, direction, balance_after, currency, "
     "category, category_source, category_confidence, is_internal_transfer, "
-    "transfer_pair_id, recurring_series_id, reference, source_row"
+    "is_mirror_leg, transfer_pair_id, recurring_series_id, reference, source_row, "
+    "fingerprint, accounting_month, needs_review, review_reason, flow_role, "
+    "excluded, note"
 )
 
 
@@ -262,11 +281,14 @@ def save_transactions(db: Database, transactions: Sequence[Transaction]) -> int:
             _txt(txn.amount), txn.direction.value, _txt(txn.balance_after),
             txn.currency, txn.category.value, txn.category_source.value,
             txn.category_confidence, int(txn.is_internal_transfer),
+            int(txn.is_mirror_leg),
             txn.transfer_pair_id, txn.recurring_series_id, txn.reference,
             txn.source_row,
+            txn.fingerprint, txn.accounting_month, int(txn.needs_review),
+            txn.review_reason, txn.flow_role, int(txn.excluded), txn.note,
         ))
 
-    placeholders = ",".join(["?"] * 20)
+    placeholders = ",".join(["?"] * len(_TXN_COLUMNS.split(",")))
     with db.connection() as conn:
         conn.executemany(
             f"INSERT OR REPLACE INTO transactions ({_TXN_COLUMNS}) VALUES ({placeholders})",
@@ -276,17 +298,29 @@ def save_transactions(db: Database, transactions: Sequence[Transaction]) -> int:
 
 
 def update_transaction_categories(db: Database, transactions: Iterable[Transaction]) -> int:
-    """Persist categorization results without rewriting the whole row."""
+    """Persist enrichment results without rewriting the whole row.
+
+    Carries `is_mirror_leg` and the user-authored columns as well as the
+    category. Leaving the mirror flag out of this write is what made a
+    dashboard rebuilt after a restart disagree with the one computed at
+    ingestion: analytics counts exactly one leg of a transfer as real cash,
+    and every reloaded row claimed to be the leg that counts.
+    """
     rows = [
         (t.category.value, t.category_source.value, t.category_confidence,
-         int(t.is_internal_transfer), t.transfer_pair_id, t.merchant, t.id)
+         int(t.is_internal_transfer), int(t.is_mirror_leg), t.transfer_pair_id,
+         t.merchant, t.fingerprint, t.accounting_month, int(t.needs_review),
+         t.review_reason, t.flow_role, int(t.excluded), t.note, t.id)
         for t in transactions if t.id
     ]
     with db.connection() as conn:
         conn.executemany(
             """UPDATE transactions
                   SET category = ?, category_source = ?, category_confidence = ?,
-                      is_internal_transfer = ?, transfer_pair_id = ?, merchant = ?
+                      is_internal_transfer = ?, is_mirror_leg = ?,
+                      transfer_pair_id = ?, merchant = ?, fingerprint = ?,
+                      accounting_month = ?, needs_review = ?, review_reason = ?,
+                      flow_role = ?, excluded = ?, note = ?
                 WHERE id = ?""",
             rows,
         )
@@ -432,10 +466,18 @@ def _row_to_transaction(row) -> Transaction:
         category_source=ConfidenceSource(row["category_source"]),
         category_confidence=row["category_confidence"],
         is_internal_transfer=bool(row["is_internal_transfer"]),
+        is_mirror_leg=bool(_col(row, "is_mirror_leg")),
         transfer_pair_id=row["transfer_pair_id"],
         recurring_series_id=row["recurring_series_id"],
         reference=row["reference"],
         source_row=row["source_row"],
+        fingerprint=_col(row, "fingerprint") or "",
+        accounting_month=_col(row, "accounting_month") or "",
+        needs_review=bool(_col(row, "needs_review")),
+        review_reason=_col(row, "review_reason") or "",
+        flow_role=_col(row, "flow_role") or "",
+        excluded=bool(_col(row, "excluded")),
+        note=_col(row, "note") or "",
     )
 
 
@@ -744,3 +786,151 @@ def save_recurring_series(db: Database, series: Sequence[Any]) -> int:
             rows,
         )
     return len(rows)
+
+
+# --------------------------------------------------------------------------
+# User overrides - tier 0
+#
+# Everything a human decided about a transaction. Keyed by content
+# fingerprint rather than transaction id, because re-parsing a statement
+# mints fresh uuids and would orphan every decision. Deliberately NOT
+# cleared by Database.clear("parsed_data"): the whole point is that
+# re-processing the ledger leaves the user's own judgements intact.
+# --------------------------------------------------------------------------
+
+#: The fields a user can override. Each is nullable and applied only when
+#: set, so recording a note does not silently pin a category as a side effect.
+OVERRIDE_FIELDS = ("category", "flow_role", "accounting_month", "note", "excluded")
+
+
+@dataclass
+class OverrideRecord:
+    fingerprint: str
+    account_key: str = ""
+    txn_date: str = ""
+    amount: str = ""
+    direction: str = ""
+    desc_hash: str = ""
+    category: str | None = None
+    flow_role: str | None = None
+    accounting_month: str | None = None
+    note: str | None = None
+    excluded: bool | None = None
+    updated_at: str = ""
+
+    def has_any(self) -> bool:
+        return any(getattr(self, f) is not None for f in OVERRIDE_FIELDS)
+
+
+def _row_to_override(row) -> OverrideRecord:
+    excluded = _col(row, "excluded")
+    return OverrideRecord(
+        fingerprint=row["fingerprint"],
+        account_key=_col(row, "account_key") or "",
+        txn_date=_col(row, "txn_date") or "",
+        amount=_col(row, "amount") or "",
+        direction=_col(row, "direction") or "",
+        desc_hash=_col(row, "desc_hash") or "",
+        category=_col(row, "category"),
+        flow_role=_col(row, "flow_role"),
+        accounting_month=_col(row, "accounting_month"),
+        note=_col(row, "note"),
+        excluded=None if excluded is None else bool(excluded),
+        updated_at=_col(row, "updated_at") or "",
+    )
+
+
+def save_override(db: Database, record: OverrideRecord) -> None:
+    """Insert or update one decision.
+
+    Only the fields actually supplied are written; the rest keep whatever the
+    user set previously. Passing an explicit value is the only way to change
+    a field, so adding a note never disturbs an earlier recategorization.
+    """
+    sets, params = [], []
+    for field in OVERRIDE_FIELDS:
+        value = getattr(record, field)
+        if value is None:
+            continue
+        sets.append(f"{field} = ?")
+        params.append(int(value) if field == "excluded" else value)
+
+    with db.connection() as conn:
+        conn.execute(
+            """INSERT INTO user_overrides
+                   (fingerprint, account_key, txn_date, amount, direction, desc_hash)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(fingerprint) DO UPDATE SET
+                   account_key = excluded.account_key,
+                   txn_date    = excluded.txn_date,
+                   amount      = excluded.amount,
+                   direction   = excluded.direction,
+                   desc_hash   = excluded.desc_hash""",
+            (record.fingerprint, record.account_key, record.txn_date,
+             record.amount, record.direction, record.desc_hash),
+        )
+        if sets:
+            conn.execute(
+                f"UPDATE user_overrides SET {', '.join(sets)}, "
+                f"updated_at = datetime('now') WHERE fingerprint = ?",
+                (*params, record.fingerprint),
+            )
+
+
+def clear_override_field(db: Database, fingerprint: str, field: str) -> None:
+    """Unset one field, letting the automatic value take over again.
+
+    Distinct from setting it to a falsy value: NULL means "no opinion", which
+    is not the same as an explicit `excluded = false`.
+    """
+    if field not in OVERRIDE_FIELDS:
+        raise ValueError(f"{field!r} is not an overridable field")
+    with db.connection() as conn:
+        conn.execute(
+            f"UPDATE user_overrides SET {field} = NULL, updated_at = datetime('now') "
+            f"WHERE fingerprint = ?", (fingerprint,))
+        # A row that no longer carries any opinion is noise; drop it so the
+        # "N decisions" count the UI shows stays truthful.
+        conn.execute(
+            "DELETE FROM user_overrides WHERE fingerprint = ? AND "
+            + " AND ".join(f"{f} IS NULL" for f in OVERRIDE_FIELDS),
+            (fingerprint,))
+
+
+def get_overrides(db: Database) -> list[OverrideRecord]:
+    with db.connection() as conn:
+        rows = conn.execute("SELECT * FROM user_overrides").fetchall()
+    return [_row_to_override(r) for r in rows]
+
+
+def count_overrides(db: Database) -> int:
+    with db.connection() as conn:
+        return conn.execute("SELECT COUNT(*) c FROM user_overrides").fetchone()["c"]
+
+
+def repoint_override(db: Database, old_fingerprint: str, new_fingerprint: str,
+                     account_key: str) -> None:
+    """Move a decision onto the fingerprint its transaction now has.
+
+    Called when a decision was found by the loose key because its strict
+    fingerprint had shifted - an account being re-identified is the usual
+    cause, and is nobody's mistake. Without this the same recovery would have
+    to happen on every subsequent run.
+    """
+    if old_fingerprint == new_fingerprint:
+        return
+    with db.connection() as conn:
+        # The destination may already exist if two rows collapsed onto one
+        # identity. The existing decision there is the more recent statement
+        # of intent, so it wins and the stale row is simply dropped.
+        exists = conn.execute(
+            "SELECT 1 FROM user_overrides WHERE fingerprint = ?",
+            (new_fingerprint,)).fetchone()
+        if exists:
+            conn.execute("DELETE FROM user_overrides WHERE fingerprint = ?",
+                         (old_fingerprint,))
+            return
+        conn.execute(
+            "UPDATE user_overrides SET fingerprint = ?, account_key = ? "
+            "WHERE fingerprint = ?",
+            (new_fingerprint, account_key, old_fingerprint))

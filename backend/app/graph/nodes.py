@@ -12,21 +12,16 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import date
-from decimal import Decimal
 from pathlib import Path
 
-from ..analytics import forecast as forecast_mod
-from ..analytics import loans as loans_mod
-from ..analytics.engine import analyze
-from ..analytics.recurring import detect_recurring
-from ..categorize.rules import categorize_by_rules, fallback_category
+from ..db.database import get_db
 from ..ingestion import router
-from ..models.schemas import (Account, AccountType, Category, ConfidenceSource,
-                              LIABILITY_TYPES, ReconciliationStatus, Statement)
+from ..models.schemas import (Account, AccountType, ReconciliationStatus,
+                              Statement)
 from ..normalize.normalizer import normalize
 from ..normalize.parsers import extract_merchant
 from ..reconcile.balance_check import reconcile
-from ..reconcile.transfers import detect_transfers, find_duplicate_transactions
+from ..reconcile.transfers import find_duplicate_transactions
 from .state import AnalysisState, FileTask, ParsedFile
 
 log = logging.getLogger(__name__)
@@ -352,104 +347,58 @@ def _merge_account_facts(target: Account, incoming: Account) -> None:
 # 4. Enrichment
 # --------------------------------------------------------------------------
 
-def detect_transfers_node(state: AnalysisState) -> dict:
-    """Flag money moved between the user's own accounts.
+def enrich_node(state: AnalysisState) -> dict:
+    """Everything between a merged ledger and a finished analysis.
 
-    Runs BEFORE categorization on purpose: cross-account evidence that a debit
-    is a credit-card payment is far stronger than any text pattern, and the
-    rules layer then leaves those rows alone.
+    This was seven separate graph nodes - transfers, rules, model, fallback,
+    recurring, analytics, loans, forecast - in a straight line with exactly
+    one branch, which `enrich_ledger` now makes internally. Collapsing them
+    is what lets the Gmail and file-retry routes run *the same* sequence
+    instead of each maintaining its own copy; the three had already drifted
+    apart, and the drift was invisible because every copy looked plausible.
+
+    The fan-out and retry machinery above `merge_ledger` is untouched - that
+    is where the graph earns its keep.
     """
-    transactions = state.get("transactions") or []
-    accounts = state.get("accounts") or {}
-    report = detect_transfers(transactions, accounts)
-    return {"transfer_report": report, "warnings": list(report.notes)}
+    from ..pipeline.enrich import enrich_ledger
+
+    result = enrich_ledger(
+        get_db(),
+        state.get("transactions") or [],
+        state.get("accounts") or {},
+        use_llm=bool(state.get("use_llm")),
+        holder_names=state.get("holder_names") or [],
+        horizon_months=state.get("horizon_months", 6),
+    )
+
+    warnings = list(result.warnings)
+    for projection in result.loan_projections:
+        account = (state.get("accounts") or {}).get(projection.account_id)
+        label = account.display_name() if account else "Loan"
+        warnings.extend(f"{label}: {w}" for w in projection.warnings)
+
+    return {
+        "transactions": result.transactions,
+        "transfer_report": result.transfer_report,
+        "recurring": result.recurring,
+        "analysis": result.analysis,
+        "loan_projections": result.loan_projections,
+        "forecast": result.forecast,
+        "rules_settled": result.rules_settled,
+        "llm_settled": result.llm_settled,
+        "warnings": warnings,
+        "status": "reporting",
+    }
 
 
-def categorize_node(state: AnalysisState) -> dict:
-    """Rules pass. Deterministic, instant, and settles most rows."""
-    transactions = state.get("transactions") or []
-    settled = categorize_by_rules(transactions)
-    return {"rules_settled": settled}
 
 
-def route_after_rules(state: AnalysisState) -> str:
-    """Only involve a model when rules genuinely left something unresolved."""
-    transactions = state.get("transactions") or []
-    remaining = [t for t in transactions if t.category == Category.UNCATEGORIZED]
-    if remaining and state.get("use_llm"):
-        return "categorize_llm"
-    return "finalize_categories"
 
-
-def finalize_categories(state: AnalysisState) -> dict:
-    """Assign a last-resort bucket to whatever is still unlabelled."""
-    transactions = state.get("transactions") or []
-    holder_names = state.get("holder_names") or []
-    touched = 0
-    for txn in transactions:
-        if txn.category == Category.UNCATEGORIZED:
-            fallback = fallback_category(txn, holder_names)
-            if fallback != Category.UNCATEGORIZED:
-                txn.category = fallback
-                txn.category_source = ConfidenceSource.DEFAULT
-                txn.category_confidence = 0.3
-                touched += 1
-    return {"warnings": [] if not touched else
-            [f"{touched} transaction(s) fell back to a default category."]}
-
-
-def detect_recurring_node(state: AnalysisState) -> dict:
-    series = detect_recurring(state.get("transactions") or [])
-    return {"recurring": series}
 
 
 # --------------------------------------------------------------------------
 # 5. Analysis
 # --------------------------------------------------------------------------
 
-def run_analytics(state: AnalysisState) -> dict:
-    analysis = analyze(state.get("transactions") or [], state.get("accounts") or {})
-    return {"analysis": analysis, "status": "analyzing"}
 
 
-def project_loans(state: AnalysisState) -> dict:
-    """Amortize every loan account. Pure formula, no estimation."""
-    accounts = state.get("accounts") or {}
-    transactions = state.get("transactions") or []
-
-    projections = []
-    warnings = []
-    for account_id, account in accounts.items():
-        account_txns = [t for t in transactions if t.account_id == account_id]
-        projection = loans_mod.project_loan(account, account_txns)
-        if projection:
-            projections.append(projection)
-            warnings.extend(f"{account.display_name()}: {w}" for w in projection.warnings)
-
-    return {"loan_projections": projections, "warnings": warnings}
-
-
-def build_forecast(state: AnalysisState) -> dict:
-    analysis = state.get("analysis")
-    if analysis is None:
-        return {"forecast": None}
-
-    accounts = state.get("accounts") or {}
-    # Forecast the CASH position: what is actually spendable. Investment
-    # holdings are excluded because selling them to cover a shortfall is a
-    # decision, not a cashflow, and loans are liabilities rather than balances.
-    opening = sum(
-        (a.current_balance or Decimal("0"))
-        for a in accounts.values()
-        if a.account_type in {AccountType.SAVINGS, AccountType.CURRENT,
-                              AccountType.WALLET}
-    )
-
-    result = forecast_mod.forecast(
-        monthly=analysis.monthly,
-        series=state.get("recurring") or [],
-        opening_balance=opening,
-        horizon_months=state.get("horizon_months", 6),
-        as_of=analysis.period_end or date.today(),
-    )
-    return {"forecast": result, "status": "reporting"}

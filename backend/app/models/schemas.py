@@ -252,6 +252,39 @@ class Transaction(BaseModel):
     reference: str | None = None
     source_row: int | None = None
 
+    #: Content identity - account, date, amount, direction, description - as
+    #: opposed to `id`, which is a fresh uuid on every parse. Everything the
+    #: user authors (a corrected category, a note, an exclusion) hangs off
+    #: this, so their decisions survive re-processing the same statement.
+    #: See pipeline.fingerprint.
+    fingerprint: str = ""
+
+    #: The period this row is reported in (YYYY-MM). Usually the calendar
+    #: month of `txn_date`, but not always: a salary paid on the last working
+    #: day arrives on the 31st one month and the 1st two months later, which
+    #: would double-count one month and empty another. Set by
+    #: analytics.periods; empty until then.
+    accounting_month: str = ""
+
+    #: Automatic classification was not confident enough to decide alone. The
+    #: safe default has still been applied - this never leaves a figure
+    #: missing - but the row is surfaced for the user to confirm or flip.
+    needs_review: bool = False
+    review_reason: str = ""
+
+    #: Which side of the books this row lands on. Populated in Workstream 2;
+    #: empty means "derive it from category and direction", which is what the
+    #: existing `is_spend` property already does.
+    flow_role: str = ""
+
+    #: True when the user explicitly took this row out of all totals. Distinct
+    #: from a transfer: a transfer is excluded because it is not a real flow,
+    #: this is excluded because the user said so.
+    excluded: bool = False
+
+    #: Free-text note the user attached to this row.
+    note: str = ""
+
     @field_validator("amount")
     @classmethod
     def _amount_non_negative(cls, v: Decimal) -> Decimal:
@@ -269,6 +302,10 @@ class Transaction(BaseModel):
         """True only for money that genuinely left the user's net worth."""
         return (
             self.direction == Direction.DEBIT
+            # A row the user explicitly took out of their totals is out of
+            # every total, unconditionally - this check comes first because
+            # an explicit human decision outranks anything inferred.
+            and not self.excluded
             and not self.is_internal_transfer
             and self.category not in NON_SPEND_CATEGORIES
         )
