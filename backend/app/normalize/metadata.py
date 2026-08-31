@@ -619,7 +619,7 @@ def extract_metadata(text: str, filename: str = "", sender: str = "") -> Stateme
         meta.period_start, meta.period_end = detect_period(text)
 
     holder = _find_labeled(head or text, [
-        r"account\s*holder(?:\s*name)?", r"customer\s*name", r"borrower\s*name",
+        r"prepared\s*for", r"account\s*holder(?:\s*name)?", r"customer\s*name", r"borrower\s*name",
         r"investor\s*name", r"card\s*holder(?:\s*name)?", r"name\s*of\s*(?:the\s*)?holder",
     ])
     if holder and not re.search(r"\d{4,}", holder):
@@ -635,7 +635,7 @@ def extract_metadata(text: str, filename: str = "", sender: str = "") -> Stateme
         r"closing\s*balance", r"balance\s*c/?f", r"carried\s*forward",
         r"total\s*amount\s*due", r"closing\s*principal\s*outstanding",
         r"current\s*balance", r"net\s*balance", r"total\s*dues",
-    ], take="last")
+    ])
     meta.credit_limit = _labeled_amount(balances_text, [
         r"credit\s*limit", r"total\s*credit\s*limit", r"sanctioned\s*limit",
     ])

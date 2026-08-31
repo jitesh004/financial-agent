@@ -47,7 +47,7 @@ def query_schema() -> dict[str, Any]:
     return q.schema(get_db())
 
 
-def _apply_board(spec: dict[str, Any], board: dict[str, Any] | None) -> dict[str, Any]:
+def _apply_board(spec: Any, board: dict[str, Any] | None) -> dict[str, Any]:
     """Overlay a board's date range and filters onto one widget's query.
 
     The board's range wins unless the widget pinned its own - a "last year vs
@@ -55,6 +55,8 @@ def _apply_board(spec: dict[str, Any], board: dict[str, Any] | None) -> dict[str
     month, or it stops meaning anything. Board filters always AND with the
     widget's: they narrow, never widen.
     """
+    if not isinstance(spec, dict):
+        return {}
     if not board:
         return spec
     merged = dict(spec)

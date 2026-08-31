@@ -399,7 +399,7 @@ def read_file(path: Path, password: str | None = None,
         log.exception("portfolio extraction crashed on %s", path.name)
         return None, [f"Extraction failed: {type(exc).__name__}: {exc}"]
 
-    text = getattr(result, "text", "") or ""
+    text = getattr(result, "full_text", "") or getattr(result, "text", "") or ""
     tables = getattr(result, "tables", []) or []
     for table in tables:
         for row in getattr(table, "rows", []) or []:

@@ -172,10 +172,10 @@ TEMPLATES: list[Template] = [
     Template(
         "card-spend", "debit", kind="card",
         pattern=_compile(
-            rf"{_AMOUNT}\s*(?:was\s+)?(?:spent|used|charged)\s*(?:on|at|using)?\s*"
-            rf"(?:your\s*)?(?:.{{0,30}}?card\s*)?(?:ending\s*(?:with\s*)?)?"
+            rf"{_AMOUNT}\s*(?:has been |is |was )?(?:spent|used|charged|debited)\s*(?:on|at|using)?\s*"
+            rf"(?:your\s*)?(?:.{{0,50}}?card\s*)?(?:ending\s*(?:with\s*)?)?"
             rf"(?P<account>[\w*x]*\d{{4}})?"
-            rf".{{0,60}}?(?:at|towards)\s+(?P<payee>[\w@.\-& ]{{2,60}}?)"
+            rf".{{0,80}}?(?:at|towards|for)\s+(?P<payee>[\w@.\-& ]{{2,60}}?)"
             rf"(?:\s+on\s+{_DATE_TOKEN})?[\s.]")),
     Template(
         "atm-withdrawal", "debit", kind="atm",
@@ -187,16 +187,20 @@ TEMPLATES: list[Template] = [
     Template(
         "generic-debit", "debit",
         pattern=_compile(
+            rf"(?:(?:your\s*)?(?:[\w\s]{{0,30}}?(?:account|a/?c)\s*(?:no\.?\s*)?)?"
+            rf"(?P<account>[\w*x]*\d{{4}})?\s*(?:has been |is |was )?debited\s*(?:for|with|by|from)?\s*)?"
             rf"{_AMOUNT}\s*(?:has been |is |was )?debited"
             rf"(?:.{{0,40}}?(?:a/?c|account)\s*(?:no\.?\s*)?"
-            rf"(?P<account>[\w*x]*\d{{4}}))?"
+            rf"(?P<account2>[\w*x]*\d{{4}}))?"
             rf"(?:.{{0,80}}?on\s+{_DATE_TOKEN})?")),
     Template(
         "generic-credit", "credit",
         pattern=_compile(
+            rf"(?:(?:your\s*)?(?:[\w\s]{{0,30}}?(?:account|a/?c)\s*(?:no\.?\s*)?)?"
+            rf"(?P<account>[\w*x]*\d{{4}})?\s*(?:has been |is |was )?credited\s*(?:for|with|by|to|into)?\s*)?"
             rf"{_AMOUNT}\s*(?:has been |is |was )?credited"
             rf"(?:.{{0,40}}?(?:a/?c|account)\s*(?:no\.?\s*)?"
-            rf"(?P<account>[\w*x]*\d{{4}}))?"
+            rf"(?P<account2>[\w*x]*\d{{4}}))?"
             rf"(?:.{{0,80}}?on\s+{_DATE_TOKEN})?")),
 ]
 
@@ -205,9 +209,8 @@ TEMPLATES: list[Template] = [
 #: declined transaction becomes a real one.
 NOT_A_TRANSACTION = re.compile(
     r"\b(?:will be|would be|is due|due on|reminder|scheduled|has failed|"
-    r"failed|declined|unsuccessful|not (?:been )?(?:processed|completed)|"
-    r"request(?:ed)? (?:for|to)|otp|one[- ]time password|"
-    r"do not share|statement is ready|e-?statement|"
+    r"failed|declined|unsuccessful|statement is ready|e-?statement|"
+    r"your otp is|is your otp|your verification code|use otp|"
     r"auto[- ]?pay (?:is )?(?:set|scheduled))\b", re.IGNORECASE)
 
 

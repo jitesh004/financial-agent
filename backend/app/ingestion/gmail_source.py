@@ -616,7 +616,8 @@ REJECTION_RULES: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
-def statement_rejection_reason(sender: str, subject: str) -> str | None:
+def statement_rejection_reason(sender: str, subject: str,
+                               intent: str = DEFAULT_INTENT) -> str | None:
     """Why this email is not a statement, or None if it is one.
 
     Returning a reason rather than a bare bool is what makes the filter
@@ -625,6 +626,14 @@ def statement_rejection_reason(sender: str, subject: str) -> str | None:
     """
     subject = subject or ""
     haystack = f"{sender} {subject}".lower()
+
+    if intent == "bureau":
+        for pattern, reason in REJECTION_RULES:
+            if pattern.search(subject):
+                return reason
+        if any(t in haystack for t in _BUREAU_SUBJECT_TERMS) or any(t in haystack for t in _BUREAU_FROM_TERMS):
+            return None
+        return "no bureau signal"
 
     # 1. Explicit non-statements lose regardless of who sent them.
     for pattern, reason in REJECTION_RULES:
@@ -701,6 +710,7 @@ def find_statements(
     max_messages: int = 100,
     require_statement_sender: bool = True,
     progress: Any = None,
+    intent: str = DEFAULT_INTENT,
 ) -> FetchResult:
     """List statement PDF attachments matching the query. Downloads nothing.
 
@@ -752,7 +762,7 @@ def find_statements(
         date = _header(message, "Date")
 
         if require_statement_sender:
-            reason = statement_rejection_reason(sender, subject)
+            reason = statement_rejection_reason(sender, subject, intent=intent)
             if reason is not None:
                 pdf_count = sum(
                     1 for part in _walk_parts(message.get("payload", {}))

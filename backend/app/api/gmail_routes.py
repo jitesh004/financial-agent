@@ -345,7 +345,8 @@ def _run_scan(job_id: str, max_messages: int, months: int | None = None,
 
         query = build_query(months=months, intent=intent)
         result = find_statements(client, query=query,
-                                 max_messages=max_messages, progress=on_fetch)
+                                 max_messages=max_messages, progress=on_fetch,
+                                 intent=intent)
 
         # Second phase, so the counter restarts against a new denominator
         # instead of continuing from the message count.
@@ -657,7 +658,7 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
                     parse_status=_REGISTRY_STATUS.get(status, status),
                     institution_guess=extra.get("institution", ""),
                     account_type_guess=extra.get("account_type", ""),
-                    statement_id=statement_obj.id if statement_obj else None,
+                    statement_id=None,
                     transaction_count=extra.get("transaction_count", 0),
                     error_message=message,
                 ))
@@ -714,6 +715,37 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
                     f"Profile > Known passwords.",
                     password_rule=label, file_hash=digest, size_bytes=size_bytes,
                     password_status=password_status)
+                continue
+
+            # Check if this is a credit bureau report
+            from ..ingestion import bureau
+            text = bureau._text_of(extraction)
+            if bureau.looks_like_bureau_report(text, name):
+                bureau_report = bureau.parse_report(text, name)
+                bureau_report.warnings = [*extraction.warnings, *bureau_report.warnings]
+                repo.save_bureau_report(db, bureau_report, file_hash=digest, filename=name)
+                try:
+                    ledger_accounts = repo.get_accounts(db)
+                    stored_bureau = repo.get_bureau_accounts(db)
+                    from .wealth_routes import _Attr
+                    from ..reconcile import bureau_match
+                    matches = bureau_match.match_accounts([_Attr(row) for row in stored_bureau], ledger_accounts)
+                    repo.apply_bureau_matches(db, matches)
+                except Exception as e:
+                    log.warning("failed to rematch bureau: %s", e)
+
+                progress.item(
+                    name, "done",
+                    f"Bureau report · {bureau_report.bureau.upper()} · Score {bureau_report.score or '—'}",
+                    key=str(path),
+                )
+                record_file("ok", f"Credit bureau report: {bureau_report.bureau.upper()} (score: {bureau_report.score or '—'})",
+                            transaction_count=0,
+                            account=bureau_report.bureau.upper(),
+                            file_hash=digest, size_bytes=size_bytes,
+                            password=resolved_password, password_status=password_status,
+                            institution=bureau_report.bureau.upper(),
+                            account_type="credit_report")
                 continue
 
             if not extraction.tables:
@@ -794,10 +826,13 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
                 account_type=account.account_type.value,
             )
 
+        for record in file_records:
+            repo.upsert_source_file(db, record)
+
         if not transactions:
             progress.complete(
                 result={"statements": statement_rows, "transaction_count": 0},
-                message="No transactions could be parsed from these files.")
+                message=f"{len(statement_rows)} file(s) processed (no bank transactions).")
             return
 
         # ---- Shared enrichment + analysis ------------------------------

@@ -452,6 +452,8 @@ def compile_query(spec: dict[str, Any], today: date | None = None) -> Compiled:
         decoders.append("raw")
 
     for i, requested in enumerate(measures):
+        if isinstance(requested, str):
+            requested = {"field": requested}
         measure_key = requested.get("field")
         measure = MEASURES.get(measure_key)
         if measure is None:

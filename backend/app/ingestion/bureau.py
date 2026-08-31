@@ -507,7 +507,7 @@ def _text_of(result: Any) -> str:
     else; a bureau report can come back either way depending on how the issuer
     laid it out, and both have to be readable here.
     """
-    text = getattr(result, "text", "") or ""
+    text = getattr(result, "full_text", "") or getattr(result, "text", "") or ""
     for table in getattr(result, "tables", []) or []:
         for row in getattr(table, "rows", []) or []:
             text += "\n" + " ".join(str(cell) for cell in row if cell)
