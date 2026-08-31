@@ -29,7 +29,7 @@ const SECTIONS = [
 
 const STORAGE_KEY = 'fa-datahub-section';
 
-export default function DataHub({ data }) {
+export default function DataHub({ data, onImport }) {
   const [section, setSection] = useState(
     () => localStorage.getItem(STORAGE_KEY) || 'quality');
 
@@ -55,8 +55,8 @@ export default function DataHub({ data }) {
         {active.hint}
       </div>
 
-      {section === 'quality' && <Files data={data} />}
-      {section === 'registry' && <FilesAndPasswords />}
+      {section === 'quality' && <Files data={data} onImport={onImport} />}
+      {section === 'registry' && <FilesAndPasswords onImport={onImport} />}
       {section === 'manage' && <DataManager />}
     </>
   );

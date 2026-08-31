@@ -330,41 +330,39 @@ export default function useMailbox({ open, onImported }) {
   /* Alerts arrive fully parsed inside the scan's own result - there is no file
      to download, so nothing else in the chain would ever put them in staging.
      Staged once per scan, keyed on the scan's id. */
-  const stagedAlertsRef = useRef(null);
-  useEffect(() => {
-    const alertRows = scanResult?.alerts;
-    if (!scanJob?.id || !alertRows?.length) return;
-    if (stagedAlertsRef.current === scanJob.id) return;
-    stagedAlertsRef.current = scanJob.id;
-    api.stageScanResults({
-      files: [],
-      /* Staged on whether the alert was UNDERSTOOD, not on whether an
-         account matched. "No account here ends 4345" is a statement about
-         the ledger, and in this flow the ledger does not exist yet - the
-         statement that would create that account is two steps away. Matching
-         happens when the ledger is built, where there is something to match
-         against. */
-      alerts: alertRows.filter(
-        (a) => a.amount && a.date_iso && a.account_suffix),
-    }).catch(() => { stagedAlertsRef.current = null; });
-  }, [scanJob?.id, scanResult]);
+
   const scanIntent = scanResult?.intent || 'statement';
 
   /* Everything every source's scan turned up, each row tagged with the source
      that found it. The footer counts a selection made anywhere against this,
      which is what makes ticking a file in one section enable the button. */
   const rows = useMemo(() => {
-    const out = [];
-    const seen = new Set();
+    /* One row per document, attributed to the MOST SPECIFIC scan that found
+       it.
+     *
+     * The sources overlap by design: the statement scan's sender list already
+     * contains every broker, so a Zerodha holdings PDF is found by both
+     * "Account statements" and "Investments". Keeping whichever arrived first
+     * meant 108 investment files were attributed to statements, staged as
+     * statements, and the Investments section reported nothing at all - while
+     * Choose went on offering them, because it counted each source's own
+     * results and so counted those files twice. */
+    const specificity = { statement: 0, upload: 1, bureau: 2, investment: 2,
+                          transactional: 2 };
+    const byId = new Map();
     for (const [key, result] of Object.entries(sourceResults || {})) {
       for (const row of result?.attachments || []) {
         const id = `${row.message_id}:${row.filename}:${row.size}`;
-        if (seen.has(id)) continue;
-        seen.add(id);
-        out.push({ ...row, intent: row.intent || key });
+        const intent = row.intent || key;
+        const existing = byId.get(id);
+        if (existing
+            && (specificity[existing.intent] ?? 0) >= (specificity[intent] ?? 0)) {
+          continue;
+        }
+        byId.set(id, { ...row, intent });
       }
     }
-    if (out.length) return out;
+    if (byId.size) return [...byId.values()];
     // Nothing per-source yet (a scan started from the old single-scan path).
     return scanResult?.attachments || [];
   }, [sourceResults, scanResult]);
@@ -469,6 +467,52 @@ export default function useMailbox({ open, onImported }) {
   }, []);
 
   useEffect(() => { if (open) refreshSections(); }, [open, refreshSections]);
+
+  /* Re-read the per-source counts whenever reading or rebuilding finishes.
+   *
+   * The Parse step refreshed only after a run IT started, but the common path
+   * starts one from Choose - "Download & read" chains download -> parse - and
+   * nothing told the counts to reload afterwards. The screen went on showing
+   * the numbers from before the download: 146 statements and no investments,
+   * over a staging area that by then held 39 and 107. */
+  const settledWorkRef = useRef(null);
+  useEffect(() => {
+    if (!job || job.active) return;
+    if (!['stage_parse', 'stage_process', 'alerts'].includes(job.kind)) return;
+    if (settledWorkRef.current === job.id) return;
+    settledWorkRef.current = job.id;
+    refreshSections();
+  }, [job, refreshSections]);
+
+  /* Alerts are staged from the ALERT source's own result.
+   *
+   * This used to read `scanJob` - the single most recently adopted scan -
+   * which stopped being the alert scan the moment a source was scanned after
+   * it. Scanning alerts and then statements left the alerts staged nowhere:
+   * the Choose step offered 113 of them, ticking made no difference, and
+   * Parse reported the source empty. Each source keeps its own result now, so
+   * this reads the one it actually needs. */
+  const stagedAlertsRef = useRef(null);
+  useEffect(() => {
+    const result = sourceResults?.transactional;
+    const alertRows = result?.alerts;
+    if (!result?.__id || !alertRows?.length) return;
+    if (stagedAlertsRef.current === result.__id) return;
+    stagedAlertsRef.current = result.__id;
+    api.stageScanResults({
+      files: [],
+      /* Staged on whether the alert was UNDERSTOOD, not on whether an
+         account matched. "No account here ends 4345" is a statement about
+         the ledger, and in this flow the ledger may not have been built yet -
+         the statement that would create that account can be two steps away.
+         Matching happens when the ledger is built, where there is something
+         to match against. */
+      alerts: alertRows.filter(
+        (a) => a.amount && a.date_iso && a.account_suffix),
+    })
+      .then(() => refreshSections())
+      .catch(() => { stagedAlertsRef.current = null; });
+  }, [sourceResults, refreshSections]);
 
   /* Scan ONE source. Nothing else is touched, which is what makes the Retry
      button in each section mean "just this one" - re-reading alerts must not

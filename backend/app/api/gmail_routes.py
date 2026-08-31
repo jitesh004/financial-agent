@@ -197,6 +197,55 @@ def _run_multi_scan(job_id: str, max_messages: int, months: int | None,
         _run_alert_scan(job_id, max_messages, months, append=bool(file_intents))
 
 
+def _staged_accounts(db, already: list | None = None) -> list:
+    """Accounts described by staged statements that the LEDGER does not have.
+
+    These are real accounts the user holds - simply not processed yet - and an
+    alert matching one of them is matchable whatever the ledger currently
+    says.
+
+    Deduplicated against the ledger, and that is the whole difficulty: adding
+    a staged copy of a card the ledger already knows gives `match_account` two
+    candidates ending 9239 and it refuses the ambiguity, exactly as it should.
+    Every alert for a known card was then rejected with "2 accounts end 9239
+    and the sender does not say which" - a worse failure than the one this
+    function exists to fix.
+    """
+    from ..db import staging as _staging
+    from ..models.schemas import Account
+
+    def key_of(institution: str, mask: str) -> str:
+        return f"{(institution or '').strip().lower()}|{(mask or '').strip().lower()}"
+
+    out = []
+    seen = {key_of(a.institution, a.account_number_masked)
+            for a in (already or [])}
+    try:
+        entries = _staging.all_entries(db, kinds=("statement",),
+                                       with_payload=True)
+    except Exception:  # pragma: no cover - a hint is never load-bearing
+        log.warning("could not read staged accounts for alert matching")
+        return out
+    for entry in entries:
+        payload = (entry.get("payload") or {}).get("account")
+        if not payload:
+            continue
+        key = key_of(payload.get("institution", ""),
+                     payload.get("account_number_masked", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            account = Account(**payload)
+        except Exception:
+            continue
+        # A synthetic id so `match_account` has something to return; the
+        # rebuild resolves the real one when it materialises the statement.
+        account.id = f"staged:{key}"
+        out.append(account)
+    return out
+
+
 def _run_alert_scan(job_id: str, max_messages: int,
                     months: int | None = None, append: bool = False) -> None:
     """Read alert emails and parse them, without writing anything.
@@ -225,7 +274,17 @@ def _run_alert_scan(job_id: str, max_messages: int,
         progress.bump_total(max(1, len(found.alerts)))
         progress.phase("Reading the alerts")
 
-        accounts = repo.get_accounts(db)
+        # Accounts from the LEDGER and from anything staged.
+        #
+        # An alert names four digits and an issuer and nothing else, so it can
+        # only be attached to an account some statement has described. Asking
+        # only the ledger made that verdict depend on WHEN you scanned: with
+        # the ledger cleared and 604 statements sitting in staging waiting to
+        # be processed, every one of 211 alerts was refused for belonging to
+        # "no account here" - a true statement about an empty table and a
+        # useless one about the user's cards.
+        ledger_accounts = repo.get_accounts(db)
+        accounts = ledger_accounts + _staged_accounts(db, ledger_accounts)
         existing = repo.get_transactions(db)
         outcome = alerts_pipeline.build_transactions(
             found.alerts, accounts, existing)

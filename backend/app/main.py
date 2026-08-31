@@ -228,6 +228,18 @@ CLEAR_ACTIONS: tuple[ClearAction, ...] = (
         preserves=("statement files", "AI inference", "your decisions", "your profile"),
     ),
     ClearAction(
+        scope="staged_imports",
+        label="Forget everything staged",
+        description="Empty the import wizard's staging area - every document "
+                    "it has read and every choice about them - without "
+                    "touching the ledger those choices already produced. "
+                    "Start here when a narrower scan should mean a smaller "
+                    "set, because staging accumulates and never shrinks on "
+                    "its own.",
+        clears=("staged documents", "what is ticked for import"),
+        preserves=("your ledger", "downloaded files", "your decisions"),
+    ),
+    ClearAction(
         scope="files",
         label="Clear downloaded files",
         description="Remove the statement files themselves along with the "

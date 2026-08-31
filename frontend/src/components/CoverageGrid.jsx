@@ -100,7 +100,7 @@ export default function CoverageGrid({ onSelectFile }) {
     );
   }
   if (!rows.length) {
-    return <Empty title="No accounts yet">Upload statements, or connect Gmail, to see coverage here.</Empty>;
+    return <Empty title="No accounts yet">Import some statements to see coverage here.</Empty>;
   }
 
   const missingCount = rows.reduce(

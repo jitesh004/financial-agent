@@ -109,16 +109,6 @@ export default function App() {
         </div>
 
         <nav className="tabs" role="tablist">
-          {!hasData && (
-            <button
-              className="tab"
-              role="tab"
-              aria-selected={!ALWAYS_AVAILABLE.includes(tab)}
-              onClick={() => setTab('overview')}
-            >
-              Upload
-            </button>
-          )}
           {TABS.map(([key, label]) => {
             const isDataTab = !ALWAYS_AVAILABLE.includes(key);
             if (!hasData && isDataTab) return null;
@@ -203,10 +193,12 @@ export default function App() {
             {tab === 'review' && <ReviewHub />}
             {tab === 'ledger' && <Ledger data={data} />}
             {tab === 'debt' && <Debt data={data} />}
-            {tab === 'credit' && <CreditReport accounts={data?.accounts || []} />}
-            {tab === 'portfolio' && <Portfolio />}
+            {tab === 'credit' && <CreditReport accounts={data?.accounts || []}
+              onImport={() => setMailboxOpen(true)} />}
+            {tab === 'portfolio' && <Portfolio onImport={() => setMailboxOpen(true)} />}
             {tab === 'explore' && <Explore />}
-            {tab === 'data' && <DataHub data={data} />}
+            {tab === 'data' && <DataHub data={data}
+              onImport={() => setMailboxOpen(true)} />}
             {tab === 'settings' && <Settings onLedgerChanged={load} />}
           </>
         )}

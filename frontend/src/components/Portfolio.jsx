@@ -15,7 +15,7 @@ const KIND_LABEL = {
   bond: 'Bonds & debt', other: 'Other',
 };
 
-export default function Portfolio() {
+export default function Portfolio({ onImport }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [sort, setSort] = useState({ key: 'value', dir: 'desc' });
@@ -48,7 +48,12 @@ export default function Portfolio() {
 
   if (!holdings.length) {
     return (
-      <Empty title="No holdings imported yet">
+      <Empty title="No holdings imported yet"
+        action={onImport && (
+          <button className="btn primary" onClick={onImport}>
+            Import statements
+          </button>
+        )}>
         Import a CAS from CDSL or NSDL, a CAMS or KFintech statement, or your
         broker&apos;s own holdings PDF. Every position is valued at the NAV the
         statement printed, and the total is checked against the one it declares.

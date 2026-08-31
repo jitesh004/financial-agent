@@ -26,7 +26,7 @@ const SOURCE_LABEL = { gmail: 'Gmail', upload: 'Uploaded' };
  * password opened it, whether it parsed, and - for one that didn't - a way to
  * fix the password and try again without re-processing everything else.
  */
-export default function FilesAndPasswords() {
+export default function FilesAndPasswords({ onImport }) {
   const [files, setFiles] = useState(null);
   const [error, setError] = useState(null);
   const [filter, setFilter] = useState('');
@@ -135,7 +135,16 @@ if (error) return <Callout tone="neg">{error}</Callout>;
     );
   }
   if (!files.length) {
-    return <Empty title="No files yet">Upload statements, or connect Gmail, to see them here.</Empty>;
+    return (
+      <Empty title="No files yet"
+        action={onImport && (
+          <button className="btn primary" onClick={onImport}>
+            Import statements
+          </button>
+        )}>
+        Import some statements to see them here.
+      </Empty>
+    );
   }
 
   return (

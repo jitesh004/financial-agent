@@ -87,6 +87,17 @@ class SelectionRequest(BaseModel):
     groups: list[GroupSelection] = []
 
 
+#: Where an entry belongs when it never recorded which scan found it -
+#: inferred from what reading it revealed, which is the next best evidence.
+_INTENT_FOR_KIND = {
+    "alert": "transactional",
+    "bureau": "bureau",
+    "portfolio": "investment",
+    "trades": "investment",
+    "statement": "statement",
+}
+
+
 def _group_key(entry: dict[str, Any]) -> str:
     return f"{entry.get('account_key') or 'unattached'}::{entry.get('kind')}"
 
@@ -222,7 +233,11 @@ def sections() -> dict[str, Any]:
         }
 
     for entry in entries:
-        key = entry.get("scan_intent") or "statement"
+        # An entry with no recorded source is placed by WHAT IT IS rather than
+        # assumed to be a statement. Assuming hid 113 alerts inside the
+        # statements count, where nothing could act on them.
+        key = entry.get("scan_intent") or _INTENT_FOR_KIND.get(
+            entry.get("kind"), "statement")
         if key not in out:
             # A source that no longer exists in the registry still has files
             # staged against it, and they must stay visible.
@@ -363,6 +378,29 @@ def select(request: SelectionRequest) -> dict[str, Any]:
     # Unticking a statement can revive the alerts it was superseding.
     staging.apply_supersession(db)
     return {"changed": len(decisions), **staging.counts(db)}
+
+
+@router.post("/forget")
+def forget(intent: str | None = None) -> dict[str, Any]:
+    """Drop staged documents - one source's, or all of them.
+
+    Staging is a library, not a queue: it keeps every document it has ever
+    read, so narrowing a scan from a year to three months does NOT make the
+    older ones go away. That is the right default - they were read correctly
+    and re-reading them costs minutes - but it means there has to be a way to
+    say "forget those", and this is it.
+
+    The ledger is untouched. What was already processed stays processed until
+    the next Process data rebuilds it from whatever is left here.
+    """
+    db = get_db()
+    entries = staging.all_entries(db)
+    doomed = [e["id"] for e in entries
+              if not intent or (e.get("scan_intent") or "statement") == intent]
+    removed = staging.remove(db, doomed)
+    staging.apply_supersession(db)
+    return {"removed": removed, "scope": intent or "everything",
+            **staging.counts(db)}
 
 
 @router.delete("/files")

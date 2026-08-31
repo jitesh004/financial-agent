@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Callout, Card, Chip, Stat } from './ui';
+import { Callout, Card, Chip, ConfirmButton, Stat } from './ui';
 import { api, titleCase } from '../lib';
 import { PREFS, usePrefs } from '../prefs';
 import LlmSettings from './LlmSettings';
@@ -53,10 +53,6 @@ export default function Settings({ onLedgerChanged }) {
   }
 
   async function remove(cat) {
-    if (!window.confirm(
-      `Remove "${titleCase(cat)}"? Transactions using it become uncategorized.`)) {
-      return;
-    }
     try {
       await api.deleteCategory(cat);
       load();
@@ -111,13 +107,15 @@ export default function Settings({ onLedgerChanged }) {
           {custom.map((c) => (
             <span key={c} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
               <Chip tone="accent">{titleCase(c)}</Chip>
-              <button
+              <ConfirmButton
                 className="btn icon"
                 title={`Remove ${titleCase(c)}`}
-                onClick={() => remove(c)}
+                question={`Remove "${titleCase(c)}"? Transactions using it become uncategorized.`}
+                confirmLabel="Remove"
+                onConfirm={() => remove(c)}
               >
                 ×
-              </button>
+              </ConfirmButton>
             </span>
           ))}
         </div>

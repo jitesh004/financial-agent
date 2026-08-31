@@ -377,6 +377,9 @@ api.stagingSelect = (body) => request('/api/staging/select', {
   body: JSON.stringify(body),
 });
 api.stagingSections = () => request('/api/staging/sections');
+api.stagingForget = (intent) => jsonPost(
+  intent ? `/api/staging/forget?intent=${encodeURIComponent(intent)}`
+         : '/api/staging/forget');
 api.stagingParse = (intent) => jsonPost(
   intent ? `/api/staging/parse?intent=${encodeURIComponent(intent)}`
          : '/api/staging/parse');

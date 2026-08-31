@@ -12,7 +12,9 @@ import { Callout, Chip } from '../ui';
  * Nothing here reaches the ledger. That is the next step but one.
  */
 
-export default function ParseSections({ sections, onParse, onRefresh, busy }) {
+export default function ParseSections({
+  intents, chosen, sections, chosenCounts, onParse, onRefresh, busy,
+}) {
   const [jobId, setJobId] = useState(null);
   const [job, setJob] = useState(null);
   const [running, setRunning] = useState(null);
@@ -43,7 +45,27 @@ export default function ParseSections({ sections, onParse, onRefresh, busy }) {
     else { setRunning(null); onRefresh?.(); }
   };
 
-  const rows = (sections || []).filter((s) => s.staged > 0);
+  /* One section per source, whatever it holds - the same set Scanning and
+     Choose show, plus uploads.
+   *
+     This used to list only sources with something staged, so Investments and
+     Transaction alerts simply were not on the screen when they had nothing.
+     A step that silently drops a section reads as broken: the question it
+     leaves you with is "where did it go", and the answer - "it has nothing
+     yet" - is one line that the section can perfectly well say itself. */
+  const known = Object.fromEntries((sections || []).map((x) => [x.key, x]));
+  const order = [
+    ...(intents || []).filter((one) => chosen?.has(one.key)),
+    { key: 'upload', label: 'Files from this computer' },
+  ];
+  const rows = order.map((one) => ({
+    key: one.key,
+    label: known[one.key]?.label || one.label,
+    staged: 0, parsed: 0, pending: 0, failed: 0, rows: 0,
+    ...(known[one.key] || {}),
+    chosen: chosenCounts?.[one.key] || 0,
+  }));
+  const anyStaged = rows.some((s) => s.staged > 0);
   const anyPending = rows.some((s) => s.pending > 0 || s.failed > 0);
 
   return (
@@ -55,7 +77,7 @@ export default function ParseSections({ sections, onParse, onRefresh, busy }) {
         read is never read twice.
       </p>
 
-      {!rows.length && (
+      {!anyStaged && (
         <Callout tone="warn">
           Nothing is staged yet. Scan a source or add files on{' '}
           <strong>Source</strong> first.
@@ -78,13 +100,34 @@ export default function ParseSections({ sections, onParse, onRefresh, busy }) {
                 style={{ padding: '3px 10px', fontSize: 12 }}
                 onClick={() => run(section.key)}>
                 {isRunning ? 'Reading…'
-                  : outstanding ? `Read ${outstanding}` : 'All read'}
+                  : outstanding ? `Read ${outstanding}`
+                    : section.staged ? 'All read' : 'Nothing to read'}
               </button>
             </div>
 
             {isRunning && job?.active && (
               <div style={{ marginTop: 8 }}>
                 <JobProgress job={job} title="" />
+              </div>
+            )}
+
+            {section.staged === 0 && (
+              <div className="xp-hint" style={{ textTransform: 'none', marginTop: 6 }}>
+                {section.chosen > 0
+                  /* Ticking on Choose selects; it does not fetch. Without
+                     saying so, a source with 108 files chosen and 0 staged
+                     looks like the wizard lost them. */
+                  ? <>
+                      <strong>{section.chosen} chosen but not fetched yet.</strong>{' '}
+                      Go back to <strong>Choose</strong> and press{' '}
+                      <strong>Download &amp; read</strong> — choosing marks
+                      what you want; that button goes and gets it.
+                    </>
+                  : <>
+                      Nothing staged from this source yet — scan it on{' '}
+                      <strong>Scanning</strong>, then pick its files on{' '}
+                      <strong>Choose</strong>.
+                    </>}
               </div>
             )}
 
@@ -103,7 +146,7 @@ export default function ParseSections({ sections, onParse, onRefresh, busy }) {
         );
       })}
 
-      {rows.length > 0 && !anyPending && (
+      {anyStaged && !anyPending && (
         <Callout tone="pos">
           Everything staged has been read. What it produced is on{' '}
           <strong>Review</strong>, and still counts for nothing until you

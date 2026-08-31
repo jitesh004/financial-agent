@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, dateLabel, money, titleCase } from '../lib';
 import { downloadCsv, toCsv, usePrefs } from '../prefs';
-import { Callout, Card, Chip, Empty } from './ui';
+import { Callout, Card, Chip, Empty, PromptButton } from './ui';
 
 const PAGE = 100;
 
@@ -140,17 +140,12 @@ export default function TransactionsTable({
     }
   }
 
-  async function addNote(txn) {
-    const note = window.prompt('Note for this transaction', txn.note || '');
-    if (note === null) return;
+  async function addNote(txn, note) {
     await patch(txn, { note });
   }
 
-  async function markNotMine(txn) {
-    const who = window.prompt(
-      'Whose expense was this? It stops counting as your spending and appears '
-      + 'under Owed until it comes back.', '');
-    if (who === null) return;
+  async function markNotMine(txn, who) {
+    if (!who) return;
     setSaving(txn.id);
     try {
       await api.claimTransaction(txn.id, {
@@ -385,16 +380,14 @@ export default function TransactionsTable({
               >
                 Include
               </button>
-              <button
+              <PromptButton
                 className="btn"
                 disabled={saving === 'bulk'}
-                onClick={() => {
-                  const note = window.prompt('Note for all selected');
-                  if (note !== null) applyBulk({ note });
-                }}
+                placeholder="Note for all selected"
+                onSubmit={(note) => applyBulk({ note })}
               >
                 Add note
-              </button>
+              </PromptButton>
               <div style={{ flex: 1 }} />
               <button className="btn" onClick={() => setPicked(new Set())}>
                 Clear selection
@@ -501,14 +494,16 @@ export default function TransactionsTable({
                       </td>
                     )}
                     <td className="right nowrap">
-                      <button
+                      <PromptButton
                         className="btn icon"
                         title={t.note ? 'Edit note' : 'Add a note'}
                         disabled={saving === t.id}
-                        onClick={() => addNote(t)}
+                        initial={t.note || ''}
+                        placeholder="Note for this transaction"
+                        onSubmit={(note) => addNote(t, note)}
                       >
                         {t.note ? '✎' : '+'}
-                      </button>
+                      </PromptButton>
                       <button
                         className="btn icon"
                         title={t.excluded
@@ -520,14 +515,16 @@ export default function TransactionsTable({
                         {t.excluded ? '↺' : '⊘'}
                       </button>
                       {t.direction === 'debit' && !t.is_internal_transfer && (
-                        <button
+                        <PromptButton
                           className="btn icon"
                           title="This purchase was not mine - track it as owed to me"
                           disabled={saving === t.id}
-                          onClick={() => markNotMine(t)}
+                          placeholder="Whose expense was this?"
+                          submitLabel="Mark owed"
+                          onSubmit={(who) => markNotMine(t, who)}
                         >
                           ⇄
-                        </button>
+                        </PromptButton>
                       )}
                     </td>
                   </tr>

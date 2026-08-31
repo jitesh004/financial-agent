@@ -19,7 +19,7 @@ const RECON = {
    reach this view in that state - the tab was hidden without a ledger - but it
    now lives inside the always-available Data tab, where "nothing imported yet"
    is a normal thing to be looking at rather than a crash. */
-export default function Files({ data }) {
+export default function Files({ data, onImport }) {
   const statements = data?.statements || [];
   const accounts = data?.accounts || [];
   const transfers = data?.transfers || {};
@@ -27,8 +27,13 @@ export default function Files({ data }) {
 
   if (!statements.length) {
     return (
-      <Empty title="No files analyzed yet">
-        Upload a statement or scan your mailbox, and the coverage grid and
+      <Empty title="No files analyzed yet"
+        action={onImport && (
+          <button className="btn primary" onClick={onImport}>
+            Import statements
+          </button>
+        )}>
+        Import a statement or scan your mailbox, and the coverage grid and
         parse quality for every file will appear here.
       </Empty>
     );

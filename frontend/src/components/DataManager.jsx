@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Callout, Card, Chip, Stat } from './ui';
+import { Callout, Card, Chip, ConfirmButton, Stat } from './ui';
 import { api, formatBytes, money } from '../lib';
 
 /* The seven clearing actions, in place of one unlabelled Reset.
@@ -86,7 +86,6 @@ export default function DataManager() {
   }
 
   async function deleteSnapshot(name) {
-    if (!window.confirm(`Are you sure you want to permanently delete snapshot ${name}?`)) return;
     setBusy(true);
     try {
       await api.deleteSnapshot(name);
@@ -100,8 +99,6 @@ export default function DataManager() {
   }
 
   async function reanalyzeAll() {
-    const label = rebuildMonths === 0 ? 'ALL' : `last ${rebuildMonths} months of`;
-    if (!window.confirm(`This will wipe all parsed data and rebuild the ${label} statements from existing files. It runs in the background and may take a few minutes. Proceed?`)) return;
     setBusy(true);
     try {
       const res = await api.reanalyze(rebuildMonths || null);
@@ -295,10 +292,15 @@ export default function DataManager() {
                 <option value={24}>Last 24 months</option>
               </select>
             </div>
-            <button className="btn primary" disabled={busy} onClick={reanalyzeAll}
-              style={{ alignSelf: 'flex-end' }}>
+            <ConfirmButton className="btn primary" disabled={busy}
+              style={{ alignSelf: 'flex-end' }}
+              question={`Wipe all parsed data and rebuild ${rebuildMonths === 0
+                ? 'every statement' : `the last ${rebuildMonths} months`} from
+                the files on disk? It runs in the background.`}
+              confirmLabel="Start rebuild"
+              onConfirm={reanalyzeAll}>
               Start Rebuild
-            </button>
+            </ConfirmButton>
           </div>
         </div>
       </Card>
@@ -324,9 +326,12 @@ export default function DataManager() {
               <button className="btn" disabled={busy} onClick={() => restore(s.name)}>
                 Restore
               </button>
-              <button className="btn danger" disabled={busy} onClick={() => deleteSnapshot(s.name)}>
+              <ConfirmButton className="btn danger" disabled={busy}
+                question={`Permanently delete snapshot ${s.name}?`}
+                confirmLabel="Delete"
+                onConfirm={() => deleteSnapshot(s.name)}>
                 Delete
-              </button>
+              </ConfirmButton>
             </div>
           </div>
         ))}

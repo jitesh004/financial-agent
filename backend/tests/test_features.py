@@ -2681,3 +2681,73 @@ def test_a_contract_note_is_not_read_as_a_bank_statement_either(tmp_db, tmp_path
     assert parsed["kind"] == "trades", parsed["kind"]
     assert parsed["row_count"] == 0, "a contract note produces no transactions"
     assert status == staging_pipeline.STATUS_EMPTY
+
+
+def test_a_staged_alert_records_which_scan_found_it(tmp_db):
+    """Without it the column defaults to empty, and empty read as "statement".
+
+    113 alerts were staged perfectly well and then counted under Account
+    statements. The alerts section reported nothing staged while its own
+    documents sat in the section next to it, and the Parse step offered no
+    way to reach them.
+    """
+    from app.db import staging
+    from app.pipeline.staging_pipeline import stage_alert
+
+    entry_id = stage_alert(tmp_db, {
+        "message_id": "m1", "amount": "1069.80", "direction": "debit",
+        "date_iso": "2026-08-31", "account_suffix": "1751",
+        "institution": "HSBC", "merchant": "AMAZON",
+    })
+    entry = next(e for e in staging.all_entries(tmp_db) if e["id"] == entry_id)
+    assert entry["scan_intent"] == "transactional", entry["scan_intent"]
+    assert entry["kind"] == "alert"
+
+
+def test_an_entry_with_no_recorded_source_is_placed_by_what_it_is(tmp_db):
+    """Assuming "statement" is how the alerts came to hide among them."""
+    from app.api.staging_routes import _INTENT_FOR_KIND
+
+    assert _INTENT_FOR_KIND["alert"] == "transactional"
+    assert _INTENT_FOR_KIND["portfolio"] == "investment"
+    assert _INTENT_FOR_KIND["trades"] == "investment"
+    assert _INTENT_FOR_KIND["bureau"] == "bureau"
+
+
+def test_a_more_specific_scan_corrects_a_documents_source(tmp_db):
+    """The scans overlap, so the first answer is not always the best one.
+
+    The statement scan's sender list contains every broker, so a Zerodha
+    holdings PDF is found first as a statement and later as an investment.
+    Keeping the first filed 108 investment documents under Account
+    statements: the Investments section reported nothing staged while Choose
+    went on offering them, and Parse gave no way to reach them.
+    """
+    from app.db import staging
+
+    first = staging.add(tmp_db, "hash-1", filename="holdings.pdf",
+                        scan_intent="statement")
+    again = staging.add(tmp_db, "hash-1", filename="holdings.pdf",
+                        scan_intent="investment")
+    assert again == first, "still one document"
+    entry = next(e for e in staging.all_entries(tmp_db) if e["id"] == first)
+    assert entry["scan_intent"] == "investment"
+
+    # And the correction only goes one way - the catch-all never wins back.
+    staging.add(tmp_db, "hash-1", filename="holdings.pdf",
+                scan_intent="statement")
+    entry = next(e for e in staging.all_entries(tmp_db) if e["id"] == first)
+    assert entry["scan_intent"] == "investment"
+
+
+def test_correcting_a_source_does_not_disturb_the_selection(tmp_db):
+    """Re-scanning must never re-tick something turned off."""
+    from app.db import staging
+
+    entry_id = staging.add(tmp_db, "hash-2", filename="x.pdf",
+                           scan_intent="statement")
+    staging.set_selected(tmp_db, [(entry_id, False)])
+    staging.add(tmp_db, "hash-2", filename="x.pdf", scan_intent="investment")
+    entry = next(e for e in staging.all_entries(tmp_db) if e["id"] == entry_id)
+    assert entry["selected"] is False
+    assert entry["scan_intent"] == "investment"

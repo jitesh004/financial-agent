@@ -273,7 +273,14 @@ def stage_alert(db: Database, alert: dict[str, Any]) -> str | None:
         db, digest,
         filename=(alert.get("merchant") or alert.get("subject")
                   or "Transaction alert")[:120],
-        origin="gmail", kind="alert", message_id=message_id,
+        origin="gmail", kind="alert",
+        # Without this the column defaults to empty, and an empty scan_intent
+        # is read as "statement" - so 113 alerts were staged perfectly well
+        # and then counted under Account statements. The alerts section
+        # reported nothing staged while its documents sat in the next section
+        # along, and Parse offered no way to reach them.
+        scan_intent="transactional",
+        message_id=message_id,
         sender=alert.get("sender", ""), subject=alert.get("subject", ""),
         payload={"kind": "alert", "alert": alert},
         parse_status=STATUS_OK,

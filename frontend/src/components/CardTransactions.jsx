@@ -11,7 +11,7 @@ export default function CardTransactions({ data }) {
 
   if (!accounts.length) {
     return <Empty title="No credit cards found">
-      Upload a card statement, or connect Gmail, to see them here.
+      Import a card statement from the Import wizard to see them here.
     </Empty>;
   }
 

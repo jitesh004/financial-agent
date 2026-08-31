@@ -154,10 +154,18 @@ function RefusedFiles({ excluded, ignored }) {
   );
 }
 
-function Section({ source, result, selected, onToggle, onToggleMany, staged }) {
+function Section({ source, result, mineRows, selected, onToggle,
+                  onToggleMany, staged }) {
   const [open, setOpen] = useState(false);
 
   const rows = useMemo(() => {
+    // `mine` is the deduplicated, source-attributed list from the hook - not
+    // this scan's raw output. The sources overlap (the statement scan's
+    // sender list contains every broker), so counting each scan's own result
+    // showed the same Zerodha PDF under both Account statements and
+    // Investments, and the two sections together claimed 256 files where
+    // there were 148.
+    if (mineRows) return mineRows;
     if (!result) return [];
     if (result.attachments) return result.attachments;
     // Alerts have no file to fetch, so what is offered here are the ones that
@@ -248,8 +256,16 @@ function Section({ source, result, selected, onToggle, onToggleMany, staged }) {
 }
 
 export default function ChooseSections({
-  intents, chosen, sections, sourceResults, selected, onToggle, onToggleMany,
+  intents, chosen, sections, sourceResults, rows, selected, onToggle,
+  onToggleMany,
 }) {
+  // Grouped by the source each document was attributed to, so every file
+  // appears exactly once across the sections.
+  const byIntent = (rows || []).reduce((acc, r) => {
+    const key = r.intent || 'statement';
+    (acc[key] = acc[key] || []).push(r);
+    return acc;
+  }, {});
   const staged = Object.fromEntries((sections || []).map((s) => [s.key, s]));
   const picked = intents.filter((one) => chosen.has(one.key));
 
@@ -271,6 +287,7 @@ export default function ChooseSections({
 
       {picked.map((one) => (
         <Section key={one.key} source={one} result={sourceResults?.[one.key]}
+          mineRows={byIntent[one.key]}
           staged={staged[one.key]?.staged || 0}
           selected={selected} onToggle={onToggle} onToggleMany={onToggleMany} />
       ))}

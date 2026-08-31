@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, money } from '../../lib';
-import { Callout, Chip, Empty } from '../ui';
+import { Callout, Chip, ConfirmButton, Empty } from '../ui';
 
 /* Step 5: what has been read, and what of it should count.
  *
@@ -119,6 +119,21 @@ export default function ImportReview({ onChanged }) {
     groups: groups.map((g) => ({ key: g.key, include })),
   });
 
+  /* Unticking and forgetting are different answers.
+   *
+   * Untick means "not this time" - the document stays read, and re-ticking it
+   * costs nothing. Forget means "this should not be here at all", which is
+   * what you want after narrowing a scan: staging keeps everything it has
+   * ever read, so a smaller window leaves the older documents sitting there
+   * with no way to remove them. */
+  const forget = async (ids) => {
+    setBusy(true);
+    try {
+      await api.stagingRemove(ids);
+      await load();
+    } catch (e) { setError(e.message); } finally { setBusy(false); }
+  };
+
   const toggleOpen = (key) => setOpen((prev) => {
     const next = new Set(prev);
     if (next.has(key)) next.delete(key); else next.add(key);
@@ -143,7 +158,9 @@ export default function ImportReview({ onChanged }) {
       <p style={{ color: 'var(--text-2)', fontSize: 13, margin: 0 }}>
         Everything that has been read, grouped by account and by where it came
         from. <strong>None of this is in your ledger yet.</strong> Tick what
-        should count, then process it on the next step.
+        should count, then process it on the next step. Untick means “not this
+        time”; <strong>Forget</strong> removes a document from the wizard
+        altogether.
       </p>
 
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -205,11 +222,21 @@ export default function ImportReview({ onChanged }) {
                   </div>
                 )}
               </div>
-              <div style={{ textAlign: 'right', fontSize: 12, whiteSpace: 'nowrap' }}>
-                {Number(group.debits) > 0 && <div>−{money(group.debits)}</div>}
-                {Number(group.credits) > 0 && (
-                  <div style={{ color: 'var(--pos, #2e7d32)' }}>+{money(group.credits)}</div>
-                )}
+              <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                <div style={{ textAlign: 'right', fontSize: 12, whiteSpace: 'nowrap' }}>
+                  {Number(group.debits) > 0 && <div>−{money(group.debits)}</div>}
+                  {Number(group.credits) > 0 && (
+                    <div style={{ color: 'var(--pos, #2e7d32)' }}>+{money(group.credits)}</div>
+                  )}
+                </div>
+                <ConfirmButton disabled={busy}
+                  style={{ padding: '2px 8px', fontSize: 11 }}
+                  title="Remove these documents from staging entirely"
+                  question={`Forget all ${group.file_count}?`}
+                  confirmLabel="Forget"
+                  onConfirm={() => forget(group.files.map((f) => f.id))}>
+                  Forget
+                </ConfirmButton>
               </div>
             </div>
 
@@ -255,11 +282,20 @@ export default function ImportReview({ onChanged }) {
                       </div>
                     )}
                   </div>
-                  <div style={{ textAlign: 'right', fontSize: 11.5, whiteSpace: 'nowrap' }}>
-                    {Number(file.debits) > 0 && <div>−{money(file.debits)}</div>}
-                    {Number(file.credits) > 0 && (
-                      <div style={{ color: 'var(--pos, #2e7d32)' }}>+{money(file.credits)}</div>
-                    )}
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <div style={{ textAlign: 'right', fontSize: 11.5, whiteSpace: 'nowrap' }}>
+                      {Number(file.debits) > 0 && <div>−{money(file.debits)}</div>}
+                      {Number(file.credits) > 0 && (
+                        <div style={{ color: 'var(--pos, #2e7d32)' }}>+{money(file.credits)}</div>
+                      )}
+                    </div>
+                    <ConfirmButton disabled={busy}
+                      style={{ padding: '1px 7px', fontSize: 11 }}
+                      title="Remove this document from staging entirely"
+                      confirmLabel="Forget"
+                      onConfirm={() => forget([file.id])}>
+                      ✕
+                    </ConfirmButton>
                   </div>
                 </label>
               );

@@ -13,7 +13,7 @@ const BAND_TONE = {
   fair: 'warn', poor: 'neg', 'very poor': 'neg',
 };
 
-export default function CreditReport({ accounts = [] }) {
+export default function CreditReport({ accounts = [], onImport }) {
   const [overview, setOverview] = useState(null);
   const [recon, setRecon] = useState(null);
   const [error, setError] = useState(null);
@@ -50,8 +50,13 @@ export default function CreditReport({ accounts = [] }) {
 
   if (!overview.reports.length) {
     return (
-      <Empty title="No credit report imported yet">
-        Scan your mailbox for bureau reports, or upload a CIBIL, CRIF, Experian
+      <Empty title="No credit report imported yet"
+        action={onImport && (
+          <button className="btn primary" onClick={onImport}>
+            Import statements
+          </button>
+        )}>
+        Scan your mailbox for bureau reports, or add a CIBIL, CRIF, Experian
         or Equifax PDF. A bureau lists every account a lender reports on you,
         which is the only way this app can find one it has no statements for.
       </Empty>

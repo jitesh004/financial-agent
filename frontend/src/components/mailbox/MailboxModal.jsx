@@ -10,7 +10,7 @@ import SourceSections from './SourceSections';
 import ProcessStep from './ProcessStep';
 import Upload from '../Upload';
 import JobProgress from '../JobProgress';
-import { Callout, Chip, Empty } from '../ui';
+import { Callout, Chip, ConfirmButton, Empty } from '../ui';
 import {
   AttachmentTable, ExcludedPanel, FilterBar, ResultTable, SelectionSummary,
   SetupInstructions, StageStrip, StepRail,
@@ -356,6 +356,11 @@ export default function MailboxModal({ mailbox, open, onClose, onUploaded }) {
                 mailbox.refreshSections?.();
                 return id;
               }}
+              onForget={async (key) => {
+                await api.stagingForget(key);
+                await mailbox.refreshSections?.();
+                setStaged({});
+              }}
             />
           )}
 
@@ -365,6 +370,7 @@ export default function MailboxModal({ mailbox, open, onClose, onUploaded }) {
               chosen={chosen}
               sections={mailbox.sections}
               sourceResults={mailbox.sourceResults}
+              rows={rows}
               selected={selection}
               onToggle={toggleRow}
               onToggleMany={toggleMany}
@@ -373,6 +379,17 @@ export default function MailboxModal({ mailbox, open, onClose, onUploaded }) {
 
           {view === 'parse' && (
             <ParseSections
+              intents={intents}
+              chosen={chosen}
+              /* How many of each source's files are ticked on Choose but not
+                 fetched yet - the difference between "you have not chosen
+                 anything" and "you chose and did not press the button". */
+              chosenCounts={rows.reduce((acc, r) => {
+                if (!selection.has(rowKey(r))) return acc;
+                const key = r.intent || 'statement';
+                acc[key] = (acc[key] || 0) + 1;
+                return acc;
+              }, {})}
               sections={mailbox.sections}
               busy={busy}
               onParse={mailbox.parseSource}
@@ -459,6 +476,19 @@ export default function MailboxModal({ mailbox, open, onClose, onUploaded }) {
             </>
           )}
           <div style={{ flex: 1 }} />
+          <ConfirmButton
+            title="Empty the wizard and start again. Your ledger is untouched."
+            question="Forget every staged document? Your ledger is untouched."
+            confirmLabel="Forget everything"
+            onConfirm={async () => {
+              await api.stagingForget();
+              reset();
+              setStaged({});
+              await mailbox.refreshSections?.();
+              goTo(0);
+            }}>
+            Start over
+          </ConfirmButton>
           <button className="btn" onClick={onClose}>
             {busy ? 'Close and keep running' : 'Close'}
           </button>

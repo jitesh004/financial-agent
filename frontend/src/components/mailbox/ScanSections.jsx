@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../../lib';
 import JobProgress from '../JobProgress';
-import { Callout, Chip } from '../ui';
+import { Callout, Chip, ConfirmButton } from '../ui';
 
 /* Step 2: one scan per source, run in turn, each with its own Retry.
  *
@@ -12,7 +12,7 @@ import { Callout, Chip } from '../ui';
  * to want a per-section Retry at all.
  */
 
-function Section({ source, jobId, onScan, running }) {
+function Section({ source, jobId, onScan, onForget, running }) {
   const [job, setJob] = useState(null);
   const [open, setOpen] = useState(false);
 
@@ -63,7 +63,11 @@ function Section({ source, jobId, onScan, running }) {
         </button>
         <strong style={{ fontSize: 13 }}>{source.label}</strong>
         {done && found != null && <Chip tone="pos">{found} found</Chip>}
-        {source.staged > 0 && <Chip>{source.staged} staged</Chip>}
+        {source.staged > 0 && (
+          <Chip title="Everything this source has ever staged, not just this scan">
+            {source.staged} kept
+          </Chip>
+        )}
         {done && refused.length > 0 && (
           <Chip tone="warn">{refused.length} not used</Chip>
         )}
@@ -74,6 +78,16 @@ function Section({ source, jobId, onScan, running }) {
           </Chip>
         )}
         <div style={{ flex: 1 }} />
+        {source.staged > 0 && (
+          <ConfirmButton disabled={running}
+            style={{ padding: '3px 10px', fontSize: 12 }}
+            title="Remove what this source has staged. Your ledger is untouched."
+            question={`Forget ${source.staged} document(s)?`}
+            confirmLabel="Forget"
+            onConfirm={() => onForget(source.key)}>
+            Forget {source.staged}
+          </ConfirmButton>
+        )}
         <button className="btn" disabled={running}
           style={{ padding: '3px 10px', fontSize: 12 }}
           onClick={() => onScan(source.key)}>
@@ -130,7 +144,8 @@ function Section({ source, jobId, onScan, running }) {
 }
 
 export default function ScanSections({
-  intents, chosen, sections, sourceJobs, onScan, busy, pendingUploads,
+  intents, chosen, sections, sourceJobs, onScan, onForget, busy,
+  pendingUploads,
 }) {
   const staged = Object.fromEntries((sections || []).map((s) => [s.key, s]));
   const picked = intents.filter((one) => chosen.has(one.key));
@@ -171,6 +186,14 @@ export default function ScanSections({
         </button>
       </div>
 
+      <Callout>
+        <strong>Staging keeps what it has read.</strong> Narrowing a scan from
+        a year to three months finds fewer documents, but it does not remove
+        the ones already here — they were read correctly and re-reading them
+        costs minutes. Use <strong>Forget</strong> on a source to drop its
+        documents and start that source clean.
+      </Callout>
+
       {!picked.length && (
         <Callout tone="warn">
           No sources are ticked. Go back to <strong>Source</strong> and pick at
@@ -183,7 +206,7 @@ export default function ScanSections({
           source={{ ...one, staged: staged[one.key]?.staged || 0 }}
           jobId={sourceJobs?.[one.key]}
           running={queue}
-          onScan={onScan} />
+          onScan={onScan} onForget={onForget} />
       ))}
 
       {/* Files from this computer are a source like any other, so they are

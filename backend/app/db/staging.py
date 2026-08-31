@@ -32,6 +32,18 @@ _WRITABLE = (
 )
 
 
+#: How particular a source is about what it looks for. "statement" is the
+#: catch-all - its sender list contains every broker and bureau - so anything
+#: else that also found a document knows more about it.
+_SOURCE_SPECIFICITY = {"": 0, "statement": 1, "upload": 2,
+                       "bureau": 3, "investment": 3, "transactional": 3}
+
+
+def _more_specific(incoming: str, stored: str | None) -> bool:
+    return (_SOURCE_SPECIFICITY.get(incoming or "", 2)
+            > _SOURCE_SPECIFICITY.get(stored or "", 0))
+
+
 def _row_to_entry(row: Any) -> dict[str, Any]:
     entry = dict(row)
     entry["selected"] = bool(entry.get("selected"))
@@ -67,9 +79,23 @@ def add(db: Database, file_hash: str, **fields: Any) -> str:
 
     with db.connection() as conn:
         existing = conn.execute(
-            "SELECT id FROM staged_files WHERE file_hash = ?", (file_hash,)
-        ).fetchone()
+            "SELECT id, scan_intent FROM staged_files WHERE file_hash = ?",
+            (file_hash,)).fetchone()
         if existing:
+            # The entry stands - its selection and its parse result are not
+            # this call's to overwrite - but its SOURCE can be corrected.
+            #
+            # The scans overlap: the statement scan's sender list contains
+            # every broker, so a Zerodha holdings PDF is found first as a
+            # statement and later as an investment. Leaving the first answer
+            # in place filed 108 investment documents under Account
+            # statements, and the Investments section reported nothing staged
+            # while Choose went on offering them.
+            incoming = fields.get("scan_intent")
+            if incoming and _more_specific(incoming, existing["scan_intent"]):
+                conn.execute(
+                    "UPDATE staged_files SET scan_intent = ? WHERE id = ?",
+                    (incoming, existing["id"]))
             return existing["id"]
 
         entry_id = str(uuid.uuid4())

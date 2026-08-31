@@ -599,8 +599,8 @@ def test_the_inventory_names_what_each_action_preserves():
     body = client.get("/api/data/inventory").json()
     by_scope = {a["scope"]: a for a in body["actions"]}
 
-    assert set(by_scope) == {"derived", "parsed_data", "files", "ai_inferences",
-                             "decisions", "everything"}
+    assert set(by_scope) == {"derived", "parsed_data", "staged_imports", "files",
+                             "ai_inferences", "decisions", "everything"}
     assert "your decisions" in by_scope["parsed_data"]["preserves"]
     assert "AI inference" in by_scope["parsed_data"]["preserves"]
     assert by_scope["everything"]["confirm_phrase"] == "DELETE EVERYTHING"

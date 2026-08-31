@@ -32,11 +32,12 @@ export function Chip({ children, tone = '', className = '', style, ...rest }) {
   return <span className={`chip ${tone} ${className}`} style={style} {...rest}>{children}</span>;
 }
 
-export function Empty({ title, children }) {
+export function Empty({ title, children, action }) {
   return (
     <div className="empty">
       <h3>{title}</h3>
       {children && <p>{children}</p>}
+      {action && <div style={{ marginTop: 14 }}>{action}</div>}
     </div>
   );
 }
@@ -114,5 +115,109 @@ export function ThemeToggle({ theme, onToggle }) {
     <button className="btn icon" onClick={onToggle} title="Toggle theme" aria-label="Toggle theme">
       {theme === 'dark' ? '☀' : '☾'}
     </button>
+  );
+}
+
+/* Confirmation that does not depend on the browser granting us a dialog.
+ *
+ * `window.confirm` is suppressed in embedded and app-hosted browsers: it
+ * returns false immediately without ever showing anything, so a handler
+ * written as `if (!window.confirm(...)) return;` becomes a button that does
+ * nothing at all, silently, with no error to find. Ten controls in this app
+ * were dead that way - Start over, Forget, Clear parsed ledger, Stop tracking
+ * - and the failure looks exactly like a bug in the thing being confirmed.
+ *
+ * Asking in the page costs one extra click and always works.
+ */
+export function ConfirmButton({
+  children, onConfirm, confirmLabel = 'Confirm', question,
+  className = 'btn', style, disabled, title, timeout = 8000,
+}) {
+  const [armed, setArmed] = React.useState(false);
+  const timer = React.useRef(null);
+
+  React.useEffect(() => () => clearTimeout(timer.current), []);
+
+  const arm = () => {
+    setArmed(true);
+    // Disarms itself: a button left sitting in "are you sure" is a trap for
+    // whoever comes back to the tab later.
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => setArmed(false), timeout);
+  };
+
+  const go = async () => {
+    clearTimeout(timer.current);
+    setArmed(false);
+    await onConfirm?.();
+  };
+
+  if (!armed) {
+    return (
+      <button type="button" className={className} style={style}
+        disabled={disabled} title={title} onClick={arm}>
+        {children}
+      </button>
+    );
+  }
+
+  return (
+    <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+      {question && (
+        <span className="xp-hint" style={{ textTransform: 'none' }}>{question}</span>
+      )}
+      <button type="button" className={`${className} primary`} style={style}
+        disabled={disabled} onClick={go}>
+        {confirmLabel}
+      </button>
+      <button type="button" className={className} style={style}
+        onClick={() => { clearTimeout(timer.current); setArmed(false); }}>
+        Cancel
+      </button>
+    </span>
+  );
+}
+
+/* The same problem for `window.prompt`, which is suppressed identically and
+   returns null - so "add a note" quietly did nothing. */
+export function PromptButton({
+  children, onSubmit, placeholder = '', initial = '',
+  className = 'btn', style, disabled, title, submitLabel = 'Save',
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [value, setValue] = React.useState(initial);
+
+  React.useEffect(() => { if (open) setValue(initial); }, [open, initial]);
+
+  if (!open) {
+    return (
+      <button type="button" className={className} style={style}
+        disabled={disabled} title={title} onClick={() => setOpen(true)}>
+        {children}
+      </button>
+    );
+  }
+
+  const submit = async () => {
+    setOpen(false);
+    await onSubmit?.(value);
+  };
+
+  return (
+    <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+      <input type="text" value={value} autoFocus placeholder={placeholder}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') submit();
+          if (e.key === 'Escape') setOpen(false);
+        }}
+        style={{ minWidth: 180, fontSize: 12 }} />
+      <button type="button" className={`${className} primary`} onClick={submit}>
+        {submitLabel}
+      </button>
+      <button type="button" className={className} onClick={() => setOpen(false)}>
+        Cancel
+      </button>
+    </span>
   );
 }

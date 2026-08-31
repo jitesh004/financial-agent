@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Callout, Card, Chip, Empty, Stat } from './ui';
+import { Callout, Card, Chip, ConfirmButton, Empty, Stat } from './ui';
 import { api, dateLabel, money, titleCase } from '../lib';
 
 /* Recurring commitments, each expandable to the transactions behind it.
@@ -64,7 +64,6 @@ export default function Recurring() {
   }
 
   async function remove(id) {
-    if (!window.confirm('Stop tracking this series? The transactions stay.')) return;
     try {
       await api.deleteSeries(id);
       load();
@@ -186,9 +185,12 @@ export default function Recurring() {
                   >
                     {s.is_active ? 'Ignore' : 'Track'}
                   </button>
-                  <button className="btn danger" onClick={() => remove(s.id)}>
+                  <ConfirmButton className="btn danger"
+                    question="Stop tracking this series? The transactions stay."
+                    confirmLabel="Stop tracking"
+                    onConfirm={() => remove(s.id)}>
                     Delete
-                  </button>
+                  </ConfirmButton>
                 </div>
               </div>
             </div>

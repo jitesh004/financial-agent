@@ -14,7 +14,7 @@ export default function Debt({ data }) {
   if (!loans.length && !cards.length) {
     return (
       <Empty title="No debt accounts found">
-        Upload a loan or credit card statement to see amortization, payoff dates
+        Import a loan or credit card statement to see amortization, payoff dates
         and total interest.
       </Empty>
     );
