@@ -31,7 +31,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ..models.schemas import AccountType, Category, ConfidenceSource
+from ..models.schemas import AccountType, Category, ConfidenceSource, Direction
 from .fingerprint import stamp_fingerprints
 from .overrides import OverrideReport, apply_overrides
 
@@ -81,7 +81,8 @@ def enrich_ledger(
     from ..analytics import loans as loans_mod
     from ..categorize.rules import categorize_by_rules, fallback_category
     from ..reconcile.settlement import match_settlements
-    from ..reconcile.transfers import detect_transfers, find_duplicate_transactions
+    from ..reconcile.transfers import (detect_reversals, detect_transfers,
+                                       find_duplicate_transactions)
 
     def phase(label: str) -> None:
         if progress:
@@ -147,6 +148,18 @@ def enrich_ledger(
     from .overrides import apply_splits
     transactions = apply_splits(db, transactions)
     result.transactions = transactions
+
+    # 2c. Cancel a failed charge against its own same-account refund, before
+    # transfer matching or categorization ever sees either leg - a gateway
+    # that fails a charge and reverses it before a successful retry is not
+    # three real transactions, and neither the failed debit nor its refund
+    # should count as spending, income, or a candidate leg for anything else.
+    phase("Cancelling reversed charges")
+    reversed_count = detect_reversals(transactions)
+    if reversed_count:
+        result.warnings.append(
+            f"{reversed_count} failed charge(s) were matched against their own "
+            f"refund and excluded from every total.")
 
     # 3. Transfers first - see the module docstring.
     phase("Matching transfers between accounts")
@@ -256,6 +269,32 @@ def enrich_ledger(
                 "Credit from a person against a spending category - counted "
                 "as money back rather than income. Confirm or flip."
             )
+
+        # A card-bill row that never found its far leg is a silent default,
+        # not a confirmed fact - detect_transfers only found candidates
+        # within its own day-gap and account set, and a missing statement,
+        # a payment made from an account not yet uploaded, or a partial
+        # payment all look identical from here. Surfacing it is what turns
+        # "assumed" into "confirmed or corrected" instead of a number the
+        # user never gets a chance to check.
+        if (txn.category == Category.CC_PAYMENT and not txn.is_internal_transfer
+                and not txn.needs_review):
+            txn.needs_review = True
+            if txn.direction == Direction.CREDIT:
+                txn.review_reason = (
+                    "This card's payment-received entry has no matching bank "
+                    "debit - either that statement is missing, or someone "
+                    "else paid this bill. Counted as settling the card, not "
+                    "as income."
+                )
+            else:
+                txn.review_reason = (
+                    "This card-bill payment has no matching entry on the "
+                    "card's own statement, so it is counted as spending - "
+                    "the only record available without that statement. "
+                    "Connecting it would let this be excluded as a transfer "
+                    "instead."
+                )
 
     if not run_analysis:
         return result

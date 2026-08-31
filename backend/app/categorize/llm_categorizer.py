@@ -40,6 +40,9 @@ Rules:
 - Descriptions are payment-rail strings, so they are abbreviated and noisy.
 - "direction" tells you whether money came in or went out; a credit is far more
   likely to be income, a refund, or a reversal.
+- DO NOT use the "emi" category just because the description contains the word "EMI". 
+  Many banks prefix one-time purchases (like a hospital bill or electronics) with "EMI" 
+  if the user converted it to an installment plan. Categorize these based on what was purchased (e.g. healthcare, shopping).
 """
 
 

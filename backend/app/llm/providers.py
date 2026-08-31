@@ -59,7 +59,11 @@ class GeminiProvider(Provider):
             resp = client.post(url, json=payload)
             resp.raise_for_status()
             data = resp.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
+            try:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            except (KeyError, IndexError):
+                logging.error(f"Unexpected Gemini response: {data}")
+                return ""
 
     def complete_json(self, prompt: str, system: str = "", max_tokens: int = 4096, tier: str = "fast") -> Any:
         system = system or "You return only valid JSON. No prose, no code fences."
@@ -103,7 +107,11 @@ class AzureOpenAIProvider(Provider):
             resp = client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            try:
+                return data["choices"][0]["message"].get("content", "")
+            except (KeyError, IndexError):
+                logging.error(f"Unexpected Azure response: {data}")
+                return ""
 
     def complete_json(self, prompt: str, system: str = "", max_tokens: int = 4096, tier: str = "fast") -> Any:
         system = system or "You return only valid JSON. No prose, no code fences."

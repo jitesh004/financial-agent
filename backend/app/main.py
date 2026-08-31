@@ -303,7 +303,8 @@ async def upload(
 
     runs.create(run_id, len(tasks))
     runs.update(run_id, warnings=rejected)
-    background.add_task(_run_analysis, run_id, tasks, use_llm, horizon_months)
+    background.add_task(_run_analysis, run_id, tasks, use_llm, horizon_months,
+                        incremental=True)
 
     return {
         "run_id": run_id,
@@ -318,6 +319,7 @@ def _run_analysis(
     tasks: list[dict[str, Any]],
     use_llm: bool,
     horizon_months: int,
+    incremental: bool = False,
 ) -> None:
     """Execute the graph and persist the result. Runs off the request thread."""
     runs.update(run_id, status="running", progress="Extracting statements")
@@ -362,7 +364,24 @@ def _run_analysis(
         _persist(state)
         _save_file_registry(state, source="upload")
 
-        payload = _build_payload(state)
+        if incremental:
+            # /api/upload's graph only ever sees the files just added - it
+            # has no idea a ledger already exists, so `state` here is that
+            # delta alone, not the whole picture. Building the dashboard
+            # payload straight from it showed the user ONLY the newly
+            # uploaded files' accounts and transactions - every earlier
+            # upload appeared to have vanished, most visibly when the new
+            # files failed to parse and the delta was empty. Nothing was
+            # actually lost: `_persist` above merges into the same database
+            # rows an ordinary reanalyze reads from, by account identity and
+            # by id. Rebuilding from what is now in the database, the same
+            # way a restart recovers the dashboard, is what makes adding
+            # files actually additive instead of a fresh start every time.
+            rebuilt_run_id = _rebuild_from_persisted_data(get_db())
+            payload = runs.get(rebuilt_run_id)["result"]
+        else:
+            payload = _build_payload(state)
+
         runs.update(
             run_id,
             status="complete",
@@ -372,7 +391,8 @@ def _run_analysis(
             result=payload,
         )
         runs.set_latest(run_id)
-        remember_run(run_id, payload)
+        if not incremental:
+            remember_run(run_id, payload)
         log.info("run %s complete: %d transactions", run_id,
                  len(state.get("transactions") or []))
 
@@ -523,6 +543,12 @@ def _save_file_registry(state: dict[str, Any], source: str) -> None:
     for entry in latest_attempt_per_file(state.get("statements") or []):
         statement = entry.get("statement")
         statement_id = statement.id if statement else None
+        
+        # Extract real period hint from the parsed statement if available
+        period_hint = None
+        if statement and statement.period_start:
+            period_hint = f"{statement.period_start.year:04d}-{statement.period_start.month:02d}"
+
         if statement_id and statement_id not in persisted_statement_ids:
             statement_id = None
         record = repo.SourceFileRecord(
@@ -542,6 +568,7 @@ def _save_file_registry(state: dict[str, Any], source: str) -> None:
             statement_id=statement_id,
             transaction_count=entry.get("transaction_count") or 0,
             error_message=entry.get("message") or "",
+            period_hint=period_hint,
         )
         repo.upsert_source_file(db, record)
     repo.backfill_source_file_account_ids(db)

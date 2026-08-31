@@ -115,7 +115,22 @@ def normalize(
         _apply_balance_to_account(account, account_type, statement)
         return statement, account
 
-    candidates = _rank_tables(extraction.tables)
+    # Resolves a bare "June 18" - American Express prints every transaction
+    # date with no year, trusting the statement period (printed once,
+    # elsewhere - see metadata.detect_period) to supply it. Needed starting
+    # here, not just for the final row conversion below: a column of
+    # otherwise-unparseable dates is one `_rank_tables` cannot recognise as
+    # the date column at all, which fails the table before a single row is
+    # ever converted. Preferring period_end over period_start is a
+    # simplification - exactly right for a statement whose period does not
+    # cross a calendar year boundary, which is every case actually seen.
+    default_year = None
+    if meta.period_end:
+        default_year = meta.period_end.year
+    elif meta.period_start:
+        default_year = meta.period_start.year
+
+    candidates = _rank_tables(extraction.tables, default_year=default_year)
     if not candidates:
         statement.parse_warnings.append(
             "No table in this file looked like a transaction list."
@@ -123,12 +138,12 @@ def normalize(
         _apply_balance_to_account(account, account_type, statement)
         return statement, account
 
-    best_mapping, chosen = candidates[0]
-    merged_rows = _merge_continuations(chosen, candidates, best_mapping)
+    best_mapping, chosen, chosen_body = candidates[0]
+    merged_rows = _merge_continuations(chosen, chosen_body, candidates, best_mapping)
 
     transactions, warnings = _rows_to_transactions(
         merged_rows, best_mapping, account_type, meta.currency,
-        opening_balance=meta.opening_balance,
+        opening_balance=meta.opening_balance, default_year=default_year,
     )
     statement.transactions = transactions
     statement.parse_warnings.extend(warnings)
@@ -191,25 +206,36 @@ def _metadata_text(extraction: ExtractionResult) -> str:
 # Table selection
 # --------------------------------------------------------------------------
 
-def _rank_tables(tables: list[ExtractedTable]) -> list[tuple[ColumnMapping, ExtractedTable]]:
+def _rank_tables(
+    tables: list[ExtractedTable], default_year: int | None = None,
+) -> list[tuple[ColumnMapping, ExtractedTable, list[list[str]]]]:
     """Score every extracted table and return the usable ones, best first.
 
     A statement file typically contains several tables: a metadata block, the
     transactions, and sometimes a summary. We want the one that maps cleanly to
     transaction roles and has the most rows.
+
+    Each entry carries its own resolved body alongside the original
+    `ExtractedTable` rather than writing the body back onto `table.rows` -
+    `extract()` builds a fresh `ExtractionResult` per call, but a caller can
+    still hand the SAME result to `normalize()` more than once (files_routes's
+    fetch-one-month flow normalizes once to check account identity, then again
+    inside the merge). Overwriting `table.rows` here made the second call
+    resolve against the first call's already-stripped, already-merged output
+    instead of the original extraction - harmless when that happened to
+    resolve the same way again, silently wrong the moment it didn't.
     """
     from collections import defaultdict
 
-    entries: list[tuple[ColumnMapping, ExtractedTable, int]] = []
+    entries: list[tuple[ColumnMapping, ExtractedTable, list[list[str]], int]] = []
     for table in tables:
-        mapping, body = _resolve_mapping(table)
+        mapping, body = _resolve_mapping(table, default_year=default_year)
         if mapping is None or not mapping.is_usable():
             continue
-        parseable = _count_parseable(body, mapping)
+        parseable = _count_parseable(body, mapping, default_year=default_year)
         if parseable < MIN_PARSEABLE_ROWS:
             continue
-        table.rows = body
-        entries.append((mapping, table, parseable))
+        entries.append((mapping, table, body, parseable))
 
     # Group pages of the same logical table before scoring.
     #
@@ -219,16 +245,16 @@ def _rank_tables(tables: list[ExtractedTable]) -> list[tuple[ColumnMapping, Extr
     # row-by-row the text version always wins, even when the ruled version is
     # cleaner - and a lower-quality parse that still "works" is exactly the kind
     # of silent wrongness this pipeline exists to prevent.
-    groups: dict[tuple, list[tuple[ColumnMapping, ExtractedTable, int]]] = defaultdict(list)
-    for mapping, table, parseable in entries:
+    groups: dict[tuple, list[tuple[ColumnMapping, ExtractedTable, list[list[str]], int]]] = defaultdict(list)
+    for mapping, table, body, parseable in entries:
         key = (tuple(sorted(mapping.roles.items())), table.source_sheet)
-        groups[key].append((mapping, table, parseable))
+        groups[key].append((mapping, table, body, parseable))
 
     scored: list[tuple[float, list]] = []
     for members in groups.values():
-        total_rows = sum(p for _, _, p in members)
+        total_rows = sum(p for _, _, _, p in members)
         mapping = members[0][0]
-        best_confidence = max(t.confidence for _, t, _ in members)
+        best_confidence = max(t.confidence for _, t, _, _ in members)
         # Extraction confidence is weighted heavily enough to break a row-count
         # tie: when a ruled table and a text-recovered table both cover the same
         # rows, the structured one is materially more trustworthy.
@@ -238,14 +264,22 @@ def _rank_tables(tables: list[ExtractedTable]) -> list[tuple[ColumnMapping, Extr
         scored.append((score, members))
 
     scored.sort(key=lambda s: -s[0])
-    return [(m, t) for _, members in scored for m, t, _ in members]
+    return [(m, t, b) for _, members in scored for m, t, b, _ in members]
 
 
-def _resolve_mapping(table: ExtractedTable) -> tuple[ColumnMapping | None, list[list[str]]]:
+def _resolve_mapping(
+    table: ExtractedTable, default_year: int | None = None,
+) -> tuple[ColumnMapping | None, list[list[str]]]:
     """Find this table's column mapping and return its data rows (header removed).
 
     Tries, in order: an explicit header field, a header row inside the table,
     then inference from cell content.
+
+    `default_year` resolves a bare "June 18" the same way it does for the
+    final row conversion (see parsers.parse_date) - needed here too, because
+    a column of otherwise-unparseable dates is a column `infer_roles_from_data`
+    cannot recognise as the date column at all, and a table with no
+    recognised date column never passes `is_usable()` in the first place.
     """
     rows = table.rows
     if not rows:
@@ -256,35 +290,176 @@ def _resolve_mapping(table: ExtractedTable) -> tuple[ColumnMapping | None, list[
         if mapping.is_usable():
             return mapping, rows
 
-    header_idx = find_header_row(rows)
+    header_idx = find_header_row(rows, default_year=default_year)
     if header_idx is not None:
         mapping = map_columns(rows[header_idx])
         if mapping.is_usable():
             return mapping, rows[header_idx + 1:]
 
-    inferred = infer_roles_from_data(rows)
-    if inferred.is_usable():
+    inferred = infer_roles_from_data(rows, default_year=default_year)
+    if inferred.is_usable() and not _has_truncated_amounts(rows, inferred):
         # Drop any leading header-looking row so it isn't parsed as data.
-        body = rows[1:] if looks_like_header(rows[0]) else rows
+        body = rows[1:] if looks_like_header(rows[0], default_year=default_year) else rows
+        return inferred, body
+
+    # Tried whenever the plain inference either failed outright or produced a
+    # mapping whose own money columns look truncated: a `stream`-strategy
+    # extraction (see ingestion.extractors) can place a page-wide column
+    # boundary in the middle of a right-aligned number's digits rather than
+    # before or after it. The split point then differs row to row, because
+    # each row's amount is a different width - "5,399.00" becomes "5,3" /
+    # "99.00" in one row, "648,912.00" becomes "64" / "8,912.00" in another.
+    # Gating this on `_has_truncated_amounts` rather than on `is_usable()`
+    # alone matters because a split-amount table can still satisfy
+    # `is_usable()` - the leading half of a split number is still numeric and
+    # still fills the column densely, so it reads as a perfectly good money
+    # role right up until you look at what actually landed in it. Requiring
+    # the plain reading to ALSO look intact before trusting it is what keeps
+    # this from ever touching a genuinely split debit/credit layout - the
+    # common, currently-working case for every other bank - since that always
+    # reads as intact without any repair.
+    repaired_rows = _repair_split_amounts(rows)
+    if repaired_rows is not rows:
+        repaired_inferred = infer_roles_from_data(repaired_rows, default_year=default_year)
+        if repaired_inferred.is_usable() and not _has_truncated_amounts(repaired_rows, repaired_inferred):
+            body = (repaired_rows[1:]
+                    if looks_like_header(repaired_rows[0], default_year=default_year)
+                    else repaired_rows)
+            return repaired_inferred, body
+
+    # Repair either found nothing to fix or didn't produce anything cleaner -
+    # fall back to the plain reading if it was at least usable, rather than
+    # discarding the whole table over a money column that merely looks
+    # suspicious.
+    if inferred.is_usable():
+        body = rows[1:] if looks_like_header(rows[0], default_year=default_year) else rows
         return inferred, body
 
     return None, rows
 
 
-def _count_parseable(rows: list[list[str]], mapping: ColumnMapping) -> int:
+#: A cell with digits (and thousands commas) but NO decimal point. A real,
+#: complete Indian-currency amount is essentially always printed with two
+#: decimals even for a whole-rupee figure - a cell missing that decimal is
+#: the tell that it is the LEADING half of a number a column boundary cut
+#: through, not a complete amount in its own column.
+_BARE_DIGITS = re.compile(r"^[\d,]+$")
+#: The trailing half of a split amount: digits ending in exactly two
+#: decimals, short enough to plausibly be the tail of a larger number.
+_DECIMAL_TAIL = re.compile(r"^\d{1,3}\.\d{2}$")
+
+
+def _repair_split_amounts(rows: list[list[str]]) -> list[list[str]]:
+    """Rejoin an amount a `stream` extraction split across two adjacent cells.
+
+    The merged value is written into the RIGHT-hand cell of the pair, not the
+    left, and the left is cleared instead. A row whose amount was never split
+    in the first place already has it sitting in that same trailing cell -
+    writing the repaired value there too, rather than into the leading cell,
+    is what lets both kinds of row end up with their one true amount in the
+    same column, so a single money role can pick up both. Merging into the
+    left cell instead would still repair each split row's own value
+    correctly, but scatter the results across two different columns
+    depending on whether a given row happened to need repair, leaving no one
+    column dense enough for `infer_roles_from_data` to recognise as the
+    money column at all.
+
+    Returns `rows` itself, unchanged, when nothing needed repair - callers
+    rely on `is` to tell whether anything actually happened.
+    """
+    changed = False
+    repaired: list[list[str]] = []
+    for row in rows:
+        new_row = list(row)
+        i = 0
+        while i < len(new_row) - 1:
+            left = str(new_row[i] or "").strip()
+            right = str(new_row[i + 1] or "").strip()
+            if left and _BARE_DIGITS.match(left) and _DECIMAL_TAIL.match(right):
+                new_row[i + 1] = left + right
+                new_row[i] = ""
+                changed = True
+                i += 2
+            else:
+                i += 1
+        repaired.append(new_row)
+    return repaired if changed else rows
+
+
+def _has_truncated_amounts(rows: list[list[str]], mapping: ColumnMapping) -> bool:
+    """True when a mapping's own money columns look like split-amount halves.
+
+    A mapping can satisfy `is_usable()` while still being wrong: the "clear
+    winner" date-column carve-out in `infer_roles_from_data` only checks the
+    date column's own hit rate, so a table whose amounts were split across
+    two adjacent cells by a `stream` extraction (see `_repair_split_amounts`)
+    can still resolve to a mapping that assigns debit/credit to the LEADING
+    halves of those splits - present, dense and numeric, so indistinguishable
+    from a real money column by every check upstream of this one. The tell is
+    what actually landed in the column: a genuine amount is essentially
+    always printed with two decimals, even for a whole-rupee figure, so a
+    money column mostly full of bare digits with no decimal point at all is
+    the same signal `_repair_split_amounts` looks for, just checked after the
+    fact instead of before.
+    """
+    money_cols = [c for c in (mapping.get("debit"), mapping.get("credit"),
+                              mapping.get("amount")) if c is not None]
+    if not money_cols:
+        return False
+    total = bare = 0
+    for row in rows:
+        for c in money_cols:
+            if c >= len(row):
+                continue
+            cell = str(row[c] or "").strip()
+            if not cell:
+                continue
+            total += 1
+            if _BARE_DIGITS.match(cell):
+                bare += 1
+    return total > 0 and bare >= total * 0.3
+
+
+def _count_parseable(rows: list[list[str]], mapping: ColumnMapping,
+                     default_year: int | None = None) -> int:
     date_col = mapping.get("txn_date")
     if date_col is None:
         return 0
     count = 0
     for row in rows:
-        if date_col < len(row) and parse_date(row[date_col]) is not None:
+        if date_col < len(row) and parse_date(row[date_col], default_year=default_year) is not None:
             count += 1
     return count
 
 
+def _project_row(row: list[str], from_mapping: ColumnMapping,
+                 to_mapping: ColumnMapping) -> list[str]:
+    """Rebuild `row` so each role's value sits at `to_mapping`'s column index.
+
+    A continuation page can resolve to the same set of roles at DIFFERENT
+    column positions than the page chosen to represent the whole statement -
+    the split-amount repair (see _repair_split_amounts) is one concrete way
+    this happens: it only engages on a page that actually needed it, so that
+    page's "amount" can land at a different index than an unaffected page's.
+    Concatenating raw rows across such pages and reading them all through one
+    fixed set of column indices would silently read some pages' amounts out
+    of the wrong column - empty, or someone else's data - rather than
+    failing loudly. Projecting each continuation page's rows into the chosen
+    page's layout first is what keeps the merge honest.
+    """
+    width = max([*to_mapping.roles.values(), len(row) - 1], default=-1) + 1
+    new_row = [""] * width
+    for role, to_idx in to_mapping.roles.items():
+        from_idx = from_mapping.get(role)
+        if from_idx is not None and from_idx < len(row):
+            new_row[to_idx] = row[from_idx]
+    return new_row
+
+
 def _merge_continuations(
     chosen: ExtractedTable,
-    candidates: list[tuple[ColumnMapping, ExtractedTable]],
+    chosen_body: list[list[str]],
+    candidates: list[tuple[ColumnMapping, ExtractedTable, list[list[str]]]],
     mapping: ColumnMapping,
 ) -> list[list[str]]:
     """Stitch together tables that are continuations of the chosen one.
@@ -293,20 +468,46 @@ def _merge_continuations(
     only the first as "the" transaction table would silently discard 97% of the
     user's data - a failure mode that produces a plausible-looking but
     completely wrong analysis, which is worse than an obvious crash.
-    """
-    merged: list[list[str]] = list(chosen.rows)
 
-    for other_mapping, table in candidates[1:]:
+    An exact match on role INDICES (not just names) is trusted from anywhere
+    in the document - the common multi-page case, where every page was
+    extracted the same way and lines up column for column. A same-NAME,
+    different-INDEX match is trusted only when it directly extends a run of
+    pages already merged (see _project_row): a later page can resolve to the
+    same roles at a different position - the split-amount repair only
+    engages on a page that actually needed it, so its "amount" can land
+    somewhere another page's does not - without being a different table at
+    all. Anywhere else in the document, a same-shaped-but-differently-indexed
+    table is far more likely to be an unrelated block - a rewards summary, a
+    credit-limit recap - that happens to have a date-like, text-like and
+    number-like column without being a continuation of anything. A real
+    statement (data/samples/icici_credit_card_2025_2026.pdf, a full year,
+    392 real transactions) had exactly such a block: requiring page adjacency
+    is what keeps it from being pulled in as 37 extra rows.
+    """
+    merged: list[list[str]] = list(chosen_body)
+    merged_pages: set[int] = {chosen.source_page} if chosen.source_page is not None else set()
+
+    for other_mapping, table, body in candidates[1:]:
         if table is chosen:
             continue
-        # Same role layout on a later page means the same logical table.
-        if other_mapping.roles != mapping.roles:
+        if set(other_mapping.roles.keys()) != set(mapping.roles.keys()):
             continue
         if chosen.source_page is not None and table.source_page is None:
             continue
         if chosen.source_sheet != table.source_sheet:
             continue
-        merged.extend(table.rows)
+        if other_mapping.roles == mapping.roles:
+            merged.extend(body)
+            if table.source_page is not None:
+                merged_pages.add(table.source_page)
+        else:
+            if table.source_page is None or not merged_pages:
+                continue
+            if not any(abs(table.source_page - p) == 1 for p in merged_pages):
+                continue
+            merged.extend(_project_row(r, other_mapping, mapping) for r in body)
+            merged_pages.add(table.source_page)
 
     return merged
 
@@ -327,6 +528,7 @@ def _rows_to_transactions(
     account_type: AccountType,
     currency: str,
     opening_balance: Decimal | None = None,
+    default_year: int | None = None,
 ) -> tuple[list[Transaction], list[str]]:
     warnings: list[str] = []
     transactions: list[Transaction] = []
@@ -345,7 +547,8 @@ def _rows_to_transactions(
     skipped_balance_marker = 0
 
     for i, row in enumerate(rows):
-        txn_date = parse_date(_cell(row, date_col), day_first=day_first)
+        txn_date = parse_date(_cell(row, date_col), day_first=day_first,
+                              default_year=default_year)
         if txn_date is None:
             skipped_no_date += 1
             continue
@@ -384,7 +587,8 @@ def _rows_to_transactions(
 
         transactions.append(Transaction(
             txn_date=txn_date,
-            value_date=parse_date(_cell(row, mapping.get("value_date")), day_first=day_first),
+            value_date=parse_date(_cell(row, mapping.get("value_date")), day_first=day_first,
+                                  default_year=default_year),
             raw_description=raw_desc,
             normalized_description=normalize_description(raw_desc),
             amount=amount,

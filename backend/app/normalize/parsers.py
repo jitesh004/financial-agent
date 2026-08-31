@@ -43,6 +43,12 @@ _DATE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^(\d{1,2})([A-Za-z]{3})(\d{2,4})$"), "dmonthy"),
     # 20260115
     (re.compile(r"^(\d{4})(\d{2})(\d{2})$"), "ymd"),
+    # June 18 - no year at all. American Express prints transaction dates
+    # this way, relying on the statement period (printed once, elsewhere) to
+    # supply the year rather than repeating it on every row. Least specific
+    # on purpose, tried last, and only ever resolves with a `default_year`
+    # supplied by the caller - see parse_date.
+    (re.compile(r"^([A-Za-z]{3,9})[-/.\s,]+(\d{1,2})$"), "monthd_noyear"),
 ]
 
 _DATE_NOISE = re.compile(r"\s+\d{1,2}:\d{2}(:\d{2})?\s*(AM|PM)?$", re.IGNORECASE)
@@ -55,11 +61,19 @@ def _expand_year(y: int) -> int:
     return 1900 + y if y >= 70 else 2000 + y
 
 
-def parse_date(value: str, day_first: bool = True) -> date | None:
+def parse_date(value: str, day_first: bool = True,
+               default_year: int | None = None) -> date | None:
     """Parse a statement date cell. Returns None rather than raising.
 
     A None here is a signal to the caller that the row is probably not a
     transaction row at all (a header, a footer, a page break).
+
+    `default_year` resolves a bare "June 18" - American Express prints
+    transaction dates with no year at all, trusting the statement period
+    (printed once, elsewhere) to supply it. Without a year to fall back on,
+    that pattern never matches, and it is deliberately left unresolved
+    rather than guessed at: a caller with no year to offer should keep
+    treating the row as unparseable, the same as it always has.
     """
     if value is None:
         return None
@@ -92,6 +106,14 @@ def parse_date(value: str, day_first: bool = True) -> date | None:
                 mo = _MONTHS.get(m.group(1).lower(), 0)
                 d = int(m.group(2))
                 y = _expand_year(int(m.group(3)))
+                if not mo:
+                    continue
+            elif kind == "monthd_noyear":
+                if default_year is None:
+                    continue
+                mo = _MONTHS.get(m.group(1).lower(), 0)
+                d = int(m.group(2))
+                y = default_year
                 if not mo:
                     continue
             else:  # ambiguous

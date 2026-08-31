@@ -948,6 +948,97 @@ def test_an_excluded_parser_artifact_does_not_corrupt_which_series_look_active()
         "regular series look overdue and inactive")
 
 
+def test_a_failed_charge_and_its_own_refund_cancel_out():
+    """A payment gateway that fails a charge can post the debit AND its
+    reversal before a retry succeeds - one debit, a same-amount same-day
+    credit, and a second debit, all on one card. That is one failed attempt
+    (net zero) and one real charge, not three real transactions. Before this,
+    the failed debit counted as spending and the refund counted as income
+    (or netted against something unrelated), and the real, successful charge
+    was indistinguishable from the failed one."""
+    from app.reconcile.transfers import detect_reversals
+
+    failed = Transaction(
+        id="d1", account_id="a1", txn_date=date(2026, 8, 17),
+        raw_description="RAZ*DREAMPLUG PAYTECH Bengaluru U IND",
+        merchant="DREAMPLUG PAYTECH BENGALURU", amount=Decimal("1221.68"),
+        direction=Direction.DEBIT, category=Category.CC_PAYMENT)
+    refund = Transaction(
+        id="c1", account_id="a1", txn_date=date(2026, 8, 17),
+        raw_description="RAZ*DREAMPLUG PAYTECH Bengaluru IND",
+        merchant="DREAMPLUG PAYTECH", amount=Decimal("1221.68"),
+        direction=Direction.CREDIT, category=Category.CC_PAYMENT)
+    succeeded = Transaction(
+        id="d2", account_id="a1", txn_date=date(2026, 8, 17),
+        raw_description="RAZ*DREAMPLUG PAYTECH Bengaluru IND",
+        merchant="DREAMPLUG PAYTECH", amount=Decimal("1221.68"),
+        direction=Direction.DEBIT, category=Category.CC_PAYMENT)
+
+    count = detect_reversals([failed, refund, succeeded])
+
+    assert count == 1
+    assert failed.excluded is True
+    assert refund.excluded is True
+    assert succeeded.excluded is False, (
+        "the successful retry must be left for normal classification, not "
+        "swept up by the same-amount match")
+
+
+def test_reversal_detection_requires_a_matching_merchant():
+    """Amount and date alone are not enough: a same-amount, same-day,
+    same-account pair is common enough by coincidence (two unrelated bills
+    due the same day) that cancelling them without a merchant match would
+    net out two real, unrelated transactions."""
+    from app.reconcile.transfers import detect_reversals
+
+    unrelated_debit = Transaction(
+        id="d1", account_id="a1", txn_date=date(2026, 8, 17),
+        raw_description="NETFLIX SUBSCRIPTION", merchant="NETFLIX",
+        amount=Decimal("500.00"), direction=Direction.DEBIT,
+        category=Category.SUBSCRIPTIONS)
+    unrelated_credit = Transaction(
+        id="c1", account_id="a1", txn_date=date(2026, 8, 17),
+        raw_description="SALARY ARREARS", merchant="EMPLOYER",
+        amount=Decimal("500.00"), direction=Direction.CREDIT,
+        category=Category.OTHER_INCOME)
+
+    count = detect_reversals([unrelated_debit, unrelated_credit])
+
+    assert count == 0
+    assert unrelated_debit.excluded is False
+    assert unrelated_credit.excluded is False
+
+
+def test_an_unmatched_card_settlement_is_flagged_for_review():
+    """A cc_payment row that transfer detection could not pair with its far
+    leg is a silent default, not a confirmed fact - it is counted as
+    spending (a debit) or as settling the card rather than income (a
+    credit) purely because nothing better is available. Before this, that
+    default applied with no way for the user to ever see or correct it."""
+    from app.db import repository as repo
+    from app.pipeline.enrich import enrich_ledger
+
+    db = Database(Path(tempfile.mkdtemp()) / "cc.db")
+
+    unmatched_debit = Transaction(
+        id="d1", account_id="a1", txn_date=date(2026, 3, 4),
+        raw_description="CREDIT CARD PAYMENT", amount=Decimal("50000"),
+        direction=Direction.DEBIT, category=Category.CC_PAYMENT)
+    unmatched_credit = Transaction(
+        id="c1", account_id="a1", txn_date=date(2026, 3, 5),
+        raw_description="PAYMENT RECEIVED BBPS", amount=Decimal("1300"),
+        direction=Direction.CREDIT, category=Category.CC_PAYMENT)
+
+    result = enrich_ledger(db, [unmatched_debit, unmatched_credit], {},
+                           run_analysis=False)
+
+    by_id = {t.id: t for t in result.transactions}
+    assert by_id["d1"].needs_review is True
+    assert by_id["c1"].needs_review is True
+    assert "spending" in by_id["d1"].review_reason.lower()
+    assert "income" in by_id["c1"].review_reason.lower()
+
+
 def test_a_retried_file_does_not_leave_two_statements_in_the_ledger():
     """`statements` is an additive LangGraph channel (state.py) so a file
     retried after a failed reconciliation check ends up with TWO ParsedFile
@@ -1015,3 +1106,199 @@ def test_no_duplicate_function_definitions_shadow_the_live_claims_code():
             if isinstance(n, ast.FunctionDef) and n.col_offset == 0]
     dupes = {n for n in names if names.count(n) > 1}
     assert not dupes, f"duplicate top-level function definitions: {sorted(dupes)}"
+
+
+def test_repair_split_amounts_rejoins_a_stream_extraction_split():
+    """A `stream`-strategy pdfplumber extraction can place a page-wide column
+    boundary through the middle of a right-aligned amount - "5,399.00" comes
+    back as two cells, "5,3" and "99.00" - and the split point differs row to
+    row because each amount is a different width. Confirmed against a real
+    American Express statement (data/statements - see normalizer.py).
+
+    The merged value lands in the RIGHT-hand cell, not the left: a row whose
+    amount was never split already has it sitting there, and only writing
+    repaired values to that same trailing position lets both kinds of row
+    end up in one column for role inference to find.
+    """
+    from app.normalize.normalizer import _repair_split_amounts
+
+    rows = [
+        ["July 4", "ZUDIO Z698", "", "5,3", "99.00"],
+        ["July 11", "EASEBUZZ", "", "", "671.00"],  # already whole - nothing to merge
+        ["July 14", "ZEPTONOW", "", "2", "40.00"],
+    ]
+    repaired = _repair_split_amounts(rows)
+
+    assert repaired is not rows, "a table that needed repair must not be reported as unchanged"
+    assert repaired[0] == ["July 4", "ZUDIO Z698", "", "", "5,399.00"]
+    assert repaired[1] == rows[1], "a row with nothing to merge must be left exactly as it was"
+    assert repaired[2] == ["July 14", "ZEPTONOW", "", "", "240.00"]
+
+
+def test_repair_split_amounts_is_a_noop_when_nothing_is_split():
+    """A genuinely working split debit/credit layout - the common,
+    currently-correct case for every other bank - must come back byte-for-byte
+    unchanged, and `is rows` is what callers rely on to know that."""
+    from app.normalize.normalizer import _repair_split_amounts
+
+    rows = [["01-May-2026", "Salary", "", "50000.00", "50000.00"]]
+    assert _repair_split_amounts(rows) is rows
+
+
+def test_has_truncated_amounts_flags_a_mapping_built_on_split_halves():
+    """The 'clear winner' date-column threshold (column_map.py) can make a
+    table `is_usable()` even when its money column was actually assigned to
+    the LEADING half of a split amount - present, dense and numeric, so
+    indistinguishable from a real money column by every check upstream of
+    this one. `_has_truncated_amounts` is the after-the-fact check that
+    catches it by looking at what actually landed in the column."""
+    from app.normalize.column_map import ColumnMapping
+    from app.normalize.normalizer import _has_truncated_amounts
+
+    truncated_rows = [
+        ["July 4", "ZUDIO", "5,3", "99.00"],
+        ["July 14", "ZEPTONOW", "2", "40.00"],
+    ]
+    bad_mapping = ColumnMapping(roles={"txn_date": 0, "description": 1, "amount": 2})
+    assert _has_truncated_amounts(truncated_rows, bad_mapping) is True
+
+    whole_rows = [
+        ["July 4", "ZUDIO", "5399.00"],
+        ["July 14", "ZEPTONOW", "240.00"],
+    ]
+    good_mapping = ColumnMapping(roles={"txn_date": 0, "description": 1, "amount": 2})
+    assert _has_truncated_amounts(whole_rows, good_mapping) is False
+
+
+def test_normalize_recovers_split_amounts_amid_page_footer_clutter():
+    """End-to-end: a table with a page-footer clutter row (numeric, but no
+    date anywhere in it - see _looks_like_transaction_row) ahead of real
+    transaction rows whose amounts a `stream` extraction split across two
+    cells. Modelled on a real American Express statement where this exact
+    combination initially produced truncated amounts (`56`, `2`, `5.3`)
+    and the wrong direction for every row.
+    """
+    from app.models.schemas import AccountType, ExtractedTable, ExtractionResult, SourceFormat
+    from app.normalize.normalizer import normalize
+
+    rows = [
+        # Credit-limit recap: numeric-looking, but no date anywhere in it.
+        ["Available Credit Limit Rs", "", "648", "912.00", ""],
+        ["01-May-2026", "Grocery Store", "", "1", "50.00"],
+        ["02-May-2026", "Movie Tickets", "", "", "75.00"],
+        ["03-May-2026", "Electric Bill", "", "2", "10.50"],
+    ]
+    extraction = ExtractionResult(
+        tables=[ExtractedTable(rows=rows, source_page=1)],
+        full_text="Statement of transactions for card ending 1234",
+        extractor_used="test", source_format=SourceFormat.PDF,
+    )
+
+    statement, _ = normalize(extraction, "card.pdf", account_type_hint=AccountType.CREDIT_CARD)
+
+    amounts = sorted(str(t.amount) for t in statement.transactions)
+    assert amounts == ["150.00", "210.50", "75.00"], (
+        "amounts must be rejoined, not left truncated at the split point")
+    assert all(t.direction == Direction.DEBIT for t in statement.transactions)
+
+
+def test_continuation_pages_with_repaired_column_indices_still_merge():
+    """A page whose amount needed the split-amount repair (see
+    _repair_split_amounts) can resolve its 'amount' role to a different
+    column index than an unaffected page of the same statement - the repair
+    only engages on a page that actually needed it. Requiring an exact index
+    match to recognise a continuation, as the code used to, silently
+    dropped every later page whose layout came out even slightly
+    differently shaped this way.
+    """
+    from app.models.schemas import ExtractedTable
+    from app.normalize.column_map import ColumnMapping
+    from app.normalize.normalizer import _merge_continuations
+
+    chosen = ExtractedTable(rows=[["placeholder"]], source_page=1)
+    chosen_body = [["01-May-2026", "Grocery Store", "150.00"]]
+    chosen_mapping = ColumnMapping(roles={"txn_date": 0, "description": 1, "amount": 2})
+
+    page2 = ExtractedTable(rows=[["placeholder"]], source_page=2)
+    page2_body = [["18-May-2026", "Cinema", "", "75.00"]]
+    page2_mapping = ColumnMapping(roles={"txn_date": 0, "description": 1, "amount": 3})
+
+    merged = _merge_continuations(
+        chosen, chosen_body,
+        [(chosen_mapping, chosen, chosen_body), (page2_mapping, page2, page2_body)],
+        chosen_mapping,
+    )
+
+    assert len(merged) == 2
+    assert merged[0] == ["01-May-2026", "Grocery Store", "150.00"]
+    # Page 2's amount, at ITS OWN column 3, is projected into the chosen
+    # page's column 2 rather than being read from column 2 verbatim (which
+    # would silently pick up an empty cell) or dropped.
+    assert merged[1][0] == "18-May-2026"
+    assert merged[1][2] == "75.00"
+
+
+def test_a_same_shaped_table_far_from_any_merged_page_is_not_pulled_in():
+    """Matching a continuation page on role NAMES rather than exact column
+    indices (see the test above) is deliberately restricted to a page that
+    directly extends a run of pages already merged. Without that
+    restriction, a real year-long ICICI statement
+    (data/samples/icici_credit_card_2025_2026.pdf) had its 392 genuine
+    transactions polluted with 37 extra rows pulled in from an unrelated
+    Credit Summary block elsewhere in the document that happened to also
+    resolve to a date-like, description-like and amount-like column.
+    """
+    from app.models.schemas import ExtractedTable
+    from app.normalize.column_map import ColumnMapping
+    from app.normalize.normalizer import _merge_continuations
+
+    chosen = ExtractedTable(rows=[["placeholder"]], source_page=1)
+    chosen_body = [["01-May-2026", "Grocery Store", "150.00"]]
+    chosen_mapping = ColumnMapping(roles={"txn_date": 0, "description": 1, "amount": 2})
+
+    far_page = ExtractedTable(rows=[["placeholder"]], source_page=9)
+    far_body = [["At 28-Jul-2026", "Available Credit Limit", "", "648912.00"]]
+    far_mapping = ColumnMapping(roles={"txn_date": 0, "description": 1, "amount": 3})
+
+    merged = _merge_continuations(
+        chosen, chosen_body,
+        [(chosen_mapping, chosen, chosen_body), (far_mapping, far_page, far_body)],
+        chosen_mapping,
+    )
+
+    assert len(merged) == 1, (
+        "a same-shaped table nine pages away must not be treated as a "
+        "continuation of the chosen page")
+
+
+def test_normalize_is_idempotent_when_called_twice_on_the_same_extraction():
+    """files_routes's fetch-one-month flow normalizes the same
+    ExtractionResult object twice - once to check account identity before
+    committing to it, once more inside the actual merge
+    (merge_extracted_file_into_ledger). `_rank_tables` used to write its
+    resolved, header-stripped rows back onto the shared
+    `ExtractedTable.rows`, so the second call resolved against the first
+    call's already-processed output instead of the original extraction.
+    Against a real year-long ICICI statement this parsed to 392 transactions
+    on the first call and a silently different 429 on the second - the
+    exact same file and the exact same code, corrupted by having been read
+    once already.
+    """
+    from app.models.schemas import AccountType, ExtractedTable, ExtractionResult, SourceFormat
+    from app.normalize.normalizer import normalize
+
+    rows = [
+        ["01-May-2026", "Grocery Store", "150.00"],
+        ["02-May-2026", "Movie Tickets", "75.00"],
+        ["03-May-2026", "Electric Bill", "210.50"],
+    ]
+    extraction = ExtractionResult(
+        tables=[ExtractedTable(rows=rows, source_page=1)],
+        full_text="Statement of transactions for card ending 1234",
+        extractor_used="test", source_format=SourceFormat.PDF,
+    )
+
+    statement1, _ = normalize(extraction, "card.pdf", account_type_hint=AccountType.CREDIT_CARD)
+    statement2, _ = normalize(extraction, "card.pdf", account_type_hint=AccountType.CREDIT_CARD)
+
+    assert len(statement1.transactions) == len(statement2.transactions) == 3

@@ -107,11 +107,12 @@ RULES: list[Rule] = [
     # ---- Investments ---------------------------------------------------
     _r(r"\bSIP\b|\bMUTUAL\s+FUND\b|\bMF\s+PURCHASE\b|\bFOLIO\b|\bNAV\b|"
        r"\bPARAG\s+PARIKH\b|\bNIFTY\b|\bINDEX\s+FUND\b|\bFLEXI\s*CAP\b|"
-       r"\bELSS\b|\bBSE\s+LTD\b|\bNSE\s+CLEARING\b",
+       r"\bELSS\b|\bBSE\s+LTD\b|\bNSE\s+CLEARING\b|\bINDMONEY\b",
        Category.INVESTMENT, 0.93),
     _r(r"\bZERODHA\b|\bGROWW\b|\bUPSTOX\b|\bICICI\s*DIRECT\b|\bANGEL\s*ONE\b|"
        r"\bKUVERA\b|\bCOIN\b|\bDEMAT\b|\bNPS\b|\bPPF\b|\bEPF\b|\bSUKANYA\b|"
-       r"\bRECURRING\s+DEPOSIT\b|\bFIXED\s+DEPOSIT\b|\bRD\s+INSTAL?MENT\b",
+       r"\bRECURRING\s+DEPOSIT\b|\bFIXED\s+DEPOSIT\b|\bRD\s+INSTAL?MENT\b|"
+       r"\bINDMONEY\b",
        Category.INVESTMENT, 0.9),
 
     # ---- Housing & utilities -------------------------------------------

@@ -253,6 +253,11 @@ def detect_account_number(text: str) -> str | None:
     We surface the last four digits only, which is enough for a user to tell
     two accounts apart and useless to anyone who intercepts the database.
     """
+    # Amex: XXXX-XXXXXX-31004
+    amex_match = re.search(r"[X*]{4}-[X*]{6}-(\d{5})", text, re.IGNORECASE)
+    if amex_match:
+        return f"XXXX{amex_match.group(1)[-4:]}"
+
     # Deliberately NOT "customer id": one customer ID spans every account the
     # bank holds for you, so it identifies the person, not the account. ICICI
     # prints the account number plainly on some months and only "Cust ID" on
@@ -264,7 +269,7 @@ def detect_account_number(text: str) -> str | None:
     labeled = _find_labeled(text, [
         r"account\s*(?:number|no\.?|#)", r"a/?c\s*(?:number|no\.?)",
         r"card\s*(?:number|no\.?)", r"loan\s*account\s*(?:number|no\.?)",
-        r"folio\s*(?:number|no\.?)",
+        r"folio\s*(?:number|no\.?)", r"membership\s*(?:number|no\.?)",
     ])
     if labeled:
         # Take the digits of a single account-shaped TOKEN, not every digit in
@@ -351,6 +356,30 @@ def detect_period(text: str) -> tuple[date | None, date | None]:
             start, end = parse_date(m.group(1)), parse_date(m.group(2))
             if start and end and start <= end:
                 return start, end
+
+    # American Express states the range as "Statement Period From May 29 to
+    # June 28, 2026" - only the END carries a year, trusting the reader to
+    # infer the start's year from it (the same convention the card uses for
+    # every transaction row, see parsers.parse_date). Parsed as its own
+    # two-step case: the year comes from the end date, and is only carried
+    # back to the start as-is if that does not put the start AFTER the end -
+    # a period crossing a calendar year boundary ("December 29 to January 5,
+    # 2026") must count the start as the year before.
+    m = re.search(
+        r"statement\s*period\s*from\s*"
+        r"([A-Za-z]{3,9}\s+\d{1,2})\s*(?:to|-|–|through|till)\s*"
+        r"([A-Za-z]{3,9}\s+\d{1,2}\s*,?\s*\d{2,4})",
+        text, re.IGNORECASE,
+    )
+    if m:
+        end = parse_date(m.group(2))
+        if end:
+            start = parse_date(m.group(1), default_year=end.year)
+            if start and start > end:
+                start = parse_date(m.group(1), default_year=end.year - 1)
+            if start and start <= end:
+                return start, end
+
     return None, None
 
 
@@ -576,7 +605,18 @@ def extract_metadata(text: str, filename: str = "", sender: str = "") -> Stateme
         if not meta.product_name and meta.institution == "ICICI Bank":
             meta.product_name = detect_card_variant_from_filename(filename)
     meta.account_number_masked = detect_account_number(head) or detect_account_number(text)
-    meta.period_start, meta.period_end = detect_period(head or text)
+    # Tried against `head` first, then the wider `text` if that finds
+    # nothing - same idiom as account_number_masked just above, and for the
+    # same reason letterhead()'s own docstring gives for balances: a period
+    # statement can legitimately sit past wherever _TXN_LINE_START decided
+    # the letterhead ends. That guard is tuned to recognise transaction
+    # rows, not every line that happens to start with a date - a wrapped
+    # due-date reminder ("...by\n16/07/2026.") is exactly such a line, and
+    # when it triggers early, the actual "Statement Period From ..." text
+    # further down is truncated away before detect_period ever sees it.
+    meta.period_start, meta.period_end = detect_period(head)
+    if not meta.period_start:
+        meta.period_start, meta.period_end = detect_period(text)
 
     holder = _find_labeled(head or text, [
         r"account\s*holder(?:\s*name)?", r"customer\s*name", r"borrower\s*name",

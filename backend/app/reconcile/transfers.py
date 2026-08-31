@@ -379,6 +379,81 @@ def find_duplicate_transactions(transactions: list[Transaction]) -> list[Transac
     return duplicates
 
 
+#: How many days apart a failed charge and its own reversal may post. A
+#: gateway typically reverses same-day or the next business day; this is
+#: deliberately tighter than MAX_DAY_GAP, which is for a transfer settling
+#: across accounts, not a same-account refund of a failed attempt.
+REVERSAL_MAX_DAY_GAP = 3
+
+
+def detect_reversals(transactions: list[Transaction]) -> int:
+    """Cancel out a failed charge against its own same-account refund.
+
+    A payment gateway that fails a charge often posts BOTH the debit and its
+    reversal before a retry succeeds - one debit, a same-amount credit, and a
+    second debit, all on one card, one day. That is not three real events, it
+    is one failed attempt (net zero) and one that actually went through. Left
+    alone, the failed debit counted as real spending and the refund credit
+    either inflated income or, if it happened to share a category with
+    spending, silently netted against something it had nothing to do with.
+
+    This is deliberately narrower than a transfer: nothing here crosses
+    accounts (`detect_transfers` already refuses a same-account pair for
+    exactly that reason), and a same-amount, same-account, same-day pair is
+    common enough by coincidence that amount and date alone are not enough -
+    requiring the same merchant too is what keeps this from cancelling two
+    genuinely unrelated transactions that happen to match on size and timing.
+    """
+    by_account: dict[str, list[Transaction]] = defaultdict(list)
+    for txn in transactions:
+        if txn.is_internal_transfer or txn.excluded:
+            continue
+        by_account[txn.account_id or ""].append(txn)
+
+    reversed_count = 0
+    for acct_txns in by_account.values():
+        credits = [t for t in acct_txns if t.direction == Direction.CREDIT]
+        debits = [t for t in acct_txns if t.direction == Direction.DEBIT]
+        claimed: set[int] = set()
+
+        for credit in credits:
+            candidates = [
+                d for d in debits
+                if id(d) not in claimed
+                and d.amount == credit.amount
+                and abs((d.txn_date - credit.txn_date).days) <= REVERSAL_MAX_DAY_GAP
+                and _same_merchant(d, credit)
+            ]
+            if not candidates:
+                continue
+            best = min(candidates,
+                      key=lambda d: abs((d.txn_date - credit.txn_date).days))
+            claimed.add(id(best))
+
+            best.excluded = True
+            credit.excluded = True
+            note = "Reversed: a failed charge refunded the same day, not real spending."
+            best.note = f"{best.note} {note}".strip()
+            credit.note = f"{credit.note} {note}".strip()
+            reversed_count += 1
+
+    return reversed_count
+
+
+def _same_merchant(a: Transaction, b: Transaction) -> bool:
+    """Same merchant, allowing for one description carrying an extra word.
+
+    Real extractions of the same gateway's narration commonly disagree by a
+    trailing city/rail token ("...Bengaluru U IND" vs "...Bengaluru IND") -
+    a strict equality would miss the exact pair this function exists for.
+    """
+    m1 = (a.merchant or a.raw_description or "").strip().upper()
+    m2 = (b.merchant or b.raw_description or "").strip().upper()
+    if not m1 or not m2:
+        return False
+    return m1 == m2 or m1 in m2 or m2 in m1
+
+
 def _balances_agree(a: Transaction, b: Transaction) -> bool:
     """A genuine repeat moves the running balance; a duplicate does not."""
     if a.balance_after is not None and b.balance_after is not None:
