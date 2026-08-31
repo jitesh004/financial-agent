@@ -52,6 +52,39 @@ def detect_layout(text: str, filename: str = "") -> tuple[str, str]:
     return "unknown", ""
 
 
+#: Phrases that mark a securities document as a record of TRADES rather than
+#: of holdings.
+#:
+#: Both are securities documents and both are full of ISINs, instrument names
+#: and numbers, so every positive signal below fires on either. The difference
+#: is what the numbers mean: a holdings statement's quantity is what you own,
+#: a contract note's is what changed hands, and its "rate" may be a strike
+#: price rather than a value.
+#:
+#: An Upstox "ANNUAL GLOBAL TRANSACTION STATEMENT ... Segment: Future &
+#: Option" was read as holdings and produced one position - "NIFTY NIFTY NIFTY
+#: NIFTY", 1,050 units at 22,500 - worth 2.36 CRORE, which was most of a
+#: portfolio that should have totalled about 1.8 lakh. Every line on it in
+#: fact closed at Net Quantity 0.00: nothing was held at all.
+_TRADE_DOCUMENT_MARKERS = (
+    "contract note",
+    "global transaction statement",
+    "transaction cum bill",
+    "strike rate",
+    "strike price",
+    "future & option",
+    "futures & options",
+    "future and option",
+    "futures and options",
+)
+
+
+def looks_like_trades(text: str) -> bool:
+    """Is this a record of what was traded rather than of what is held?"""
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _TRADE_DOCUMENT_MARKERS)
+
+
 def looks_like_portfolio(text: str, filename: str = "") -> bool:
     """Whether this is a holdings document rather than a bank statement.
 
@@ -59,6 +92,10 @@ def looks_like_portfolio(text: str, filename: str = "") -> bool:
     contains one - so it alone is enough. Otherwise two softer markers must
     agree, which keeps a bank statement that merely mentions "mutual fund" out.
     """
+    # Checked before every positive signal, because they all fire on a
+    # contract note too - see the note above.
+    if looks_like_trades(text):
+        return False
     if ISIN.search(text):
         return True
     if detect_layout(text, filename)[0] == "unknown":
@@ -97,6 +134,24 @@ _DATE_LINE = re.compile(
 _TOTAL_LINE = re.compile(
     r"(?:total|grand\s+total|portfolio)\s*(?:value|valuation)?"
     r"\D{0,30}((?:rs\.?|inr|₹)?\s*[\d,]+(?:\.\d{1,2})?)", re.IGNORECASE)
+
+
+#: Characters a PDF extraction leaves inside an identifier: a soft hyphen
+#: where the text was wrapped, a zero-width space, a non-breaking space.
+_INVISIBLE = re.compile(r"[­​‌‍﻿ \s]+")
+
+
+def _clean_identifier(value: str) -> str:
+    """Strip the invisible debris out of a folio, ISIN or symbol.
+
+    These are keys, not prose: holdings are deduplicated by (account, ISIN,
+    folio), so a folio that reads "5104091481/0" in one month and
+    "510409148­ 1/0" in the next - the same number, wrapped across a line
+    - is two different holdings as far as the database is concerned. One fund
+    appeared twice in the portfolio at two different valuations, and every
+    monthly statement added another copy.
+    """
+    return _INVISIBLE.sub("", value or "")
 
 
 def to_decimal(raw: Any) -> Decimal | None:
@@ -349,7 +404,10 @@ def rows_to_holdings(rows: Sequence[Sequence[Any]]) -> list[Holding]:
                 continue
             cell = row[index]
             if field_name in {"instrument", "symbol", "folio", "isin"}:
-                setattr(holding, field_name, str(cell or "").strip())
+                value = str(cell or "").strip()
+                if field_name in {"folio", "isin", "symbol"}:
+                    value = _clean_identifier(value)
+                setattr(holding, field_name, value)
             else:
                 setattr(holding, field_name, to_decimal(cell))
 

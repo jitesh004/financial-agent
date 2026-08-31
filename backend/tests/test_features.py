@@ -2506,3 +2506,178 @@ def test_money_and_dates_survive_a_round_trip_through_storage():
     assert rebuilt.accounts[0].sanctioned == Decimal("1000")
     assert rebuilt.accounts[0].opened_on == date(2020, 1, 1)
     assert rebuilt.accounts[0].closed_on is None
+
+
+# --------------------------------------------------------------------------
+# One ledger, two pages, two different column layouts.
+# --------------------------------------------------------------------------
+
+def test_an_amount_split_inside_its_decimals_is_rejoined():
+    """American Express breaks "294.78" into "294.7" and "8".
+
+    The leading half is a legal-looking amount, so nothing complained: eleven
+    June transactions were read at the wrong value. Money printed to one
+    decimal place is itself the tell - Indian statements print two.
+    """
+    from app.normalize.normalizer import _repair_split_amounts
+
+    rows = [["June 6", "Razorpay*Zomato", "", "294.7", "8"],
+            ["June 17", "AMAZON Mumbai", "", "2,962.0", "5"]]
+    repaired = _repair_split_amounts(rows)
+    # Joined into the LEFT cell: that is the column this shape leaves the
+    # amounts dense in, and a money role has to find them somewhere.
+    assert repaired[0][3] == "294.78" and repaired[0][4] == ""
+    assert repaired[1][3] == "2,962.05" and repaired[1][4] == ""
+
+
+def test_the_older_split_shape_still_joins_rightwards():
+    """A boundary falling BEFORE the decimals leaves the bulk on the right."""
+    from app.normalize.normalizer import _repair_split_amounts
+
+    rows = [["July 4", "ZUDIO", "5,3", "99.00"]]
+    repaired = _repair_split_amounts(rows)
+    assert repaired[0][2] == "" and repaired[0][3] == "5,399.00"
+
+
+def test_a_money_column_is_judged_on_its_own_numbers():
+    """Pooling columns let one column's debris hide another's split amounts.
+
+    On the Amex statement the column holding the split amounts was 31%
+    suspect by itself, but averaging it with a neighbour full of
+    "americanexpress.co.in" dragged the pair under the threshold - so the
+    broken mapping was accepted and the repair never ran.
+    """
+    from app.normalize.column_map import ColumnMapping
+    from app.normalize.normalizer import _has_truncated_amounts
+
+    rows = [
+        ["June 4", "ZEPTO", "americanexpress.co.in", "164.0"],
+        ["June 5", "AMAZON", "Cyber City, Tower C", "2,249.0"],
+        ["June 6", "AMAZON", "Gurgaon - 122002", "346.0"],
+    ]
+    mapping = ColumnMapping(roles={"txn_date": 0, "description": 1,
+                                   "debit": 2, "credit": 3})
+    assert _has_truncated_amounts(rows, mapping) is True
+
+
+def test_two_pages_of_one_ledger_merge_across_column_layouts():
+    """Amex reads page 1 as debit/credit and page 2 as a single amount.
+
+    Requiring identical role NAMES refused the merge, and page one's eleven
+    transactions - 11,348.23, exactly the gap the reconciliation gate then
+    reported - were dropped without a word.
+    """
+    from app.models.schemas import ExtractedTable
+    from app.normalize.column_map import ColumnMapping
+    from app.normalize.normalizer import _merge_continuations, _same_kind_of_table
+
+    page1 = ColumnMapping(roles={"txn_date": 0, "description": 1,
+                                 "debit": 6, "credit": 7, "balance": 8})
+    page2 = ColumnMapping(roles={"txn_date": 0, "description": 2, "amount": 8})
+    assert _same_kind_of_table(page1, page2)
+
+    chosen = ExtractedTable(rows=[], confidence=0.65, source_page=2)
+    other = ExtractedTable(rows=[], confidence=0.65, source_page=1)
+    body1 = [["June 6", "Razorpay*Zomato", "", "", "", "", "", "294.7", "8"]]
+
+    merged = _merge_continuations(
+        chosen, [["June 18", "", "EASEBUZZ", "", "", "", "", "", "2,163.00"]],
+        [(page2, chosen, []), (page1, other, body1)], page2)
+
+    # The split is rejoined BEFORE projection - once the halves are reshaped
+    # into another page's layout they are no longer adjacent.
+    assert any("294.78" in str(cell) for row in merged for cell in row), merged
+
+
+def test_a_projected_amount_takes_its_direction_from_the_printed_marker():
+    """Not from the name an inferred column happened to be given.
+
+    Amex's first page resolved to a "credit" column that in fact held eleven
+    ordinary purchases; trusting the label turned every one into money coming
+    in.
+    """
+    from app.normalize.column_map import ColumnMapping
+    from app.normalize.normalizer import _project_row
+
+    source = ColumnMapping(roles={"txn_date": 0, "description": 1, "credit": 2})
+    target = ColumnMapping(roles={"txn_date": 0, "description": 1, "amount": 2})
+
+    plain = _project_row(["June 4", "ZEPTO", "164.00"], source, target)
+    assert plain[2] == "164.00", "no marker printed, so no CR is invented"
+
+    marked = _project_row(["June 24", "AMAZON", "599.00 CR"], source, target)
+    assert "CR" in marked[2], "a marker that WAS printed must survive"
+
+
+def test_a_contract_note_is_not_a_holdings_statement():
+    """Both are securities documents; only one says what you own.
+
+    An Upstox "ANNUAL GLOBAL TRANSACTION STATEMENT ... Segment: Future &
+    Option" was read as holdings and produced one position - "NIFTY NIFTY
+    NIFTY NIFTY", 1,050 units at 22,500 - worth 2.36 CRORE, over a portfolio
+    that should have totalled about four lakh. The 1,050 was a traded
+    quantity and the 22,500 a strike price; every line closed at Net Quantity
+    0.00, so nothing was held at all.
+    """
+    from app.ingestion.portfolio import looks_like_portfolio, looks_like_trades
+
+    fno = ("ANNUAL GLOBAL TRANSACTION STATEMENT (AGS) Segment : Future & Option\n"
+           "Security Description Strike Rate Due Date Net Quantity\n"
+           "NIFTY CE 22,500.00 2025-04-09 1,050.00 85.23 89,493.75")
+    assert looks_like_trades(fno)
+    assert not looks_like_portfolio(fno)
+
+    holdings = ("CONSOLIDATED ACCOUNT STATEMENT\n"
+                "Folio No 5104091481/0 INE002A01018 Units Held 127.76 "
+                "NAV 452.86 Market Value 57,857.69")
+    assert not looks_like_trades(holdings)
+    assert looks_like_portfolio(holdings)
+
+
+def test_a_folio_wrapped_across_a_line_is_the_same_folio():
+    """Holdings are keyed by (account, ISIN, folio).
+
+    A PDF that wrapped "5104091481/0" left a soft hyphen in it, so one month
+    read "510409148\xad 1/0" and the next read it clean. The database saw two
+    holdings, and the same fund appeared twice at two different valuations -
+    once per monthly statement.
+    """
+    from app.ingestion.portfolio import _clean_identifier
+
+    assert _clean_identifier("510409148\xad 1/0") == "5104091481/0"
+    assert _clean_identifier("5104091481/0") == "5104091481/0"
+    assert _clean_identifier("INF966L01986") == "INF966L01986"
+    assert _clean_identifier("​INE002A01018﻿") == "INE002A01018"
+
+
+def test_a_contract_note_is_not_read_as_a_bank_statement_either(tmp_db, tmp_path):
+    """Refusing it as a portfolio is only half the job.
+
+    Teaching `looks_like_portfolio` to reject a contract note stopped it
+    inventing holdings, and the file then fell through to the STATEMENT
+    reader - which is worse. Fifteen Zerodha contract notes each produced one
+    transaction whose amount was its settlement number: "Settlement No:
+    2026151" became a 20,26,151 debit, and money out for the year read three
+    crore.
+    """
+    from app.db import staging
+    from app.ingestion.router import file_hash
+    from app.pipeline import staging_pipeline
+
+    note = tmp_path / "23-09-2025-contract-notes_UC9050.csv"
+    note.write_text(
+        "Contract Note cum Tax Invoice\n"
+        "Settlement No:,2025182,Strike Rate,22500.00\n"
+        "Security,Buy Qty,Buy Rate,Sell Qty,Sell Rate\n"
+        "NIFTY CE,1050,85.23,1050,85.16\n",
+        encoding="utf-8")
+
+    entry_id = staging.add(tmp_db, file_hash(note), filename=note.name,
+                           path=str(note), origin="upload")
+    entry = next(e for e in staging.all_entries(tmp_db) if e["id"] == entry_id)
+    status = staging_pipeline.parse_entry(tmp_db, entry)
+
+    parsed = next(e for e in staging.all_entries(tmp_db) if e["id"] == entry_id)
+    assert parsed["kind"] == "trades", parsed["kind"]
+    assert parsed["row_count"] == 0, "a contract note produces no transactions"
+    assert status == staging_pipeline.STATUS_EMPTY

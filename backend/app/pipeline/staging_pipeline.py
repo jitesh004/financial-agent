@@ -91,11 +91,57 @@ def parse_entry(db: Database, entry: dict[str, Any],
     if bureau_reader.looks_like_bureau_report(text, name):
         return _stage_bureau(db, entry_id, text, name, extraction)
 
+    # Checked BEFORE the statement reader, not just before the portfolio one.
+    #
+    # Teaching `looks_like_portfolio` to refuse a contract note stopped it
+    # inventing holdings, but the file then fell through to the statement
+    # reader instead - which is worse. Fifteen Zerodha contract notes each
+    # produced one transaction whose "amount" was its SETTLEMENT NUMBER:
+    # "Settlement No: 2026151" became a 20,26,151 debit, and money out for
+    # the year read three crore.
+    #
+    # A record of trades is neither a ledger nor a portfolio. It is read,
+    # understood, and counted for nothing.
+    if portfolio_reader.looks_like_trades(text):
+        return _stage_trades(db, entry_id, text, name, extraction,
+                             entry.get("sender", ""))
+
     if portfolio_reader.looks_like_portfolio(text, name):
         return _stage_portfolio(db, entry_id, text, name, extraction,
                                 entry.get("sender", ""))
 
     return _stage_statement(db, entry_id, name, extraction, entry.get("sender", ""))
+
+
+def _stage_trades(db: Database, entry_id: str, text: str, name: str,
+                  extraction: Any, sender: str) -> str:
+    """Record a contract note or transaction statement as read, and empty.
+
+    Deliberately produces no transactions. The money a trade moves reaches
+    the ledger through the bank statement that funded it; counting the
+    contract note as well would count it twice, and its columns - traded
+    quantity, strike rate, settlement number - are not the columns a ledger
+    has.
+    """
+    from ..ingestion.gmail_source import institution_for_sender
+    from ..ingestion import portfolio as portfolio_reader
+
+    provider = (portfolio_reader.detect_layout(text, name)[1]
+                or institution_for_sender(sender) or "Broker")
+    staging.record_parse(
+        db, entry_id, status=STATUS_EMPTY,
+        message="A record of trades, not of money held or moved. Read and "
+                "understood; nothing in it counts toward your ledger.",
+        payload={"kind": "trades", "provider": provider},
+        kind="trades",
+        warnings=list(getattr(extraction, "warnings", []) or []),
+        account_label=f"{provider} contract notes",
+        account_key=f"trades|{provider}",
+        account_type="investment",
+        row_count=0, debits="0", credits="0",
+        recon_status="not_applicable",
+    )
+    return STATUS_EMPTY
 
 
 def _stage_statement(db: Database, entry_id: str, name: str, extraction: Any,

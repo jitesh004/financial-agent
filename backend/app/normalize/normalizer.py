@@ -456,6 +456,24 @@ _BARE_DIGITS = re.compile(r"^[\d,]+$")
 #: decimals, short enough to plausibly be the tail of a larger number.
 _DECIMAL_TAIL = re.compile(r"^\d{1,3}\.\d{2}$")
 
+#: The other place a stream extraction breaks an amount: INSIDE the decimals,
+#: leaving one digit behind and carrying the last one into the next cell.
+#: American Express does this on the first page of every statement -
+#:
+#:     June 6   Razorpay*Zomato - PD Gurugram    | 294.7  | 8
+#:     June 17  AMAZON Mumbai                    | 2,962.0| 5
+#:
+#: The left half is a legal-looking amount, so nothing complained: eleven
+#: June transactions were read as 294.7 and 2,962.0 - or, once their column
+#: was mis-labelled, not read at all. Money printed to one decimal place is
+#: itself the tell; Indian statements print two.
+_SPLIT_DECIMAL_HEAD = re.compile(r"^[\d,]+\.\d$")
+
+#: A cell that is purely a number. Everything else in a money column - an
+#: address, a page number, a heading - is debris and evidence of nothing.
+_NUMBER_LIKE = re.compile(r"^[\d,]+(?:\.\d+)?$")
+_SPLIT_DECIMAL_TAIL = re.compile(r"^\d$")
+
 
 def _repair_split_amounts(rows: list[list[str]]) -> list[list[str]]:
     """Rejoin an amount a `stream` extraction split across two adjacent cells.
@@ -488,6 +506,25 @@ def _repair_split_amounts(rows: list[list[str]]) -> list[list[str]]:
                 new_row[i] = ""
                 changed = True
                 i += 2
+            elif (left and _SPLIT_DECIMAL_HEAD.match(left)
+                    and _SPLIT_DECIMAL_TAIL.match(right)):
+                # This shape joins into the LEFT cell, the opposite of the one
+                # above, for the same underlying reason: put the value where
+                # that column's amounts already are.
+                #
+                # A boundary falling BEFORE the decimals leaves the bulk of
+                # every amount in the trailing cell, so the trailing cell is
+                # the dense money column. A boundary falling INSIDE them
+                # leaves all but one digit in the LEADING cell - "294.7" and
+                # "8" - so the leading cell is. Writing the repaired value
+                # into the trailing cell there moved every amount out of the
+                # column the reader had already recognised as money and into
+                # one it went on to label a running balance, and eleven rows
+                # then had a date and no amount at all.
+                new_row[i] = left + right
+                new_row[i + 1] = ""
+                changed = True
+                i += 2
             else:
                 i += 1
         repaired.append(new_row)
@@ -514,18 +551,39 @@ def _has_truncated_amounts(rows: list[list[str]], mapping: ColumnMapping) -> boo
                               mapping.get("amount")) if c is not None]
     if not money_cols:
         return False
-    total = bare = 0
-    for row in rows:
-        for c in money_cols:
+    # Judged per column, over that column's NUMBER-LIKE cells only.
+    #
+    # Pooling every money column and counting every non-empty cell let one
+    # column's noise hide another's signal: on an Amex statement the column
+    # holding the split amounts was 31% suspect on its own, but averaging it
+    # with a neighbouring column full of "americanexpress.co.in" and "Cyber
+    # City, Tower C" dragged the pair to 26% - under the threshold, so the
+    # broken mapping was accepted and the repair never ran. A column's
+    # letterhead debris says nothing about whether its numbers are whole.
+    for c in money_cols:
+        total = suspect = 0
+        for row in rows:
             if c >= len(row):
                 continue
             cell = str(row[c] or "").strip()
-            if not cell:
+            if not cell or not _NUMBER_LIKE.match(cell):
                 continue
             total += 1
-            if _BARE_DIGITS.match(cell):
-                bare += 1
-    return total > 0 and bare >= total * 0.3
+            # No decimal point at all - the boundary fell before the decimals.
+            # Or exactly ONE decimal digit, which is the boundary falling
+            # INSIDE them: American Express splits "294.78" into "294.7" and
+            # "8", and the leading half is a perfectly legal-looking amount.
+            # Indian statements print two decimals, so one is the tell - and
+            # without it the plain mapping was accepted, the repair never ran,
+            # and eleven June transactions worth 11,348.23 were read at the
+            # wrong value out of a column labelled "credit".
+            if _BARE_DIGITS.match(cell) or _SPLIT_DECIMAL_HEAD.match(cell):
+                suspect += 1
+        # Two is enough to be a pattern; one stray number is not, and
+        # that single cell is the only thing this minimum guards against.
+        if total >= 2 and suspect >= total * 0.5:
+            return True
+    return False
 
 
 def _count_parseable(rows: list[list[str]], mapping: ColumnMapping,
@@ -538,6 +596,25 @@ def _count_parseable(rows: list[list[str]], mapping: ColumnMapping,
         if date_col < len(row) and parse_date(row[date_col], default_year=default_year) is not None:
             count += 1
     return count
+
+
+#: The roles that can carry an amount. A table has money in it if it has any
+#: one of them.
+_MONEY_ROLES = ("amount", "debit", "credit")
+
+
+def _same_kind_of_table(a: ColumnMapping, b: ColumnMapping) -> bool:
+    """Are these two mappings both describing a ledger?
+
+    Used to let two pages of ONE statement merge when the extractor read their
+    columns differently - one page as debit/credit, the next as a single
+    amount. Requiring identical role names refused that merge, and the second
+    page's transactions were silently lost.
+    """
+    def shaped(m: ColumnMapping) -> bool:
+        return ("txn_date" in m.roles and "description" in m.roles
+                and any(r in m.roles for r in _MONEY_ROLES))
+    return shaped(a) and shaped(b)
 
 
 def _project_row(row: list[str], from_mapping: ColumnMapping,
@@ -557,10 +634,48 @@ def _project_row(row: list[str], from_mapping: ColumnMapping,
     """
     width = max([*to_mapping.roles.values(), len(row) - 1], default=-1) + 1
     new_row = [""] * width
+
+    def cell(role: str) -> str:
+        idx = from_mapping.get(role)
+        return str(row[idx] or "").strip() if idx is not None and idx < len(row) else ""
+
     for role, to_idx in to_mapping.roles.items():
         from_idx = from_mapping.get(role)
         if from_idx is not None and from_idx < len(row):
             new_row[to_idx] = row[from_idx]
+            continue
+
+        # The money columns are the same fact written two ways, and one page of
+        # a statement can be read each way. American Express prints one ledger
+        # across two pages; page 1 resolved to debit/credit/balance columns and
+        # page 2 to a single amount, so neither could give the other its money
+        # and eleven June transactions - 11,348.23, exactly the gap the
+        # reconciliation gate reported - were dropped on the floor.
+        #
+        # Direction survives the trip as a trailing "CR", which is the
+        # convention `parse_amount` already reads and issuers already print.
+        if role == "amount":
+            debit, credit = cell("debit"), cell("credit")
+            value = debit or credit
+            if not value:
+                continue
+            # Direction comes from a marker PRINTED on the value, never from
+            # the name this page's columns happened to be given. Those names
+            # are inferred from the data, and on a page that is mostly
+            # letterhead the inference is a guess: Amex's first page resolved
+            # to a "credit" column that in fact held eleven ordinary
+            # purchases, and trusting the label turned every one of them into
+            # money coming in.
+            new_row[to_idx] = value
+        elif role in ("debit", "credit"):
+            amount = cell("amount")
+            if not amount:
+                continue
+            is_credit = bool(re.search(r"\b(?:cr|credit)\b\.?\s*$", amount,
+                                       re.IGNORECASE))
+            if (role == "credit") == is_credit:
+                new_row[to_idx] = re.sub(r"\s*\b(?:cr|credit)\b\.?\s*$", "",
+                                         amount, flags=re.IGNORECASE)
     return new_row
 
 
@@ -599,7 +714,13 @@ def _merge_continuations(
     for other_mapping, table, body in candidates[1:]:
         if table is chosen:
             continue
-        if set(other_mapping.roles.keys()) != set(mapping.roles.keys()):
+        # Identical role names take the fast path below. Differing ones are
+        # allowed through only when both tables are transaction-shaped - a
+        # date, a description and some money column each - and only into the
+        # page-adjacency branch further down, which is what keeps an unrelated
+        # rewards or credit-limit block from being pulled in.
+        if (set(other_mapping.roles.keys()) != set(mapping.roles.keys())
+                and not _same_kind_of_table(other_mapping, mapping)):
             continue
         if chosen.source_page is not None and table.source_page is None:
             continue
@@ -614,7 +735,14 @@ def _merge_continuations(
                 continue
             if not any(abs(table.source_page - p) == 1 for p in merged_pages):
                 continue
-            merged.extend(_project_row(r, other_mapping, mapping) for r in body)
+            # Repaired before projecting, not after: a split amount is a
+            # fact about the CELLS, and once they have been reshaped into
+            # another page's column layout the two halves are no longer
+            # adjacent and can never be rejoined. This is what turns Amex's
+            # "294.7" | "8" back into 294.78 before it becomes a transaction.
+            repaired = _repair_split_amounts(body)
+            merged.extend(_project_row(r, other_mapping, mapping)
+                          for r in repaired)
             merged_pages.add(table.source_page)
 
     return merged

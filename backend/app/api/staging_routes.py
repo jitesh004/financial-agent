@@ -40,6 +40,7 @@ KIND_LABELS = {
     "alert": "Transaction alert",
     "bureau": "Credit report",
     "portfolio": "Investments",
+    "trades": "Contract notes",
 }
 
 KIND_NOTES = {
@@ -48,6 +49,9 @@ KIND_NOTES = {
              "statement.",
     "bureau": "A credit bureau's own record of your accounts.",
     "portfolio": "Holdings on one date, not a ledger of transactions.",
+    "trades": "A record of what was bought and sold. The money reaches your "
+              "ledger through the bank statement that funded it, so nothing "
+              "here is counted again.",
 }
 
 
@@ -420,6 +424,24 @@ def _run_process(job_id: str) -> None:
                 progress=progress.phase,
             )
             repo.save_transactions(db, enriched.transactions)
+
+            # Transfers and recurring series are pipeline OUTPUT, computed by
+            # enrichment and stored alongside the rows. The old import path
+            # wrote them; this one did not, so a rebuild produced twenty-three
+            # recurring series and then dropped every one - the Recurring tab
+            # read an empty table and showed zero.
+            try:
+                report_obj = enriched.transfer_report
+                if report_obj is not None and getattr(report_obj, "pairs", None):
+                    repo.save_transfer_pairs(db, report_obj.pairs)
+            except Exception:  # pragma: no cover - a pairing is not the ledger
+                log.exception("could not store transfer pairs")
+            try:
+                if enriched.recurring:
+                    repo.save_recurring_series(db, enriched.recurring)
+            except Exception:  # pragma: no cover
+                log.exception("could not store recurring series")
+
             report = enriched.override_report.as_dict()
 
             progress.phase("Storing the analysis")
@@ -430,6 +452,7 @@ def _run_process(job_id: str) -> None:
                             if getattr(t, "category", "") == "uncategorized")
         result = {**built,
                   "uncategorized": uncategorized,
+                  "recurring": len(enriched.recurring or []) if transactions else 0,
                   **{f"decisions_{k}": v for k, v in report.items()
                      if k != "notes"}}
         lost = report.get("orphaned", 0)
