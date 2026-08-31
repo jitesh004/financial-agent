@@ -77,22 +77,95 @@ _FROM_TERMS = (
 _QUERY_EXCLUSIONS = "-category:promotions -category:social -in:spam -in:trash"
 
 
-def build_query(months: int | None = None, extra: str = "") -> str:
-    """Build the Gmail search query.
+#: Credit bureaus. Their reports are PDFs like a statement, but they describe
+#: what you owe across every lender rather than one account's activity, so they
+#: are searched for separately and parsed by a different reader entirely.
+_BUREAU_SUBJECT_TERMS = (
+    "credit report", "credit information report", "credit score",
+    "cibil report", "cibil score", "experian credit", "crif report",
+    "equifax credit", "your credit health", "annual credit report",
+)
+
+_BUREAU_FROM_TERMS = (
+    "cibil", "transunion", "crif", "crifhighmark", "experian", "equifax",
+    "creditreport", "creditscore", "onescore", "creditvidya", "bureau",
+)
+
+#: Transaction alerts. Deliberately NOT `has:attachment` - the whole point of
+#: these is that the amount is in the body of a one-line email, which is why
+#: they arrive within minutes rather than the fortnight a statement takes.
+_ALERT_SUBJECT_TERMS = (
+    "transaction alert", "debited", "credited", "spent on", "txn alert",
+    "transaction on", "payment of", "upi transaction", "debit alert",
+    "credit alert", "card transaction", "withdrawn",
+)
+
+_ALERT_FROM_TERMS = (
+    "alerts", "alert", "noreply", "donotreply", "no-reply", "notification",
+    "transaction", "txn", "cards", "upi",
+)
+
+#: The three things a scan can look for. Each is a different kind of document
+#: with a different reader behind it, so the search that finds one is no use
+#: for the others.
+SCAN_INTENTS: dict[str, dict[str, object]] = {
+    "statement": {
+        "label": "Account statements",
+        "description": "Bank, card, loan and portfolio statement PDFs.",
+        "needs_attachment": True,
+        "subjects": _SUBJECT_TERMS,
+        "senders": _FROM_TERMS,
+        "max_months": None,
+    },
+    "bureau": {
+        "label": "Credit bureau reports",
+        "description": "CIBIL, CRIF, Experian and Equifax reports - what every "
+                       "lender says you owe, including accounts no statement "
+                       "ever reaches you for.",
+        "needs_attachment": True,
+        "subjects": _BUREAU_SUBJECT_TERMS,
+        "senders": _BUREAU_FROM_TERMS,
+        "max_months": None,
+    },
+    "transactional": {
+        "label": "Transaction alerts (recent)",
+        "description": "The one-line alerts your bank sends within minutes of "
+                       "a payment. Covers the gap before a statement is cut.",
+        "needs_attachment": False,
+        "subjects": _ALERT_SUBJECT_TERMS,
+        "senders": _ALERT_FROM_TERMS,
+        # Hard-capped. Alerts are unreconciled by nature and only earn their
+        # place by being fresher than the statement; a year of them would be a
+        # year of unchecked figures sitting next to checked ones.
+        "max_months": 2,
+    },
+}
+
+DEFAULT_INTENT = "statement"
+
+
+def build_query(months: int | None = None, extra: str = "",
+                intent: str = DEFAULT_INTENT) -> str:
+    """Build the Gmail search query for one kind of document.
 
     `months` limits how far back to look. Gmail's own `newer_than` is used
     rather than a computed date, so the window stays correct no matter when the
-    scan runs. None means the whole mailbox.
+    scan runs. None means the whole mailbox - except where the intent caps it,
+    which transaction alerts do.
     """
-    subjects = " OR ".join(f'subject:"{t}"' for t in _SUBJECT_TERMS)
-    senders = " OR ".join(f"from:{t}" for t in _FROM_TERMS)
+    spec = SCAN_INTENTS.get(intent) or SCAN_INTENTS[DEFAULT_INTENT]
 
-    parts = [
-        "has:attachment",
-        "filename:pdf",
-        f"(({subjects}) OR ({senders}))",
-        _QUERY_EXCLUSIONS,
-    ]
+    subjects = " OR ".join(f'subject:"{t}"' for t in spec["subjects"])
+    senders = " OR ".join(f"from:{t}" for t in spec["senders"])
+
+    parts: list[str] = []
+    if spec["needs_attachment"]:
+        parts += ["has:attachment", "filename:pdf"]
+    parts += [f"(({subjects}) OR ({senders}))", _QUERY_EXCLUSIONS]
+
+    cap = spec["max_months"]
+    if cap is not None:
+        months = cap if months is None else min(months, cap)
     if months:
         # Gmail understands d/m/y suffixes; months is the natural unit here.
         parts.append(f"newer_than:{months}m" if months < 12
@@ -131,6 +204,10 @@ SENDER_CATEGORIES: dict[str, tuple[str, ...]] = {
     "loan": (
         "loanestatement", "loanstatement", "bajajfinserv", "tatacapital",
         "lichousing", "hdfcltd", "homeloan",
+    ),
+    "bureau": (
+        "cibil", "transunion", "crif", "crifhighmark", "experian", "equifax",
+        "onescore", "creditreport", "creditscore",
     ),
     "broker": (
         "zerodha", "upstox", "5paisa", "dhan.co", "paytmmoney", "angelbroking",
@@ -183,7 +260,10 @@ def classify_sender(sender: str) -> str:
     classify as a card, not as that bank's savings account.
     """
     lowered = (sender or "").lower()
-    for category in ("card", "loan", "broker", "bank"):
+    # Bureau first: a bureau mails from addresses that look like a bank's,
+    # and misfiling one as a bank statement sends it to a reader that will
+    # find no transactions in it and call that a parse failure.
+    for category in ("bureau", "card", "loan", "broker", "bank"):
         if any(fragment in lowered for fragment in SENDER_CATEGORIES[category]):
             return category
     return "unknown"
@@ -835,3 +915,143 @@ class FakeGmailClient:
 
     def get_attachment(self, message_id: str, attachment_id: str) -> bytes:
         return self._messages[message_id]["_attachments"][attachment_id]
+
+
+# --------------------------------------------------------------------------
+# Transaction alerts
+#
+# A different shape of fetch from `find_statements`: the payload is the body of
+# the email, not a file hanging off it. Everything else - the paging, the
+# thread pool, the progress reporting - is the same problem, so the same
+# approach is used rather than a second mechanism.
+# --------------------------------------------------------------------------
+
+@dataclass
+class FoundAlert:
+    """One alert email, and whatever could be read out of it."""
+
+    message_id: str
+    sender: str
+    subject: str
+    date: str
+    body: str
+    #: Set by the caller once txn_email has had a look at it.
+    parsed: Any = None
+    skip_reason: str = ""
+
+    @property
+    def institution(self) -> str:
+        return institution_for_sender(self.sender)
+
+
+def _decode_body(data: str) -> str:
+    """Gmail's base64url body payload as text."""
+    import base64
+    try:
+        return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode(
+            "utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def message_body(message: dict[str, Any]) -> str:
+    """The readable body of an email, plain text preferred over HTML.
+
+    Both are collected because banks are inconsistent about which they fill:
+    some send the sentence only in the HTML part, some only in the plain part,
+    and a reader that takes the first part it finds gets an empty string from
+    roughly half of them.
+    """
+    plain, html_parts = [], []
+    for part in _walk_parts(message.get("payload", {})):
+        mime = part.get("mimeType", "")
+        data = (part.get("body") or {}).get("data")
+        if not data:
+            continue
+        if mime == "text/plain":
+            plain.append(_decode_body(data))
+        elif mime == "text/html":
+            html_parts.append(_decode_body(data))
+
+    if plain and any(p.strip() for p in plain):
+        return "\n".join(plain)
+    return "\n".join(html_parts)
+
+
+@dataclass
+class AlertFetchResult:
+    connected: bool = True
+    scanned_messages: int = 0
+    alerts: list[FoundAlert] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+def find_alerts(
+    client: GmailClient,
+    query: str = "",
+    max_messages: int = 200,
+    progress: Any = None,
+) -> AlertFetchResult:
+    """Fetch transaction alert emails and return their bodies.
+
+    Downloads nothing and writes nothing: this is the review step, exactly as
+    `find_statements` is for attachments. What comes back is what WOULD be
+    imported, so a list of unreconciled figures can be looked at before any of
+    them joins the ledger.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    result = AlertFetchResult()
+    query = query or build_query(intent="transactional")
+
+    try:
+        message_ids = client.list_messages(query, max_messages)
+    except Exception as exc:
+        result.connected = False
+        result.warnings.append(f"Could not query Gmail: {exc}")
+        return result
+
+    total = len(message_ids)
+    if progress:
+        progress(0, total)
+
+    def fetch(message_id: str):
+        return message_id, client.get_message(message_id)
+
+    fetched: list[tuple[str, dict[str, Any]]] = []
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+        futures = [pool.submit(fetch, mid) for mid in message_ids]
+        for done, future in enumerate(as_completed(futures), start=1):
+            try:
+                fetched.append(future.result())
+            except Exception as exc:
+                result.warnings.append(f"Skipped a message: {exc}")
+            if progress:
+                progress(done, total)
+
+    # Newest-first, as the mailbox had them; completion order is thread timing.
+    position = {mid: i for i, mid in enumerate(message_ids)}
+    fetched.sort(key=lambda pair: position.get(pair[0], 0))
+
+    for message_id, message in fetched:
+        result.scanned_messages += 1
+        sender = _header(message, "From")
+        subject = _header(message, "Subject")
+
+        # Marketing reaches this query as easily as it reaches the statement
+        # one - banks advertise from the address that sends alerts - and an
+        # offer email mentioning an amount is exactly the shape that produces
+        # a plausible, invented transaction.
+        if PROMOTIONAL_SUBJECTS.search(subject or "") or _EMOJI.search(subject or ""):
+            continue
+
+        body = message_body(message)
+        if not body.strip():
+            continue
+
+        result.alerts.append(FoundAlert(
+            message_id=message_id, sender=sender, subject=subject,
+            date=_header(message, "Date"), body=body,
+        ))
+
+    return result

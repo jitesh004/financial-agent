@@ -131,3 +131,52 @@ def extract(
         f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
     )
     return result
+
+
+# --------------------------------------------------------------------------
+# Which reader a document belongs to
+#
+# A bureau report, a holdings statement and a bank statement are all PDFs, and
+# only their contents distinguish them. Routing on the sender or the filename
+# guesses wrong often enough to matter: a CIBIL report pushed through the
+# statement pipeline finds no transactions and gets recorded as a parse
+# failure, which reads like a bug rather than a misrouted file.
+# --------------------------------------------------------------------------
+
+#: What a document is, once something has looked inside it.
+DOC_STATEMENT = "statement"
+DOC_BUREAU = "bureau"
+DOC_PORTFOLIO = "portfolio"
+
+
+def classify_document(text: str, filename: str = "") -> str:
+    """Which reader should handle this document.
+
+    Order matters. A bureau report mentions credit limits and balances often
+    enough to look statement-shaped, and a CAS lists ISINs that no bank
+    statement carries - so the two specific tests run first and the statement
+    pipeline is the fallback, which is also the safe default: it is the only
+    one with a reconciliation gate to catch its own mistakes.
+    """
+    from .bureau import looks_like_bureau_report
+    from .portfolio import looks_like_portfolio
+
+    if looks_like_bureau_report(text, filename):
+        return DOC_BUREAU
+    if looks_like_portfolio(text, filename):
+        return DOC_PORTFOLIO
+    return DOC_STATEMENT
+
+
+def text_of(result: "ExtractionResult") -> str:
+    """All the text an extraction produced, tables included.
+
+    Classification needs to see everything: the marker that identifies a
+    document is as likely to be inside a table cell as in the running text,
+    depending on how the issuer laid the page out.
+    """
+    text = getattr(result, "text", "") or ""
+    for table in getattr(result, "tables", []) or []:
+        for row in getattr(table, "rows", []) or []:
+            text += "\n" + " ".join(str(cell) for cell in row if cell)
+    return text

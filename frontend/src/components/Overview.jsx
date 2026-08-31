@@ -5,6 +5,8 @@ import {
 } from 'recharts';
 import { colorFor, compact, dateLabel, money, monthLabel, pct, titleCase } from '../lib';
 import { BarList, Callout, Card, ChartTooltip, Chip, Stat, axisProps, moneyAxis } from './ui';
+import Claims from './Claims';
+import Forecast from './Forecast';
 
 const SEVERITY_TONE = { urgent: 'neg', watch: 'warn', info: 'accent' };
 
@@ -181,6 +183,16 @@ export default function Overview({ data }) {
         {(narrative?.caveats || []).map((c, i) => <Callout tone="warn" key={`c${i}`}>{c}</Callout>)}
         {(analysis.notes || []).map((n, i) => <Callout key={`n${i}`}>{n}</Callout>)}
       </Card>
+
+      {/* Forecast and Owed were tabs of their own. Both answer a question about
+          the position this page already describes - what happens next, and what
+          is coming back - so they read better as the end of that story than as
+          two more places to go looking. */}
+      <div className="section-title">What happens next</div>
+      <Forecast data={data} />
+
+      <div className="section-title">Money owed to you</div>
+      <Claims />
     </>
   );
 }

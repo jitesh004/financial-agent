@@ -1,60 +1,59 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import CardTransactions from './components/CardTransactions';
+import CreditReport from './components/CreditReport';
+import DataHub from './components/DataHub';
 import Debt from './components/Debt';
-import EmiPayments from './components/EmiPayments';
-import Files from './components/Files';
-import FilesAndPasswords from './components/FilesAndPasswords';
-import Forecast from './components/Forecast';
-import GmailWizard from './components/GmailWizard';
+import Ledger from './components/Ledger';
+import Portfolio from './components/Portfolio';
+import ReviewHub from './components/ReviewHub';
 import Overview from './components/Overview';
 import Profile from './components/Profile';
-import SavingsAccounts from './components/SavingsAccounts';
 import Spending from './components/Spending';
-import Transactions from './components/Transactions';
 import Upload from './components/Upload';
-import UpiTransactions from './components/UpiTransactions';
 import { Callout, Empty, ThemeToggle } from './components/ui';
 import { api } from './lib';
 
-import DataManager from './components/DataManager';
 import WorkflowNav from './components/WorkflowNav';
-import ReviewQueue from './components/ReviewQueue';
-import Claims from './components/Claims';
 import Recurring from './components/Recurring';
-import Categorize from './components/Categorize';
 import Settings from './components/Settings';
 import MonthView from './components/MonthView';
+import Explore from './components/explore/Explore';
+import MailboxButton from './components/mailbox/MailboxButton';
+import MailboxModal from './components/mailbox/MailboxModal';
+import useMailbox from './components/mailbox/useMailbox';
 
 
 // Ordered by how often they are used, not by when they were built. The five
 // views added with the accounting model existed as components and render
 // branches for a while but were never listed here, which meant there was no
 // way to reach any of them.
+// Eighteen tabs became eleven. Four of the removed ones - Savings, Cards, UPI
+// and EMI - were the same transactions table behind different presets, and
+// three more split file bookkeeping and triage across tabs that described the
+// same work. What varied is now a control inside one tab, which is where a
+// choice belongs when it changes a view rather than a subject.
 const TABS = [
   ['overview', 'Overview'],
   ['month-view', 'Months'],
   ['spending', 'Spending'],
   ['recurring', 'Recurring'],
-  ['review-queue', 'Review'],
-  ['categorize', 'Categorize'],
-  ['claims', 'Owed'],
+  ['review', 'Review'],
+  ['ledger', 'Ledger'],
   ['debt', 'Debt'],
-  ['emi', 'EMI Payments'],
-  ['forecast', 'Forecast'],
-  ['transactions', 'Transactions'],
-  ['savings', 'Savings Accounts'],
-  ['cards', 'Card Transactions'],
-  ['upi', 'UPI Transactions'],
-  ['files', 'Files & quality'],
-  ['file-registry', 'Files & Passwords'],
-  ['data-manager', 'Data'],
+  ['credit', 'Credit report'],
+  ['portfolio', 'Portfolio'],
+  ['explore', 'Explore'],
+  ['data', 'Data'],
   ['settings', 'Settings'],
 ];
+
+//: Tabs that work without a parsed ledger behind them.
+const ALWAYS_AVAILABLE = ['settings', 'data', 'credit', 'portfolio'];
 
 export default function App() {
   const [data, setData] = useState(null);
   const [tab, setTab] = useState('overview');
   const [showProfile, setShowProfile] = useState(false);
+  const [mailboxOpen, setMailboxOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [reviewCount, setReviewCount] = useState(0);
@@ -88,6 +87,11 @@ export default function App() {
 
   useEffect(() => { load(); }, [load]);
 
+  // One poller for the whole app. Held here rather than inside the modal
+  // because the header button needs the same answer, and because an import
+  // that finishes while the modal is closed still has to refresh the ledger.
+  const mailbox = useMailbox({ open: mailboxOpen, onImported: load });
+
   const onComplete = (result) => {
     setData(result);
     setTab('overview');
@@ -108,14 +112,14 @@ export default function App() {
             <button
               className="tab"
               role="tab"
-              aria-selected={!['settings', 'data-manager', 'file-registry'].includes(tab)}
+              aria-selected={!ALWAYS_AVAILABLE.includes(tab)}
               onClick={() => setTab('overview')}
             >
               Upload
             </button>
           )}
           {TABS.map(([key, label]) => {
-            const isDataTab = !['settings', 'data-manager', 'file-registry'].includes(key);
+            const isDataTab = !ALWAYS_AVAILABLE.includes(key);
             if (!hasData && isDataTab) return null;
             return (
               <button
@@ -126,7 +130,7 @@ export default function App() {
                 onClick={() => setTab(key)}
               >
                 {label}
-                {key === 'review-queue' && reviewCount > 0 && (
+                {key === 'review' && reviewCount > 0 && (
                   <span
                     className="chip warn"
                     style={{ marginLeft: 6, padding: '0 6px' }}
@@ -141,6 +145,7 @@ export default function App() {
 
         <div className="header-spacer" />
 
+        <MailboxButton mailbox={mailbox} onOpen={() => setMailboxOpen(true)} />
         <button className="btn" onClick={() => setShowProfile(true)}>Profile</button>
         {hasData && (
           <button className="btn" onClick={() => setData(null)}>Upload more</button>
@@ -155,7 +160,7 @@ export default function App() {
           <div style={{ display: 'flex', gap: 10, alignItems: 'center', padding: 40 }}>
             <div className="spinner" /> Loading…
           </div>
-        ) : !hasData && !['settings', 'data-manager', 'file-registry'].includes(tab) ? (
+        ) : !hasData && !ALWAYS_AVAILABLE.includes(tab) ? (
           <>
             <div style={{ maxWidth: 760, margin: '0 auto 22px', textAlign: 'center' }}>
               <h1 style={{ fontSize: 26, fontWeight: 660, letterSpacing: '-.6px', margin: '18px 0 8px' }}>
@@ -176,14 +181,28 @@ export default function App() {
             {error && <Callout tone="warn" style={{ marginBottom: 14 }}>{error}</Callout>}
             {/* Wider than a typical form column: the Gmail review table carries
                 seven columns and is unusable squeezed into 820px. */}
-            <div style={{ maxWidth: 1180, margin: '0 auto', display: 'grid', gap: 14 }}>
-              <div style={{ maxWidth: 820, width: '100%', margin: '0 auto' }}>
-                <Upload onComplete={onComplete} />
-              </div>
+            <div style={{ maxWidth: 820, margin: '0 auto', display: 'grid', gap: 14 }}>
+              <Upload onComplete={onComplete} />
               <div style={{ textAlign: 'center', color: 'var(--text-3)', fontSize: 12, textTransform: 'uppercase', letterSpacing: '.08em' }}>
                 or
               </div>
-              <GmailWizard onComplete={load} />
+              {/* The import itself lives in the header modal now, reachable from
+                  every screen rather than only from this one - which was the
+                  odd part before: the page you could not get back to was the
+                  one that put the data there. */}
+              <div className="card" style={{ textAlign: 'center' }}>
+                <div className="card-title" style={{ marginBottom: 6 }}>
+                  Import from Gmail
+                </div>
+                <p style={{ color: 'var(--text-2)', fontSize: 13, margin: '0 0 14px' }}>
+                  Finds your bank and card statement emails, downloads the PDFs
+                  and parses them. Read-only access, and nothing is downloaded
+                  until you have seen the list and chosen.
+                </p>
+                <button className="btn primary" onClick={() => setMailboxOpen(true)}>
+                  Scan mailbox
+                </button>
+              </div>
             </div>
           </>
         ) : (
@@ -191,26 +210,23 @@ export default function App() {
             {error && <Callout tone="warn">{error}</Callout>}
             {hasData && <WorkflowNav onNavigate={setTab} />}
             {tab === 'overview' && <Overview data={data} />}
-            {tab === 'spending' && <Spending data={data} />}
-            {tab === 'debt' && <Debt data={data} />}
-            {tab === 'forecast' && <Forecast data={data} />}
-            {tab === 'emi' && <EmiPayments data={data} />}
-            {tab === 'transactions' && <Transactions data={data} />}
-            {tab === 'savings' && <SavingsAccounts data={data} />}
-            {tab === 'cards' && <CardTransactions data={data} />}
-            {tab === 'upi' && <UpiTransactions data={data} />}
-            {tab === 'files' && <Files data={data} />}
-            {tab === 'file-registry' && <FilesAndPasswords />}
-            {tab === 'data-manager' && <DataManager />}
-            {tab === 'review-queue' && <ReviewQueue />}
-            {tab === 'categorize' && <Categorize />}
-            {tab === 'settings' && <Settings />}
-            {tab === 'claims' && <Claims />}
-            {tab === 'recurring' && <Recurring />}
             {tab === 'month-view' && <MonthView data={data} />}
+            {tab === 'spending' && <Spending data={data} />}
+            {tab === 'recurring' && <Recurring />}
+            {tab === 'review' && <ReviewHub />}
+            {tab === 'ledger' && <Ledger data={data} />}
+            {tab === 'debt' && <Debt data={data} />}
+            {tab === 'credit' && <CreditReport accounts={data?.accounts || []} />}
+            {tab === 'portfolio' && <Portfolio />}
+            {tab === 'explore' && <Explore />}
+            {tab === 'data' && <DataHub data={data} />}
+            {tab === 'settings' && <Settings />}
           </>
         )}
       </main>
+
+      <MailboxModal mailbox={mailbox} open={mailboxOpen}
+        onClose={() => setMailboxOpen(false)} />
     </div>
   );
 }

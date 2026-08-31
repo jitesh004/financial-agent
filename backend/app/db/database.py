@@ -16,6 +16,7 @@ Two SQLite specifics that matter for a financial ledger:
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -25,16 +26,33 @@ from typing import Iterator
 
 log = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = Path(__file__).resolve().parents[3] / "data" / "financial_agent.db"
+#: FA_DB_PATH points the whole app at a different ledger. Set it to work
+#: against a copy - trying a migration, reproducing a bug, demoing with sample
+#: statements - without putting the real database anywhere near the attempt.
+DEFAULT_DB_PATH = Path(
+    os.environ.get("FA_DB_PATH")
+    or Path(__file__).resolve().parents[3] / "data" / "financial_agent.db"
+)
 
 #: How many automatic snapshots to keep before pruning the oldest.
 MAX_SNAPSHOTS = 10
 
 #: Derived data: reproducible from the parsed ledger in seconds.
-_TIER_DERIVED = ("transfer_pairs", "recurring_series", "analysis_runs")
+#: Job history sits here as the one thing that is not reproducible but is also
+#: not precious - it is an operational log of work already done, and losing it
+#: costs nothing but the trace. A job still in flight re-inserts its own row on
+#: the next flush, so clearing this scope mid-run does not orphan it.
+_TIER_DERIVED = ("transfer_pairs", "recurring_series", "analysis_runs",
+                 "job_items", "jobs")
 
 #: Parsed data: reproducible from the statement files, at the cost of CPU.
-_TIER_PARSED = ("transactions", "statements", "accounts")
+#: Rows read from transaction alert emails live here too. They are
+#: reproducible in the same sense - by re-scanning the mailbox rather than
+#: by re-reading a file - so clearing this scope drops them and a fresh
+#: alert scan brings them back.
+_TIER_PARSED = ("transactions", "statements", "holdings",
+                "portfolio_statements", "bureau_accounts",
+                "bureau_reports", "accounts")
 
 #: The file registry. The files themselves live on disk and are handled
 #: separately - see the storage module - because losing a manually uploaded
@@ -52,10 +70,14 @@ _TIER_AI = ("ai_inferences", "merchant_categories")
 #: cannot be regenerated from any statement. Leaving them out of every scope
 #: meant a factory reset silently left them behind, so the workspace did not
 #: actually return to its first-run state.
+#: A dashboard someone assembled is authored, not derived: no statement, no
+#: re-parse and no amount of CPU brings back a board of questions they wrote
+#: themselves. Widgets are listed before their parent for readability only -
+#: they cascade from `dashboards` either way.
 _TIER_DECISIONS = ("user_overrides", "claim_settlements", "transaction_splits",
                    "custom_categories", "recurring_series_overrides",
                    "claims", "split_rules", "settlement_group_legs",
-                   "settlement_groups")
+                   "settlement_groups", "dashboard_widgets", "dashboards")
 
 _TIER_IDENTITY = ("user_profile",)
 
@@ -488,6 +510,213 @@ CREATE TABLE IF NOT EXISTS settlement_group_legs (
 
 CREATE INDEX IF NOT EXISTS idx_settlement_legs_fp
     ON settlement_group_legs(fingerprint);
+
+
+-- ---------------------------------------------------------------------------
+-- Explore: user-built dashboards.
+--
+-- A widget stores a QUERY, never a result. Storing computed figures would mean
+-- a saved dashboard could disagree with the ledger it was built from the
+-- moment a category is corrected or a statement re-parsed. Everything here is
+-- re-executed against the live tables on open.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS dashboards (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    description  TEXT NOT NULL DEFAULT '',
+    -- The one that opens first. Enforced as at-most-one in the repository
+    -- rather than by a constraint: SQLite has no partial unique constraint
+    -- that survives an UPDATE swapping two rows.
+    is_default   INTEGER NOT NULL DEFAULT 0,
+    position     INTEGER NOT NULL DEFAULT 0,
+    -- Board-level date range and filters, applied on top of every widget's
+    -- own query so one control can re-cut the whole board.
+    filters_json TEXT NOT NULL DEFAULT '{}',
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS dashboard_widgets (
+    id           TEXT PRIMARY KEY,
+    dashboard_id TEXT NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
+    title        TEXT NOT NULL DEFAULT '',
+    type         TEXT NOT NULL DEFAULT 'table',
+    query_json   TEXT NOT NULL DEFAULT '{}',
+    viz_json     TEXT NOT NULL DEFAULT '{}',
+    position     INTEGER NOT NULL DEFAULT 0,
+    -- Columns of a 12-wide grid, and height in 120px row units.
+    width        INTEGER NOT NULL DEFAULT 6,
+    height       INTEGER NOT NULL DEFAULT 2,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_widgets_dashboard
+    ON dashboard_widgets(dashboard_id, position);
+
+
+-- ---------------------------------------------------------------------------
+-- Background jobs.
+--
+-- Scanning a mailbox and parsing a few hundred statements takes minutes, and
+-- the progress of that work used to live in a process-local dict. Closing the
+-- browser was survivable; restarting the API was not, and a job in flight
+-- simply vanished - the UI had a job id that answered 404 and no way to tell
+-- "finished" from "never happened".
+--
+-- `request_json` is what the job was asked to do. It is the difference between
+-- reporting that a job was interrupted and being able to pick it up again.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id            TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL,
+    -- queued | running | complete | failed | cancelled | interrupted
+    status        TEXT NOT NULL DEFAULT 'queued',
+    phase         TEXT NOT NULL DEFAULT '',
+    current       INTEGER NOT NULL DEFAULT 0,
+    total         INTEGER NOT NULL DEFAULT 0,
+    message       TEXT NOT NULL DEFAULT '',
+    started_at    REAL NOT NULL DEFAULT 0,
+    finished_at   REAL,
+    result_json   TEXT NOT NULL DEFAULT 'null',
+    request_json  TEXT NOT NULL DEFAULT 'null',
+    errors_json   TEXT NOT NULL DEFAULT '[]',
+    warnings_json TEXT NOT NULL DEFAULT '[]',
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_started ON jobs(started_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Credit bureau reports.
+--
+-- A bureau report is not a statement: no opening balance, no rows, nothing to
+-- reconcile. It is an independent account of what the user owes, which makes
+-- it the one source that can reveal an account the ledger has never seen - a
+-- card whose statements never arrive by email is invisible here until a bureau
+-- names it.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS bureau_reports (
+    id              TEXT PRIMARY KEY,
+    bureau          TEXT NOT NULL,          -- cibil | crif | experian | equifax
+    score           INTEGER,
+    score_band      TEXT NOT NULL DEFAULT '',
+    pulled_on       TEXT,
+    holder_name     TEXT NOT NULL DEFAULT '',
+    file_hash       TEXT NOT NULL DEFAULT '',
+    source_filename TEXT NOT NULL DEFAULT '',
+    warnings        TEXT NOT NULL DEFAULT '[]',
+    ingested_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bureau_hash
+    ON bureau_reports(file_hash) WHERE file_hash != '';
+
+CREATE TABLE IF NOT EXISTS bureau_accounts (
+    id            TEXT PRIMARY KEY,
+    report_id     TEXT NOT NULL REFERENCES bureau_reports(id) ON DELETE CASCADE,
+    lender        TEXT NOT NULL DEFAULT '',
+    -- Normalised lender name ("HDFC BANK LTD" -> "hdfc"). Bureaus and
+    -- statements spell the same institution differently, and matching on the
+    -- printed name alone finds almost nothing.
+    lender_key    TEXT NOT NULL DEFAULT '',
+    account_type  TEXT NOT NULL DEFAULT 'unknown',
+    account_number_masked TEXT NOT NULL DEFAULT '',
+    -- Last four digits: the only part of an account number that survives both
+    -- a bureau's masking and a statement's.
+    number_suffix TEXT NOT NULL DEFAULT '',
+    ownership     TEXT NOT NULL DEFAULT '',
+    opened_on     TEXT,
+    closed_on     TEXT,
+    status        TEXT NOT NULL DEFAULT 'open',
+    sanctioned    TEXT,
+    current_balance TEXT,
+    overdue       TEXT,
+    credit_limit  TEXT,
+    emi_amount    TEXT,
+    dpd_history   TEXT NOT NULL DEFAULT '[]',
+    worst_dpd     INTEGER NOT NULL DEFAULT 0,
+    -- The ledger account this was matched to, once someone agreed to it.
+    account_id    TEXT REFERENCES accounts(id) ON DELETE SET NULL,
+    -- unmatched | auto | suggested | confirmed | rejected
+    match_status  TEXT NOT NULL DEFAULT 'unmatched',
+    match_confidence REAL NOT NULL DEFAULT 0.0,
+    match_reason  TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_bureau_accounts_report
+    ON bureau_accounts(report_id);
+CREATE INDEX IF NOT EXISTS idx_bureau_accounts_match
+    ON bureau_accounts(account_id);
+
+
+-- ---------------------------------------------------------------------------
+-- Investment holdings.
+--
+-- A portfolio statement declares a total, and units x NAV has to reproduce it.
+-- That is the same reconciliation gate the bank statements go through, applied
+-- to the one number a broker prints that can be checked against its own rows.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS portfolio_statements (
+    id              TEXT PRIMARY KEY,
+    account_id      TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+    layout          TEXT NOT NULL DEFAULT '',   -- cas | cams | kfintech | broker
+    provider        TEXT NOT NULL DEFAULT '',
+    as_of           TEXT,
+    declared_value  TEXT,
+    computed_value  TEXT,
+    recon_status    TEXT NOT NULL DEFAULT 'not_applicable',
+    recon_discrepancy TEXT,
+    recon_message   TEXT NOT NULL DEFAULT '',
+    file_hash       TEXT NOT NULL DEFAULT '',
+    source_filename TEXT NOT NULL DEFAULT '',
+    ingested_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_portfolio_hash
+    ON portfolio_statements(file_hash) WHERE file_hash != '';
+
+CREATE TABLE IF NOT EXISTS holdings (
+    id           TEXT PRIMARY KEY,
+    statement_id TEXT REFERENCES portfolio_statements(id) ON DELETE CASCADE,
+    account_id   TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+    isin         TEXT NOT NULL DEFAULT '',
+    symbol       TEXT NOT NULL DEFAULT '',
+    instrument   TEXT NOT NULL DEFAULT '',
+    -- equity | mutual_fund | etf | bond | other
+    kind         TEXT NOT NULL DEFAULT 'equity',
+    folio        TEXT NOT NULL DEFAULT '',
+    units        TEXT,
+    avg_cost     TEXT,
+    nav          TEXT,
+    value        TEXT,
+    invested     TEXT,
+    as_of        TEXT,
+    -- One row per instrument per folio per valuation date: re-importing the
+    -- same statement updates the position rather than adding a second copy.
+    UNIQUE (account_id, isin, folio, as_of)
+);
+
+CREATE INDEX IF NOT EXISTS idx_holdings_asof ON holdings(as_of DESC);
+CREATE INDEX IF NOT EXISTS idx_holdings_statement ON holdings(statement_id);
+
+
+CREATE TABLE IF NOT EXISTS job_items (
+    job_id   TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    seq      INTEGER NOT NULL,
+    name     TEXT NOT NULL,
+    -- A stable identifier for the unit of work, so resuming can tell which
+    -- items are already done. Names are not unique - two banks both send
+    -- "statement.pdf" - and resuming on a name would skip real work.
+    key      TEXT NOT NULL DEFAULT '',
+    status   TEXT NOT NULL DEFAULT 'pending',
+    detail   TEXT NOT NULL DEFAULT '',
+    cached   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (job_id, seq)
+);
 """
 
 
@@ -546,6 +775,14 @@ class Database:
                 ("flow_role", "TEXT NOT NULL DEFAULT ''"),
                 ("excluded", "INTEGER NOT NULL DEFAULT 0"),
                 ("note", "TEXT NOT NULL DEFAULT ''"),
+                # Where the row came from. An email alert is a real
+                # transaction but an unreconciled one, and no total can be
+                # trusted that cannot tell the two apart.
+                ("source", "TEXT NOT NULL DEFAULT 'statement'"),
+                # Set when the statement covering this row arrived later and
+                # replaced it. Kept rather than deleted, so the alert that
+                # arrived first stays auditable.
+                ("superseded", "INTEGER NOT NULL DEFAULT 0"),
             )),
             ("transaction_splits", (
                 ("origin_date", "TEXT NOT NULL DEFAULT ''"),
@@ -572,6 +809,7 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_txn_acct_month ON transactions(accounting_month)",
             "CREATE INDEX IF NOT EXISTS idx_txn_review ON transactions(needs_review) "
             "WHERE needs_review = 1",
+            "CREATE INDEX IF NOT EXISTS idx_txn_source ON transactions(source)",
         ):
             conn.execute(stmt)
 

@@ -76,7 +76,10 @@ export const moneyAxis = { ...axisProps, tickFormatter: compact, width: 58 };
 /* Horizontal bar list. Preferred over a pie for category breakdowns: humans
    compare bar lengths far more accurately than pie-slice angles, and a pie
    with fifteen categories is unreadable at any size. */
-export function BarList({ items, total, colorKey = 'color', max = 12 }) {
+/* `format` exists because this list is no longer only used for money. An
+   Explore widget can rank by transaction count, and the default currency
+   formatter turned 654 transactions into "₹654". */
+export function BarList({ items, total, colorKey = 'color', max = 12, format = compact }) {
   const shown = items.slice(0, max);
   const peak = Math.max(...shown.map((i) => i.value), 1);
 
@@ -96,7 +99,7 @@ export function BarList({ items, total, colorKey = 'color', max = 12 }) {
               }}
             />
           </div>
-          <div className="catrow-value num">{compact(item.value)}</div>
+          <div className="catrow-value num">{format(item.value)}</div>
           <div className="catrow-pct num">
             {total ? `${((item.value / total) * 100).toFixed(0)}%` : ''}
           </div>

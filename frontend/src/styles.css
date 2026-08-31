@@ -391,3 +391,248 @@ select:focus, input:focus { outline: 2px solid var(--accent); outline-offset: -1
 .tooltip-row span:last-child { font-variant-numeric: tabular-nums; }
 
 .scroll-y { max-height: 420px; overflow-y: auto; }
+
+
+/* ===================================================================
+   Explore: user-built dashboards
+   =================================================================== */
+
+.xp-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 10px 12px; margin-bottom: 14px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+}
+.xp-bar .xp-sep { width: 1px; align-self: stretch; background: var(--border); margin: 0 2px; }
+.xp-bar-label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--text-3); font-weight: 600;
+}
+
+.xp-boards { display: flex; gap: 6px; overflow-x: auto; flex: 1; min-width: 0; }
+.xp-board-tab {
+  padding: 6px 12px; border-radius: 7px; border: 1px solid transparent;
+  background: transparent; color: var(--text-2); font: inherit; font-size: 13px;
+  cursor: pointer; white-space: nowrap;
+}
+.xp-board-tab:hover { background: var(--surface-2); color: var(--text); }
+.xp-board-tab.active {
+  background: var(--accent-soft); color: var(--accent); font-weight: 600;
+}
+
+/* The 12-column canvas. Rows are a fixed unit so a widget's height is
+   predictable regardless of what its query happens to return - a chart that
+   resizes itself every time the data changes is unreadable on a board. */
+.xp-grid {
+  display: grid; grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 14px; align-items: start;
+}
+/* Twelve columns is a desktop idea. Below that the widths a widget was given
+   stop meaning anything - a half-width tile at 375px is 170px of chart, which
+   is narrower than its own legend - so the grid narrows and then collapses,
+   and the inline span is overridden rather than respected. */
+@media (max-width: 1000px) {
+  .xp-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .xp-widget[style*="span 3"], .xp-widget[style*="span 4"] {
+    grid-column: span 3 !important;
+  }
+}
+@media (max-width: 700px) {
+  .xp-grid { grid-template-columns: minmax(0, 1fr); }
+  .xp-grid > * { grid-column: 1 / -1 !important; }
+}
+
+.xp-widget {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 16px;
+  display: flex; flex-direction: column; min-width: 0; overflow: hidden;
+}
+.xp-widget.dragging { opacity: .4; }
+.xp-widget.drop-target { outline: 2px dashed var(--accent); outline-offset: 2px; }
+.xp-widget-head {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+  flex: none; min-height: 22px;
+}
+.xp-widget-title {
+  font-size: 13px; font-weight: 650; letter-spacing: -.1px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.xp-widget-sub { font-size: 11px; color: var(--text-3); margin-left: auto; flex: none; }
+.xp-widget-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.xp-widget-body.scroll { overflow: auto; }
+.xp-drag { cursor: grab; color: var(--text-3); font-size: 13px; line-height: 1; }
+.xp-drag:active { cursor: grabbing; }
+
+.xp-actions { display: flex; gap: 2px; margin-left: auto; flex: none; }
+.xp-icon-btn {
+  background: transparent; border: none; color: var(--text-3); cursor: pointer;
+  padding: 3px 5px; border-radius: 5px; font-size: 12px; line-height: 1; font: inherit;
+}
+.xp-icon-btn:hover { background: var(--surface-2); color: var(--text); }
+
+/* Stat tiles size their own number to the space they were given. */
+.xp-stat { display: flex; flex-direction: column; justify-content: center; flex: 1; }
+.xp-stat-value {
+  font-size: 28px; font-weight: 640; letter-spacing: -.8px; line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.xp-stat-delta { font-size: 12px; margin-top: 6px; display: flex; gap: 6px; align-items: center; }
+
+.xp-empty {
+  flex: 1; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 6px; color: var(--text-3); font-size: 12.5px;
+  text-align: center; padding: 12px;
+}
+
+.xp-add {
+  border: 1px dashed var(--border-strong); border-radius: 10px;
+  background: transparent; color: var(--text-2); cursor: pointer; font: inherit;
+  font-size: 13px; padding: 22px; min-height: 96px;
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+}
+.xp-add:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+/* ---- modal ---- */
+.xp-overlay {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, .45);
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+  z-index: 50;
+}
+.xp-modal {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  width: min(1120px, 100%); max-height: 90vh; display: flex; flex-direction: column;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .3);
+}
+.xp-modal.narrow { width: min(520px, 100%); }
+.xp-modal-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 18px; border-bottom: 1px solid var(--border); flex: none;
+}
+.xp-modal-title { font-size: 15px; font-weight: 650; }
+.xp-modal-body { padding: 16px 18px; overflow: auto; flex: 1; }
+.xp-modal-foot {
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px 18px; border-top: 1px solid var(--border); flex: none;
+}
+
+/* Builder on the left, live preview on the right: a query you cannot see the
+   result of is a guess. */
+.xp-editor { display: grid; grid-template-columns: minmax(0, 360px) minmax(0, 1fr); gap: 18px; }
+@media (max-width: 900px) { .xp-editor { grid-template-columns: minmax(0, 1fr); } }
+.xp-editor-pane { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.xp-preview {
+  border: 1px solid var(--border); border-radius: 10px; padding: 14px;
+  min-height: 320px; display: flex; flex-direction: column; min-width: 0;
+}
+
+.xp-field { display: flex; flex-direction: column; gap: 5px; }
+.xp-field > label, .xp-legend {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--text-3); font-weight: 600;
+}
+.xp-hint { font-size: 11.5px; color: var(--text-3); line-height: 1.45; }
+
+.xp-input, .xp-select {
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
+  border-radius: 7px; padding: 6px 8px; font: inherit; font-size: 13px; min-width: 0;
+}
+.xp-input:focus, .xp-select:focus { outline: none; border-color: var(--accent); }
+.xp-select.slim, .xp-input.slim { padding: 4px 6px; font-size: 12px; }
+
+.xp-row { display: flex; gap: 6px; align-items: center; }
+.xp-row > .xp-select, .xp-row > .xp-input { flex: 1; min-width: 0; }
+
+.xp-types { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 5px; }
+.xp-type {
+  border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2);
+  color: var(--text-2); cursor: pointer; font: inherit; font-size: 10.5px;
+  padding: 7px 2px; display: flex; flex-direction: column; align-items: center; gap: 3px;
+}
+.xp-type:hover { border-color: var(--border-strong); color: var(--text); }
+.xp-type.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.xp-type-glyph { font-size: 15px; line-height: 1; }
+
+.xp-list { display: flex; flex-direction: column; gap: 6px; }
+.xp-item {
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px;
+  display: flex; flex-direction: column; gap: 6px; background: var(--surface-2);
+}
+
+/* Value pickers can hold every category or every account; they scroll rather
+   than pushing the Save button off the bottom of the modal. */
+.xp-options {
+  max-height: 132px; overflow-y: auto; border: 1px solid var(--border);
+  border-radius: 7px; padding: 5px; background: var(--surface);
+  display: flex; flex-direction: column; gap: 1px;
+}
+.xp-option {
+  display: flex; align-items: center; gap: 7px; padding: 3px 5px;
+  border-radius: 5px; font-size: 12.5px; cursor: pointer; color: var(--text-2);
+}
+.xp-option:hover { background: var(--surface-2); color: var(--text); }
+.xp-option input { accent-color: var(--accent); }
+
+.xp-check { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-2); cursor: pointer; }
+.xp-check input { accent-color: var(--accent); }
+
+.xp-sql {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 7px;
+  padding: 9px; color: var(--text-2); white-space: pre-wrap; word-break: break-word;
+  max-height: 150px; overflow: auto; line-height: 1.5;
+}
+
+.xp-pivot { font-size: 12px; border-collapse: collapse; width: 100%; }
+.xp-pivot th, .xp-pivot td {
+  padding: 5px 8px; border-bottom: 1px solid var(--border); white-space: nowrap;
+}
+.xp-pivot thead th {
+  position: sticky; top: 0; background: var(--surface); z-index: 1;
+  font-size: 11px; color: var(--text-3); font-weight: 600; text-align: right;
+}
+.xp-pivot thead th:first-child, .xp-pivot tbody th { text-align: left; }
+.xp-pivot tbody th { font-weight: 500; color: var(--text-2); }
+.xp-pivot td { text-align: right; font-variant-numeric: tabular-nums; }
+.xp-pivot tfoot td, .xp-pivot tfoot th {
+  font-weight: 650; border-top: 1px solid var(--border-strong); border-bottom: none;
+}
+
+.xp-note { font-size: 13px; line-height: 1.6; color: var(--text-2); white-space: pre-wrap; }
+
+.xp-templates { display: grid; gap: 8px; }
+.xp-template {
+  text-align: left; border: 1px solid var(--border); border-radius: 9px;
+  padding: 11px 13px; background: var(--surface-2); cursor: pointer;
+  color: var(--text); font: inherit;
+}
+.xp-template:hover { border-color: var(--accent); background: var(--accent-soft); }
+.xp-template-name { font-size: 13px; font-weight: 620; margin-bottom: 2px; }
+.xp-template-desc { font-size: 12px; color: var(--text-3); line-height: 1.45; }
+
+
+/* ===================================================================
+   Mailbox: the header button and its modal
+   =================================================================== */
+
+.mailbox-btn {
+  display: inline-flex; align-items: center; gap: 7px; position: relative;
+  overflow: hidden;
+}
+.mailbox-btn.busy { border-color: var(--accent); color: var(--accent); }
+.mailbox-btn.warn { border-color: var(--warn); color: var(--warn); }
+
+/* A thread of progress along the bottom edge of the button. Reading a
+   percentage from the header beats opening a modal to learn nothing moved. */
+.mailbox-progress {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+  background: var(--border);
+}
+.mailbox-progress > span {
+  display: block; height: 100%; background: var(--accent);
+  transition: width .3s ease;
+}
+
+/* Wider than the Explore editor: the attachment review table carries seven
+   columns and is unusable squeezed narrower. */
+.xp-modal.mailbox { width: min(1180px, 100%); }
+.xp-modal.mailbox .xp-modal-body { display: flex; flex-direction: column; gap: 12px; }
+.xp-modal.mailbox .card { border: none; padding: 0; background: transparent; }

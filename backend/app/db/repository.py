@@ -278,7 +278,7 @@ _TXN_COLUMNS = (
     "category, category_source, category_confidence, is_internal_transfer, "
     "is_mirror_leg, transfer_pair_id, recurring_series_id, reference, source_row, "
     "fingerprint, accounting_month, needs_review, review_reason, flow_role, "
-    "excluded, note"
+    "excluded, note, source, superseded"
 )
 
 
@@ -299,6 +299,7 @@ def save_transactions(db: Database, transactions: Sequence[Transaction]) -> int:
             txn.source_row,
             txn.fingerprint, txn.accounting_month, int(txn.needs_review),
             txn.review_reason, txn.flow_role, int(txn.excluded), txn.note,
+            txn.source, int(txn.superseded),
         ))
 
     placeholders = ",".join(["?"] * len(_TXN_COLUMNS.split(",")))
@@ -536,6 +537,8 @@ def _row_to_transaction(row) -> Transaction:
         flow_role=_col(row, "flow_role") or "",
         excluded=bool(_col(row, "excluded")),
         note=_col(row, "note") or "",
+        source=_col(row, "source") or "statement",
+        superseded=bool(_col(row, "superseded")),
     )
 
 
@@ -1410,3 +1413,644 @@ def get_statement_periods_by_account(db: Database) -> dict[str, list[Any]]:
             period_end=_d(row.get("period_end")),
         ))
     return by_account
+
+
+# --------------------------------------------------------------------------
+# Explore dashboards
+#
+# A widget row stores a query, not a result. Reading one back therefore never
+# involves stale figures - the query is re-run against the live ledger.
+# --------------------------------------------------------------------------
+
+def _json(raw: Any, fallback: Any) -> Any:
+    if not raw:
+        return fallback
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return fallback
+
+
+def _widget_json(row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "dashboard_id": row["dashboard_id"],
+        "title": row["title"],
+        "type": row["type"],
+        "query": _json(row["query_json"], {}),
+        "viz": _json(row["viz_json"], {}),
+        "position": row["position"],
+        "width": row["width"],
+        "height": row["height"],
+    }
+
+
+def _dashboard_json(row, widgets: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    out = {
+        "id": row["id"],
+        "name": row["name"],
+        "description": row["description"],
+        "is_default": bool(row["is_default"]),
+        "position": row["position"],
+        "filters": _json(row["filters_json"], {}),
+        "updated_at": row["updated_at"],
+    }
+    if widgets is not None:
+        out["widgets"] = widgets
+    return out
+
+
+def list_dashboards(db: Database) -> list[dict[str, Any]]:
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT d.*, (SELECT COUNT(*) FROM dashboard_widgets w"
+            "             WHERE w.dashboard_id = d.id) AS widget_count"
+            " FROM dashboards d ORDER BY d.position, d.created_at"
+        ).fetchall()
+    return [{**_dashboard_json(r), "widget_count": r["widget_count"]} for r in rows]
+
+
+def get_dashboard(db: Database, dashboard_id: str) -> dict[str, Any] | None:
+    with db.connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM dashboards WHERE id = ?", (dashboard_id,)).fetchone()
+        if row is None:
+            return None
+        widgets = conn.execute(
+            "SELECT * FROM dashboard_widgets WHERE dashboard_id = ?"
+            " ORDER BY position, created_at", (dashboard_id,)).fetchall()
+    return _dashboard_json(row, [_widget_json(w) for w in widgets])
+
+
+def create_dashboard(db: Database, name: str, description: str = "",
+                     filters: dict[str, Any] | None = None,
+                     widgets: list[dict[str, Any]] | None = None) -> str:
+    dashboard_id = str(uuid.uuid4())
+    with db.connection() as conn:
+        position = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 AS p FROM dashboards"
+        ).fetchone()["p"]
+        first = conn.execute("SELECT COUNT(*) c FROM dashboards").fetchone()["c"] == 0
+        conn.execute(
+            "INSERT INTO dashboards (id, name, description, is_default, position,"
+            " filters_json) VALUES (?, ?, ?, ?, ?, ?)",
+            (dashboard_id, name, description, 1 if first else 0, position,
+             json.dumps(filters or {})),
+        )
+    for index, widget in enumerate(widgets or []):
+        create_widget(db, dashboard_id, {**widget, "position": index})
+    return dashboard_id
+
+
+def update_dashboard(db: Database, dashboard_id: str, **fields: Any) -> bool:
+    sets, params = [], []
+    for column in ("name", "description"):
+        if fields.get(column) is not None:
+            sets.append(f"{column} = ?")
+            params.append(fields[column])
+    if fields.get("filters") is not None:
+        sets.append("filters_json = ?")
+        params.append(json.dumps(fields["filters"]))
+    if fields.get("position") is not None:
+        sets.append("position = ?")
+        params.append(int(fields["position"]))
+
+    with db.connection() as conn:
+        if conn.execute("SELECT 1 FROM dashboards WHERE id = ?",
+                        (dashboard_id,)).fetchone() is None:
+            return False
+        if fields.get("is_default"):
+            # At most one default. Cleared for everyone first, so the two
+            # statements can never both be true even briefly.
+            conn.execute("UPDATE dashboards SET is_default = 0")
+            sets.append("is_default = 1")
+        if not sets:
+            return True
+        sets.append("updated_at = datetime('now')")
+        conn.execute(f"UPDATE dashboards SET {', '.join(sets)} WHERE id = ?",
+                     [*params, dashboard_id])
+        return True
+
+
+def delete_dashboard(db: Database, dashboard_id: str) -> bool:
+    with db.connection() as conn:
+        row = conn.execute("SELECT is_default FROM dashboards WHERE id = ?",
+                           (dashboard_id,)).fetchone()
+        if row is None:
+            return False
+        conn.execute("DELETE FROM dashboards WHERE id = ?", (dashboard_id,))
+        # Deleting the default would otherwise leave the Explore tab with no
+        # board to open and an empty state that reads as data loss.
+        if row["is_default"]:
+            survivor = conn.execute(
+                "SELECT id FROM dashboards ORDER BY position LIMIT 1").fetchone()
+            if survivor:
+                conn.execute("UPDATE dashboards SET is_default = 1 WHERE id = ?",
+                             (survivor["id"],))
+    return True
+
+
+def create_widget(db: Database, dashboard_id: str,
+                  widget: dict[str, Any]) -> str | None:
+    widget_id = str(uuid.uuid4())
+    with db.connection() as conn:
+        if conn.execute("SELECT 1 FROM dashboards WHERE id = ?",
+                        (dashboard_id,)).fetchone() is None:
+            return None
+        position = widget.get("position")
+        if position is None:
+            position = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 AS p FROM dashboard_widgets"
+                " WHERE dashboard_id = ?", (dashboard_id,)).fetchone()["p"]
+        conn.execute(
+            "INSERT INTO dashboard_widgets (id, dashboard_id, title, type,"
+            " query_json, viz_json, position, width, height)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (widget_id, dashboard_id, widget.get("title", ""),
+             widget.get("type", "table"), json.dumps(widget.get("query") or {}),
+             json.dumps(widget.get("viz") or {}), position,
+             int(widget.get("width", 6)), int(widget.get("height", 2))),
+        )
+        conn.execute("UPDATE dashboards SET updated_at = datetime('now')"
+                     " WHERE id = ?", (dashboard_id,))
+    return widget_id
+
+
+def update_widget(db: Database, widget_id: str, widget: dict[str, Any]) -> bool:
+    sets, params = [], []
+    for column in ("title", "type"):
+        if widget.get(column) is not None:
+            sets.append(f"{column} = ?")
+            params.append(widget[column])
+    for column, key in (("query_json", "query"), ("viz_json", "viz")):
+        if widget.get(key) is not None:
+            sets.append(f"{column} = ?")
+            params.append(json.dumps(widget[key]))
+    for column in ("position", "width", "height"):
+        if widget.get(column) is not None:
+            sets.append(f"{column} = ?")
+            params.append(int(widget[column]))
+    if not sets:
+        return True
+    with db.connection() as conn:
+        cursor = conn.execute(
+            f"UPDATE dashboard_widgets SET {', '.join(sets)} WHERE id = ?",
+            [*params, widget_id])
+        conn.execute(
+            "UPDATE dashboards SET updated_at = datetime('now') WHERE id ="
+            " (SELECT dashboard_id FROM dashboard_widgets WHERE id = ?)",
+            (widget_id,))
+        return cursor.rowcount > 0
+
+
+def delete_widget(db: Database, widget_id: str) -> bool:
+    with db.connection() as conn:
+        cursor = conn.execute("DELETE FROM dashboard_widgets WHERE id = ?",
+                              (widget_id,))
+        return cursor.rowcount > 0
+
+
+def save_layout(db: Database, dashboard_id: str,
+                layout: list[dict[str, Any]]) -> int:
+    """Persist position and size for several widgets at once.
+
+    All of them inside one connection: a drag that reorders six tiles must not
+    be able to land half-applied, which would leave two widgets claiming the
+    same slot and the order changing again on reload.
+    """
+    updated = 0
+    with db.connection() as conn:
+        for entry in layout:
+            cursor = conn.execute(
+                "UPDATE dashboard_widgets SET position = ?, width = ?, height = ?"
+                " WHERE id = ? AND dashboard_id = ?",
+                (int(entry.get("position", 0)), int(entry.get("width", 6)),
+                 int(entry.get("height", 2)), entry.get("id"), dashboard_id))
+            updated += cursor.rowcount
+        conn.execute("UPDATE dashboards SET updated_at = datetime('now')"
+                     " WHERE id = ?", (dashboard_id,))
+    return updated
+
+
+# --------------------------------------------------------------------------
+# Background jobs
+#
+# The in-memory JobStore stays the source of truth for a job that is running -
+# it is written to on every tick and reading it costs nothing. These functions
+# are the durable mirror: enough to answer "what happened to that scan?" after
+# a restart, and enough to pick an interrupted one back up.
+# --------------------------------------------------------------------------
+
+#: A job in one of these states was alive when the process stopped.
+UNFINISHED_JOB_STATES = ("queued", "running")
+
+
+def save_job(db: Database, header: dict[str, Any],
+             items: list[dict[str, Any]] | None = None) -> None:
+    """Upsert one job row and append any items not yet written.
+
+    Items are appended by sequence number rather than rewritten, because a
+    download of four hundred attachments would otherwise rewrite the whole
+    list on every tick.
+
+    The header is an ON CONFLICT upsert, emphatically NOT INSERT OR REPLACE.
+    Replace deletes the existing row before inserting the new one, and
+    job_items cascades from jobs - so every flush would have silently wiped
+    the per-file trace the flush before it had just written, leaving a
+    completed job claiming it processed nothing. An upsert edits the row in
+    place and the children survive.
+
+    Plain INSERT still happens when the row is genuinely absent, so a job
+    whose row was cleared mid-run (the derived scope is clearable) puts
+    itself back rather than quietly failing to record anything more.
+    """
+    with db.connection() as conn:
+        conn.execute(
+            "INSERT INTO jobs (id, kind, status, phase, current,"
+            " total, message, started_at, finished_at, result_json,"
+            " request_json, errors_json, warnings_json, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))"
+            " ON CONFLICT(id) DO UPDATE SET"
+            "   kind = excluded.kind, status = excluded.status,"
+            "   phase = excluded.phase, current = excluded.current,"
+            "   total = excluded.total, message = excluded.message,"
+            "   finished_at = excluded.finished_at,"
+            "   result_json = excluded.result_json,"
+            "   request_json = excluded.request_json,"
+            "   errors_json = excluded.errors_json,"
+            "   warnings_json = excluded.warnings_json,"
+            "   updated_at = datetime('now')",
+            (header["id"], header["kind"], header["status"], header["phase"],
+             header["current"], header["total"], header["message"],
+             header["started_at"], header["finished_at"],
+             _job_json(header.get("result")), _job_json(header.get("request")),
+             _job_json(header.get("errors") or []),
+             _job_json(header.get("warnings") or [])),
+        )
+        if items:
+            conn.executemany(
+                "INSERT OR REPLACE INTO job_items (job_id, seq, name, key,"
+                " status, detail, cached) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(header["id"], item["seq"], item["name"], item.get("key", ""),
+                  item["status"], item.get("detail", ""),
+                  1 if item.get("cached") else 0)
+                 for item in items],
+            )
+
+
+def _job_json(value: Any) -> str:
+    """Serialise a job payload, never raising.
+
+    A result that cannot be serialised must not take down the job that
+    produced it - the work already happened. Anything exotic is coerced to its
+    string form and the trace is preserved rather than the process dying at the
+    final flush.
+    """
+    try:
+        return json.dumps(value, default=str)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
+        log.warning("job payload was not serialisable: %s", exc)
+        return json.dumps({"unserialisable": str(exc)})
+
+
+def get_job(db: Database, job_id: str) -> dict[str, Any] | None:
+    with db.connection() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            return None
+        items = conn.execute(
+            "SELECT * FROM job_items WHERE job_id = ? ORDER BY seq", (job_id,)
+        ).fetchall()
+    return _job_row(row, items)
+
+
+def list_jobs(db: Database, limit: int = 20, kind: str | None = None,
+              active_only: bool = False) -> list[dict[str, Any]]:
+    """Recent jobs, newest first. Items are omitted - a list view never shows
+    four hundred per-file rows, and loading them would dominate the query."""
+    clauses, params = [], []
+    if kind:
+        clauses.append("kind = ?")
+        params.append(kind)
+    if active_only:
+        clauses.append(f"status IN ({', '.join('?' * len(UNFINISHED_JOB_STATES))})")
+        params.extend(UNFINISHED_JOB_STATES)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with db.connection() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM jobs {where} ORDER BY started_at DESC LIMIT ?",
+            [*params, limit]).fetchall()
+    return [_job_row(row, []) for row in rows]
+
+
+def _job_row(row, items) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "status": row["status"],
+        "phase": row["phase"],
+        "current": row["current"],
+        "total": row["total"],
+        "message": row["message"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "result": _json(row["result_json"], None),
+        "request": _json(row["request_json"], None),
+        "errors": _json(row["errors_json"], []),
+        "warnings": _json(row["warnings_json"], []),
+        "updated_at": row["updated_at"],
+        "items": [
+            {"seq": i["seq"], "name": i["name"], "key": i["key"],
+             "status": i["status"], "detail": i["detail"],
+             "cached": bool(i["cached"])}
+            for i in items
+        ],
+    }
+
+
+def mark_unfinished_jobs_interrupted(db: Database) -> int:
+    """Called once at startup. A job cannot outlive the process that ran it.
+
+    Without this, a scan killed by a restart stays 'running' forever and the
+    UI shows a progress bar that will never move again - strictly worse than
+    saying plainly that it stopped.
+    """
+    placeholders = ", ".join("?" * len(UNFINISHED_JOB_STATES))
+    with db.connection() as conn:
+        cursor = conn.execute(
+            f"UPDATE jobs SET status = 'interrupted',"
+            f" message = CASE WHEN message = '' THEN"
+            f"   'Stopped when the server restarted.' ELSE message END,"
+            f" phase = 'Interrupted', updated_at = datetime('now')"
+            f" WHERE status IN ({placeholders})",
+            UNFINISHED_JOB_STATES)
+        return cursor.rowcount
+
+
+def completed_job_keys(db: Database, job_id: str) -> set[str]:
+    """Work units this job already finished, for resuming it.
+
+    A failed item is deliberately NOT counted as finished: whatever went wrong
+    may well have been the interruption itself, and retrying one file is
+    cheaper than explaining to someone why it was skipped.
+    """
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT key FROM job_items WHERE job_id = ?"
+            " AND status IN ('done', 'skipped') AND key != ''", (job_id,)
+        ).fetchall()
+    return {row["key"] for row in rows}
+
+
+def prune_jobs(db: Database, keep: int = 100) -> int:
+    """Keep the most recent jobs and drop the rest, items and all."""
+    with db.connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM jobs WHERE id NOT IN ("
+            "  SELECT id FROM jobs ORDER BY started_at DESC LIMIT ?)", (keep,))
+        return cursor.rowcount
+
+
+# --------------------------------------------------------------------------
+# Credit bureau reports
+#
+# Stored alongside the ledger rather than merged into it. A bureau's figure for
+# an account is a second opinion, not a correction: it is reported monthly, is
+# often weeks stale, and overwriting a reconciled balance with it would replace
+# a checked number with an unchecked one.
+# --------------------------------------------------------------------------
+
+def save_bureau_report(db: Database, report: Any, file_hash: str = "",
+                       filename: str = "") -> str:
+    """Persist a parsed report and its accounts. Returns the report id.
+
+    Re-importing the same file replaces the previous parse of it rather than
+    adding a second copy - the file hash is the identity, exactly as it is for
+    statements.
+    """
+    report_id = str(uuid.uuid4())
+    with db.connection() as conn:
+        if file_hash:
+            existing = conn.execute(
+                "SELECT id FROM bureau_reports WHERE file_hash = ?",
+                (file_hash,)).fetchone()
+            if existing:
+                report_id = existing["id"]
+                conn.execute("DELETE FROM bureau_accounts WHERE report_id = ?",
+                             (report_id,))
+                conn.execute("DELETE FROM bureau_reports WHERE id = ?",
+                             (report_id,))
+
+        conn.execute(
+            "INSERT INTO bureau_reports (id, bureau, score, score_band,"
+            " pulled_on, holder_name, file_hash, source_filename, warnings)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (report_id, report.bureau, report.score, report.score_band,
+             report.pulled_on.isoformat() if report.pulled_on else None,
+             report.holder_name, file_hash, filename,
+             json.dumps(report.warnings)),
+        )
+        for account in report.accounts:
+            conn.execute(
+                "INSERT INTO bureau_accounts (id, report_id, lender, lender_key,"
+                " account_type, account_number_masked, number_suffix, ownership,"
+                " opened_on, closed_on, status, sanctioned, current_balance,"
+                " overdue, credit_limit, emi_amount, dpd_history, worst_dpd)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), report_id, account.lender,
+                 account.lender_key, account.account_type,
+                 account.account_number_masked, account.number_suffix,
+                 account.ownership,
+                 account.opened_on.isoformat() if account.opened_on else None,
+                 account.closed_on.isoformat() if account.closed_on else None,
+                 account.status, _txt(account.sanctioned),
+                 _txt(account.current_balance), _txt(account.overdue),
+                 _txt(account.credit_limit), _txt(account.emi_amount),
+                 json.dumps(account.dpd_history), account.worst_dpd),
+            )
+    return report_id
+
+
+def get_bureau_reports(db: Database) -> list[dict[str, Any]]:
+    """Every report, newest pull first."""
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT r.*, (SELECT COUNT(*) FROM bureau_accounts a"
+            "             WHERE a.report_id = r.id) AS account_count"
+            " FROM bureau_reports r"
+            " ORDER BY COALESCE(r.pulled_on, r.ingested_at) DESC"
+        ).fetchall()
+    return [{
+        "id": r["id"], "bureau": r["bureau"], "score": r["score"],
+        "score_band": r["score_band"], "pulled_on": r["pulled_on"],
+        "holder_name": r["holder_name"], "source_filename": r["source_filename"],
+        "warnings": _json(r["warnings"], []), "account_count": r["account_count"],
+        "ingested_at": r["ingested_at"],
+    } for r in rows]
+
+
+def get_bureau_accounts(db: Database, report_id: str | None = None
+                        ) -> list[dict[str, Any]]:
+    where = "WHERE report_id = ?" if report_id else ""
+    params = (report_id,) if report_id else ()
+    with db.connection() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM bureau_accounts {where} ORDER BY lender, number_suffix",
+            params).fetchall()
+    return [_bureau_account_json(r) for r in rows]
+
+
+def _bureau_account_json(row) -> dict[str, Any]:
+    return {
+        "id": row["id"], "report_id": row["report_id"], "lender": row["lender"],
+        "lender_key": row["lender_key"], "account_type": row["account_type"],
+        "account_number_masked": row["account_number_masked"],
+        "number_suffix": row["number_suffix"], "ownership": row["ownership"],
+        "opened_on": row["opened_on"], "closed_on": row["closed_on"],
+        "status": row["status"], "sanctioned": row["sanctioned"],
+        "current_balance": row["current_balance"], "overdue": row["overdue"],
+        "credit_limit": row["credit_limit"], "emi_amount": row["emi_amount"],
+        "dpd_history": _json(row["dpd_history"], []),
+        "worst_dpd": row["worst_dpd"], "account_id": row["account_id"],
+        "match_status": row["match_status"],
+        "match_confidence": row["match_confidence"],
+        "match_reason": row["match_reason"],
+    }
+
+
+def apply_bureau_matches(db: Database, matches: Iterable[Any]) -> int:
+    """Record automatic and suggested links.
+
+    A link a human already confirmed or rejected is never overwritten: the
+    whole reason fuzzy matches are offered rather than applied is that the
+    person is the authority, and re-running the matcher must not quietly
+    overrule them.
+    """
+    updated = 0
+    with db.connection() as conn:
+        for match in matches:
+            row = conn.execute(
+                "SELECT match_status FROM bureau_accounts WHERE id = ?",
+                (match.bureau_account_id,)).fetchone()
+            if row is None or row["match_status"] in {"confirmed", "rejected"}:
+                continue
+            conn.execute(
+                "UPDATE bureau_accounts SET account_id = ?, match_status = ?,"
+                " match_confidence = ?, match_reason = ? WHERE id = ?",
+                (match.account_id if match.status == "auto" else None,
+                 match.status, match.confidence, match.reason,
+                 match.bureau_account_id))
+            updated += 1
+    return updated
+
+
+def set_bureau_match(db: Database, bureau_account_id: str,
+                     account_id: str | None, confirmed: bool) -> bool:
+    """A human's decision about one link. Final until they change it."""
+    with db.connection() as conn:
+        cursor = conn.execute(
+            "UPDATE bureau_accounts SET account_id = ?, match_status = ?,"
+            " match_confidence = ?, match_reason = ? WHERE id = ?",
+            (account_id if confirmed else None,
+             "confirmed" if confirmed else "rejected",
+             1.0 if confirmed else 0.0,
+             "confirmed by you" if confirmed else "rejected by you",
+             bureau_account_id))
+        return cursor.rowcount > 0
+
+
+# --------------------------------------------------------------------------
+# Investment holdings
+# --------------------------------------------------------------------------
+
+def save_portfolio_statement(db: Database, statement: Any, account_id: str | None,
+                             file_hash: str = "", filename: str = "") -> str:
+    """Persist a holdings statement and its positions.
+
+    Positions are keyed by (account, ISIN, folio, valuation date), so importing
+    the same statement twice updates the holdings rather than doubling the
+    portfolio - the failure this would otherwise cause is a net worth that
+    grows every time you re-import.
+    """
+    statement_id = str(uuid.uuid4())
+    status, gap, message = statement.reconcile()
+    as_of = statement.as_of.isoformat() if statement.as_of else None
+
+    with db.connection() as conn:
+        if file_hash:
+            existing = conn.execute(
+                "SELECT id FROM portfolio_statements WHERE file_hash = ?",
+                (file_hash,)).fetchone()
+            if existing:
+                statement_id = existing["id"]
+                conn.execute("DELETE FROM holdings WHERE statement_id = ?",
+                             (statement_id,))
+                conn.execute("DELETE FROM portfolio_statements WHERE id = ?",
+                             (statement_id,))
+
+        conn.execute(
+            "INSERT INTO portfolio_statements (id, account_id, layout, provider,"
+            " as_of, declared_value, computed_value, recon_status,"
+            " recon_discrepancy, recon_message, file_hash, source_filename)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (statement_id, account_id, statement.layout, statement.provider,
+             as_of, _txt(statement.declared_value),
+             _txt(statement.computed_value), status, _txt(gap), message,
+             file_hash, filename),
+        )
+        for holding in statement.holdings:
+            conn.execute(
+                "INSERT INTO holdings (id, statement_id, account_id, isin,"
+                " symbol, instrument, kind, folio, units, avg_cost, nav, value,"
+                " invested, as_of) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(account_id, isin, folio, as_of) DO UPDATE SET"
+                "   statement_id = excluded.statement_id,"
+                "   units = excluded.units, nav = excluded.nav,"
+                "   value = excluded.value, avg_cost = excluded.avg_cost,"
+                "   invested = excluded.invested,"
+                "   instrument = excluded.instrument, kind = excluded.kind",
+                (str(uuid.uuid4()), statement_id, account_id, holding.isin,
+                 holding.symbol, holding.instrument, holding.kind,
+                 holding.folio, _txt(holding.units), _txt(holding.avg_cost),
+                 _txt(holding.nav), _txt(holding.computed_value()),
+                 _txt(holding.invested), as_of),
+            )
+    return statement_id
+
+
+def get_holdings(db: Database, latest_only: bool = True) -> list[dict[str, Any]]:
+    """Current positions.
+
+    `latest_only` keeps one row per instrument - the most recent valuation.
+    Without it a portfolio imported across several statement dates counts the
+    same holding once per date, which is a net worth that multiplies with
+    diligence.
+    """
+    with db.connection() as conn:
+        if latest_only:
+            rows = conn.execute(
+                "SELECT h.* FROM holdings h"
+                " JOIN (SELECT account_id, isin, folio, MAX(as_of) AS latest"
+                "       FROM holdings GROUP BY account_id, isin, folio) newest"
+                "   ON h.account_id IS newest.account_id"
+                "  AND h.isin = newest.isin AND h.folio = newest.folio"
+                "  AND h.as_of IS newest.latest"
+                " ORDER BY CAST(h.value AS REAL) DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM holdings ORDER BY as_of DESC").fetchall()
+    return [{
+        "id": r["id"], "account_id": r["account_id"], "isin": r["isin"],
+        "symbol": r["symbol"], "instrument": r["instrument"], "kind": r["kind"],
+        "folio": r["folio"], "units": r["units"], "avg_cost": r["avg_cost"],
+        "nav": r["nav"], "value": r["value"], "invested": r["invested"],
+        "as_of": r["as_of"],
+    } for r in rows]
+
+
+def get_portfolio_statements(db: Database) -> list[dict[str, Any]]:
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM portfolio_statements ORDER BY as_of DESC").fetchall()
+    return [dict(r) for r in rows]

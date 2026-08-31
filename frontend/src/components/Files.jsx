@@ -15,14 +15,23 @@ const RECON = {
   not_applicable: { tone: '', label: 'No balances stated' },
 };
 
+/* `data` is null until something has been parsed. It used to be impossible to
+   reach this view in that state - the tab was hidden without a ledger - but it
+   now lives inside the always-available Data tab, where "nothing imported yet"
+   is a normal thing to be looking at rather than a crash. */
 export default function Files({ data }) {
-  const statements = data.statements || [];
-  const accounts = data.accounts || [];
-  const transfers = data.transfers || {};
-  const quality = data.data_quality || {};
+  const statements = data?.statements || [];
+  const accounts = data?.accounts || [];
+  const transfers = data?.transfers || {};
+  const quality = data?.data_quality || {};
 
   if (!statements.length) {
-    return <Empty title="No files analyzed yet" />;
+    return (
+      <Empty title="No files analyzed yet">
+        Upload a statement or scan your mailbox, and the coverage grid and
+        parse quality for every file will appear here.
+      </Empty>
+    );
   }
 
   return (

@@ -7,7 +7,10 @@ import TransactionsTable from './TransactionsTable';
    projection - what's still owed, at what rate, paid off by when. This is the
    other half: what was ACTUALLY paid, month by month, which can differ from
    the nominal EMI (a part-payment, a missed month, a revised rate). */
-export default function EmiPayments({ data }) {
+/* `cardsOnly` renders just the loan summary cards. The Ledger tab's EMI
+   view shows them above its own transaction table, so rendering the table
+   here as well would put the same rows on screen twice. */
+export default function EmiPayments({ data, cardsOnly = false }) {
   const loans = data.loans || [];
   const accounts = data.accounts || [];
 
@@ -18,6 +21,7 @@ export default function EmiPayments({ data }) {
   // cards, which genuinely have nothing to show - when there is truly no
   // loan account AT ALL; the table's own empty state handles "no EMI rows".
   if (!loans.length) {
+    if (cardsOnly) return null;
     return (
       <>
         <Empty title="No loan accounts found">
@@ -60,12 +64,14 @@ export default function EmiPayments({ data }) {
         })}
       </div>
 
-      <TransactionsTable
-        accounts={accounts}
-        title="EMI Payments"
-        fixedCategory="emi"
-        emptyHint="No EMI transactions matched the current filters."
-      />
+      {!cardsOnly && (
+        <TransactionsTable
+          accounts={accounts}
+          title="EMI Payments"
+          fixedCategory="emi"
+          emptyHint="No EMI transactions matched the current filters."
+        />
+      )}
     </>
   );
 }

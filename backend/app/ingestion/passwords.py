@@ -170,8 +170,15 @@ def derive_passwords(
         for dob in dobs[:3]:
             candidates.append(f"{mobile[-10:]}{dob}")
 
-    # 7. PAN-based (mutual-fund / demat statements from CAMS/KFintech, and
-    #    increasingly the neobanks).
+    # 6b. Full date of birth on its own, and PAN + DOB. Bureau reports use
+    #     these almost exclusively - they hold no account number to build a
+    #     password from, only the identity details they were queried with.
+    for dob in dobs:
+        if len(dob) == 8:
+            candidates.append(dob)
+
+    # 7. PAN-based (mutual-fund / demat statements from CAMS/KFintech, the
+    #    bureaus, and increasingly the neobanks).
     if pan:
         candidates.append(pan)
         candidates.append(pan.lower())
@@ -278,6 +285,13 @@ PASSWORD_RULES: list[tuple[tuple[str, ...], str, str]] = [
      "Your PAN in uppercase"),
     (("bajaj", "tatacapital", "lichousing"), "Name(4) + DDMM",
      "First 4 letters of name + DDMM"),
+    # Bureaus lock their reports with the details they hold on file rather
+    # than anything account-specific, so PAN and full date of birth are the
+    # two that matter and neither shares a format with a bank statement.
+    (("cibil", "transunion"), "DDMMYYYY", "Date of birth as DDMMYYYY"),
+    (("experian",), "PAN", "Your PAN in uppercase"),
+    (("crif", "highmark"), "DDMMYYYY", "Date of birth as DDMMYYYY"),
+    (("equifax",), "PAN", "Your PAN in uppercase"),
 ]
 
 #: Shown when nothing matches - we still try the full candidate set.

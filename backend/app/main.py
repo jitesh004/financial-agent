@@ -14,6 +14,7 @@ import logging
 import shutil
 import threading
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -26,12 +27,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from . import storage
-from .api import files_routes, gmail_routes
+from .api import (files_routes, gmail_routes, job_routes, query_routes,
+                  wealth_routes)
 from .api import serializers as ser
 from .db.database import get_db
 from .db import repository as repo
 from .graph.build import build_graph
 from .ingestion.router import SUPPORTED_EXTENSIONS, file_hash
+from .jobs import jobs
 from .models.schemas import Category
 
 try:
@@ -61,7 +64,33 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
-app = FastAPI(title="Financial Agent", version="1.0.0")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Reconcile job state with reality before serving anything.
+
+    A job cannot outlive the process that ran it, so anything still marked
+    running belongs to a process that is gone. Leaving those rows alone would
+    show a progress bar that can never move again - strictly worse than saying
+    plainly that the work stopped, and the difference between offering to
+    resume it and pretending nothing was lost.
+    """
+    try:
+        stopped = jobs.recover()
+        if stopped:
+            log.info("marked %d job(s) interrupted from a previous run", stopped)
+    except Exception:  # bookkeeping must never block startup
+        log.exception("could not reconcile job state at startup")
+
+    yield
+
+    # Last chance to record where anything still in flight had got to.
+    try:
+        jobs.flush()
+    except Exception:
+        log.exception("could not flush job state at shutdown")
+
+
+app = FastAPI(title="Financial Agent", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,6 +105,9 @@ app.add_middleware(
 app.include_router(gmail_routes.router)
 app.include_router(files_routes.router)
 app.include_router(files_routes.coverage_router)
+app.include_router(query_routes.router)
+app.include_router(job_routes.router)
+app.include_router(wealth_routes.router)
 
 
 class RunStore:
@@ -492,6 +524,18 @@ def _persist(state: dict[str, Any]) -> None:
 
     if transactions:
         repo.save_transactions(db, transactions)
+        # A statement covering a payment an email alert already reported
+        # retires that alert. Every import goes through here - upload and
+        # Gmail alike - so this is the one place it has to happen. Skipping it
+        # leaves both copies in the ledger and inflates spending by exactly the
+        # amount the user was most diligent about capturing.
+        from .pipeline.alerts import supersede_after_import
+        try:
+            supersede_after_import(db, transactions)
+        except Exception:
+            # Never fail an import over this: the statement rows are the
+            # reconciled ones and belong in the ledger either way.
+            log.exception("could not retire alerts covered by this import")
 
     report = state.get("transfer_report")
     if report is not None and report.pairs:

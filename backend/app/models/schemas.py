@@ -370,6 +370,26 @@ class Transaction(BaseModel):
     #: Free-text note the user attached to this row.
     note: str = ""
 
+    #: Where this row came from. A statement row is reconciled against the
+    #: balances its own document printed; an email alert is not, and no total
+    #: that mixes the two can be trusted unless it can tell them apart.
+    source: str = "statement"
+
+    #: Set when the statement covering this alert arrived later and replaced
+    #: it. Kept rather than deleted - the alert really did arrive, and being
+    #: able to see that a checked row superseded it is worth a column.
+    superseded: bool = False
+
+    @property
+    def is_reconcilable(self) -> bool:
+        """Whether this row belongs in a balance check at all.
+
+        An alert has no opening or closing balance to tie to, so including one
+        in the reconciliation gate would report the statement it sits beside as
+        failing forever.
+        """
+        return self.source == "statement"
+
     @field_validator("amount")
     @classmethod
     def _amount_non_negative(cls, v: Decimal) -> Decimal:

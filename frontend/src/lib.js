@@ -196,11 +196,25 @@ api.gmailSetIgnored = (senders) => request('/api/gmail/ignored', {
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ excluded_senders: senders }),
 });
-api.gmailScan = (maxMessages = 400, months = null) => jsonPost(
+api.gmailIntents = () => request('/api/gmail/intents');
+api.gmailScan = (maxMessages = 400, months = null, intent = 'statement') => jsonPost(
   `/api/gmail/scan?max_messages=${maxMessages}`
-  + (months ? `&months=${months}` : ''),
+  + (months ? `&months=${months}` : '')
+  + `&intent=${intent}`,
 );
-api.gmailDownload = (attachments) => jsonPost('/api/gmail/download', { attachments });
+/* Alerts have no download stage - the amount is in the body, so the scan has
+   already read everything. This writes the chosen ones into the ledger. */
+api.gmailImportAlerts = (messageIds, scanJobId) =>
+  jsonPost('/api/gmail/alerts/import', {
+    message_ids: messageIds, scan_job_id: scanJobId,
+  });
+/* `thenProcess` chains the parse on the SERVER when the download finishes.
+   The chain used to be two awaits in the browser, so closing the tab between
+   them left a pile of downloaded files that nothing ever parsed. */
+api.gmailDownload = (attachments, { thenProcess = false, useLlm = false } = {}) =>
+  jsonPost('/api/gmail/download', {
+    attachments, then_process: thenProcess, use_llm: useLlm,
+  });
 api.gmailProcess = (files) => jsonPost('/api/gmail/process', { files });
 api.gmailJob = (id) => request(`/api/gmail/jobs/${id}`);
 api.gmailCancel = (id) => jsonPost(`/api/gmail/jobs/${id}/cancel`);
@@ -231,4 +245,108 @@ export function formatDuration(seconds) {
   const m = Math.floor(seconds / 60);
   const s = Math.round(seconds % 60);
   return `${m}m ${s}s`;
+}
+
+
+
+api.querySchema = () => request('/api/query/schema');
+
+/* `board` carries the dashboard's own date range and filters. The server
+   merges them into the widget's query, so the same widget can be re-cut by
+   the board without its saved definition ever being rewritten. */
+api.runQuery = (query, board) => jsonPost('/api/query', { query, board });
+
+api.boards = () => request('/api/dashboards');
+api.board = (id) => request(`/api/dashboards/${id}`);
+api.boardTemplates = () => request('/api/dashboards/templates');
+api.createBoard = (body) => jsonPost('/api/dashboards', body);
+api.updateBoard = (id, body) => request(`/api/dashboards/${id}`, {
+  method: 'PUT',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(body),
+});
+api.deleteBoard = (id) => request(`/api/dashboards/${id}`, { method: 'DELETE' });
+api.duplicateBoard = (id, name) => jsonPost(`/api/dashboards/${id}/duplicate`, { name });
+api.runBoard = (id, board) => jsonPost(`/api/dashboards/${id}/run`, { board });
+api.importBoard = (dashboard) => jsonPost('/api/dashboards/import', { dashboard });
+
+api.createWidget = (dashboardId, widget) =>
+  jsonPost(`/api/dashboards/${dashboardId}/widgets`, widget);
+api.updateWidget = (dashboardId, widgetId, widget) =>
+  request(`/api/dashboards/${dashboardId}/widgets/${widgetId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(widget),
+  });
+api.deleteWidget = (dashboardId, widgetId) =>
+  request(`/api/dashboards/${dashboardId}/widgets/${widgetId}`, { method: 'DELETE' });
+api.saveLayout = (dashboardId, layout) =>
+  request(`/api/dashboards/${dashboardId}/layout`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ layout }),
+  });
+
+/* Downloads go through fetch rather than a plain link so an error surfaces as
+   an error, instead of the browser silently saving a JSON error body as if it
+   were the file the user asked for. */
+async function download(path, options, filename) {
+  const response = await fetch(path, options);
+  if (!response.ok) throw new Error(`Export failed: ${response.status}`);
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+api.exportQueryCsv = (query, board, filename = 'export') => download(
+  '/api/query/export',
+  {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, board, filename }),
+  },
+  `${filename}.csv`,
+);
+
+api.exportBoard = (id, name = 'dashboard') =>
+  download(`/api/dashboards/${id}/export`, {}, `${name}.json`);
+
+
+/* ---------- Background jobs ----------
+   Kind-agnostic, unlike the /api/gmail/jobs routes these sit beside: a job is
+   created by the file registry's retry as well as by the mailbox wizard.
+
+   `activeJobs` is the one that matters for reconnecting. It answers "is work
+   happening right now?" without the caller having kept a job id, which is what
+   lets progress survive closing the tab - the UI rejoins work in flight
+   instead of assuming anything it was not watching had stopped. */
+
+api.jobs = (params = {}) => {
+  const query = new URLSearchParams(
+    Object.entries(params).filter(([, v]) => v !== '' && v != null),
+  );
+  return request(`/api/jobs?${query}`);
+};
+api.activeJobs = () => api.jobs({ active: true });
+api.job = (id) => request(`/api/jobs/${id}`);
+api.cancelJob = (id) => jsonPost(`/api/jobs/${id}/cancel`);
+/* Re-dispatches only what the interrupted run had not finished. */
+api.resumeJob = (id) => jsonPost(`/api/gmail/jobs/${id}/resume`);
+
+/* Poll a job until it stops. Unlike pollJob above this tolerates a job that
+   was interrupted - a server restart mid-scan resolves rather than hanging
+   forever waiting for a status that will never arrive. */
+export async function watchJob(jobId, onTick, intervalMs = 700) {
+  for (;;) {
+    const job = await api.job(jobId);
+    onTick?.(job);
+    if (!job.active) return job;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
 }
