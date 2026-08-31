@@ -95,8 +95,16 @@ RULES: list[Rule] = [
     # double-counts every bill: CRED alone accounted for 4.08 lakh.
     _r(r"\bCREDIT\s+CARD\s+PAYMENT\b|\bCARD\s+PAYMENT\b|\bPAYMENT\s+RECEIVED\b|"
        r"\bAUTOPAY\b.*\bCARD\b|\bCC\s+PAYMENT\b|\bBPPY\b|\bCRED\b|\bCRED\.CLUB\b|"
-       r"\bBILLPAY\b|\bBBPS[\s\-]*PAYMENT\b|\bAMEX\b|\bAMERICAN\s+EXPRESS\b",
+       r"\bBILLPAY\b|\bBBPS[\s\-]*(?:PAYMENT|PMT)\b|\bAMEX\b|"
+       r"\bAMERICAN\s+EXPRESS\b",
        Category.CC_PAYMENT, 0.93),
+    # HSBC abbreviates it to "BBPS PMT" where every other issuer writes
+    # "BBPS PAYMENT". The rule above missed that one spelling, so four bill
+    # payments totalling 83,105 fell through to the unexplained-credit
+    # fallback and were booked as income - inflating earnings by the exact
+    # amount of money that had left a bank account to settle a card.
+    _r(r"\bREWARD\s+POINTS?\s+CREDIT\b|\bCASHBACK\s+CREDIT\b",
+       Category.REFUND, 0.9),
     # HDFC prints reward points inside the description, and a bill payment earns
     # none - so its row can reduce to nothing but a timestamp and a bare "+ C".
     # Every merchant row keeps either a name or a points count, which makes a

@@ -1698,3 +1698,811 @@ def test_closing_balance_is_not_read_from_the_mitc_illustration():
     )
     meta = extract_metadata(text, "4375XXXXXXXX2002_620647_Retail_HPCL_NORM.pdf")
     assert meta.closing_balance != Decimal("26958.20")
+
+
+# --------------------------------------------------------------------------
+# Gemini replies in two parts: its thinking, then its answer.
+# --------------------------------------------------------------------------
+
+def test_gemini_reply_skips_the_models_thinking():
+    """The answer is the part NOT flagged as a thought.
+
+    Gemini 2.5 returns the chain of thought as an ordinary text part with
+    `"thought": true` ahead of the real reply. Reading parts[0] meant every
+    call got the reasoning: categorisation asked for JSON, got "*   Input: A
+    numbered list of merchant strings...", parsed nothing, and reported "0
+    from the model" while the provider was answering perfectly well.
+    """
+    from app.llm.providers import _gemini_text
+
+    reply = {"candidates": [{"content": {"parts": [
+        {"text": "*   Input: a numbered list...", "thought": True},
+        {"text": '[{"i": 0, "category": "groceries"}]'},
+    ]}}]}
+    assert _gemini_text(reply) == '[{"i": 0, "category": "groceries"}]'
+
+
+def test_gemini_reply_without_thinking_is_unchanged():
+    """Models that do not think out loud must keep working."""
+    from app.llm.providers import _gemini_text
+
+    reply = {"candidates": [{"content": {"parts": [{"text": "plain answer"}]}}]}
+    assert _gemini_text(reply) == "plain answer"
+
+
+def test_gemini_reply_that_is_only_thinking_is_not_swallowed():
+    """Returning "" here would read downstream as a silent failure."""
+    from app.llm.providers import _gemini_text
+
+    reply = {"candidates": [{"content": {"parts": [
+        {"text": "thinking and nothing else", "thought": True},
+    ]}}]}
+    assert _gemini_text(reply) == "thinking and nothing else"
+
+
+def test_gemini_malformed_reply_returns_empty_rather_than_raising():
+    from app.llm.providers import _gemini_text
+
+    assert _gemini_text({"candidates": []}) == ""
+    assert _gemini_text({}) == ""
+
+
+# --------------------------------------------------------------------------
+# "Uncategorized" is the absence of an answer, never a cached one.
+# --------------------------------------------------------------------------
+
+def _txn(desc, tid="t1"):
+    from app.models.schemas import Direction, Transaction
+    from datetime import date
+    from decimal import Decimal
+    return Transaction(
+        id=tid, account_id="a1", txn_date=date(2026, 7, 1),
+        raw_description=desc, merchant=desc, amount=Decimal("100"),
+        direction=Direction.DEBIT, category="uncategorized")
+
+
+def test_clearing_a_category_forgets_the_merchant(tmp_db):
+    """Storing it as a user decision would pin the merchant forever.
+
+    The cache's upsert refuses to overwrite a user row with any later guess,
+    so one cleared transaction would keep the model from ever being asked
+    about that merchant again.
+    """
+    from app.categorize.llm_categorizer import record_user_correction
+    from app.db.repository import lookup_merchants
+
+    txn = _txn("RBL*SULOCHANA BH")
+    record_user_correction(tmp_db, txn, "dining")
+    assert "RBL*SULOCHANA BH" in lookup_merchants(tmp_db, ["RBL*SULOCHANA BH"])
+
+    record_user_correction(tmp_db, txn, "uncategorized")
+    assert lookup_merchants(tmp_db, ["RBL*SULOCHANA BH"]) == {}, \
+        "clearing a category must drop the cache entry, not pin it"
+
+
+def test_a_cached_uncategorized_still_reaches_the_model(tmp_db):
+    """A hit that resolves nothing must not stand in for an answer."""
+    from app.categorize.llm_categorizer import categorize_with_llm
+    from app.db.repository import save_merchant_categories
+
+    save_merchant_categories(tmp_db, {"HAS": ("uncategorized", 1.0, "user")})
+
+    asked = []
+
+    class Model:
+        available = True
+
+        def complete_json(self, prompt, system="", **kw):
+            asked.append(prompt)
+            return [{"i": 0, "category": "shopping", "confidence": 0.9}]
+
+    txn = _txn("HAS")
+    from_cache, from_model = categorize_with_llm([txn], db=tmp_db, client=Model())
+
+    assert asked, "the merchant was never sent to the model"
+    assert from_cache == 0 and from_model == 1
+    assert txn.category == "shopping"
+
+
+# --------------------------------------------------------------------------
+# Junk dates, traced to the three statements that produced them.
+# --------------------------------------------------------------------------
+
+def test_idfc_prints_its_period_with_no_keyword():
+    """"23/Jul/2026 - 22/Aug/2026", sitting under the title.
+
+    Unread, that line was parsed as a transaction instead: the year truncated
+    to "20" and an amount built out of "26 - 22" gave a 2,622-rupee debit
+    dated 2020-07-23, on a statement whose only real row was a 277.76 credit.
+    """
+    from datetime import date
+    from app.normalize.metadata import detect_period
+
+    assert detect_period("Credit Card Statement\n23/Jul/2026 - 22/Aug/2026") \
+        == (date(2026, 7, 23), date(2026, 8, 22))
+
+
+def test_icici_prints_its_period_month_first():
+    """"Statement period : May 12, 2026 to August 11, 2026"."""
+    from datetime import date
+    from app.normalize.metadata import detect_period
+
+    assert detect_period("Statement period : May 12, 2026 to August 11, 2026") \
+        == (date(2026, 5, 12), date(2026, 8, 11))
+
+
+def test_two_loose_numbers_are_not_a_period():
+    """The keyword-less pattern must not read any nearby pair as a range."""
+    from app.normalize.metadata import detect_period
+
+    assert detect_period("Rows 12 - 15 of 90") == (None, None)
+
+
+def test_a_decade_apart_is_not_a_period():
+    """A statement covers a billing cycle, not eleven years."""
+    from app.normalize.metadata import detect_period
+
+    assert detect_period("01/Jan/2015 - 01/Jan/2026") == (None, None)
+
+
+def test_ddmmyyyy_filenames_anchor_the_outlier_guard():
+    """IDFC names files the other way round: ..._22082026_... is Aug 2026."""
+    from datetime import date
+    from app.normalize.normalizer import _anchor_from_filename
+
+    assert _anchor_from_filename("20000002170971_22082026_115345421.pdf") \
+        == date(2026, 8, 1)
+
+
+def test_a_single_row_statement_is_still_guarded():
+    """The row count stopped mattering once the anchor came from the period.
+
+    The IDFC statement had exactly two parsed rows, one of them junk. Needing
+    three rows for a median meant the guard declined to run on precisely the
+    statement that needed it.
+    """
+    from datetime import date
+    from decimal import Decimal
+    from app.models.schemas import Direction, Statement, Transaction
+    from app.normalize.normalizer import _drop_outlier_dates
+
+    junk = Transaction(
+        id="j", account_id="a", txn_date=date(2020, 7, 23),
+        raw_description="(no description)", amount=Decimal("2622"),
+        direction=Direction.DEBIT)
+    stmt = Statement(
+        id="s", account_id="a", source_filename="x.pdf",
+        period_start=date(2026, 7, 23), period_end=date(2026, 8, 22),
+        transactions=[junk])
+
+    _drop_outlier_dates(stmt)
+    assert stmt.transactions == [], "one bad row on a one-row statement"
+    assert stmt.parse_warnings
+
+
+def test_an_out_of_cycle_refund_counts_in_the_cycle_that_billed_it():
+    """Real money, wrong month.
+
+    "27APR RAZ*CARS24 SERVICES PR ... 2,242.00 CR" sits between 30JUL and
+    09AUG on an HSBC statement covering 24 Jul - 23 Aug 2026: a refund
+    carrying the date of the purchase it reverses. Dropping it would delete
+    real money; counting it in April stretched the ledger's span by a quarter.
+    """
+    from datetime import date
+    from decimal import Decimal
+    from app.analytics.periods import assign_accounting_months
+    from app.models.schemas import Direction, Transaction
+
+    refund = Transaction(
+        id="r", account_id="a", statement_id="s1", txn_date=date(2026, 4, 27),
+        raw_description="RAZ*CARS24 SERVICES PR Gurgaon IND",
+        amount=Decimal("2242.00"), direction=Direction.CREDIT)
+    normal = Transaction(
+        id="n", account_id="a", statement_id="s1", txn_date=date(2026, 8, 13),
+        raw_description="PAY*BOOKMYSHOW", amount=Decimal("619.06"),
+        direction=Direction.DEBIT)
+
+    periods = {"s1": (date(2026, 7, 24), date(2026, 8, 23))}
+    assign_accounting_months([refund, normal], [], periods)
+
+    assert refund.txn_date == date(2026, 4, 27), "the printed date must stand"
+    assert refund.accounting_month == "2026-08"
+    assert normal.accounting_month == "2026-08"
+
+
+def test_a_row_dated_after_the_cycle_is_not_claimed_by_it():
+    """Only rows dated BEFORE the period start are pulled forward."""
+    from datetime import date
+    from decimal import Decimal
+    from app.analytics.periods import assign_accounting_months
+    from app.models.schemas import Direction, Transaction
+
+    later = Transaction(
+        id="l", account_id="a", statement_id="s1", txn_date=date(2026, 9, 30),
+        raw_description="x", amount=Decimal("1"), direction=Direction.DEBIT)
+    assign_accounting_months(
+        [later], [], {"s1": (date(2026, 7, 24), date(2026, 8, 23))})
+    assert later.accounting_month == "2026-09"
+
+
+def test_the_span_agrees_with_the_month_rows():
+    """The header and the table must answer the same question.
+
+    A refund dated 27 April but billed in the August cycle is counted in
+    August. Measuring the span off raw dates announced "27 Apr - 17 Aug, 5
+    months" above a table with four month rows in it.
+    """
+    from datetime import date
+    from decimal import Decimal
+    from app.analytics.engine import analyze
+    from app.models.schemas import Direction, Transaction
+
+    rows = [
+        Transaction(id="a", account_id="x", txn_date=date(2026, 4, 27),
+                    accounting_month="2026-08", raw_description="refund",
+                    amount=Decimal("2242"), direction=Direction.CREDIT),
+        Transaction(id="b", account_id="x", txn_date=date(2026, 5, 3),
+                    accounting_month="2026-05", raw_description="a",
+                    amount=Decimal("100"), direction=Direction.DEBIT),
+        Transaction(id="c", account_id="x", txn_date=date(2026, 8, 17),
+                    accounting_month="2026-08", raw_description="b",
+                    amount=Decimal("100"), direction=Direction.DEBIT),
+    ]
+    result = analyze(rows)
+    assert result.period_start == date(2026, 5, 3), \
+        "the span must start in the first month anything is counted in"
+    assert result.period_end == date(2026, 8, 17)
+
+
+def test_an_excluded_row_cannot_stretch_the_span():
+    """Rejecting a misread date has to change the numbers it distorted."""
+    from datetime import date
+    from decimal import Decimal
+    from app.analytics.engine import analyze
+    from app.models.schemas import Direction, Transaction
+
+    rows = [
+        Transaction(id="junk", account_id="x", txn_date=date(2020, 7, 23),
+                    raw_description="(no description)", amount=Decimal("2622"),
+                    direction=Direction.DEBIT, excluded=True),
+        Transaction(id="real", account_id="x", txn_date=date(2026, 7, 29),
+                    raw_description="real", amount=Decimal("277.76"),
+                    direction=Direction.CREDIT),
+    ]
+    result = analyze(rows)
+    assert result.period_start == date(2026, 7, 29)
+
+
+# --------------------------------------------------------------------------
+# Staging: read, reviewed, and only then counted.
+# --------------------------------------------------------------------------
+
+def _csv_statement(tmp_path):
+    """A tiny statement that the CSV extractor can read without a password."""
+    path = tmp_path / "acme-card-jul.csv"
+    path.write_text(
+        "Date,Description,Debit,Credit,Balance\n"
+        "01/07/2026,COFFEE SHOP,120.00,,4880.00\n"
+        "05/07/2026,SALARY,,5000.00,9880.00\n",
+        encoding="utf-8")
+    return path
+
+
+def test_parsing_a_staged_file_touches_no_ledger(tmp_db, tmp_path):
+    """The whole point of staging, as an assertion.
+
+    Two import errors reached the running app before anything covered this
+    path - `Statement.reconcile` (a module function, not a method) and
+    `institution_for_sender` imported from the wrong module. Both were only
+    found by watching a real parse fail, which is exactly what a test is for.
+    """
+    from app.db import repository as repo
+    from app.db import staging
+    from app.ingestion.router import file_hash
+    from app.pipeline import staging_pipeline
+
+    path = _csv_statement(tmp_path)
+    entry_id = staging.add(tmp_db, file_hash(path),
+                           filename=path.name, path=str(path), origin="upload")
+
+    entry = next(e for e in staging.all_entries(tmp_db) if e["id"] == entry_id)
+    status = staging_pipeline.parse_entry(tmp_db, entry)
+
+    assert status in ("ok", "empty"), f"the file could not be read: {status}"
+    assert repo.count_transactions(tmp_db) == 0, \
+        "parsing must not put anything in the ledger"
+    assert repo.get_accounts(tmp_db) == [], \
+        "parsing must not create accounts either"
+
+    parsed = next(e for e in staging.all_entries(tmp_db) if e["id"] == entry_id)
+    assert parsed["parse_status"] == status
+    assert parsed["row_count"] >= 1
+
+
+def test_a_restaged_file_is_not_read_twice(tmp_db, tmp_path):
+    """Identity is the content hash, so a re-scan costs nothing."""
+    from app.db import staging
+    from app.ingestion.router import file_hash
+
+    path = _csv_statement(tmp_path)
+    digest = file_hash(path)
+    first = staging.add(tmp_db, digest, filename=path.name, path=str(path))
+    second = staging.add(tmp_db, digest, filename=path.name, path=str(path))
+    assert first == second
+    assert staging.counts(tmp_db)["total"] == 1
+
+
+def test_restaging_does_not_re_tick_what_was_turned_off(tmp_db, tmp_path):
+    """Re-scanning a mailbox must not undo a decision."""
+    from app.db import staging
+    from app.ingestion.router import file_hash
+
+    path = _csv_statement(tmp_path)
+    digest = file_hash(path)
+    entry_id = staging.add(tmp_db, digest, filename=path.name, path=str(path))
+    staging.set_selected(tmp_db, [(entry_id, False)])
+
+    staging.add(tmp_db, digest, filename=path.name, path=str(path))
+    again = next(e for e in staging.all_entries(tmp_db) if e["id"] == entry_id)
+    assert again["selected"] is False
+
+
+def test_a_statement_supersedes_the_alerts_it_covers(tmp_db):
+    """And un-ticking it brings them back.
+
+    Supersession is recomputed from the current selection rather than
+    accumulated, so it is reversible - which matters, because the alternative
+    is a checkbox that permanently destroys rows the first time it is used.
+    """
+    from app.db import staging
+
+    statement = staging.add(
+        tmp_db, "hash-statement", filename="july.pdf", kind="statement")
+    staging.record_parse(tmp_db, statement, status="ok", kind="statement",
+                         account_key="HSBC|XXXX1751",
+                         period_start="2026-07-01", period_end="2026-07-31")
+
+    alert = staging.add(tmp_db, "hash-alert", filename="a coffee", kind="alert")
+    staging.record_parse(tmp_db, alert, status="ok", kind="alert",
+                         account_key="HSBC|XXXX1751",
+                         period_start="2026-07-14", period_end="2026-07-14")
+
+    staging.apply_supersession(tmp_db)
+    rows = {e["id"]: e for e in staging.all_entries(tmp_db)}
+    assert rows[alert]["superseded_by"] == statement
+    assert not any(e["id"] == alert for e in
+                   staging.all_entries(tmp_db, selected_only=True)), \
+        "a superseded alert must not be processed even while it is ticked"
+
+    staging.set_selected(tmp_db, [(statement, False)])
+    staging.apply_supersession(tmp_db)
+    rows = {e["id"]: e for e in staging.all_entries(tmp_db)}
+    assert rows[alert]["superseded_by"] is None, \
+        "un-ticking the statement must bring its alerts back"
+
+
+def test_an_alert_outside_the_period_is_not_superseded(tmp_db):
+    from app.db import staging
+
+    statement = staging.add(tmp_db, "h1", filename="july.pdf", kind="statement")
+    staging.record_parse(tmp_db, statement, status="ok", kind="statement",
+                         account_key="HSBC|XXXX1751",
+                         period_start="2026-07-01", period_end="2026-07-31")
+    alert = staging.add(tmp_db, "h2", filename="august coffee", kind="alert")
+    staging.record_parse(tmp_db, alert, status="ok", kind="alert",
+                         account_key="HSBC|XXXX1751",
+                         period_start="2026-08-14", period_end="2026-08-14")
+
+    staging.apply_supersession(tmp_db)
+    rows = {e["id"]: e for e in staging.all_entries(tmp_db)}
+    assert rows[alert]["superseded_by"] is None
+
+
+def test_a_rebuild_does_not_delete_the_job_running_it():
+    """Process data runs inside a job, and clears tables when it starts.
+
+    The scope it used - "parsed_data" - includes `jobs`, so the rebuild
+    deleted its own row. It then finished perfectly well against a row that no
+    longer existed, and the screen watching it sat on "Computing analysis"
+    forever waiting for a status nothing was ever going to write.
+    """
+    from app.db.database import CLEAR_SCOPES
+
+    assert "jobs" not in CLEAR_SCOPES["rebuild"]
+    assert "job_items" not in CLEAR_SCOPES["rebuild"]
+    # It must still replace everything a document produces, or unticking a
+    # file would leave its rows behind.
+    for table in ("transactions", "statements", "accounts", "bureau_reports",
+                  "holdings", "analysis_runs"):
+        assert table in CLEAR_SCOPES["rebuild"], table
+
+
+# --------------------------------------------------------------------------
+# IDFC and ICICI HPCL: two statements that parsed to the wrong thing.
+# --------------------------------------------------------------------------
+
+def test_a_table_with_a_description_beats_one_without():
+    """IDFC's statement offered its only transaction twice.
+
+        t1  29 Jul 26 | BillDesk BBPS CC Payment/DP316… | 277.76 CR
+        t3  29 Jul 26 |                                 | 277.7
+
+    t3 held one more parseable row and won on row count, turning the month's
+    only transaction into an unnamed 277.7 DEBIT - wrong description, wrong
+    amount, wrong direction, with the real row sitting right there intact.
+    """
+    from app.models.schemas import ExtractedTable
+    from app.normalize.normalizer import _rank_tables
+
+    real = ExtractedTable(
+        rows=[["29 Jul 26", "BillDesk BBPS CC Payment/DP316", "277.76 CR"]],
+        confidence=0.55)
+    summary = ExtractedTable(
+        rows=[["29 Jul 26", "", "", "", "", "", "", "277.7"],
+              ["22 Aug 26", "", "", "", "", "", "", "0.00"]],
+        confidence=0.65)
+
+    ranked = _rank_tables([summary, real], default_year=2026)
+    assert ranked, "neither table was usable"
+    winner_roles = ranked[0][0].roles
+    assert "description" in winner_roles, \
+        "the table that maps a description must win a near tie"
+
+
+def test_a_worked_example_is_not_a_ledger():
+    """Card statements must print an illustration; it is not your money.
+
+    ICICI's HPCL statement carries two, drawn exactly like transaction tables.
+    Judged on shape the bigger one wins, and the file parsed to a 1-rupee
+    "urchase on" and a 5-rupee "ayment on" dated 2023 - three years outside
+    its own period - while the two genuine rows were never seen.
+    """
+    from app.models.schemas import ExtractedTable
+    from app.normalize.normalizer import _is_worked_example
+
+    illustration = ExtractedTable(
+        rows=[["1", "Purchase on Sep 20, 2023", "26,000"],
+              ["5", "Payment on Oct 28, 2023", "1,100"]],
+        confidence=0.65,
+        surrounding_text="The following illustration will indicate the method "
+                         "of calculating the MAD in this scenario")
+    ledger = ExtractedTable(
+        rows=[["16/07/2026", "13804164290 MICROSOFTBUS MUMBAI IN", "2.00 CR"]],
+        confidence=0.55,
+        surrounding_text="STATEMENT SUMMARY Total Amount due")
+
+    assert _is_worked_example(illustration)
+    assert not _is_worked_example(ledger)
+
+
+def test_a_split_illustration_caption_is_still_recognised():
+    """PDF extraction breaks words across cells: "e i llustration"."""
+    from app.models.schemas import ExtractedTable
+    from app.normalize.normalizer import _is_worked_example
+
+    table = ExtractedTable(
+        rows=[["** The abov", "e i", "llustration", "has been prepared a"]],
+        confidence=0.65, surrounding_text="")
+    assert _is_worked_example(table)
+
+
+def test_a_bank_named_as_a_landmark_is_not_the_issuer():
+    """Half of India writes addresses this way.
+
+    An ICICI card statement prints the cardholder's address ABOVE the issuer's
+    own name, and that address reads "OPP STATE BANK OF INDIA". The address is
+    the whole of the letterhead slice, so the card was filed under State Bank
+    of India and every figure on it attributed to a bank the user does not
+    hold a card with.
+    """
+    from app.normalize.metadata import detect_institution
+
+    address = ("MR JITESH AGARWAL\nM3 KALSAGAR SHRI RAM COLONY\n"
+               "ALANDI ROAD BHOSARI\nOPP STATE BANK OF INDIA\n"
+               "MAHARASHTRA, PUNE 411039")
+    assert detect_institution(address) is None
+
+    for preposition in ("Near", "Behind", "Beside", "Opposite", "Adj."):
+        assert detect_institution(f"12 Main Road, {preposition} HDFC Bank") is None, \
+            preposition
+
+    # The bank is still detected when it is not a landmark.
+    assert detect_institution("HDFC Bank Credit Card Statement") == "HDFC Bank"
+
+
+def test_the_bank_named_most_often_wins():
+    """An issuer names itself throughout its own statement."""
+    from app.normalize.metadata import detect_institution
+
+    text = ("Opp State Bank of India, Pune\n"
+            "ICICI Bank Credit Card GST Number: 27AAACI1195H3ZK\n"
+            "ICICI Bank Tower, Old Padra Road\n"
+            "Contact ICICI Bank customer care")
+    assert detect_institution(text) == "ICICI Bank"
+
+
+def test_the_identity_cache_reads_the_columns_it_writes(tmp_db):
+    """Both accessors named a column this table has never had.
+
+    Every call raised OperationalError, and neither is wrapped in a try - so
+    the path meant to rescue an unrecognised statement was the one thing
+    guaranteed to fail its parse outright.
+    """
+    from app.db import repository as repo
+
+    assert repo.get_ai_inference(tmp_db, "no-such-hash") is None
+    repo.save_ai_inference(tmp_db, "hash-1",
+                           {"institution": "ICICI Bank",
+                            "account_type": "credit_card"})
+    assert repo.get_ai_inference(tmp_db, "hash-1") == {
+        "institution": "ICICI Bank", "account_type": "credit_card"}
+    # Writing the same key again must update rather than raise.
+    repo.save_ai_inference(tmp_db, "hash-1", {"institution": "ICICI Bank"})
+    assert repo.get_ai_inference(tmp_db, "hash-1") == {"institution": "ICICI Bank"}
+
+
+def test_a_page_dump_loses_to_a_real_ledger():
+    """One row in one beats two rows in sixteen.
+
+    When a PDF's ruled table cannot be found, the extractor recovers the whole
+    PAGE as text - headings, marketing, footers - and a couple of those rows
+    happen to parse. IDFC's July statement offered that table alongside its
+    real one, and it won on row count. Its columns fall in the middle of
+    words, including in the middle of the amount: 277.76 was stored as 277.7.
+    """
+    from app.models.schemas import ExtractedTable
+    from app.normalize.normalizer import _rank_tables
+
+    real = ExtractedTable(
+        rows=[["28 Jun 26", "DISTRICT MOVIE TICKE, NEW DELHI", "277.76 DR"]],
+        confidence=0.55)
+    page_dump = ExtractedTable(
+        rows=[["YOUR CA", "RD INFO", "RMATI", "ON", "", "", "", ""],
+              ["Statement Date:", "Rela", "tionship No.", "CKYC :", "", "", "", ""],
+              ["22/Jul/2026", "5285", "938954", "XXXXXXXXX", "X8490", "", "", ""],
+              ["YOUR TR", "ANSAC", "TIONS", "", "", "", "", ""],
+              ["Card Number: X", "XXX 9402", "", "", "", "", "", ""],
+              ["28 Jun 26", "", "DISTRICT", "MOVIE TICKE, N", "EW DELHI", "", "", "277.7"],
+              ["Enjoy t", "he Conve", "nience of", "flexible pay", "ments!", "", "", ""],
+              ["", "Upgrade no", "w", "", "Refer now", "", "Apply now", ""],
+              ["Covert your", "IDFC FIRST", "Bank Credit", "Card", "", "", "", ""],
+              ["", "", "", "", "", "Flexible tenure", "", ""]],
+        confidence=0.65)
+
+    ranked = _rank_tables([page_dump, real], default_year=2026)
+    assert ranked, "neither table was usable"
+    winner_body = ranked[0][2]
+    assert any("277.76" in str(cell) for row in winner_body for cell in row), \
+        "the dense table holding the untruncated amount must win"
+
+
+def test_a_timestamp_is_not_a_description():
+    """IDFC's savings statement wraps the narration around the amount line:
+
+        AddMoney/20252846025956/528
+        11 Oct 25   17:10 11 Oct 25   1,000.00   1,000.00 CR
+        478636439/UPI
+
+    so the column beside the date holds a clock time and a value date, and the
+    words sit on the lines above and below. Stored as-is, "17:10 11 Oct 25"
+    becomes a payee: it shows in the ledger as a merchant, takes a category,
+    and is learned into the merchant cache.
+    """
+    from app.normalize.normalizer import _is_only_a_timestamp
+
+    for timestamp in ("17:10 11 Oct 25", "02:41 31 Oct 25", "17:10",
+                      "11/10/25", "2025-10-11", "  09:05 1 Jan 2026 "):
+        assert _is_only_a_timestamp(timestamp), timestamp
+
+    for narration in ("02:42 INTEREST CREDIT", "DISTRICT MOVIE TICKET",
+                      "BillDesk BBPS CC Payment", "UPI/1234", "AMAZON 12 PAY"):
+        assert not _is_only_a_timestamp(narration), narration
+
+    # Empty is not a timestamp - the caller has its own branch for that.
+    assert not _is_only_a_timestamp("")
+    assert not _is_only_a_timestamp("   ")
+
+
+# --------------------------------------------------------------------------
+# Which number identifies the account.
+# --------------------------------------------------------------------------
+
+def test_the_card_number_always_beats_an_account_number():
+    """HDFC's Marriott statement prints both, one line apart.
+
+        Credit Card No. 00361147XXXX6885
+        Alternate Account Number 0001015980001716889
+
+    The generic label was tried first, so the card was filed as XXXX6889 - a
+    number that identifies something else. All fifteen of its transaction
+    alerts said 6885 and every one was refused for naming an account that did
+    not exist.
+    """
+    from app.normalize.metadata import detect_account_number
+
+    assert detect_account_number(
+        "JITESH MUKESH AGARWAL Credit Card No. 00361147XXXX6885\n"
+        "A-1004 UTSAV HOMES Alternate Account Number 0001015980001716889"
+    ) == "XXXX6885"
+
+    # In either order, and whatever the account number is called.
+    assert detect_account_number(
+        "Account Number 12345678 ... Card Number 4315XXXXXXXX1111") == "XXXX1111"
+    assert detect_account_number(
+        "Card No 4315XXXXXXXX1111 ... A/c No 12345678") == "XXXX1111"
+
+    # A statement with no card still reads its account number.
+    assert detect_account_number("Account Number 001015980001716889") == "XXXX6889"
+
+
+def test_a_customer_id_is_not_an_account_number():
+    """One customer ID spans every account the bank holds for you.
+
+    ICICI's savings statement prints it first, masked identically:
+
+        STATEMENT SUMMARY for Customer ID : XXXXX9341
+        Savings A/c XXXXXXXX1951
+    """
+    from app.normalize.metadata import detect_account_number
+
+    assert detect_account_number(
+        "STATEMENT SUMMARY for Customer ID : XXXXX9341 as on July 31, 2026.\n"
+        "Savings A/c XXXXXXXX1951 4,366.43 Registered"
+    ) == "XXXX1951"
+
+
+def test_a_mask_whose_runs_were_collapsed_is_still_read():
+    """HSBC prints "51xx xxxx xxxx 1751"; extraction gives "51xx xx xx 1751".
+
+    A pattern demanding groups of exactly four masking characters found
+    nothing, so twelve HSBC statements carried no account number at all - and
+    their alerts, which all said 1751, were refused.
+    """
+    from app.normalize.metadata import detect_account_number
+
+    assert detect_account_number("State: 27 51xx xx xx 1751") == "XXXX1751"
+    assert detect_account_number("51xx xxxx xxxx 1751") == "XXXX1751"
+    assert detect_account_number("XXXX XXXX XXXX 1234") == "XXXX1234"
+    assert detect_account_number("438628******2343") == "XXXX2343"
+
+
+def test_a_masked_account_number_is_not_an_isin():
+    """"XXXXXXXX1951" is two letters, nine alphanumerics and a digit.
+
+    An ISIN alone is treated as proof that a document is a securities
+    statement, so twelve months of ICICI savings statements - eighty
+    transactions each - were routed to the holdings reader, found to contain
+    no holdings, and filed as empty portfolios. Their transactions were never
+    read.
+    """
+    from app.ingestion.portfolio import ISIN
+
+    for masked in ("XXXXXXXX1951", "XXXXXXXXXX85", "4315XXXXXXXX9239"):
+        assert not ISIN.search(masked), masked
+    for real in ("INE002A01018", "INF109K01Z48", "US0378331005", "IN0020230069"):
+        assert ISIN.search(real), real
+
+
+def test_no_source_file_contains_a_literal_control_byte():
+    """A regex written as "\b" that became a backspace character matches nothing.
+
+    Two guards in metadata.py silently did nothing because the escape was
+    eaten when the file was written, leaving \x08 in the pattern. Nothing
+    failed; the rules just never fired.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "app"
+    offenders = []
+    for path in root.rglob("*.py"):
+        raw = path.read_bytes()
+        for byte in (b"\x08", b"\x07", b"\x0b", b"\x0c"):
+            if byte in raw:
+                offenders.append(f"{path.name}: {byte!r}")
+    assert not offenders, offenders
+
+
+def test_alerts_are_rebuilt_after_the_statements_they_attach_to(tmp_db):
+    """An alert can only join an account some statement described.
+
+    Entries arrive sorted by account label, and an alert's label is shorter
+    than its statement's - "HDFC Bank (…6885)" sorts before "HDFC Bank
+    Marriott Bonvoy Credit Card (XXXX6885)". So every alert was looked up
+    against an account that did not exist yet, and all of them were dropped
+    from the rebuild without a word.
+    """
+    from app.db import repository as repo
+    from app.db import staging
+    from app.pipeline import staging_pipeline
+    import app.db.database as database_mod
+
+    previous = database_mod._db
+    database_mod._db = tmp_db
+    try:
+        statement = staging.add(tmp_db, "h-stmt", filename="marriott.pdf",
+                                kind="statement")
+        staging.record_parse(
+            tmp_db, statement, status="ok", kind="statement",
+            account_key="HDFC Bank|XXXX6885",
+            account_label="HDFC Bank Marriott Bonvoy Credit Card (XXXX6885)",
+            period_start="2026-07-01", period_end="2026-07-31",
+            payload={"kind": "statement",
+                     "statement": {"id": "s1", "account_id": "a1",
+                                   "source_filename": "marriott.pdf",
+                                   "transactions": []},
+                     "account": {"institution": "HDFC Bank",
+                                 "account_type": "credit_card",
+                                 "account_number_masked": "XXXX6885"},
+                     "reconciliation": {"status": "passed", "message": ""}})
+
+        alert = staging.add(tmp_db, "h-alert", filename="BIRD", kind="alert")
+        staging.record_parse(
+            tmp_db, alert, status="ok", kind="alert",
+            account_key="HDFC Bank|XXXX6885",
+            account_label="HDFC Bank (…6885)",
+            period_start="2026-08-04", period_end="2026-08-04",
+            payload={"kind": "alert",
+                     "alert": {"amount": "2899.00", "direction": "debit",
+                               "date_iso": "2026-08-04", "merchant": "BIRD",
+                               "account_suffix": "6885"}})
+
+        built = staging_pipeline.materialise(tmp_db)
+        rows = built.pop("_transactions", [])
+        assert any(t.source == "email_alert" for t in rows), \
+            "the alert was dropped because its account did not exist yet"
+    finally:
+        database_mod._db = previous
+
+
+def test_money_and_dates_survive_a_round_trip_through_storage():
+    """JSON has no Decimal and no date, so both come back as strings.
+
+    Nothing complains when the object is rebuilt - it is constructed happily -
+    and the failure lands later, in whatever first does arithmetic or calls a
+    date method:
+
+        units * nav        -> TypeError: can't multiply sequence by non-int
+        as_of.isoformat()  -> AttributeError: 'str' object has no attribute
+
+    That cost 81 broker statements out of one rebuild. A Decimal that is
+    secretly a string still adds up - by concatenation - which is the reason
+    this is checked rather than trusted.
+    """
+    import dataclasses
+    from datetime import date
+    from decimal import Decimal
+    from app.ingestion.bureau import BureauAccount, BureauReport
+    from app.ingestion.portfolio import Holding, PortfolioStatement
+    from app.pipeline.staging_pipeline import _rebuild_dataclass
+
+    holding = Holding(instrument="Reliance", isin="INE002A01018", symbol="RELI",
+                      folio="", kind="equity", units=Decimal("10"),
+                      nav=Decimal("2.5"), value=Decimal("25"),
+                      avg_cost=None, invested=None)
+    statement = PortfolioStatement(
+        layout="broker", provider="Zerodha", as_of=date(2026, 3, 31),
+        declared_value=Decimal("25"), holdings=[holding], warnings=[])
+
+    back = _rebuild_dataclass(PortfolioStatement,
+                              dataclasses.asdict(statement))
+    assert back.as_of == date(2026, 3, 31)
+    assert back.as_of.isoformat() == "2026-03-31"
+    assert back.holdings[0].units * back.holdings[0].nav == Decimal("25.0")
+    assert back.holdings[0].avg_cost is None
+
+    account = BureauAccount(
+        lender="HDFC", account_type="credit_card",
+        account_number_masked="XXXX6885", ownership="individual",
+        opened_on=date(2020, 1, 1), closed_on=None, status="open",
+        sanctioned=Decimal("1000"), current_balance=Decimal("5"),
+        overdue=None, credit_limit=None, emi_amount=None, dpd_history=[])
+    report = BureauReport(bureau="crif", score=833, score_band="good",
+                          pulled_on=date(2026, 8, 1), holder_name="J",
+                          accounts=[account], warnings=[])
+
+    rebuilt = _rebuild_dataclass(BureauReport, dataclasses.asdict(report))
+    assert rebuilt.pulled_on == date(2026, 8, 1)
+    assert rebuilt.score == 833 and isinstance(rebuilt.score, int)
+    assert rebuilt.accounts[0].sanctioned == Decimal("1000")
+    assert rebuilt.accounts[0].opened_on == date(2020, 1, 1)
+    assert rebuilt.accounts[0].closed_on is None

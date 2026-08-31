@@ -130,7 +130,14 @@ def normalize(
     elif meta.period_start:
         default_year = meta.period_start.year
 
+    examples = sum(1 for t in extraction.tables if _is_worked_example(t))
     candidates = _rank_tables(extraction.tables, default_year=default_year)
+    if examples:
+        statement.parse_warnings.append(
+            f"Ignored {examples} table(s) that the document itself labels as "
+            f"an illustration - the worked example in the terms and "
+            f"conditions, not your transactions."
+        )
     if not candidates:
         statement.parse_warnings.append(
             "No table in this file looked like a transaction list."
@@ -148,6 +155,7 @@ def normalize(
     statement.transactions = transactions
     statement.parse_warnings.extend(warnings)
     _drop_rows_after_period(statement, meta.period_end)
+    _drop_outlier_dates(statement)
 
     if best_mapping.inferred_from_data:
         statement.parse_warnings.append(
@@ -206,6 +214,51 @@ def _metadata_text(extraction: ExtractionResult) -> str:
 # Table selection
 # --------------------------------------------------------------------------
 
+#: Phrases that mark a table as a WORKED EXAMPLE rather than a ledger.
+#:
+#: Indian card issuers are required to print a "Most Important Terms and
+#: Conditions" section, and it demonstrates how interest and minimum payment
+#: are calculated using a fictional statement - dates, merchants, amounts and
+#: all. ICICI's HPCL card prints two of them, and they extract exactly like a
+#: transaction table because that is what they are drawn as.
+#:
+#: Judged on shape alone they beat the real one: on that statement the ledger
+#: held two rows and the illustration held twenty-four, so the file parsed to
+#: a 1-rupee "urchase on" and a 5-rupee "ayment on" dated 2023 - three years
+#: outside its own period - while the two genuine transactions were never seen.
+#:
+#: Matched against text with the whitespace removed, because PDF extraction
+#: splits words across cells ("e i llustration"). "illustration" is specific
+#: enough that no accidental run of characters forms it.
+_EXAMPLE_MARKERS = (
+    "illustration",
+    "illustrative",
+    "mostimportanttermsandconditions",
+    "samplestatement",
+    "hypothetical",
+)
+
+
+def _squeezed(text: str) -> str:
+    return "".join(str(text or "").split()).lower()
+
+
+def _is_worked_example(table: ExtractedTable) -> bool:
+    """Does this table announce itself as an example rather than a record?
+
+    Reads the text around the table and its own opening rows - the two places
+    the caption lives. Not the whole table: a merchant legitimately called
+    "Illustration Studio" three hundred rows down must not disqualify a real
+    ledger.
+    """
+    context = _squeezed(getattr(table, "surrounding_text", "") or "")
+    rows = list(getattr(table, "rows", None) or [])
+    heading = _squeezed(" ".join(
+        str(cell or "") for row in rows[:3] for cell in row))
+    return any(marker in context or marker in heading
+               for marker in _EXAMPLE_MARKERS)
+
+
 def _rank_tables(
     tables: list[ExtractedTable], default_year: int | None = None,
 ) -> list[tuple[ColumnMapping, ExtractedTable, list[list[str]]]]:
@@ -229,6 +282,13 @@ def _rank_tables(
 
     entries: list[tuple[ColumnMapping, ExtractedTable, list[list[str]], int]] = []
     for table in tables:
+        if _is_worked_example(table):
+            # Dropped outright rather than scored down. A worked example is
+            # not a weaker record of the same money - it is a record of money
+            # that never moved, and preferring nothing to it is the whole
+            # point of the reconciliation gate.
+            log.debug("skipping a worked example table")
+            continue
         mapping, body = _resolve_mapping(table, default_year=default_year)
         if mapping is None or not mapping.is_usable():
             continue
@@ -258,9 +318,57 @@ def _rank_tables(
         # Extraction confidence is weighted heavily enough to break a row-count
         # tie: when a ruled table and a text-recovered table both cover the same
         # rows, the structured one is materially more trustworthy.
+        #
+        # The description term is worth about two and a half rows, and it is
+        # there because a table with dates and amounts but NO description is
+        # usually not a ledger at all - it is a summary block, and the mapping
+        # over it is a guess. IDFC's statement offered both:
+        #
+        #   t1  date | description                    | amount
+        #       29 Jul 26 | BillDesk BBPS CC Payment… | 277.76 CR
+        #
+        #   t3  date | ...six empty columns... | amount
+        #       29 Jul 26 |                    | 277.7
+        #
+        # t3 held one more parseable row, won on row count alone, and turned
+        # the month's only transaction into an unnamed 277.7 DEBIT - wrong
+        # description, wrong amount, wrong direction, from a statement whose
+        # real row was sitting right there fully intact.
+        #
+        # Deliberately a constant, not a multiplier: it decides near-ties and
+        # nothing else. A forty-row ledger whose description column was missed
+        # still comfortably outscores a one-row table that happens to have one.
+        has_description = "description" in mapping.roles
+
+        # What fraction of the table is actually transactions.
+        #
+        # A ledger is mostly ledger. When a PDF's ruled table cannot be found,
+        # the extractor falls back to recovering the page as text, and that
+        # produces a table of the WHOLE PAGE - headings, marketing, footers -
+        # in which a couple of rows happen to parse. IDFC's July statement
+        # offered exactly that:
+        #
+        #   t1   28 Jun 26 | DISTRICT MOVIE TICKE, NEW DELHI | 277.76 DR
+        #
+        #   t3   YOUR CA | RD INFO | RMATI | ON
+        #        Enjoy t | he Conve | nience of | flexible pay | ments!
+        #        28 Jun 26 | | DISTRICT | MOVIE TICKE, N | EW DELHI | | | 277.7
+        #        …thirteen more rows of page furniture
+        #
+        # t3 is the page cut into columns that fall in the middle of words -
+        # and, fatally, in the middle of the amount: 277.76 became 277.7,
+        # sixteen rows of noise carrying one silently truncated figure. It won
+        # because it had two parseable rows against t1's one.
+        #
+        # One row in one is worth more than two rows in sixteen, and that is
+        # what this term says.
+        total_body = sum(len(b) for _, _, b, _ in members) or 1
+        density = min(total_rows / total_body, 1.0)
         score = (total_rows * 10
                  + mapping.confidence * 20
-                 + best_confidence * 40)
+                 + best_confidence * 40
+                 + (25 if has_description else 0)
+                 + density * 30)
         scored.append((score, members))
 
     scored.sort(key=lambda s: -s[0])
@@ -522,6 +630,102 @@ def _cell(row: list[str], idx: int | None) -> str:
     return str(row[idx] or "").strip()
 
 
+#: A row that says nothing but "CR" (or "Cr."/"CREDIT"). American Express
+#: prints the credit marker on its OWN line, directly under the amount it
+#: belongs to:
+#:
+#:     June 21   Paytm*UBERINDIASYSTEMSP  Noida        2.00
+#:                                                       CR
+#:     June 24   AMAZON Mumbai                        599.00
+#:                                                       CR
+#:
+#: Nothing looks at the next row, so all three of June's credits were read as
+#: charges. They came to exactly the 984.00 the statement declared as credits,
+#: and booking them as spending was a two-for-one error: it inflated the month
+#: and erased the refunds. The reconciliation gate caught it only once the
+#: opening and closing balances could be read.
+_LONE_CREDIT_MARKER = re.compile(r"^\s*(?:cr|cr\.|credit)\s*$", re.IGNORECASE)
+
+
+def _fold_credit_markers(rows: list[list[str]]) -> list[list[str]]:
+    """Attach a standalone CR row to the amount above it.
+
+    The marker is appended to the amount cell rather than tracked separately,
+    because `parse_amount` already understands a trailing CR - so one line here
+    reuses the same convention every other issuer states inline.
+    """
+    if not rows:
+        return rows
+
+    folded: list[list[str]] = []
+    for row in rows:
+        cells = [str(c or "") for c in row]
+        joined = " ".join(c for c in cells if c.strip()).strip()
+        if folded and joined and _LONE_CREDIT_MARKER.match(joined):
+            previous = folded[-1]
+            # The amount is the last cell carrying digits.
+            for index in range(len(previous) - 1, -1, -1):
+                if any(ch.isdigit() for ch in str(previous[index] or "")):
+                    previous[index] = f"{previous[index]} CR"
+                    break
+            continue
+        folded.append(list(cells))
+    return folded
+
+
+#: A description cell holding nothing but a clock time and/or a date. Used to
+#: reject a "narration" like "17:10 11 Oct 25" - see the call site.
+_TIMESTAMP_ONLY = re.compile(
+    r"""^\s*
+        (?:\d{1,2}[:.]\d{2}(?::\d{2})?\s*(?:am|pm)?)?      # 17:10
+        \s*
+        (?:\d{1,2}[\s/-]*[A-Za-z]{3,9}[\s/-]*\d{2,4}        # 11 Oct 25
+          |\d{1,2}[/-]\d{1,2}[/-]\d{2,4}                    # 11/10/25
+          |\d{4}-\d{2}-\d{2})?                              # 2025-10-11
+        \s*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+#: A clock time at the very start of a description. HDFC prints the time of
+#: each transaction, and it arrives glued to the merchant:
+#:
+#:     17:47 UPI-Dominos
+#:     11:21 ZEPTO MARKETPLACE PRIVABANGALORE
+#:
+#: `extract_merchant` finds no merchant in a string that opens with digits and
+#: a colon, so all 187 such rows carried an EMPTY merchant and 107 of them
+#: went uncategorised - a fifth of the ledger, unreadable because of five
+#: characters at the front.
+_LEADING_TIME = re.compile(r"^\s*\d{1,2}[:.]\d{2}(?::\d{2})?\s*(?:am|pm)?\s+",
+                           re.IGNORECASE)
+
+
+def _strip_leading_time(text: str) -> str:
+    """Drop a clock time from the front of a description.
+
+    Only when something is left afterwards: a description that is nothing but
+    a time is handled by `_is_only_a_timestamp`, and blanking it here would
+    hide that case from the branch that knows what to do with it.
+    """
+    stripped = _LEADING_TIME.sub("", str(text or ""), count=1)
+    return stripped if stripped.strip() else str(text or "")
+
+
+def _is_only_a_timestamp(text: str) -> bool:
+    """Is this "description" just a time, a date, or both?
+
+    An empty cell is not a timestamp - the caller already has a branch for
+    that - so a blank string returns False and takes the existing path.
+    """
+    stripped = str(text or "").strip()
+    if not stripped:
+        return False
+    if not any(ch.isdigit() for ch in stripped):
+        return False
+    return bool(_TIMESTAMP_ONLY.match(stripped))
+
+
 def _rows_to_transactions(
     rows: list[list[str]],
     mapping: ColumnMapping,
@@ -532,6 +736,8 @@ def _rows_to_transactions(
 ) -> tuple[list[Transaction], list[str]]:
     warnings: list[str] = []
     transactions: list[Transaction] = []
+
+    rows = _fold_credit_markers(rows)
 
     date_col = mapping.get("txn_date")
     if date_col is None:
@@ -569,6 +775,23 @@ def _rows_to_transactions(
             continue  # zero-value rows are statement furniture, not transactions
 
         raw_desc = raw_desc_probe
+        if _is_only_a_timestamp(raw_desc):
+            # A time and a value date are not a narration. IDFC's savings
+            # statement wraps the narration around the amount line:
+            #
+            #     AddMoney/20252846025956/528
+            #     11 Oct 25   17:10 11 Oct 25   1,000.00   1,000.00 CR
+            #     478636439/UPI
+            #
+            # so the column beside the date holds "17:10 11 Oct 25" and the
+            # words are on the lines above and below, out of reach of this
+            # table. Kept as-is it becomes a merchant: a payee named
+            # "17:10 11 Oct 25" appears in the ledger, gets a category, and is
+            # learned into the merchant cache. Saying nothing is the honest
+            # answer, and it routes the row to review instead.
+            raw_desc = ""
+        else:
+            raw_desc = _strip_leading_time(raw_desc)
         if not raw_desc:
             raw_desc = "(no description)"
         raw_desc = redact_account_numbers(raw_desc)
@@ -830,21 +1053,145 @@ def _drop_rows_after_period(statement: Statement, period_end: date | None) -> No
     inventing a 6,831.64 purchase from the cardholder, two weeks after the
     statement closed. One appeared in every HSBC statement.
 
-    Only the upper bound is enforced. A card's TRANSACTION date legitimately
-    precedes the period start when a purchase posts late, so an early row is
-    real data; a late one never is.
+    The lower bound is far looser than the upper one, and deliberately so. A
+    card's TRANSACTION date legitimately precedes the period start when a
+    purchase posts late, so a row a few months early is real data. A row YEARS
+    early is not: it is a mis-read date, and one of them poisons every figure
+    derived from the ledger's span.
+
+    A real example, from an IDFC statement: the line ": 01-MAY-2026 to 3..."
+    is the printed statement period, and reading it as a row produced a 6-rupee
+    transaction dated in the year 0202. That single row stretched the
+    dashboard's range to 21,892 months and turned "average per month" from
+    about eighty-six thousand rupees into four.
     """
     if period_end is None or not statement.transactions:
         return
-    kept = [t for t in statement.transactions if t.txn_date <= period_end]
-    dropped = len(statement.transactions) - len(kept)
+
+    # Generous: a late-posting purchase, or a card that bills a quarter in
+    # arrears, is still real.
+    earliest = date(period_end.year - 2, period_end.month, 1)
+
+    kept, late, ancient = [], 0, 0
+    for txn in statement.transactions:
+        if txn.txn_date > period_end:
+            late += 1
+        elif txn.txn_date < earliest:
+            ancient += 1
+        else:
+            kept.append(txn)
+
+    if not (late or ancient):
+        return
+    statement.transactions = kept
+    if late:
+        statement.parse_warnings.append(
+            f"Ignored {late} row(s) dated after the statement period ended "
+            f"({period_end}) - these are summary figures such as the payment "
+            f"due date, not transactions."
+        )
+    if ancient:
+        statement.parse_warnings.append(
+            f"Ignored {ancient} row(s) dated before {earliest} - more than two "
+            f"years before this statement closed, so the date was misread "
+            f"rather than early."
+        )
+
+
+#: An 8-digit DDMMYYYY run, delimited so it cannot start mid-number. The
+#: account number in "20000002170971_22082026_115345421.pdf" is 14 digits and
+#: would otherwise offer several plausible-looking dates.
+_DDMMYYYY = re.compile(r"(?<!\d)(\d{2})(\d{2})(20\d{2})(?!\d)")
+
+
+def _ddmmyyyy_in(filename: str) -> str | None:
+    """"YYYY-MM" from a DDMMYYYY run in a filename, if one reads as a date."""
+    for day, month, year in _DDMMYYYY.findall(filename):
+        if 1 <= int(month) <= 12 and 1 <= int(day) <= 31:
+            return f"{year}-{month}"
+    return None
+
+
+def _anchor_from_filename(filename: str | None) -> date | None:
+    """The month this file is named for, as a date, or None.
+
+    Reuses the coverage grid's own filename reader so the two never disagree
+    about what "20000002170971_22082026_115345421.pdf" is a statement for.
+    """
+    if not filename:
+        return None
+    try:
+        from ..analytics.coverage import guess_period_hint
+        hint = guess_period_hint(filename)
+    except Exception:  # pragma: no cover - a hint is never load-bearing
+        return None
+    if not hint:
+        # The coverage grid only knows YYYYMM-style names. IDFC names its
+        # files with the statement date the other way round -
+        # "20000002170971_22082026_115345421.pdf" is 22 Aug 2026 - and that
+        # was the one file whose junk row had no other anchor to catch it.
+        hint = _ddmmyyyy_in(filename)
+    if not hint:
+        return None
+    try:
+        year, month = (int(part) for part in hint.split("-")[:2])
+        return date(year, month, 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def _drop_outlier_dates(statement: Statement) -> None:
+    """Drop rows dated years away from the rest of the same statement.
+
+    The period guard above needs a declared period to anchor on, and plenty of
+    statements print none. Those fall back to inferring the period FROM the
+    rows - so a single misread date silently becomes the period, and the whole
+    ledger's span with it.
+
+    The anchor here is the median row date, which a handful of bad rows cannot
+    move. Two real examples from one import: a 1-rupee row dated 2023 whose
+    description was "urchase on" (the tail of "purchase on", read out of a
+    footnote), and a 2,622-rupee row dated 2020 with no description at all,
+    both on statements covering a single month of 2026.
+    """
+    rows = statement.transactions
+    if not rows:
+        return
+
+    # Anchors in order of how much they can be trusted. The first two do not
+    # come from the rows at all, which is the whole point: a statement with
+    # one transaction on it has no middle to take a median of, and the row
+    # count stops mattering as soon as the anchor comes from somewhere else.
+    #
+    #   1. the period the statement itself prints
+    #   2. the date in the filename ("..._22082026_..." is August 2026)
+    #   3. the median row date, which needs three rows to mean anything
+    anchor = statement.period_end or statement.period_start
+    if anchor is None:
+        anchor = _anchor_from_filename(statement.source_filename)
+
+    if anchor is None:
+        if len(rows) < 3:
+            # Nothing outside the rows to check them against, and no
+            # trustworthy middle: discarding real data on a coin flip is
+            # worse than keeping one bad date.
+            return
+        ordered = sorted(t.txn_date for t in rows)
+        anchor = ordered[len(ordered) // 2]
+
+    median = anchor
+    floor = date(median.year - 2, 1, 1)
+    ceiling = date(median.year + 2, 12, 31)
+
+    kept = [t for t in rows if floor <= t.txn_date <= ceiling]
+    dropped = len(rows) - len(kept)
     if not dropped:
         return
     statement.transactions = kept
     statement.parse_warnings.append(
-        f"Ignored {dropped} row(s) dated after the statement period ended "
-        f"({period_end}) - these are summary figures such as the payment due "
-        f"date, not transactions."
+        f"Ignored {dropped} row(s) dated years away from the rest of this "
+        f"statement (most rows sit around {median}) - a misread date, not a "
+        f"transaction."
     )
 
 

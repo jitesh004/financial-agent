@@ -222,6 +222,35 @@ def analyze(
         return result
 
     txns = sorted(transactions, key=lambda t: t.txn_date)
+
+    # The span is measured over rows that COUNT. An excluded row is one
+    # somebody looked at and rejected - a misread date, a duplicate, a figure
+    # lifted out of a terms-and-conditions example - and letting it set the
+    # first or last date means rejecting it changes none of the numbers that
+    # made it obvious. One row dated 2020 on a ledger of four real months
+    # reported seventy-four months covered, and every per-month average
+    # divided by that.
+    spanning = [t for t in txns if not t.excluded] or txns
+
+    # ...and measured in the months the rows are COUNTED in, which is what
+    # every monthly figure below is bucketed by. A refund carrying the date of
+    # the purchase it reverses is billed in this cycle and counted in it, so a
+    # span read off the raw dates announced "27 Apr - 17 Aug, 5 months" over a
+    # table with four month rows in it. The header and the rows have to be
+    # answering the same question.
+    def _effective_month(txn):
+        return txn.accounting_month or _month_key(txn.txn_date)
+
+    if spanning:
+        first_month = min(_effective_month(t) for t in spanning)
+        last_month = max(_effective_month(t) for t in spanning)
+        in_first = [t for t in spanning if _effective_month(t) == first_month]
+        in_last = [t for t in spanning if _effective_month(t) == last_month]
+        span_start = min(t.txn_date for t in in_first)
+        span_end = max(t.txn_date for t in in_last)
+    else:  # pragma: no cover - guarded by the empty check above
+        span_start = span_end = None
+
     if start or end:
         s = start or txns[0].txn_date
         e = end or txns[-1].txn_date
@@ -235,8 +264,8 @@ def analyze(
         result.period_start = s
         result.period_end = e
     else:
-        result.period_start = txns[0].txn_date
-        result.period_end = txns[-1].txn_date
+        result.period_start = span_start
+        result.period_end = span_end
     result.transaction_count = len(txns)
 
     # Every total below is a sum over ONE role, so the sets are disjoint by

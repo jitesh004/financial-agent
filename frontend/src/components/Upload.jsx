@@ -1,20 +1,19 @@
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../lib';
 import { Callout, Card, Chip } from './ui';
 
 const ACCEPTED = '.pdf,.xlsx,.xls,.xlsm,.csv,.tsv,.txt,.docx';
 
-const STAGES = [
-  'Extracting tables from your files',
-  'Normalizing transactions',
-  'Checking balances reconcile',
-  'Matching transfers between accounts',
-  'Categorizing spending',
-  'Detecting recurring commitments',
-  'Computing analysis and forecast',
-];
+/* What the upload is actually doing now: saving and reading. It used to end
+   with "Analysing" and "Building your dashboard", which stopped being true
+   the moment uploads started going to staging - nothing is analysed until the
+   wizard's last step. */
+const STAGES = ['Saving your files', 'Reading them', 'Staging for review'];
 
-export default function Upload({ onComplete }) {
+/* `compact` also changes WHO decides when these are read: the wizard does,
+   from its Scanning step, via the `onFilesChange` callback and the `submit`
+   handle below. */
+export default function Upload({ onComplete, compact = false, onFilesChange }) {
   const [files, setFiles] = useState([]);
   const [over, setOver] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -62,20 +61,30 @@ export default function Upload({ onComplete }) {
     );
 
     try {
-      const { run_id: runId, rejected: skipped } = await api.upload(files);
+      const { job_id: jobId, rejected: skipped, staged } = await api.upload(files);
       if (skipped?.length) setRejected(skipped);
 
-      // Poll until the background run finishes.
+      /* An upload is staged and read; it is not analysed here any more. What
+         it produced is reviewed with everything else and reaches the ledger
+         only when the wizard's last step is run - so this waits for the READ
+         to finish and then hands over, rather than waiting for figures that
+         are deliberately not being computed yet. */
+      if (!jobId) {
+        clearInterval(ticker);
+        onComplete({ staged: staged || 0 });
+        return;
+      }
       for (;;) {
         await new Promise((r) => setTimeout(r, 900));
-        const run = await api.run(runId);
-        if (run.status === 'complete') {
+        const job = await api.job(jobId).catch(() => null);
+        if (!job) break;
+        if (!job.active) {
           clearInterval(ticker);
-          onComplete(run.result, run);
+          if (job.status === 'failed') {
+            throw new Error(job.errors?.join('; ') || 'Reading the files failed.');
+          }
+          onComplete({ staged: staged || 0, ...(job.result || {}) }, job);
           return;
-        }
-        if (run.status === 'failed') {
-          throw new Error(run.errors?.join('; ') || 'Analysis failed.');
         }
       }
     } catch (err) {
@@ -85,6 +94,9 @@ export default function Upload({ onComplete }) {
       setBusy(false);
     }
   }
+
+  // Tell the wizard what is queued, so its Scanning step can offer to read it.
+  useEffect(() => { onFilesChange?.(files, analyze); }, [files]);
 
   if (busy) {
     return (
@@ -118,14 +130,18 @@ export default function Upload({ onComplete }) {
         tabIndex={0}
         onKeyDown={(e) => e.key === 'Enter' && inputRef.current?.click()}
       >
-        <h3>Drop your statements here</h3>
-        <p>
+        <h3 style={compact ? { fontSize: 14, margin: 0 } : undefined}>
+          Drop your statements here
+        </h3>
+        <p style={compact ? { fontSize: 12.5, margin: '4px 0 0' } : undefined}>
           Bank, credit card, loan and investment statements — PDF, Excel, Word or CSV.
         </p>
-        <p style={{ marginTop: 10, color: 'var(--text-3)', fontSize: 12.5 }}>
-          Upload every account for the same period. Statements that reference each
-          other let the analyzer cancel out transfers instead of counting them as spending.
-        </p>
+        {!compact && (
+          <p style={{ marginTop: 10, color: 'var(--text-3)', fontSize: 12.5 }}>
+            Upload every account for the same period. Statements that reference each
+            other let the analyzer cancel out transfers instead of counting them as spending.
+          </p>
+        )}
         <input
           ref={inputRef}
           type="file"
@@ -152,9 +168,15 @@ export default function Upload({ onComplete }) {
             </div>
           ))}
           <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
-            <button className="btn primary" onClick={analyze}>
-              Analyze {files.length} statement{files.length === 1 ? '' : 's'}
-            </button>
+            {/* In the wizard, adding files is choosing a source - the reading
+                happens on the Scanning step with every other source, so there
+                is nothing to press here. Outside it, this is still the whole
+                interaction and needs its own button. */}
+            {!compact && (
+              <button className="btn primary" onClick={analyze}>
+                Analyze {files.length} statement{files.length === 1 ? '' : 's'}
+              </button>
+            )}
             <button className="btn" onClick={() => setFiles([])}>Clear</button>
           </div>
         </Card>

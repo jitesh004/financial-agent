@@ -1,0 +1,512 @@
+"""The staged import: scan, parse, review, process.
+
+Four verbs over one table, in the order the wizard walks them.
+
+  POST /api/staging/scan-results   what a scan found, staged (parses nothing)
+  POST /api/staging/parse          read the staged files that have not been read
+  GET  /api/staging/review         what is staged, grouped for a decision
+  POST /api/staging/select         tick and untick
+  POST /api/staging/process        build the ledger from what is ticked
+
+The separation is the feature. Everything before `process` leaves the ledger
+exactly as it was, so a scan that turns up a badly-parsed statement changes no
+total on any tab until someone has looked at it and said yes.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException
+from pydantic import BaseModel
+
+from ..db import repository as repo
+from ..db import staging
+from ..db.database import get_db
+from ..jobs import JobProgress, jobs
+from ..pipeline import staging_pipeline as pipeline
+
+log = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/staging", tags=["staging"])
+
+
+KIND_LABELS = {
+    "statement": "Statement",
+    "alert": "Transaction alert",
+    "bureau": "Credit report",
+    "portfolio": "Investments",
+}
+
+KIND_NOTES = {
+    "statement": "Reconciled against the balances the issuer printed.",
+    "alert": "Read from an alert email. Nothing has checked it against a "
+             "statement.",
+    "bureau": "A credit bureau's own record of your accounts.",
+    "portfolio": "Holdings on one date, not a ledger of transactions.",
+}
+
+
+class StagedFile(BaseModel):
+    file_hash: str
+    filename: str
+    path: str | None = None
+    origin: str = "gmail"
+    kind: str = "statement"
+    message_id: str | None = None
+    sender: str = ""
+    subject: str = ""
+
+
+class ScanResults(BaseModel):
+    files: list[StagedFile] = []
+    alerts: list[dict[str, Any]] = []
+
+
+class Selection(BaseModel):
+    ids: list[str] = []
+    include: bool = True
+
+
+class GroupSelection(BaseModel):
+    """A whole account+origin group, ticked or unticked in one go."""
+    key: str
+    include: bool
+
+
+class SelectionRequest(BaseModel):
+    files: list[Selection] = []
+    groups: list[GroupSelection] = []
+
+
+def _group_key(entry: dict[str, Any]) -> str:
+    return f"{entry.get('account_key') or 'unattached'}::{entry.get('kind')}"
+
+
+# ------------------------------------------------------------------ staging --
+
+
+@router.post("/scan-results")
+def stage_scan_results(payload: ScanResults) -> dict[str, Any]:
+    """Record what a scan found. Parses nothing, reads nothing.
+
+    Called with the whole scan result, every time, including files staged on a
+    previous run - `staging.add` recognises them by content hash and leaves
+    their selection and their parse result alone. That is what makes running
+    the wizard again cheap instead of destructive.
+    """
+    db = get_db()
+    before = staging.counts(db)["total"]
+
+    for item in payload.files:
+        staging.add(
+            db, item.file_hash,
+            filename=item.filename, path=item.path, origin=item.origin,
+            kind=item.kind, message_id=item.message_id, sender=item.sender,
+            subject=item.subject,
+        )
+
+    for alert in payload.alerts:
+        try:
+            pipeline.stage_alert(db, alert)
+        except Exception:  # pragma: no cover - one bad alert is not the batch
+            log.exception("could not stage an alert")
+
+    staging.apply_supersession(db)
+    after = staging.counts(db)
+    return {"added": after["total"] - before, **after}
+
+
+@router.post("/parse")
+def start_parse(background: BackgroundTasks,
+                intent: str | None = None) -> dict[str, Any]:
+    """Parse staged files that have not been read successfully yet.
+
+    `intent` limits the run to one source, so the Parse step can offer a
+    section per source rather than one all-or-nothing button.
+    """
+    db = get_db()
+    pending = staging.unparsed(db, scan_intent=intent)
+    if not pending:
+        return {"job_id": None, "count": 0,
+                "message": "Everything staged has already been read."}
+
+    job = jobs.create("stage_parse", total=len(pending), phase="Queued",
+                      request={"count": len(pending), "intent": intent})
+    background.add_task(_run_parse, job.id, intent)
+    return {"job_id": job.id, "count": len(pending)}
+
+
+def _run_parse(job_id: str, intent: str | None = None) -> None:
+    job = jobs.get(job_id)
+    progress = JobProgress(job)
+    try:
+        db = get_db()
+        from ..ingestion.passwords import derive_passwords
+        candidates = list(derive_passwords(repo.get_profile(db)))
+
+        pending = staging.unparsed(db, scan_intent=intent)
+        progress.start(len(pending), "Reading documents")
+
+        counts: dict[str, int] = defaultdict(int)
+        for entry in pending:
+            status = pipeline.parse_entry(db, entry, candidates)
+            counts[status] += 1
+            fresh = staging.all_entries(db)
+            detail = next((e for e in fresh if e["id"] == entry["id"]), {})
+            progress.item(
+                entry["filename"][:70],
+                "done" if status in ("ok", "empty") else "failed",
+                detail=(f"{detail.get('account_label') or '—'} · "
+                        f"{detail.get('row_count') or 0} row(s)"
+                        if status == "ok" else detail.get("parse_message", status)),
+                key=entry["id"])
+
+        staging.apply_supersession(db)
+        totals = staging.counts(db)
+        progress.complete(
+            # Prefixed, because `totals` carries a `parsed` of its own - the
+            # whole staging area's - and spreading it last silently replaced
+            # this run's count with it.
+            result={"read_now": counts.get("ok", 0),
+                    "empty_now": counts.get("empty", 0),
+                    "failed_now": counts.get("failed", 0),
+                    "locked_now": counts.get("needs_password", 0), **totals},
+            message=(f"{counts.get('ok', 0)} read, "
+                     f"{counts.get('failed', 0) + counts.get('needs_password', 0)}"
+                     f" could not be. Nothing has been added to your ledger yet -"
+                     f" that happens on the last step."),
+        )
+    except Exception as exc:
+        log.exception("staged parse failed")
+        progress.fail(f"{type(exc).__name__}: {exc}")
+
+
+# ------------------------------------------------------------------- review --
+
+
+@router.get("/sections")
+def sections() -> dict[str, Any]:
+    """What each source has brought in, counted per stage of the wizard.
+
+    One row per scan source plus one for uploads, so Choose and Parse can show
+    a section each. Keyed on `scan_intent` - the question a scan asked - not
+    on `kind`, which is the answer reading the file gave and does not exist
+    until the file has been read.
+    """
+    db = get_db()
+    entries = staging.all_entries(db)
+
+    from ..ingestion.gmail_source import SCAN_INTENTS
+    order = [*SCAN_INTENTS.keys(), "upload"]
+
+    out: dict[str, dict[str, Any]] = {}
+    for key in order:
+        spec = SCAN_INTENTS.get(key, {})
+        out[key] = {
+            "key": key,
+            "label": spec.get("label") or "Files you added",
+            "description": spec.get("description")
+            or "Statements from this computer - anything Gmail does not carry.",
+            "max_months": spec.get("max_months"),
+            "staged": 0, "parsed": 0, "pending": 0, "failed": 0,
+            "selected": 0, "rows": 0,
+        }
+
+    for entry in entries:
+        key = entry.get("scan_intent") or "statement"
+        if key not in out:
+            # A source that no longer exists in the registry still has files
+            # staged against it, and they must stay visible.
+            out[key] = {"key": key, "label": key.title(), "description": "",
+                        "max_months": None, "staged": 0, "parsed": 0,
+                        "pending": 0, "failed": 0, "selected": 0, "rows": 0}
+        row = out[key]
+        row["staged"] += 1
+        status = entry.get("parse_status")
+        if status in ("ok", "empty"):
+            row["parsed"] += 1
+        elif status == "pending":
+            row["pending"] += 1
+        else:
+            row["failed"] += 1
+        if entry.get("selected") and not entry.get("superseded_by"):
+            row["selected"] += 1
+            row["rows"] += entry.get("row_count") or 0
+
+    return {"sections": list(out.values())}
+
+
+@router.get("/review")
+def review() -> dict[str, Any]:
+    """What is staged, grouped by account and origin, files nested inside.
+
+    Groups are what you judge; files are what you correct. A group answers
+    "should this card's statements count at all", a file answers "all except
+    that one".
+    """
+    db = get_db()
+    entries = staging.all_entries(db)
+
+    groups: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        key = _group_key(entry)
+        group = groups.get(key)
+        if group is None:
+            group = groups[key] = {
+                "key": key,
+                "account_label": entry.get("account_label") or "Not yet read",
+                "account_type": entry.get("account_type") or "unknown",
+                "kind": entry.get("kind"),
+                "kind_label": KIND_LABELS.get(entry.get("kind"), entry.get("kind")),
+                "kind_note": KIND_NOTES.get(entry.get("kind"), ""),
+                "files": [],
+            }
+        group["files"].append({
+            "id": entry["id"],
+            "filename": entry["filename"],
+            "origin": entry["origin"],
+            "selected": entry["selected"],
+            "superseded_by": entry["superseded_by"],
+            "parse_status": entry["parse_status"],
+            "parse_message": entry["parse_message"],
+            "period_start": entry["period_start"],
+            "period_end": entry["period_end"],
+            "row_count": entry["row_count"],
+            "debits": entry["debits"],
+            "credits": entry["credits"],
+            "recon_status": entry["recon_status"],
+            "warnings": entry["warnings"],
+        })
+
+    superseding: dict[str, str] = {e["id"]: e["filename"] for e in entries}
+
+    out = []
+    for group in groups.values():
+        files = group["files"]
+        live = [f for f in files if not f["superseded_by"]]
+        counted = [f for f in live if f["selected"]]
+        for f in files:
+            if f["superseded_by"]:
+                f["superseded_by_name"] = superseding.get(f["superseded_by"], "")
+        out.append({
+            **group,
+            "file_count": len(files),
+            "selected_count": len(counted),
+            "superseded_count": sum(1 for f in files if f["superseded_by"]),
+            "failed_count": sum(1 for f in files
+                                if f["parse_status"] not in ("ok", "empty")),
+            # Read fine, but the rows do not add up to the balances the issuer
+            # printed. A different thing from a file that could not be read,
+            # and the more interesting one: it means real transactions are
+            # missing from a document that parsed without complaint.
+            "unbalanced_count": sum(1 for f in files
+                                    if f["recon_status"] == "failed"),
+            "row_count": sum(f["row_count"] or 0 for f in counted),
+            "debits": str(sum((Decimal(f["debits"] or 0) for f in counted),
+                              Decimal("0"))),
+            "credits": str(sum((Decimal(f["credits"] or 0) for f in counted),
+                               Decimal("0"))),
+            "first": min((f["period_start"] for f in counted
+                          if f["period_start"]), default=None),
+            "last": max((f["period_end"] for f in counted
+                         if f["period_end"]), default=None),
+            # A group is on unless every live file in it is off, so a group
+            # with one file unticked still reads as on - which is what the
+            # group checkbox then toggles.
+            "included": bool(counted),
+            "partial": 0 < len(counted) < len(live),
+        })
+
+    out.sort(key=lambda g: (g["account_label"], g["kind_label"]))
+    totals = staging.counts(db)
+    # Only the kinds that carry transactions count toward "rows". A credit
+    # report lists 27 accounts and a portfolio lists 34 holdings; adding those
+    # to a transaction count produces a number that is not a count of anything.
+    return {"groups": out, **totals,
+            "rows": sum(g["row_count"] for g in out
+                        if g["kind"] in ("statement", "alert")),
+            "items": sum(g["row_count"] for g in out
+                         if g["kind"] not in ("statement", "alert")),
+            "processed": repo.count_transactions(db)}
+
+
+@router.post("/select")
+def select(request: SelectionRequest) -> dict[str, Any]:
+    """Tick or untick files, individually or a whole group at a time."""
+    db = get_db()
+    entries = staging.all_entries(db)
+    by_id = {e["id"]: e for e in entries}
+
+    decisions: dict[str, bool] = {}
+    for group in request.groups:
+        for entry in entries:
+            if _group_key(entry) == group.key:
+                decisions[entry["id"]] = group.include
+    for item in request.files:
+        for entry_id in item.ids:
+            if entry_id in by_id:
+                decisions[entry_id] = item.include
+
+    if not decisions:
+        raise HTTPException(400, "Nothing was selected or deselected.")
+
+    staging.set_selected(db, decisions.items())
+    # Unticking a statement can revive the alerts it was superseding.
+    staging.apply_supersession(db)
+    return {"changed": len(decisions), **staging.counts(db)}
+
+
+@router.delete("/files")
+def remove_files(request: Selection) -> dict[str, Any]:
+    """Drop staged files entirely. The ledger is untouched until Process."""
+    db = get_db()
+    removed = staging.remove(db, request.ids)
+    staging.apply_supersession(db)
+    return {"removed": removed, **staging.counts(db)}
+
+
+# ------------------------------------------------------------------ process --
+
+
+@router.post("/process")
+def start_process(background: BackgroundTasks) -> dict[str, Any]:
+    db = get_db()
+    selected = staging.all_entries(db, selected_only=True)
+    if not selected:
+        raise HTTPException(400, "Nothing is selected to process.")
+
+    job = jobs.create("stage_process", total=len(selected), phase="Queued",
+                      request={"count": len(selected)})
+    background.add_task(_run_process, job.id)
+    return {"job_id": job.id, "count": len(selected)}
+
+
+def _run_process(job_id: str) -> None:
+    """Rebuild the ledger from the staged selection, then analyse it."""
+    job = jobs.get(job_id)
+    progress = JobProgress(job)
+    try:
+        db = get_db()
+        selected = staging.all_entries(db, selected_only=True)
+        progress.start(len(selected), "Rebuilding your ledger")
+
+        built = pipeline.materialise(db, progress=progress.phase)
+        transactions = built.pop("_transactions", [])
+        accounts = built.pop("_accounts", {})
+        progress.advance(len(selected))
+
+        report = {}
+        if transactions:
+            from ..pipeline.enrich import enrich_ledger
+            profile = repo.get_profile(db)
+            enriched = enrich_ledger(
+                db, transactions, accounts,
+                # Rules and the learned merchant cache only. The model is a
+                # separate, explicit action under Settings, and it stays that
+                # way: calling it from here made Process data take eighteen
+                # minutes on two thousand rows and spend money without anyone
+                # choosing to, in a step whose job is to be predictable.
+                use_llm=False,
+                holder_names=[n for n in (profile.full_name,) if n],
+                statement_periods={
+                    e["id"]: (_as_date(e["period_start"]),
+                              _as_date(e["period_end"]))
+                    for e in selected if e["kind"] == "statement"},
+                progress=progress.phase,
+            )
+            repo.save_transactions(db, enriched.transactions)
+            report = enriched.override_report.as_dict()
+
+            progress.phase("Storing the analysis")
+            _publish(db, enriched, job_id,
+                     [e for e in selected if e["kind"] == "statement"])
+
+        uncategorized = sum(1 for t in transactions
+                            if getattr(t, "category", "") == "uncategorized")
+        result = {**built,
+                  "uncategorized": uncategorized,
+                  **{f"decisions_{k}": v for k, v in report.items()
+                     if k != "notes"}}
+        lost = report.get("orphaned", 0)
+        progress.complete(
+            result=result,
+            message=(
+                f"{built['transactions']} transaction(s) across "
+                f"{built['accounts']} account(s) now count. "
+                + (f"{report.get('applied', 0)} of your decisions were put back"
+                   + (f"; {lost} could not be matched to a row and are kept "
+                      f"for when it returns." if lost else ".")
+                   if report else "")
+                + (f" {uncategorized} row(s) the rules could not place are "
+                   f"waiting for the model under Settings." if uncategorized
+                   else "")
+                + (f" {built.get('unread')} selected document(s) could not be "
+                   f"read and were skipped." if built.get("unread") else "")
+                + (f" {built.get('failed')} document(s) could not be rebuilt: "
+                   f"{'; '.join(built.get('failures') or [])[:200]}"
+                   if built.get("failed") else "")),
+        )
+    except Exception as exc:
+        log.exception("staged process failed")
+        progress.fail(f"{type(exc).__name__}: {exc}")
+
+
+def _as_date(value: Any):
+    from datetime import date
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _publish(db, enriched, job_id: str, statement_entries: list) -> dict:
+    """Hand the finished analysis to the dashboard, the way an import does.
+
+    Reuses the import path's own payload builder rather than assembling a
+    second one: two builders is how the Files tab and the coverage grid came
+    to disagree about which statements existed.
+    """
+    from ..main import _build_payload, remember_run
+
+    state = {
+        "accounts": enriched.accounts,
+        "transactions": enriched.transactions,
+        "transfer_report": enriched.transfer_report,
+        "recurring": enriched.recurring,
+        "statements": [],
+        "analysis": enriched.analysis,
+        "loan_projections": enriched.loan_projections,
+        "forecast": getattr(enriched, "forecast", None),
+        "duplicate_count": enriched.duplicate_count,
+    }
+    payload = _build_payload(state)
+    payload["statements"] = [{
+        "filename": e["filename"],
+        "status": ("ok" if e["recon_status"] in ("ok", "not_applicable")
+                   else "unreconciled"),
+        "account": e["account_label"],
+        "rows": e["row_count"],
+        "detail": e["parse_message"],
+    } for e in statement_entries]
+    analysis = enriched.analysis
+    payload["data_quality"] = {
+        "files_processed": len(statement_entries),
+        "files_reconciled": sum(1 for e in statement_entries
+                                if e["recon_status"] in ("ok", "not_applicable")),
+        "files_unreconciled": sum(1 for e in statement_entries
+                                  if e["recon_status"] == "unreconciled"),
+        "files_failed": sum(1 for e in statement_entries
+                            if e["recon_status"] == "failed"),
+        "duplicates_removed": enriched.duplicate_count,
+        "uncategorized_count": getattr(analysis, "uncategorized_count", 0),
+        "notes": list(getattr(analysis, "notes", [])),
+    }
+    remember_run(job_id, payload)
+    return payload

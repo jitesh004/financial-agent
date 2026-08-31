@@ -105,11 +105,18 @@ def test_each_intent_searches_for_its_own_kind_of_document():
     assert "has:attachment" not in alerts
 
 
-def test_alerts_are_capped_at_two_months_however_wide_the_window():
-    """Unreconciled figures earn their place only by being fresher than the
-    statement. A year of them would be a year of unchecked numbers."""
-    assert "newer_than:2m" in build_query(months=120, intent="transactional")
+def test_alerts_default_to_two_months_but_are_not_capped_there():
+    """Two months is the sensible default, not a decision taken for you.
+
+    Unreconciled figures earn their place by being fresher than the statement
+    covering them, so a year of them is mostly noise - but clamping the window
+    meant asking for a year quietly got you two months and said nothing. That
+    is the same fault as a dropdown displaying one number while the app uses
+    another: the app overruling a choice in silence.
+    """
     assert "newer_than:2m" in build_query(months=None, intent="transactional")
+    assert "newer_than:1y" in build_query(months=12, intent="transactional")
+    assert "newer_than:10y" in build_query(months=120, intent="transactional")
     assert SCAN_INTENTS["transactional"]["max_months"] == 2
 
 

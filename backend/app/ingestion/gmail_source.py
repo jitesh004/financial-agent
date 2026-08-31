@@ -94,15 +94,44 @@ _BUREAU_FROM_TERMS = (
 #: Transaction alerts. Deliberately NOT `has:attachment` - the whole point of
 #: these is that the amount is in the body of a one-line email, which is why
 #: they arrive within minutes rather than the fortnight a statement takes.
+#: Investments are scanned separately from bank statements because they are a
+#: different question with a different useful window: a holdings statement is a
+#: photograph of what you own on one date, so last quarter's is history, while
+#: a bank statement from the same month is still money you need to account for.
+#: Giving them one shared "look back" setting meant every answer was wrong for
+#: one of them.
+_INVESTMENT_SUBJECT_TERMS = (
+    "portfolio", "holding", "holdings", "demat", "consolidated account statement",
+    "contract note", "capital gain", "mutual fund", "nav", "folio",
+    "transaction statement", "account statement",
+)
+
+_INVESTMENT_FROM_TERMS = (
+    "zerodha", "upstox", "5paisa", "dhan.co", "paytmmoney", "angelbroking",
+    "angeltrade", "groww", "icicidirect", "kotaksecurities", "sharekhan",
+    "motilaloswal", "angelone", "cdslstatement", "cdslindia", "nsdl",
+    "proteantech", "kfintech", "camsonline", "cams.", "mfcentral",
+)
+
+
 _ALERT_SUBJECT_TERMS = (
     "transaction alert", "debited", "credited", "spent on", "txn alert",
     "transaction on", "payment of", "upi transaction", "debit alert",
     "credit alert", "card transaction", "withdrawn",
 )
 
+#: Deliberately NOT the generic mailer words. "noreply", "alert" and
+#: "notification" are how every SaaS product on earth addresses you, and with
+#: them in the list a scan for transaction alerts came back with LinkedIn,
+#: Zoom, OpenAI, Glassdoor and a jobs board - 25 of 227 results were not from
+#: a financial institution at all. Only issuers that actually send alerts.
 _ALERT_FROM_TERMS = (
-    "alerts", "alert", "noreply", "donotreply", "no-reply", "notification",
-    "transaction", "txn", "cards", "upi",
+    "hdfcbank", "icicibank", "icici.bank", "sbi.bank", "onlinesbi", "alerts.sbi",
+    "axisbank", "axis.bank", "kotak", "yes.bank", "yesbank", "indusind",
+    "idfcfirst", "idfc", "pnb", "bankofbaroda", "bob.bank", "bobworld",
+    "canarabank", "unionbank", "rblbank", "rbl.bank", "federalbank", "aubank",
+    "bandhanbank", "southindianbank", "hsbc", "sbicard", "bobcard", "onecard",
+    "amex", "americanexpress", "slice", "cred.club", "paytmbank",
 )
 
 #: The three things a scan can look for. Each is a different kind of document
@@ -125,6 +154,16 @@ SCAN_INTENTS: dict[str, dict[str, object]] = {
         "needs_attachment": True,
         "subjects": _BUREAU_SUBJECT_TERMS,
         "senders": _BUREAU_FROM_TERMS,
+        "max_months": None,
+    },
+    "investment": {
+        "label": "Investments",
+        "description": "Broker, demat and mutual fund statements - holdings "
+                       "and contract notes from Zerodha, CAMS, KFintech, NSDL "
+                       "and the rest.",
+        "needs_attachment": True,
+        "subjects": _INVESTMENT_SUBJECT_TERMS,
+        "senders": _INVESTMENT_FROM_TERMS,
         "max_months": None,
     },
     "transactional": {
@@ -163,9 +202,18 @@ def build_query(months: int | None = None, extra: str = "",
         parts += ["has:attachment", "filename:pdf"]
     parts += [f"(({subjects}) OR ({senders}))", _QUERY_EXCLUSIONS]
 
+    # `max_months` is the DEFAULT window for a source, not a ceiling on it.
+    #
+    # It used to clamp: asking for a year of alerts silently got you two
+    # months. That is the same fault as a dropdown showing one number while
+    # the app uses another - the app quietly overruling a choice the user
+    # made and telling them nothing. Alerts really are unreconciled and a year
+    # of them really is mostly noise the statements supersede, but that is
+    # advice to print next to the control, not a decision to take on someone's
+    # behalf.
     cap = spec["max_months"]
-    if cap is not None:
-        months = cap if months is None else min(months, cap)
+    if cap is not None and months is None:
+        months = cap
     if months:
         # Gmail understands d/m/y suffixes; months is the natural unit here.
         parts.append(f"newer_than:{months}m" if months < 12

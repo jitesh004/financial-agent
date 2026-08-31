@@ -1,12 +1,19 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { formatBytes } from '../../lib';
+import { api, formatBytes } from '../../lib';
 import AttachmentGroups from '../AttachmentGroups';
 import AlertReview from './AlertReview';
+import ChooseSections from './ChooseSections';
+import ImportReview from './ImportReview';
+import ParseSections from './ParseSections';
+import ScanSections from './ScanSections';
+import SourceSections from './SourceSections';
+import ProcessStep from './ProcessStep';
+import Upload from '../Upload';
 import JobProgress from '../JobProgress';
 import { Callout, Chip, Empty } from '../ui';
 import {
   AttachmentTable, ExcludedPanel, FilterBar, ResultTable, SelectionSummary,
-  SetupInstructions, StageStrip,
+  SetupInstructions, StageStrip, StepRail,
 } from './parts';
 import { rowKey, stoppedNote } from './useMailbox';
 
@@ -25,13 +32,14 @@ import { rowKey, stoppedNote } from './useMailbox';
 /* The hook lives in App rather than here, so the header button and this share
    one poller. Mounting a second copy would mean two requests per tick and two
    answers that could disagree about whether anything is running. */
-export default function MailboxModal({ mailbox, open, onClose }) {
+export default function MailboxModal({ mailbox, open, onClose, onUploaded }) {
   const {
     status, periods, intents, error, setError, stage, job, busy,
     rows, excluded, ignoredCount, summary, selection, setSelection,
     months, setLookback, maxMessages, setCap, ignoredSenders, setIgnored,
     startScan, startImport, cancel, resume, reset, connect,
-    intent, setIntent, scanIntent, alerts, importableAlerts, importAlerts,
+    intent, chosenIntents: chosen, toggleIntent, scanIntent,
+    alerts, importableAlerts, importAlerts,
   } = mailbox;
 
   // An alert scan produces a different kind of list with a different action,
@@ -39,16 +47,108 @@ export default function MailboxModal({ mailbox, open, onClose }) {
   // the picker currently shows, which the user may already have changed.
   const reviewingAlerts = scanIntent === 'transactional';
 
+  /* ---- Steps -------------------------------------------------------------
+   *
+   * The server's `stage` says how far the import HAS got. `step` says which
+   * screen you are looking at, and the two are deliberately not the same
+   * thing: an import runs on the server whether or not this modal is open, so
+   * binding the view to it meant every screen you had already passed was
+   * unreachable the moment the next one started. Going back to check what was
+   * selected while a download runs now costs nothing and changes nothing.
+   *
+   * `reached` is the furthest step the work justifies. It only ever moves
+   * forward within a run, so stepping back does not close the door behind you.
+   */
+  const STEPS = [
+    { key: 'source', label: 'Source' },
+    { key: 'scanning', label: 'Scanning' },
+    { key: 'choose', label: 'Choose' },
+    { key: 'parse', label: 'Parse' },
+    { key: 'review', label: 'Review', always: true },
+    { key: 'process', label: 'Process data', always: true },
+  ];
+
+  /* Which step the WORK has reached. Deliberately separate from which step you
+     are looking at: the import runs on the server whether or not this is open,
+     so binding the view to it made every screen you had passed unreachable the
+     moment the next one started. */
+  const stepForStage = (s) => {
+    if (s === 'scanning') return 1;
+    if (s === 'select' || s === 'downloaded') return 2;
+    if (s === 'downloading' || s === 'parsing' || s === 'interrupted') return 3;
+    if (s === 'staged') return 4;
+    if (s === 'processing') return 5;
+    if (s === 'done') return 5;
+    return 0;
+  };
+
+  const [step, setStep] = useState(0);
+  const [reached, setReached] = useState(0);
+
+  const stageStep = stepForStage(stage);
+
+  useEffect(() => { setReached((r) => Math.max(r, stageStep)); }, [stageStep]);
+
+  /* The view does NOT follow the work any more.
+   *
+   * With one linear import it was helpful: the screen moved on as the import
+   * did. With a section per source it is the opposite - scanning four sources
+   * finishes four times, and each completion yanked the screen somewhere
+   * else. Scanning alerts threw you onto Process; the next one threw you onto
+   * Review. The rail unlocks as steps are reached; where you look is yours. */
+
+  const goTo = (index) => setStep(index);
+  const rejoin = () => setStep(stageStep);
+
+  const view = STEPS[step].key;
+  // Only ever a hint now - "there is work happening on another step" - never
+  // a reason to move the user.
+  const behind = busy && step !== stageStep;
+
+  /* Starting something is a request to watch it. Without this, scanning from
+     a step you had walked back to left you reading a stale screen while the
+     work you just asked for ran somewhere you could not see. */
+  const andFollow = (action) => (...args) => action(...args);
+
+  /* What is in staging, kept here because two steps need it: Review sets it
+     and Process reads it. Fetched by ImportReview rather than separately, so
+     there is one request and one answer rather than two that can disagree. */
+  const [staged, setStaged] = useState({});
+  /* Files picked on Source but not read yet. Held here because the
+     picking happens on one step and the reading on the next. */
+  const [pendingUploads, setPendingUploads] = useState({ count: 0 });
+
+  const doProcess = async () => {
+    setError(null);
+    try {
+      await api.stagingProcess();
+      await mailbox.refresh?.();
+    } catch (e) { setError(e.message); }
+  };
+  const doScan = andFollow(startScan);
+  /* Pressing Download & read moves you to Parse, where the progress is.
+   *
+   * The view no longer follows the work on its own - four sources finishing
+   * in turn used to yank the screen about - but moving on an explicit button
+   * press is different: you asked for this, and the thing you asked for is
+   * reported one step along. Without it the download ran with no visible
+   * sign of it anywhere. */
+  const PARSE_STEP = STEPS.findIndex((s) => s.key === 'parse');
+  const doImport = async (...args) => {
+    const result = await startImport(...args);
+    goTo(PARSE_STEP);
+    return result;
+  };
+  const doImportAlerts = andFollow(importAlerts);
+  const doResume = andFollow(resume);
+
   // Table controls. Deliberately local: these are how you are looking at the
   // list right now, not part of the import, and resetting them on close is
   // the behaviour people expect from a filter box.
   const [search, setSearch] = useState('');
-  const [excludedSenders, setExcludedSenders] = useState(() => new Set());
-  const [excludedCategories, setExcludedCategories] = useState(() => new Set(['broker']));
   const [sort, setSort] = useState({ key: 'date_iso', dir: 'desc' });
   const [grouped, setGrouped] = useState(true);
   const [dateOrder, setDateOrder] = useState('desc');
-  const [onlyMissingPassword, setOnlyMissingPassword] = useState(false);
   const [showExcluded, setShowExcluded] = useState(false);
 
   // Escape closes; the work keeps running.
@@ -72,13 +172,11 @@ export default function MailboxModal({ mailbox, open, onClose }) {
       return;
     }
     if (!rows.length) return;
-    setSelection((previous) => {
-      if (previous.size) return previous;
-      return new Set(
-        rows.filter((r) => !excludedCategories.has(r.category)).map(rowKey));
-    });
-    // excludedCategories is deliberately not a dependency: re-running this on
-    // every filter change would keep resurrecting a selection the user cleared.
+    // Everything a scan found starts ticked. Excluding "broker" here was the
+    // other half of the same silent filter - it pre-unticked every investment
+    // file in a wizard that now gives investments a section of their own.
+    setSelection((previous) => (previous.size ? previous
+      : new Set(rows.map(rowKey))));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scanId, rows.length, reviewingAlerts, importableAlerts.length]);
 
@@ -100,28 +198,17 @@ export default function MailboxModal({ mailbox, open, onClose }) {
     return [...counts.entries()].sort((a, b) => b[1] - a[1]);
   }, [rows]);
 
-  const visible = useMemo(() => {
-    const needle = search.trim().toLowerCase();
-    const out = rows.filter((r) => {
-      if (excludedCategories.has(r.category)) return false;
-      if (excludedSenders.has(r.sender_domain || r.sender_name)) return false;
-      if (onlyMissingPassword && r.password_ready) return false;
-      if (!needle) return true;
-      return `${r.filename} ${r.sender_name} ${r.subject}`.toLowerCase().includes(needle);
-    });
-    const dir = sort.dir === 'asc' ? 1 : -1;
-    return [...out].sort((a, b) => {
-      const av = a[sort.key] ?? '';
-      const bv = b[sort.key] ?? '';
-      if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * dir;
-      return String(av).localeCompare(String(bv)) * dir;
-    });
-  }, [rows, search, excludedSenders, excludedCategories, onlyMissingPassword, sort]);
-
-  // Intersected with what is visible, so a hidden row can never be silently
-  // downloaded - what you see selected is exactly what gets fetched.
+  /* What the footer will actually fetch: everything ticked, anywhere.
+   *
+   * This used to be intersected with a `visible` list carried over from the
+   * old single-table Choose screen - which filtered by a search box, a sender
+   * list, and a set of excluded categories defaulting to ["broker"]. None of
+   * those controls exist any more, so the filtering was invisible: the
+   * Investments section read "398 of 398 chosen" while the button offered to
+   * download 169, silently dropping every broker file. The sections ARE the
+   * filter now, and what you tick is what you get. */
   const effective = useMemo(
-    () => visible.filter((r) => selection.has(rowKey(r))), [visible, selection]);
+    () => rows.filter((r) => selection.has(rowKey(r))), [rows, selection]);
 
   const toggleRow = (r) => {
     const next = new Set(selection);
@@ -139,9 +226,9 @@ export default function MailboxModal({ mailbox, open, onClose }) {
   };
 
   const toggleAllVisible = () => {
-    const allSelected = visible.every((r) => selection.has(rowKey(r)));
+    const allSelected = rows.every((r) => selection.has(rowKey(r)));
     const next = new Set(selection);
-    for (const r of visible) {
+    for (const r of rows) {
       if (allSelected) next.delete(rowKey(r)); else next.add(rowKey(r));
     }
     setSelection(next);
@@ -169,8 +256,10 @@ export default function MailboxModal({ mailbox, open, onClose }) {
       <div className="xp-modal mailbox">
         <div className="xp-modal-head">
           <div>
-            <div className="xp-modal-title">Scan mailbox</div>
-            <div className="xp-hint" style={{ textTransform: 'none' }}>{subtitle}</div>
+            <div className="xp-modal-title">Import</div>
+            <div className="xp-hint" style={{ textTransform: 'none' }}>
+              {subtitle}
+            </div>
           </div>
           <div style={{ flex: 1 }} />
           {busy && (
@@ -182,8 +271,33 @@ export default function MailboxModal({ mailbox, open, onClose }) {
           <button className="xp-icon-btn" onClick={onClose} aria-label="Close">✕</button>
         </div>
 
+        {status?.connected && (
+          <div style={{
+            padding: '8px 16px 0', display: 'flex',
+            alignItems: 'center', gap: 10, flexWrap: 'wrap',
+          }}>
+            <StepRail steps={STEPS} current={step} reached={reached} onGo={goTo} />
+            {behind && (
+              <button className="btn" style={{ padding: '2px 9px', fontSize: 11 }}
+                onClick={rejoin}>
+                Back to {STEPS[stageStep].label}
+              </button>
+            )}
+          </div>
+        )}
+
         <div className="xp-modal-body">
           {error && <Callout tone="neg">{error}</Callout>}
+
+          {behind && (
+            <Callout>
+              You are looking at <strong>{STEPS[step].label}</strong>; the
+              import is on <strong>{STEPS[stageStep].label}</strong>.
+              {busy
+                ? ' It is still running — nothing here interrupts it.'
+                : ' Nothing is running.'}
+            </Callout>
+          )}
 
           {status?.connected && !status.profile_ready && (
             <Callout tone="warn">
@@ -210,273 +324,139 @@ export default function MailboxModal({ mailbox, open, onClose }) {
             </>
           )}
 
-          {stage === 'idle' && (
-            <div>
-              <div className="xp-field" style={{ marginBottom: 14 }}>
-                <span className="xp-legend">What to look for</span>
-                <div className="seg" style={{ flexWrap: 'wrap' }}>
-                  {intents.map((one) => (
-                    <button key={one.key} type="button"
-                      className={`seg-btn ${intent === one.key ? 'active' : ''}`}
-                      onClick={() => setIntent(one.key)}>
-                      {one.label}
-                    </button>
-                  ))}
-                </div>
-                <p style={{ color: 'var(--text-2)', fontSize: 13, margin: '8px 0 0' }}>
-                  {intents.find((one) => one.key === intent)?.description
-                    || 'Scans your mailbox and shows you everything it finds.'}
-                </p>
-              </div>
-
-              {intent === 'transactional' && (
-                <Callout tone="warn">
-                  Alerts are <strong>not reconciled</strong>. They cover the
-                  fortnight before a statement is cut, and each one is replaced
-                  automatically when its statement arrives. Only alerts for
-                  accounts already imported here can be used - the email gives
-                  four digits and nothing else to go on.
-                </Callout>
-              )}
-
-              <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap',
-                alignItems: 'flex-end', margin: '14px 0' }}>
-                <label>
-                  <div style={{ fontSize: 12.5, fontWeight: 550, marginBottom: 5 }}>
-                    Look back
-                  </div>
-                  <select className="xp-select" value={months ?? ''}
-                    disabled={intent === 'transactional'}
-                    onChange={(e) => setLookback(e.target.value ? Number(e.target.value) : null)}>
-                    {periods.map((p) => (
-                      <option key={p.label} value={p.months ?? ''}>{p.label}</option>
-                    ))}
-                  </select>
-                  {intent === 'transactional' && (
-                    <div className="xp-hint" style={{ textTransform: 'none' }}>
-                      Fixed at 2 months for alerts.
-                    </div>
-                  )}
-                </label>
-
-                <label>
-                  <div style={{ fontSize: 12.5, fontWeight: 550, marginBottom: 5 }}>
-                    Max emails to read
-                  </div>
-                  <select className="xp-select" value={maxMessages}
-                    onChange={(e) => setCap(Number(e.target.value))}>
-                    {[100, 250, 500, 1000, 2500, 5000].map((n) => (
-                      <option key={n} value={n}>{n}</option>
-                    ))}
-                  </select>
-                </label>
-
-                <button className="btn primary" onClick={startScan}>Scan mailbox</button>
-              </div>
-
-              <div style={{ fontSize: 12, color: 'var(--text-3)' }}>
-                A wider window finds more history but takes longer to read — roughly
-                a second per 15 emails. Raise the email limit too: a 10-year window
-                capped at 500 emails only reaches back about a year. Files already
-                downloaded are re-used from the local cache either way.
-              </div>
-
-              {stoppedNote(job) && (
-                <Callout tone={job.status === 'cancelled' ? 'warn' : 'neg'}
-                  style={{ marginTop: 12 }}>
-                  {stoppedNote(job)}
-                </Callout>
-              )}
-            </div>
-          )}
-
-          {stage === 'scanning' && (
-            <JobProgress job={job} title="Scanning your mailbox" onCancel={cancel} />
-          )}
-
-          {stage === 'select' && reviewingAlerts && (
-            <AlertReview
-              alerts={alerts}
-              selected={selection}
-              onToggle={(messageId) => {
-                const next = new Set(selection);
-                if (next.has(messageId)) next.delete(messageId);
-                else next.add(messageId);
-                setSelection(next);
+          {view === 'source' && (
+            <SourceSections
+              intents={intents}
+              chosen={chosen}
+              onToggle={toggleIntent}
+              settingsFor={mailbox.settingsFor}
+              onSetting={mailbox.setSourceSetting}
+              sections={mailbox.sections}
+              onUploaded={() => {
+                setPendingUploads({ count: 0 });
+                mailbox.refreshSections?.();
+                mailbox.refresh?.();
               }}
-              onToggleAll={() => {
-                const all = importableAlerts.every(
-                  (a) => selection.has(a.message_id));
-                setSelection(all ? new Set()
-                  : new Set(importableAlerts.map((a) => a.message_id)));
+              onFilesChange={(files, submit) => setPendingUploads({
+                count: files.length, submit,
+              })}
+            />
+          )}
+
+          {view === 'scanning' && (
+            <ScanSections
+              intents={intents}
+              chosen={chosen}
+              sections={mailbox.sections}
+              sourceJobs={mailbox.sourceJobs}
+              busy={busy}
+              pendingUploads={pendingUploads}
+              onScan={async (key) => {
+                const id = await mailbox.scanSource(key);
+                mailbox.refreshSections?.();
+                return id;
               }}
             />
           )}
 
-          {stage === 'select' && !reviewingAlerts && (
-            <>
-              <div style={{ margin: '4px 0 10px' }}>
-                <FilterBar
-                  ignoredSenders={ignoredSenders}
-                  ignoredCount={ignoredCount}
-                  onIgnoreSender={ignoreSender}
-                  onUnignoreAll={() => setIgnored([])}
-                  categories={categories}
-                  excludedCategories={excludedCategories}
-                  onToggleCategory={toggleSet(setExcludedCategories)}
-                  senders={senders}
-                  excludedSenders={excludedSenders}
-                  onToggleSender={toggleSet(setExcludedSenders)}
-                  search={search}
-                  onSearch={setSearch}
-                  onlyMissingPassword={onlyMissingPassword}
-                  onToggleMissing={() => setOnlyMissingPassword((v) => !v)}
-                />
-              </div>
-
-              <ExcludedPanel excluded={excluded} open={showExcluded}
-                onToggle={() => setShowExcluded((v) => !v)} />
-
-              <SelectionSummary
-                visible={visible.length}
-                total={rows.length}
-                selected={effective.length}
-                bytes={effective.reduce((sum, r) => sum + (r.size || 0), 0)}
-                cached={effective.filter((r) => r.cached).length}
-                missingPassword={effective.filter((r) => !r.password_ready).length}
-              />
-
-              <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
-                <button className="btn" style={{ padding: '3px 10px', fontSize: 12 }}
-                  onClick={() => setGrouped((v) => !v)}>
-                  {grouped ? 'Flat list' : 'Group by institution'}
-                </button>
-                <button className="btn" style={{ padding: '3px 10px', fontSize: 12 }}
-                  onClick={toggleAllVisible}>
-                  Select / deselect all shown
-                </button>
-              </div>
-
-              {grouped ? (
-                <AttachmentGroups
-                  rows={visible} selected={selection}
-                  onToggle={toggleRow} onToggleMany={toggleMany}
-                  dateOrder={dateOrder}
-                  onToggleDateOrder={() => setDateOrder((o) => (o === 'asc' ? 'desc' : 'asc'))}
-                />
-              ) : (
-                <AttachmentTable
-                  rows={visible} selected={selection} onToggle={toggleRow}
-                  onToggleAll={toggleAllVisible} sort={sort}
-                  onSort={(key) => setSort((s) => ({
-                    key, dir: s.key === key && s.dir === 'asc' ? 'desc' : 'asc',
-                  }))}
-                />
-              )}
-
-              {stoppedNote(job) && (
-                <Callout tone={job.status === 'cancelled' ? 'warn' : 'neg'}
-                  style={{ marginTop: 12 }}>
-                  {stoppedNote(job)} Your selection is still here — start the
-                  import again when you are ready.
-                </Callout>
-              )}
-            </>
+          {view === 'choose' && (
+            <ChooseSections
+              intents={intents}
+              chosen={chosen}
+              sections={mailbox.sections}
+              sourceResults={mailbox.sourceResults}
+              selected={selection}
+              onToggle={toggleRow}
+              onToggleMany={toggleMany}
+            />
           )}
 
-          {(stage === 'downloading' || stage === 'processing') && (
-            <>
+          {view === 'parse' && (
+            <ParseSections
+              sections={mailbox.sections}
+              busy={busy}
+              onParse={mailbox.parseSource}
+              onRefresh={mailbox.refreshSections}
+            />
+          )}
+
+          {view === 'parse' && (stage === 'downloading' || stage === 'parsing') && (
+            <div style={{ marginTop: 14 }}>
               <StageStrip active={stage} />
               <JobProgress
                 job={job}
-                title={stage === 'downloading' ? 'Downloading statements'
-                  : job?.kind === 'alerts' ? 'Adding the alerts'
-                    : 'Parsing statements'}
+                title={stage === 'downloading' ? 'Downloading documents'
+                  : 'Reading documents'}
                 onCancel={cancel}
               />
               <Callout style={{ marginTop: 12 }}>
-                You can close this. The import keeps running on the server, and
+                Nothing read here is in your ledger — it goes to Review first.
+                You can close this. The work keeps running on the server, and
                 the button in the header shows how it is getting on.
               </Callout>
-            </>
+            </div>
           )}
 
-          {stage === 'interrupted' && (
-            <>
-              <Callout tone="warn">
-                <strong>This import stopped when the server restarted.</strong>{' '}
-                {job.current} of {job.total} finished before it did.
-              </Callout>
-              <JobProgress job={job} title="Interrupted" showTrace />
-              <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
-                {job.resumable && (
-                  <button className="btn primary" onClick={resume}>
-                    Resume what is left
-                  </button>
-                )}
-                <button className="btn" onClick={reset}>Start over</button>
-              </div>
-            </>
-          )}
-
-          {stage === 'done' && summary && job?.kind === 'alerts' && (
-            <Callout tone="pos">
-              <strong>{summary.imported} unreconciled row
-              {summary.imported === 1 ? '' : 's'} added.</strong>{' '}
-              Each sits in the review queue and is replaced automatically when
-              the statement covering it arrives.
+          {view === 'parse' && stage === 'interrupted' && (
+            <Callout tone="warn" style={{ marginTop: 12 }}>
+              <strong>That run stopped when the server restarted.</strong>{' '}
+              {job.current} of {job.total} finished. Press Read again — anything
+              already read is not read twice.
             </Callout>
           )}
-
-          {stage === 'done' && summary && job?.kind !== 'alerts' && (
-            <>
-              <Callout tone="pos">
-                <strong>Import complete.</strong>{' '}
-                {summary.transaction_count?.toLocaleString('en-IN')} transactions
-                across {summary.account_count} accounts.
-              </Callout>
-              <ResultTable statements={summary.statements || []} />
-            </>
+          {view === 'review' && (
+            <ImportReview onChanged={setStaged} />
           )}
 
-          {stage === 'done' && !summary && (
-            <Empty title="Nothing to show">That import produced no statements.</Empty>
+          {view === 'process' && (
+            <ProcessStep
+              /* Falls back to the per-source counts, which are loaded whenever
+                 the modal opens. Reading them only from the Review screen
+                 meant arriving here without visiting Review first showed
+                 "0 files selected" over a ledger of two and a half thousand
+                 rows. */
+              staged={staged?.selected != null ? staged : {
+                selected: (mailbox.sections || []).reduce(
+                  (n, x) => n + (x.selected || 0), 0),
+                rows: (mailbox.sections || []).reduce(
+                  (n, x) => n + (x.rows || 0), 0),
+                pending: (mailbox.sections || []).reduce(
+                  (n, x) => n + (x.pending || 0), 0),
+                processed: staged?.processed,
+              }}
+              job={job}
+              stage={stage}
+              onRun={doProcess}
+              onFinished={() => { onUploaded?.(null); onClose(); }}
+            />
           )}
         </div>
 
         <div className="xp-modal-foot">
-          {stage === 'select' && reviewingAlerts && (
-            <>
-              <button className="btn primary"
-                disabled={!importableAlerts.some((a) => selection.has(a.message_id))}
-                onClick={() => importAlerts(
-                  importableAlerts.filter((a) => selection.has(a.message_id))
-                    .map((a) => a.message_id))}>
-                Add {importableAlerts.filter((a) => selection.has(a.message_id)).length}
-                {' '}unreconciled row
-                {importableAlerts.filter((a) => selection.has(a.message_id)).length === 1
-                  ? '' : 's'}
-              </button>
-              <button className="btn" onClick={startScan}>Re-scan</button>
-            </>
+          {view === 'choose' && (
+            <button className="btn primary" disabled={!effective.length}
+              onClick={() => doImport(effective)}>
+              Download &amp; read {effective.length} file
+              {effective.length === 1 ? '' : 's'}
+              {effective.length > 0 && (
+                <span style={{ opacity: 0.75 }}>
+                  {' '}· {formatBytes(effective.reduce((s, r) => s + (r.size || 0), 0))}
+                </span>
+              )}
+            </button>
           )}
-          {stage === 'select' && !reviewingAlerts && (
-            <>
-              <button className="btn primary" disabled={!effective.length}
-                onClick={() => startImport(effective)}>
-                Download &amp; process {effective.length} file
-                {effective.length === 1 ? '' : 's'}
-                {effective.length > 0 && (
-                  <span style={{ opacity: 0.75 }}>
-                    {' '}· {formatBytes(effective.reduce((s, r) => s + (r.size || 0), 0))}
-                  </span>
-                )}
-              </button>
-              <button className="btn" onClick={startScan}>Re-scan</button>
-            </>
+          {view === 'process' && stage === 'done' && (
+            <button className="btn primary" onClick={() => { reset(); goTo(0); }}>
+              Import more
+            </button>
           )}
-          {stage === 'done' && (
-            <button className="btn primary" onClick={reset}>Import more</button>
+          {status?.connected && (
+            <>
+              <button className="btn" disabled={step === 0}
+                onClick={() => goTo(step - 1)}>← Back</button>
+              <button className="btn" disabled={step >= STEPS.length - 1}
+                onClick={() => goTo(step + 1)}>Next →</button>
+            </>
           )}
           <div style={{ flex: 1 }} />
           <button className="btn" onClick={onClose}>

@@ -23,6 +23,76 @@ export function StageStrip({ active }) {
   );
 }
 
+/* The steps of an import, as somewhere you can move around rather than a
+   position you are held at.
+ *
+ * The import itself is server-side and its stage is derived from a job, so
+ * this cannot drive the work - it decides which step you are LOOKING at. The
+ * two are separate on purpose: going back to check what was selected while a
+ * download runs should not touch the download, and reaching the end should not
+ * lock away the screens that got you there.
+ *
+ * A step you have not reached yet is not clickable. A step behind you always
+ * is - that is the whole point of it. */
+export function StepRail({ steps, current, reached, onGo }) {
+  return (
+    <div className="step-rail" style={{
+      display: 'flex', alignItems: 'center', gap: 4,
+      flexWrap: 'wrap', margin: '0 0 4px',
+    }}>
+      {steps.map((step, index) => {
+        const done = index < current;
+        const here = index === current;
+        /* Every step is reachable, always.
+         *
+         * Gating them on progress made sense when the wizard was one linear
+         * import. Now each step is a set of sections that explains its own
+         * empty state - "no sources ticked", "nothing staged yet" - which
+         * tells you far more than a greyed-out button does. It also stopped
+         * being survivable: with the view no longer following the work,
+         * nothing advanced `reached` on a fresh session, and the wizard could
+         * not be left at step one. */
+        const open = true;
+        return (
+          <React.Fragment key={step.key}>
+            {index > 0 && (
+              <span aria-hidden style={{
+                width: 14, height: 1, background: 'var(--line)', opacity: 0.7,
+              }} />
+            )}
+            <button
+              type="button"
+              className="btn"
+              disabled={!open}
+              onClick={() => open && onGo(index)}
+              title={open ? step.label : 'Not reached yet'}
+              style={{
+                padding: '3px 10px', fontSize: 12,
+                display: 'inline-flex', alignItems: 'center', gap: 6,
+                background: here ? 'var(--accent-soft, var(--bg-2))' : undefined,
+                borderColor: here ? 'var(--accent)' : undefined,
+                fontWeight: here ? 620 : 400,
+                opacity: open ? 1 : 0.45,
+                cursor: open ? 'pointer' : 'default',
+              }}
+            >
+              <span style={{
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                width: 16, height: 16, borderRadius: 9, fontSize: 10, lineHeight: 1,
+                background: here ? 'var(--accent)' : 'var(--bg-3, var(--bg-2))',
+                color: here ? 'var(--on-accent, #fff)' : 'var(--text-2)',
+              }}>
+                {done ? '✓' : index + 1}
+              </span>
+              {step.label}
+            </button>
+          </React.Fragment>
+        );
+      })}
+    </div>
+  );
+}
+
 export function FilterBar({
   ignoredSenders, ignoredCount, onIgnoreSender, onUnignoreAll,
   categories, excludedCategories, onToggleCategory,

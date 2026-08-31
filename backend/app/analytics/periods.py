@@ -58,16 +58,46 @@ def _shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
 def assign_accounting_months(
     transactions: list[Transaction],
     recurring_series: list[RecurringSeries],
+    statement_periods: dict | None = None,
 ) -> None:
     """Set accounting_month on every transaction.
-    
+
     Default: calendar month of txn_date.
+    For a row dated outside the statement it arrived on: the cycle it was
+    billed in (see below).
     For members of a monthly recurring series: shifted using salary-drift logic.
     One-offs are NEVER moved.
     """
+    statement_periods = statement_periods or {}
+
     # 1. Default pass
     for txn in transactions:
         txn.accounting_month = f"{txn.txn_date.year:04d}-{txn.txn_date.month:02d}"
+
+        # A refund carries the date of the purchase it reverses, which can sit
+        # months before the cycle that actually credited it. HSBC printed
+        #
+        #     30JUL FIRSTCRYBABY PUNE IND                        1,120.05
+        #     27APR RAZ*CARS24 SERVICES PR Gurgaon IND     2,242.00 CR
+        #     09AUG PTM*RELIANCE RETAIL L NOIDA UTT                 2.00
+        #
+        # in that order on a statement covering 24 Jul to 23 Aug 2026. The row
+        # is real money and must not be dropped, but accounting it to April
+        # opened a four-month hole in the ledger's span - one row stretching
+        # the dashboard from four months to five, and the "months covered"
+        # count with it. The transaction date stays as printed; only the month
+        # it is counted in follows the cycle that billed it.
+        period = statement_periods.get(txn.statement_id) if txn.statement_id else None
+        if not period:
+            continue
+        start, end = period
+        if not end:
+            continue
+        if start and start <= txn.txn_date <= end:
+            continue
+        if txn.txn_date > end:
+            continue  # after the cycle closed: not this statement's to claim
+        txn.accounting_month = f"{end.year:04d}-{end.month:02d}"
 
     # Index transactions for quick lookup by ID
     txn_by_id = {t.id: t for t in transactions if t.id}

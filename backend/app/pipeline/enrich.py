@@ -68,6 +68,7 @@ def enrich_ledger(
     progress: Callable[[str], None] | None = None,
     run_analysis: bool = True,
     statements_by_account: dict | None = None,
+    statement_periods: dict | None = None,
 ) -> EnrichmentResult:
     """Deduplicate, classify, apply user decisions, and analyse.
 
@@ -302,7 +303,21 @@ def enrich_ledger(
     # 10. Period attribution — accounting_month, salary drift.
     phase("Assigning accounting periods")
     result.recurring = detect_recurring(transactions)
-    assign_accounting_months(transactions, result.recurring)
+
+    # Periods come from the caller when it has them in hand, and from the
+    # database only as a fallback. During an import the statements are not
+    # written yet - they are saved after this runs - so a lookup here found
+    # nothing for exactly the rows being imported, which are the only ones
+    # whose attribution had not already been settled on a previous pass.
+    periods = dict(statement_periods or {})
+    if not periods:
+        try:
+            from ..db.database import get_db as _get_db
+            from ..db import repository as _repo
+            periods = _repo.get_statement_period_by_id(_get_db())
+        except Exception:  # pragma: no cover - attribution is a refinement
+            log.warning("could not load statement periods for attribution")
+    assign_accounting_months(transactions, result.recurring, periods)
 
     # 11. The analysis proper.
     phase("Computing analysis")

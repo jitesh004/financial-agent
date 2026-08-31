@@ -350,3 +350,46 @@ export async function watchJob(jobId, onTick, intervalMs = 700) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
 }
+
+
+/* ---------- Settings, and the run that spends money ---------- */
+
+api.settings = () => request('/api/settings');
+api.saveSettings = (body) => request('/api/settings', {
+  method: 'PUT',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(body),
+});
+/* Returns a job id: categorising a few hundred rows is slow enough to watch,
+   and the same job machinery reports it as any import does. */
+api.runCategorize = () => jsonPost('/api/settings/categorize');
+
+/* ---------- Staging: read, reviewed, and only then counted ----------
+ *
+ * Everything a scan or an upload produces goes here first. None of it is in
+ * the ledger, no tab reads it, and `stagingProcess` is the only call in this
+ * file that changes a single figure anywhere in the app. */
+
+api.stagingReview = () => request('/api/staging/review');
+api.stagingSelect = (body) => request('/api/staging/select', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(body),
+});
+api.stagingSections = () => request('/api/staging/sections');
+api.stagingParse = (intent) => jsonPost(
+  intent ? `/api/staging/parse?intent=${encodeURIComponent(intent)}`
+         : '/api/staging/parse');
+api.stagingProcess = () => jsonPost('/api/staging/process');
+api.stagingRemove = (ids) => request('/api/staging/files', {
+  method: 'DELETE',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ ids, include: false }),
+});
+
+/* What a scan found, recorded in staging. Parses nothing. */
+api.stageScanResults = (body) => request('/api/staging/scan-results', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(body),
+});

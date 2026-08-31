@@ -6,6 +6,7 @@ module has to remember that money is stored as a string.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -571,6 +572,22 @@ def lookup_merchants(db: Database, keys: Sequence[str]) -> dict[str, tuple[Categ
         return out
 
 
+def forget_merchant(db: Database, key: str) -> None:
+    """Drop what the cache believes about one merchant.
+
+    Used when a category is cleared rather than chosen. Storing
+    "uncategorized" as a user decision would be worse than storing nothing:
+    the upsert protects user rows from every later guess, so one cleared row
+    would pin that merchant as unknowable forever - the model is never asked
+    about it again, and the run that skipped it reports it as a cache hit.
+    """
+    if not key:
+        return
+    with db.connection() as conn:
+        conn.execute("DELETE FROM merchant_categories WHERE merchant_key = ?",
+                     (key,))
+
+
 def save_merchant_categories(
     db: Database,
     mapping: dict[str, tuple[Category, float, str]],
@@ -1085,6 +1102,20 @@ def get_latest_analysis_run(db: Database) -> tuple[str, dict] | None:
         return None
 
 
+def clear_analysis_runs(db: Database) -> int:
+    """Drop every stored dashboard payload.
+
+    The stored payload exists so a restart restores the dashboard instead of
+    silently downgrading it to a lossy rebuild. That is worth having - but it
+    also means forgetting the in-memory cache is not enough to invalidate
+    anything: `/api/dashboard` falls straight through to the stored row and
+    serves the same stale figures back. Whatever decided the cache was stale
+    was talking about these too.
+    """
+    with db.connection() as conn:
+        return conn.execute("DELETE FROM analysis_runs").rowcount
+
+
 def prune_analysis_runs(db: Database, keep: int = 20) -> int:
     """Keep the newest `keep` runs. Each payload is a full dashboard."""
     with db.connection() as conn:
@@ -1373,19 +1404,74 @@ def get_confirmed_fingerprints(db) -> set:
 
 import json
 
+#: The one kind of inference these two helpers cache: "which bank issued this
+#: statement, and what sort of account is it?", keyed on the letterhead.
+_IDENTITY_KIND = "statement_identity"
+
+
+def _identity_key(input_hash: str) -> str:
+    return hashlib.sha256(f"{_IDENTITY_KIND}|{input_hash}".encode()).hexdigest()
+
+
 def get_ai_inference(db, fingerprint: str) -> dict | None:
+    """A cached model answer about a statement's identity, if there is one.
+
+    Both of these named a `fingerprint` column that this table has never had -
+    it stores `cache_key`, `kind` and `input_hash` - so every call raised
+    OperationalError. Neither is wrapped in a try, and the caller is the
+    identity fallback in `extract_metadata`, which runs precisely when the
+    deterministic reader could NOT identify a statement. So the path meant to
+    rescue an unrecognised statement was instead the one thing guaranteed to
+    fail its parse outright. The table has been empty this whole time.
+    """
     with db.connection() as conn:
-        r = conn.execute("SELECT result_json FROM ai_inferences WHERE fingerprint = ?", (fingerprint,)).fetchone()
-        if r:
-            try:
-                return json.loads(r["result_json"])
-            except json.JSONDecodeError:
-                pass
+        row = conn.execute(
+            "SELECT result_json FROM ai_inferences WHERE cache_key = ?",
+            (_identity_key(fingerprint),)).fetchone()
+    if not row:
         return None
+    try:
+        return json.loads(row["result_json"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+
 
 def save_ai_inference(db, fingerprint: str, result: dict) -> None:
     with db.connection() as conn:
-        conn.execute("INSERT OR REPLACE INTO ai_inferences (fingerprint, result_json) VALUES (?, ?)", (fingerprint, json.dumps(result)))
+        conn.execute(
+            "INSERT INTO ai_inferences (cache_key, kind, input_hash, result_json)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(cache_key) DO UPDATE SET"
+            "   result_json = excluded.result_json,"
+            "   hit_count = ai_inferences.hit_count + 1",
+            (_identity_key(fingerprint), _IDENTITY_KIND, fingerprint,
+             json.dumps(result)))
+
+
+def get_statement_period_by_id(db: Database) -> dict[str, tuple[Any, Any]]:
+    """Every statement's period, keyed by statement id.
+
+    Keyed by statement rather than by account because the question here is
+    "which billing cycle did this row arrive on", and an account has many.
+    """
+    out: dict[str, tuple[Any, Any]] = {}
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT id, period_start, period_end FROM statements").fetchall()
+    for r in rows:
+        out[r["id"]] = (_as_date(r["period_start"]), _as_date(r["period_end"]))
+    return out
+
+
+def _as_date(value: Any):
+    if not value:
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
 
 
 def get_statement_periods_by_account(db: Database) -> dict[str, list[Any]]:
@@ -1871,6 +1957,11 @@ def save_bureau_report(db: Database, report: Any, file_hash: str = "",
     return report_id
 
 
+
+
+
+
+
 def get_bureau_reports(db: Database) -> list[dict[str, Any]]:
     """Every report, newest pull first."""
     with db.connection() as conn:
@@ -2054,3 +2145,55 @@ def get_portfolio_statements(db: Database) -> list[dict[str, Any]]:
         rows = conn.execute(
             "SELECT * FROM portfolio_statements ORDER BY as_of DESC").fetchall()
     return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------------------------
+# Application settings
+#
+# Server-side rather than in the browser: these decide whether a model is
+# called and money is spent, so the browser cannot be the authority on them.
+# --------------------------------------------------------------------------
+
+#: Every switch, with the value it takes when nobody has said otherwise.
+#: `use_llm` defaults OFF: calling a model costs real money, and an app that
+#: starts spending it because a default said so is not one you can trust.
+SETTING_DEFAULTS: dict[str, Any] = {
+    "use_llm": False,
+}
+
+
+def get_settings(db: Database) -> dict[str, Any]:
+    with db.connection() as conn:
+        rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+    stored = {r["key"]: r["value"] for r in rows}
+    out: dict[str, Any] = {}
+    for key, default in SETTING_DEFAULTS.items():
+        raw = stored.get(key)
+        if raw is None:
+            out[key] = default
+        elif isinstance(default, bool):
+            out[key] = raw == "1"
+        else:
+            out[key] = raw
+    return out
+
+
+def save_settings(db: Database, values: dict[str, Any]) -> dict[str, Any]:
+    """Store only the keys this app knows about.
+
+    Unknown keys are dropped rather than saved: a settings table that accepts
+    anything becomes a place bugs hide, and there is no caller that needs it.
+    """
+    with db.connection() as conn:
+        for key, value in values.items():
+            if key not in SETTING_DEFAULTS:
+                continue
+            stored = "1" if value else "0" if isinstance(
+                SETTING_DEFAULTS[key], bool) else str(value)
+            conn.execute(
+                "INSERT INTO app_settings (key, value, updated_at)"
+                " VALUES (?, ?, datetime('now'))"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value,"
+                "   updated_at = datetime('now')",
+                (key, stored))
+    return get_settings(db)

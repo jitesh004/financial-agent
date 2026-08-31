@@ -264,8 +264,9 @@ _LABELS = {
                "sanction date"),
     "closed": ("date closed", "closed", "date of closure"),
     "status": ("account status", "status", "current status"),
-    "sanctioned": ("sanctioned amount", "high credit", "credit limit",
-                   "sanctioned", "loan amount", "disbursed amount"),
+    "sanctioned": ("sanctioned amount", "credit limit", "high credit",
+                   "sanctioned", "loan amount", "disbursed amount",
+                   "disbd amt/high credit"),
     "balance": ("current balance", "outstanding balance", "balance",
                 "current outstanding", "amount outstanding"),
     "overdue": ("amount overdue", "overdue amount", "overdue", "past due",
@@ -275,22 +276,102 @@ _LABELS = {
 }
 
 
+#: Labels this reader does not want, but must still recognise. A value runs
+#: until the next label starts, so a label that is not in the list is not a
+#: boundary - and "Account #:" swallowed "Info. as of: 09-08-2026", making the
+#: last four digits of every account on the report "2026".
+_BOUNDARY_ONLY: tuple[str, ...] = (
+    "info. as of", "info as of", "disbursed date", "disbd amt/high credit",
+    "last payment date", "cash limit", "closed date", "last paid amt",
+    "instlamt/freq", "tenure(month)", "tenure", "principal writeoff amt",
+    "settlement amt", "total writeoff amt", "payment history/asset classification",
+    # "credit grantor" is deliberately absent: it is a real label, and listing
+    # it here (even with a trailing colon) makes the longer boundary-only form
+    # win the match, so the lender is never captured at all.
+    "payment history", "asset classification", "reported on",
+    "date reported", "suit filed", "collateral", "interest rate",
+)
+
+#: Every label the readers below understand, longest first so "account type"
+#: is preferred over a bare "account" when both could match at one position.
+_ALL_LABELS: list[tuple[str, str]] = sorted(
+    ([(alias, field) for field, aliases in _LABELS.items() for alias in aliases]
+     + [(alias, "") for alias in _BOUNDARY_ONLY]),
+    key=lambda pair: len(pair[0]), reverse=True)
+
+#: The separator is REQUIRED, not optional. Without it a bare alias matches
+#: inside a value - "Account Status: Closed" was read as the label "closed",
+#: which truncated the status to empty and then reported a closed account as
+#: open. Every real label on these reports is followed by a colon.
+def _spaced(alias: str) -> str:
+    """An alias that still matches when the PDF wedged spaces inside it.
+
+    The extractor lays glyphs out individually and preserves the gaps, so
+    "Info. as of:" arrives as "I nfo. as of:". Matching the literal alias
+    missed it, which meant it never acted as a boundary - and the account
+    number before it swallowed the words and the date, leaving every account
+    on the report with a "number" of 2026.
+    """
+    return r"\s*".join(re.escape(ch) for ch in alias if not ch.isspace())
+
+
+_LABEL_RE = re.compile(
+    r"(?<![A-Za-z])(" + "|".join(_spaced(a) for a, _ in _ALL_LABELS)
+    + r")\s*[:#]\s*", re.IGNORECASE)
+
+#: Keyed without spaces, to match what the regex hands back after a
+#: split-word alias is squeezed.
+_ALIAS_TO_FIELD = {re.sub(r"\s+", "", alias).lower(): field
+                   for alias, field in _ALL_LABELS}
+
+
+def fields_in(line: str) -> list[tuple[str, str]]:
+    """Every (field, value) pair on one line.
+
+    CRIF packs four fields onto a single line -
+
+        Account Type: CREDIT CARD Credit Grantor: HSBC Account #: 2612 Info...
+
+    - so splitting on the first colon and taking the rest as the value reads
+    one field and destroys three. Values are instead bounded by wherever the
+    NEXT label begins, which is what makes a multi-field line readable at all.
+    CIBIL's one-field-per-line layout is just the degenerate case.
+    """
+    matches = list(_LABEL_RE.finditer(line))
+    if not matches:
+        return []
+    out: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        squeezed = re.sub(r"\s+", "", match.group(1)).lower()
+        field = _ALIAS_TO_FIELD.get(squeezed)
+        stop = matches[index + 1].start() if index + 1 < len(matches) else len(line)
+        if not field:
+            # A boundary-only label: it ends the previous value and starts
+            # nothing. Skipped after the bound has been taken, not before.
+            continue
+        value = line[match.end():stop].strip(" :\t")
+        out.append((field, value))
+    return out
+
+
 def _label_for(line: str) -> tuple[str | None, str]:
-    """(field, value) if this line is a labelled field, else (None, "")."""
-    if ":" not in line:
-        return None, ""
-    label, _, value = line.partition(":")
-    label = label.strip().lower().rstrip("*# ")
-    for name, aliases in _LABELS.items():
-        if any(label == alias or label.startswith(alias) for alias in aliases):
-            return name, value.strip()
-    return None, ""
+    """The first labelled field on a line, or (None, "")."""
+    found = fields_in(line)
+    return found[0] if found else (None, "")
 
 
 _DPD = re.compile(r"\b(?:000|std|xxx|\d{1,3})\b", re.IGNORECASE)
+#: What starts a new account block. Two shapes, because the bureaus disagree:
+#: CIBIL heads each block with a line of its own ("ACCOUNT DETAILS 2"), while
+#: CRIF opens with an index and the first field on the same line ("2 Account
+#: Type: CREDIT CARD ..."). Matching only the first silently read a CRIF report
+#: as one enormous account and then discarded it.
 _ACCOUNT_BREAK = re.compile(
     r"^\s*(?:account\s*(?:details|information)?\s*[-#:]?\s*\d*|"
     r"credit\s*facility|\d+\.\s*(?:credit card|loan))\s*$", re.IGNORECASE)
+
+_NUMBERED_ACCOUNT = re.compile(r"^\s*(\d{1,3})\s+account\s*type\s*:",
+                               re.IGNORECASE)
 
 
 def parse_report(text: str, filename: str = "") -> BureauReport:
@@ -347,6 +428,26 @@ def parse_report(text: str, filename: str = "") -> BureauReport:
     return report
 
 
+
+#: A lender's name is printed in capitals and usually carries a corporate
+#: suffix. Requiring that stops the "the name is on the next line" fallback
+#: from adopting whatever prose happens to follow - which is how three
+#: accounts came back owed to "s and the same is up to date as".
+_LENDER_SHAPE = re.compile(
+    r"\b(bank|ltd|limited|pvt|private|corp|finance|financial|nbfc|"
+    r"housing|capital|card|services|fintech|india)\b", re.IGNORECASE)
+
+
+def _looks_like_a_lender(name: str) -> bool:
+    if not name or len(name) < 4 or name.isdigit():
+        return False
+    letters = [c for c in name if c.isalpha()]
+    if not letters:
+        return False
+    mostly_capitals = sum(c.isupper() for c in letters) / len(letters) > 0.8
+    return mostly_capitals or bool(_LENDER_SHAPE.search(name))
+
+
 def _parse_accounts(text: str) -> list[BureauAccount]:
     """Split the report into account blocks and read each one.
 
@@ -371,57 +472,95 @@ def _parse_accounts(text: str) -> list[BureauAccount]:
                 accounts.append(current)
         current = None
 
+    pending_grantor = False
+
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
 
-        if _ACCOUNT_BREAK.match(line):
+        numbered = _NUMBERED_ACCOUNT.match(line)
+        if _ACCOUNT_BREAK.match(line) or numbered:
             flush()
             current = BureauAccount()
-            continue
+            if not numbered:
+                continue
 
-        name, value = _label_for(line)
-        if name is None:
-            if current is not None and _looks_like_dpd_row(line):
+        found = fields_in(line)
+        if not found:
+            if current is None:
+                continue
+            # CRIF leaves "Credit Grantor:" empty and prints the lender on the
+            # next line, followed by the account number. Taking the words
+            # before that first long digit run recovers the name.
+            if pending_grantor and not current.lender:
+                # CRIF leaves both "Credit Grantor:" and "Account #:" empty on
+                # the header line and prints them together on the next one:
+                #
+                #   THE HONGKONG AND SHANGHAI BANKING CORP INDIA LTD 2612596264
+                #
+                # Taking only the name threw the number away, leaving most
+                # accounts with nothing to match a ledger account against.
+                trailing = re.search(r"^(.*?)\s+(\d{6,})\s*$", line)
+                name = (trailing.group(1) if trailing
+                        else re.split(r"\s\d{6,}", line)[0]).strip()
+                if _looks_like_a_lender(name):
+                    current.lender = name
+                    if trailing and not current.account_number_masked:
+                        current.account_number_masked = trailing.group(2)
+                    pending_grantor = False
+                    continue
+            if _looks_like_dpd_row(line):
                 current.dpd_history += _DPD.findall(line)
             continue
 
-        # A second "account number" means the previous block ended, whether or
-        # not a heading separated them - which several layouts do not.
-        if name == "account_number" and current is not None \
-                and current.account_number_masked:
-            flush()
         if current is None:
             current = BureauAccount()
 
-        if name == "lender":
-            current.lender = value
-        elif name == "account_type":
-            current.account_type = map_account_type(value)
-        elif name == "account_number":
-            current.account_number_masked = value
-        elif name == "opened":
-            current.opened_on = parse_date(value)
-        elif name == "closed":
-            current.closed_on = parse_date(value)
-            if current.closed_on:
-                current.status = "closed"
-        elif name == "status":
-            current.status = _normalise_status(value)
-        elif name == "sanctioned":
-            amount = parse_money(value)
-            current.sanctioned = amount
-            if current.account_type == "credit_card":
-                current.credit_limit = amount
-        elif name == "balance":
-            current.current_balance = parse_money(value)
-        elif name == "overdue":
-            current.overdue = parse_money(value)
-        elif name == "emi":
-            current.emi_amount = parse_money(value)
-        elif name == "ownership":
-            current.ownership = value
+        for name, value in found:
+            if name == "account_number" and current.account_number_masked \
+                    and not numbered:
+                flush()
+                current = BureauAccount()
+
+            if name == "lender":
+                if value:
+                    current.lender = value
+                    pending_grantor = False
+                else:
+                    pending_grantor = True
+            elif name == "account_type":
+                current.account_type = map_account_type(value)
+            elif name == "account_number":
+                current.account_number_masked = value
+            elif name == "opened":
+                current.opened_on = parse_date(value)
+            elif name == "closed":
+                closed = parse_date(value)
+                if closed:
+                    current.closed_on = closed
+                    current.status = "closed"
+            elif name == "status":
+                current.status = _normalise_status(value)
+            elif name == "sanctioned":
+                amount = parse_money(value)
+                if amount is not None:
+                    current.sanctioned = amount
+                    if current.account_type == "credit_card":
+                        current.credit_limit = amount
+            elif name == "balance":
+                current.current_balance = parse_money(value)
+            elif name == "overdue":
+                current.overdue = parse_money(value)
+            elif name == "emi":
+                current.emi_amount = parse_money(value)
+            elif name == "ownership":
+                current.ownership = value
+
+        # "ACTIVE" / "CLOSED" often sits alone on the line after the header.
+        if current and re.fullmatch(r"(ACTIVE|CLOSED|WRITTEN OFF|SETTLED)",
+                                    line.strip(), re.IGNORECASE):
+            current.status = _normalise_status(line)
 
     flush()
     return accounts

@@ -97,7 +97,10 @@ def test_a_chained_download_starts_the_parse_itself(db, cache, fake_client):
     assert follow_on, "the download should have handed off to a parse job"
 
     parse = jobs.get(follow_on)
-    assert parse.kind == "process"
+    # A download now hands off to STAGING, not to the ledger: the files are
+    # read into the staging area and stop there, and nothing counts until
+    # Process data on the last step of the wizard.
+    assert parse.kind == "stage_parse"
     # It ran to completion here on the download's own worker, with no second
     # request from anyone - which is the whole point.
     assert parse.status in {"complete", "failed"}

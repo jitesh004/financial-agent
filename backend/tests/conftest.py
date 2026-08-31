@@ -55,3 +55,18 @@ def quiet_job_flusher():
 
     jobs._flusher.ensure_running = lambda: None
     yield
+
+
+@pytest.fixture
+def tmp_db():
+    """A pristine ledger for tests that write and read their own rows.
+
+    Separate from the session-wide redirect: the merchant cache is a shared
+    table, and one test teaching it a merchant would otherwise decide what a
+    later test sees.
+    """
+    import tempfile as _tempfile
+    from app.db import database
+
+    return database.Database(
+        Path(_tempfile.mkdtemp(prefix="fa-case-")) / "case.db")

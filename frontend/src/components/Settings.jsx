@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Callout, Card, Chip, Stat } from './ui';
 import { api, titleCase } from '../lib';
 import { PREFS, usePrefs } from '../prefs';
+import LlmSettings from './LlmSettings';
 
 /* Categories you invented, and how the app should look and behave.
  *
@@ -11,7 +12,7 @@ import { PREFS, usePrefs } from '../prefs';
  * they change what the ledger means, and they belong with the rest of the
  * tier-0 data that survives a re-parse. */
 
-export default function Settings() {
+export default function Settings({ onLedgerChanged }) {
   const [categories, setCategories] = useState([]);
   const [customCategories, setCustomCategories] = useState(new Set());
   const [name, setName] = useState('');
@@ -76,6 +77,8 @@ export default function Settings() {
           re-parse. Display options are per-browser.
         </p>
       </div>
+
+      <LlmSettings onLedgerChanged={onLedgerChanged} />
 
       {error && <Callout tone="neg">{error}</Callout>}
       {note && <Callout tone="pos">{note}</Callout>}

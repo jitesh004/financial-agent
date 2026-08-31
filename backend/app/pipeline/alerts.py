@@ -62,6 +62,13 @@ class AlertOutcome:
     account_id: str | None = None
     account_label: str = ""
     merchant: str = ""
+    #: The four digits the email gave, kept whether or not an account here
+    #: matched them. Staging needs it: an alert read before its card's
+    #: statement was imported is not a bad alert, it is an alert whose account
+    #: does not exist YET, and discarding the one identifying detail it has
+    #: would make it unmatchable forever.
+    account_suffix: str = ""
+    institution: str = ""
 
 
 @dataclass
@@ -152,6 +159,9 @@ def build_transactions(alerts: Iterable[Any], accounts: Sequence[Account],
         base.direction = parsed.direction
         base.txn_date = parsed.txn_date.isoformat() if parsed.txn_date else ""
         base.merchant = parsed.counterparty
+        base.account_suffix = parsed.account_suffix or ""
+        base.institution = institution_for_sender(
+            getattr(alert, "sender", "")) or ""
 
         if parsed.txn_date is None:
             base.reason = "no date could be read, so it cannot be placed"

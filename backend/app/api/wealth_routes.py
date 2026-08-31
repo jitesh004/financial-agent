@@ -175,9 +175,23 @@ def portfolio() -> dict[str, Any]:
     statements = repo.get_portfolio_statements(db)
 
     total_value = sum(_decimal(h["value"]) for h in holdings)
-    total_invested = sum(_decimal(h["invested"]) or
-                         (_decimal(h["units"]) * _decimal(h["avg_cost"]))
-                         for h in holdings)
+
+    # Gain is only meaningful over holdings that actually declare a cost.
+    # A CAS prints "Cumulative Amount" for mutual funds; a demat holdings
+    # statement prints no cost at all. Summing value across everything and
+    # subtracting a cost that covers only some of it reports the entire
+    # uncosted position as profit - which is how a portfolio up a few
+    # thousand rupees claimed a gain of three lakh.
+    def _cost_of(holding: dict[str, Any]) -> Decimal:
+        invested = _decimal(holding["invested"])
+        if invested:
+            return invested
+        units, avg = _decimal(holding["units"]), _decimal(holding["avg_cost"])
+        return units * avg if units and avg else Decimal("0")
+
+    costed = [h for h in holdings if _cost_of(h) > 0]
+    total_invested = sum(_cost_of(h) for h in costed)
+    costed_value = sum(_decimal(h["value"]) for h in costed)
 
     by_kind: dict[str, dict[str, Any]] = {}
     for holding in holdings:
@@ -194,10 +208,13 @@ def portfolio() -> dict[str, Any]:
         "totals": {
             "value": str(total_value),
             "invested": str(total_invested),
-            # Unrealised only, and only where a cost basis was actually
-            # printed. A "gain" computed against a missing cost is just the
-            # value again wearing a different label.
-            "gain": str(total_value - total_invested) if total_invested else None,
+            # Unrealised, over the costed holdings only - never value minus a
+            # partial cost.
+            "gain": str(costed_value - total_invested) if total_invested else None,
+            "gain_basis_value": str(costed_value),
+            # So the UI can say what the gain does and does not cover.
+            "costed_instruments": len(costed),
+            "uncosted_instruments": len(holdings) - len(costed),
             "instruments": len(holdings),
             "as_of": max((h["as_of"] for h in holdings if h["as_of"]),
                          default=None),

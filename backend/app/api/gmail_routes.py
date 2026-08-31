@@ -156,20 +156,49 @@ def scan(
     transaction alerts that cover the fortnight before a statement is cut.
     """
     _require_client()
-    if intent not in SCAN_INTENTS:
-        raise HTTPException(400, f"Unknown scan intent '{intent}'.")
+    # `intent` accepts a comma-separated list, because looking for statements
+    # and credit reports is one errand, not two. Scanned in one job so there is
+    # one progress bar and one result to review, rather than a queue the user
+    # has to babysit.
+    wanted = [i.strip() for i in intent.split(",") if i.strip()]
+    unknown = [i for i in wanted if i not in SCAN_INTENTS]
+    if unknown:
+        raise HTTPException(400, f"Unknown scan intent '{unknown[0]}'.")
+    if not wanted:
+        raise HTTPException(400, "Nothing was chosen to scan for.")
 
-    request = {"max_messages": max_messages, "months": months, "intent": intent}
+    request = {"max_messages": max_messages, "months": months,
+               "intent": ",".join(wanted)}
     job = jobs.create("scan", phase="Connecting to Gmail", request=request)
-    if intent == "transactional":
+    if wanted == ["transactional"]:
         background.add_task(_run_alert_scan, job.id, max_messages, months)
     else:
-        background.add_task(_run_scan, job.id, max_messages, months, intent)
+        background.add_task(_run_multi_scan, job.id, max_messages, months, wanted)
     return {"job_id": job.id}
 
 
+def _run_multi_scan(job_id: str, max_messages: int, months: int | None,
+                    wanted: list[str]) -> None:
+    """Scan for several kinds of mail under one job.
+
+    Alerts are always included when asked for, and always last: a statement
+    found in the same pass is what decides whether an alert is still needed,
+    so reading the statements first means supersession is settled by the time
+    the alerts land.
+    """
+    file_intents = [i for i in wanted if i != "transactional"]
+    for index, one in enumerate(file_intents):
+        # Each pass appends to the same job's result rather than replacing it.
+        _run_scan(job_id, max_messages, months, one,
+                  finish=(index == len(file_intents) - 1
+                          and "transactional" not in wanted),
+                  append=index > 0)
+    if "transactional" in wanted:
+        _run_alert_scan(job_id, max_messages, months, append=bool(file_intents))
+
+
 def _run_alert_scan(job_id: str, max_messages: int,
-                    months: int | None = None) -> None:
+                    months: int | None = None, append: bool = False) -> None:
     """Read alert emails and parse them, without writing anything.
 
     The review step for alerts. Nothing reaches the ledger here: what comes
@@ -208,9 +237,15 @@ def _run_alert_scan(job_id: str, max_messages: int,
                 detail=f"{one.status} · {one.reason}",
                 key=one.message_id)
 
+        carried = (job.result or {}) if append else {}
         progress.complete(
             result={
-                "intent": "transactional",
+                **{k: v for k, v in carried.items()
+                   if k in ("attachments", "excluded", "ignored_by_rule",
+                            "excluded_senders", "profile_ready")},
+                "intent": ("," .join(filter(None, [carried.get("intent"),
+                                                   "transactional"]))
+                           if append else "transactional"),
                 "scanned_messages": found.scanned_messages,
                 "months": months,
                 "query": query,
@@ -223,7 +258,9 @@ def _run_alert_scan(job_id: str, max_messages: int,
                      "reason": o.reason, "amount": o.amount,
                      "direction": o.direction, "date_iso": o.txn_date,
                      "account_id": o.account_id, "account": o.account_label,
-                     "merchant": o.merchant}
+                     "merchant": o.merchant,
+                     "account_suffix": o.account_suffix,
+                     "institution": o.institution}
                     for o in outcome.outcomes
                 ],
             },
@@ -325,7 +362,14 @@ def _run_alert_import(job_id: str, message_ids: list[str],
 
 
 def _run_scan(job_id: str, max_messages: int, months: int | None = None,
-              intent: str = "statement") -> None:
+              intent: str = "statement", finish: bool = True,
+              append: bool = False) -> None:
+    """One scan pass.
+
+    `append` keeps what an earlier pass in the same job already found, and
+    `finish` says whether this pass is the last - a multi-intent scan reports
+    a single result at the end rather than completing the job three times.
+    """
     job = jobs.get(job_id)
     progress = JobProgress(job)
     try:
@@ -388,33 +432,56 @@ def _run_scan(job_id: str, max_messages: int, months: int | None = None,
                 "password_rule": label,
                 "password_explanation": explanation,
                 "password_ready": profile_can_satisfy(profile, label),
+                # Which scan turned this up. Carried all the way into staging
+                # so Choose and Parse can show you what each source brought
+                # back, before anything has been read and can say what it is.
+                "intent": intent,
                 "cached": is_cached,
             })
             progress.item(att.filename, "done",
                           detail=f"{att.category} · {label}", cached=is_cached,
                           key=f"{att.message_id}/{att.filename}")
 
-        progress.complete(
+        # Every figure a multi-pass scan reports has to be the TOTAL, not the
+        # last pass's. Reporting the last one gave "Found 400 statement PDFs
+        # in 2 emails" - the 400 accumulated across passes, the 2 from the
+        # bureau pass alone - and named the whole scan "bureau".
+        scanned = result.scanned_messages
+        seen_intents = [intent]
+        excluded_rows = [
+            {"sender": e.sender, "sender_name": _sender_name(e.sender),
+             "subject": e.subject, "date_iso": _parse_mail_date(e.date),
+             "reason": e.reason, "attachment_count": e.attachment_count}
+            for e in result.excluded
+        ]
+        if append:
+            carried = job.result or {}
+            previous = carried.get("attachments") or []
+            seen = {(r.get("message_id"), r.get("filename")) for r in previous}
+            rows = previous + [r for r in rows
+                               if (r.get("message_id"), r.get("filename")) not in seen]
+            ignored += int(carried.get("ignored_by_rule") or 0)
+            scanned += int(carried.get("scanned_messages") or 0)
+            seen_intents = [i for i in
+                            (carried.get("intent") or "").split(",") if i] + [intent]
+            excluded_rows = (carried.get("excluded") or []) + excluded_rows
+
+        finisher = progress.complete if finish else progress.checkpoint
+        finisher(
             result={
                 "attachments": rows,
-                "scanned_messages": result.scanned_messages,
+                "scanned_messages": scanned,
                 "profile_ready": profile.has_password_material(),
                 "months": months,
-                "intent": intent,
+                "intent": ",".join(dict.fromkeys(seen_intents)),
                 "query": query,
                 "ignored_by_rule": ignored,
                 "excluded_senders": profile.excluded_senders,
                 # Surfaced so exclusions are auditable rather than invisible.
-                "excluded": [
-                    {"sender": e.sender, "sender_name": _sender_name(e.sender),
-                     "subject": e.subject, "date_iso": _parse_mail_date(e.date),
-                     "reason": e.reason, "attachment_count": e.attachment_count}
-                    for e in result.excluded
-                ],
+                "excluded": excluded_rows,
             },
             message=(
-                f"Found {len(rows)} statement PDFs in "
-                f"{result.scanned_messages} emails."
+                f"Found {len(rows)} document(s) in {scanned} emails."
                 + (f" {ignored} skipped from ignored accounts." if ignored else "")
             ),
         )
@@ -520,9 +587,12 @@ def _run_download(job_id: str, selected: list[dict[str, Any]],
         saved = download_to_cache(client, attachments, CACHE, progress=on_item)
 
         fresh = sum(1 for a in saved if not a.from_cache)
+        by_name = {(a.get("message_id"), a.get("filename")): a.get("intent")
+                   for a in (selected or []) if isinstance(a, dict)}
         files = [
             {"path": a.saved_path, "filename": a.filename,
-             "cached": a.from_cache, "sender": a.sender}
+             "cached": a.from_cache, "sender": a.sender,
+             "intent": by_name.get((a.message_id, a.filename)) or "statement"}
             for a in saved
         ]
 
@@ -532,9 +602,29 @@ def _run_download(job_id: str, selected: list[dict[str, Any]],
         # rather than having to guess that a second job exists.
         next_job = None
         if then_process and files:
-            next_job = jobs.create(
-                "process", total=len(files), phase="Queued",
-                request={"files": files, "use_llm": use_llm})
+            # Downloaded files go to STAGING, not to the ledger. The chain is
+            # download -> stage -> parse, and it stops there: what a parse
+            # produced is looked at on the Review step before any of it counts.
+            from ..db import staging as _staging
+            from ..ingestion.router import file_hash as _hash
+            db = get_db()
+            for record in files:
+                try:
+                    _staging.add(
+                        db, _hash(Path(record["path"])),
+                        filename=record["filename"], path=record["path"],
+                        origin="gmail", kind="statement",
+                        scan_intent=record.get("intent") or "statement",
+                        sender=record.get("sender", ""))
+                except Exception:  # pragma: no cover - one file is not the batch
+                    log.exception("could not stage %s", record.get("filename"))
+            _staging.apply_supersession(db)
+
+            pending = _staging.unparsed(db)
+            if pending:
+                next_job = jobs.create(
+                    "stage_parse", total=len(pending), phase="Queued",
+                    request={"count": len(pending)})
 
         progress.complete(
             result={
@@ -555,7 +645,8 @@ def _run_download(job_id: str, selected: list[dict[str, Any]],
     # task has not returned yet, so parsing continues without needing another
     # request to start it.
     if next_job is not None:
-        _run_process(next_job.id, files, use_llm)
+        from .staging_routes import _run_parse
+        _run_parse(next_job.id)
 
 
 # --------------------------------------------------------------------------
@@ -748,6 +839,56 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
                             account_type="credit_report")
                 continue
 
+            # A holdings statement is not a ledger either. It has no opening
+            # or closing balance and no transactions - it declares what is
+            # owned on one date - so the statement pipeline finds no rows in
+            # it and records a perfectly good CAS as a parse failure. Routed
+            # here instead, where units x NAV is checked against the total the
+            # document prints for itself.
+            from ..ingestion import portfolio as portfolio_reader
+            from ..models.schemas import Account, AccountType
+            if portfolio_reader.looks_like_portfolio(text, name):
+                holdings_statement = portfolio_reader.parse_statement(
+                    text, extraction.tables, name)
+                holdings_statement.warnings = [
+                    *extraction.warnings, *holdings_statement.warnings]
+
+                # Holdings hang off an account so re-importing the same
+                # statement updates the position instead of adding a second
+                # copy: the uniqueness key includes account_id, and SQLite
+                # treats NULLs as distinct, so a null account would let the
+                # portfolio double every time.
+                provider = (holdings_statement.provider
+                            or institution_for_sender(entry.get("sender", ""))
+                            or "Investments")
+                holdings_account = Account(
+                    institution=provider,
+                    account_type=AccountType.INVESTMENT,
+                    account_number_masked="",
+                )
+                holdings_account_id = repo.upsert_account(db, holdings_account)
+
+                repo.save_portfolio_statement(
+                    db, holdings_statement, account_id=holdings_account_id,
+                    file_hash=digest, filename=name)
+
+                recon_status, _, recon_message = holdings_statement.reconcile()
+                count = len(holdings_statement.holdings)
+                progress.item(
+                    name, "done" if recon_status != "failed" else "failed",
+                    f"Holdings · {count} position(s) · {recon_status}",
+                    key=str(path),
+                )
+                record_file(
+                    "ok" if recon_status != "failed" else "unreconciled",
+                    f"{holdings_statement.layout.upper()} holdings statement: "
+                    f"{count} position(s). {recon_message}",
+                    transaction_count=0, account=provider,
+                    file_hash=digest, size_bytes=size_bytes,
+                    password=resolved_password, password_status=password_status,
+                    institution=provider, account_type="investment")
+                continue
+
             if not extraction.tables:
                 progress.item(name, "failed", "no table found", key=str(path))
                 record_file(
@@ -845,6 +986,15 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
         enriched = enrich_ledger(
             db, transactions, accounts,
             use_llm=use_llm,
+            # These statements are not in the database yet - they are written
+            # after this returns - so their periods have to travel with them
+            # or the rows being imported are the only ones attribution cannot
+            # see.
+            statement_periods={
+                e["statement"].id: (e["statement"].period_start,
+                                    e["statement"].period_end)
+                for e in parsed_entries if e.get("statement")
+                and e["statement"].id},
             # The holder's own name turns "UPI/Jitesh Muk/..." from spending
             # into a transfer between the user's own accounts.
             holder_names=[n for n in (profile.full_name,) if n],

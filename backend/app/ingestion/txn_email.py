@@ -56,8 +56,12 @@ def to_text(body: str) -> str:
 # Field readers
 # --------------------------------------------------------------------------
 
-_AMOUNT = r"(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d{1,2})?)"
+#: Named, so a template can put the account or the payee before the money.
+#: Half the issuers do - "Account XXXX4345 has been credited for INR 413" -
+#: and reading the amount off group(1) made those unwritable.
+_AMOUNT = r"(?:rs\.?|inr|₹)\s*(?P<amount>[\d,]+(?:\.\d{1,2})?)"
 _DATE_TOKEN = (r"(\d{1,2}[-/ ][A-Za-z]{3,9}[-/ ]\d{2,4}"
+               r"|[A-Za-z]{3,9}\s+\d{1,2},?\s*\d{4}"
                r"|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}"
                r"|\d{4}-\d{2}-\d{2})")
 
@@ -77,9 +81,11 @@ def parse_date(raw: str | None, fallback: date | None = None) -> date | None:
     """A date out of any of the shapes Indian banks put in an alert."""
     if not raw:
         return fallback
-    token = raw.strip().replace("/", "-").replace(" ", "-")
+    # Commas first: "Aug 29, 2026" has to become "Aug-29-2026", not
+    # "Aug-29,-2026", or every ICICI card alert falls back to the email's date.
+    token = re.sub(r"[\s,]+", "-", raw.strip().replace("/", "-")).strip("-")
     for fmt in ("%d-%b-%Y", "%d-%b-%y", "%d-%B-%Y", "%d-%m-%Y", "%d-%m-%y",
-                "%Y-%m-%d", "%d-%b", "%b-%d-%Y"):
+                "%Y-%m-%d", "%d-%b", "%b-%d-%Y", "%B-%d-%Y", "%b-%d-%y"):
         try:
             parsed = datetime.strptime(token, fmt).date()
         except ValueError:
@@ -184,6 +190,59 @@ TEMPLATES: list[Template] = [
             rf"(?:your\s*)?(?:a/?c|account|atm)?\s*(?:no\.?\s*)?"
             rf"(?P<account>[\w*x]*\d{{4}})?"
             rf"(?:.{{0,60}}?on\s+{_DATE_TOKEN})?")),
+    # ---- wordings taken from real mail, one issuer at a time ----
+    #
+    # Everything below existed only as "not a completed transaction" until the
+    # sentences were read off actual alerts. The generic patterns further down
+    # match Yes Bank's phrasing and almost nothing else, which is why a mailbox
+    # holding six banks' alerts imported exactly one bank's.
+    Template(
+        "indusind-credit", "credit",
+        # "Your IndusInd Account XXXXXXXX4345 has been credited for INR 413
+        #  towards N/AXNPN.../UTIB0001506/PHONEPE LIMITED-PAY."
+        pattern=_compile(
+            rf"account\s*(?:no\.?\s*)?(?P<account>[\w*x]*\d{{4}})\s*"
+            rf"(?:has\s+been\s+|is\s+|was\s+)?credited\s+(?:for|with)\s+{_AMOUNT}"
+            rf"(?:\s+towards\s+(?P<payee>[^.]{{2,90}}?))?[.\s]")),
+    Template(
+        "indusind-debit", "debit",
+        pattern=_compile(
+            rf"account\s*(?:no\.?\s*)?(?P<account>[\w*x]*\d{{4}})\s*"
+            rf"(?:has\s+been\s+|is\s+|was\s+)?debited\s+(?:for|with)\s+{_AMOUNT}"
+            rf"(?:\s+towards\s+(?P<payee>[^.]{{2,90}}?))?[.\s]")),
+    Template(
+        "card-used-at", "debit", kind="card",
+        # HSBC: "your HSBC Credit Card xx1751 was used for a transaction of
+        #        INR 1069.80 at TATVARTHA HEALTH on 31/08/26."
+        pattern=_compile(
+            rf"card\s+(?:ending\s*(?:with\s*)?)?(?P<account>[\w*x]*\d{{4}})\s+"
+            rf"(?:has\s+been\s+|was\s+|is\s+)?used\s+for\s+a\s+transaction\s+of\s+"
+            rf"{_AMOUNT}\s+at\s+(?P<payee>[^.]{{2,70}}?)\s+on\s+{_DATE_TOKEN}")),
+    Template(
+        "card-used-on", "debit", kind="card",
+        # ICICI: "...Credit Card XX5001 has been used for a transaction of
+        #         INR 658.44 on Aug 29, 2026 at 06:09:23. Info: AMAZON PAY..."
+        pattern=_compile(
+            rf"card\s+(?:ending\s*(?:with\s*)?)?(?P<account>[\w*x]*\d{{4}})\s+"
+            rf"(?:has\s+been\s+|was\s+|is\s+)?used\s+for\s+a\s+transaction\s+of\s+"
+            rf"{_AMOUNT}\s+on\s+{_DATE_TOKEN}"
+            rf"(?:.{{0,40}}?info\s*:\s*(?P<payee>[^.]{{2,70}}?)\s*[.])?")),
+    Template(
+        "neft-out", "debit",
+        # Bank of Baroda: "NEFT of Rs. 72,617.00 to Shree Balaji Ayurved is
+        #                  accepted via bob World on 23-08-2026 with UTR no..."
+        # The same mail repeats the sentence in Hindi; the English one matches.
+        pattern=_compile(
+            rf"(?:neft|imps|rtgs|upi)\s+of\s+{_AMOUNT}\s+to\s+"
+            rf"(?P<payee>[^.]{{2,70}}?)\s+is\s+(?:accepted|processed|"
+            rf"successful|completed)"
+            rf"(?:.{{0,40}}?on\s+{_DATE_TOKEN})?")),
+    Template(
+        "neft-in", "credit",
+        pattern=_compile(
+            rf"(?:neft|imps|rtgs|upi)\s+of\s+{_AMOUNT}\s+from\s+"
+            rf"(?P<payee>[^.]{{2,70}}?)\s+is\s+(?:credited|received)"
+            rf"(?:.{{0,40}}?on\s+{_DATE_TOKEN})?")),
     Template(
         "generic-debit", "debit",
         pattern=_compile(
@@ -256,7 +315,7 @@ def parse_alert(body: str, subject: str = "",
         match = template.pattern.search(text)
         if not match:
             continue
-        amount = parse_amount(match.group(1))
+        amount = parse_amount(match.groupdict().get("amount"))
         if amount is None or amount <= 0:
             continue
 

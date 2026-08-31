@@ -19,7 +19,8 @@ import logging
 from collections import defaultdict
 
 from ..db.database import Database
-from ..db.repository import lookup_merchants, save_merchant_categories
+from ..db.repository import (forget_merchant, lookup_merchants,
+                             save_merchant_categories)
 from ..llm.client import LLMClient, get_client
 from ..models.schemas import Category, ConfidenceSource, Direction, Transaction
 
@@ -81,12 +82,26 @@ def _prompt(items: list[tuple[int, str, str]], allowed_names: list[str] | None =
     )
 
 
+#: What the model did on the most recent run, for reporting only.
+#:
+#: "0 from the model" has two very different causes and the counters cannot
+#: tell them apart: the call failed (a key, a timeout, an unparseable reply)
+#: or the model answered honestly that it did not recognise the merchant.
+#: Rows like "AYMENT", "HAS" and two with no description at all are the second
+#: case, and telling someone to "check the API log" over a correct answer
+#: sends them hunting a bug that is not there.
+last_run: dict[str, int] = {"asked": 0, "answered": 0, "declined": 0,
+                            "invented": 0, "failed_batches": 0}
+
+
 def categorize_with_llm(
     transactions: list[Transaction],
     db: Database | None = None,
     client: LLMClient | None = None,
 ) -> tuple[int, int]:
     """Resolve uncategorized transactions. Returns (from_cache, from_model)."""
+    last_run.update(asked=0, answered=0, declined=0, invented=0,
+                    failed_batches=0)
     pending = [t for t in transactions if t.category == Category.UNCATEGORIZED]
     if not pending:
         return 0, 0
@@ -105,6 +120,12 @@ def categorize_with_llm(
     cached: dict[str, tuple[Category, float, str]] = {}
     if db is not None:
         cached = lookup_merchants(db, list(by_key.keys()))
+        # A stored "uncategorized" is the absence of an answer, not one. Left
+        # in, it counts as a cache hit that changes nothing and, worse, keeps
+        # the merchant out of `unresolved` - so the model is never asked and
+        # the run reports "0 categorised" over rows it never looked at.
+        cached = {k: v for k, v in cached.items()
+                  if v[0] != Category.UNCATEGORIZED}
         for key, (category, confidence, source) in cached.items():
             for txn in by_key[key]:
                 txn.category = category
@@ -141,11 +162,15 @@ def categorize_with_llm(
         except Exception as exc:
             # One failed batch must not lose the batches that succeeded.
             log.warning("LLM categorization batch failed: %s", exc)
+            last_run["failed_batches"] += 1
             continue
 
         if not isinstance(answers, list):
             log.warning("expected a JSON array, got %s", type(answers).__name__)
+            last_run["failed_batches"] += 1
             continue
+
+        last_run["asked"] += len(batch)
 
         for answer in answers:
             if not isinstance(answer, dict):
@@ -158,6 +183,9 @@ def categorize_with_llm(
             if not 0 <= index < len(batch):
                 continue
             if category == Category.UNCATEGORIZED:
+                # A refusal is an answer. "RBL*SULOCHANA BH" is a person's
+                # name; there is no honest bucket for it.
+                last_run["declined"] += 1
                 continue
             # A category outside the offered set is a hallucination, and
             # storing it would invent a bucket nothing else knows about.
@@ -165,8 +193,10 @@ def categorize_with_llm(
             # honest, guessing which real category was meant is not.
             if category not in allowed_set:
                 log.debug("discarding invented category %r", category)
+                last_run["invented"] += 1
                 continue
 
+            last_run["answered"] += 1
             confidence = _clamp(answer.get("confidence", 0.6))
             key = batch[index]
             learned[key] = (category, confidence, "llm")
@@ -212,5 +242,12 @@ def record_user_correction(
     txn.category_confidence = 1.0
 
     key = _merchant_key(txn)
-    if key:
-        save_merchant_categories(db, {key: (category, 1.0, "user")})
+    if not key:
+        return
+    if category == Category.UNCATEGORIZED:
+        # Clearing a category is not a decision about the merchant, so the
+        # cache should stop asserting one. This row stays uncategorized; the
+        # next run is free to ask about the merchant again.
+        forget_merchant(db, key)
+        return
+    save_merchant_categories(db, {key: (category, 1.0, "user")})

@@ -21,13 +21,18 @@ import { api } from '../../lib';
  */
 
 const KEY = 'fa-mailbox';
-const KINDS = new Set(['scan', 'download', 'process', 'alerts']);
+const KINDS = new Set(['scan', 'download', 'process', 'alerts',
+  'stage_parse', 'stage_process']);
 
 /* Poll fast enough to feel live while someone is watching, slowly enough not
    to be silly when nobody is. */
 const INTERVAL_WATCHING = 700;
 const INTERVAL_BACKGROUND = 3000;
-const INTERVAL_IDLE = 15000;
+/* Closed, with nothing running. One request a minute, and its only job is to
+   notice work started somewhere else - another tab, or a job resumed after a
+   restart. It used to be every 15 seconds, and it used to be three requests
+   rather than one. */
+const INTERVAL_IDLE = 60000;
 
 function readStored() {
   try {
@@ -75,10 +80,17 @@ export function stageFor(job) {
   }
   if (job.kind === 'scan') return job.active ? 'scanning' : 'select';
   if (job.kind === 'download') return job.active ? 'downloading' : 'downloaded';
-  if (job.kind === 'process') return job.active ? 'processing' : 'done';
+  // Parsing fills the staging area and stops there. It ends on 'staged', not
+  // on 'done', because nothing has been added to the ledger yet - saying done
+  // here is exactly the claim this whole flow exists to stop making.
+  if (job.kind === 'stage_parse') return job.active ? 'parsing' : 'staged';
+  if (job.kind === 'process') return job.active ? 'parsing' : 'staged';
   // Alerts skip the download stage entirely: the amount is in the body, so
-  // there is nothing to fetch between reading the mail and writing the rows.
-  if (job.kind === 'alerts') return job.active ? 'processing' : 'done';
+  // there is nothing to fetch between reading the mail and staging the rows.
+  if (job.kind === 'alerts') return job.active ? 'parsing' : 'staged';
+  // The only kind that ends on 'done', because it is the only one that
+  // changes what any tab shows.
+  if (job.kind === 'stage_process') return job.active ? 'processing' : 'done';
   return 'idle';
 }
 
@@ -113,7 +125,70 @@ export default function useMailbox({ open, onImported }) {
   const [maxMessages, setMaxMessages] = useState(
     stored.maxMessages || suggestedCap(stored.months === undefined ? 12 : stored.months));
   const [capTouched, setCapTouched] = useState(Boolean(stored.capTouched));
-  const [intent, setIntentState] = useState(stored.intent || 'statement');
+
+  /* Per-source scan settings, and the scan each one last ran.
+   *
+   * One shared "look back" was wrong for every source at once: a holdings
+   * statement is a photograph of what you own on one date, so last quarter's
+   * is history, while a bank statement from the same month is money still to
+   * be accounted for - and alerts are capped at two months whatever anyone
+   * asks for. One setting could only ever be right for one of them.
+   *
+   * Each source also keeps its own job id, which is what makes a per-source
+   * Retry possible: re-scanning alerts must not disturb the statement scan
+   * sitting beside it. */
+  const [sourceSettings, setSourceSettings] = useState(
+    () => stored.sourceSettings || {});
+  const [sourceJobs, setSourceJobs] = useState(() => stored.sourceJobs || {});
+  const [sections, setSections] = useState([]);
+  /* Each source's finished scan result, kept here rather than fetched inside
+     the section that shows it.
+   *
+     Two things need them and must agree: the Choose screen lists what was
+     found, and the footer's "Download & read" button counts what is ticked.
+     With each section fetching its own copy, the footer was reading the LAST
+     scan's rows only - so ticking anything in another section left the button
+     disabled over a perfectly good selection. */
+  const [sourceResults, setSourceResults] = useState({});
+
+  /* One answer per source, whoever asks.
+   *
+   * This used to take the cap as an argument, so the screen that DISPLAYED a
+   * source's settings passed the source's own limit while the code that SENT
+   * the scan did not - alerts showed "250 emails" and requested 500. A number
+   * the user reads and a number the app uses must come from the same place. */
+  const settingsFor = useCallback((key) => {
+    const saved = sourceSettings[key] || {};
+    const spec = intents.find((one) => one.key === key);
+    const ceiling = spec?.max_months ?? null;
+    // `ceiling` is this source's DEFAULT window, not a limit on it. Alerts
+    // start at two months because a year of unreconciled figures is mostly
+    // noise the statements supersede - but that is advice printed next to the
+    // control, and a window you set yourself is honoured.
+    const months = saved.months === undefined ? (ceiling ?? 12) : saved.months;
+    return {
+      months,
+      maxMessages: saved.maxMessages || suggestedCap(months),
+      ceiling,
+    };
+  }, [sourceSettings, intents]);
+
+  const setSourceSetting = useCallback((key, patch) => {
+    setSourceSettings((previous) => {
+      const next = { ...previous, [key]: { ...(previous[key] || {}), ...patch } };
+      store({ sourceSettings: next });
+      return next;
+    });
+  }, []);
+  /* What to look for, as a SET. Statements and credit reports are one errand,
+     not two, and making them exclusive meant running the wizard twice to
+     answer one question. Stored as an array because a Set does not survive
+     JSON. */
+  const [chosenIntents, setChosenIntents] = useState(() => {
+    const saved = stored.intents || (stored.intent ? [stored.intent] : null);
+    return new Set(saved && saved.length ? saved : ['statement']);
+  });
+  const intent = [...chosenIntents].join(',');
   const [ignoredSenders, setIgnoredSenders] = useState([]);
 
   const refreshStatus = useCallback(
@@ -133,6 +208,11 @@ export default function useMailbox({ open, onImported }) {
   const jobIdRef = useRef(stored.jobId || null);
   const scanIdRef = useRef(stored.scanJobId || null);
   const completedRef = useRef(stored.completedJobId || null);
+  //: The last job seen in a terminal state, and the scan whose result is
+  //: final. Both exist so the poller can stop asking questions whose answers
+  //: cannot change.
+  const settledRef = useRef(null);
+  const settledScanRef = useRef(null);
 
   const adopt = useCallback((next) => {
     if (!next) return;
@@ -157,7 +237,23 @@ export default function useMailbox({ open, onImported }) {
 
       let current = live;
       if (!current && jobIdRef.current) {
-        current = await api.job(jobIdRef.current).catch(() => null);
+        /* A finished job never changes again, so it is fetched once and kept.
+           Without this the poller re-read the same completed job every tick
+           for as long as the app stayed open - and kept 404ing on one that had
+           been cleared, forever, because a missing job is not a reason to stop
+           asking for a job id nothing ever forgets. */
+        const cached = settledRef.current;
+        if (cached && cached.id === jobIdRef.current) {
+          current = cached;
+        } else {
+          current = await api.job(jobIdRef.current).catch(() => null);
+          if (current && !current.active) settledRef.current = current;
+          if (!current) {
+            // It is gone. Stop asking.
+            jobIdRef.current = null;
+            store({ jobId: null });
+          }
+        }
       }
 
       if (current) {
@@ -171,7 +267,7 @@ export default function useMailbox({ open, onImported }) {
         }
         adopt(current);
 
-        if (current.kind === 'process' && current.status === 'complete'
+        if (current.kind === 'stage_process' && current.status === 'complete'
             && completedRef.current !== current.id) {
           // Fire once per job, not once per poll: the ledger reload behind
           // this is expensive and the job stays complete forever.
@@ -181,11 +277,20 @@ export default function useMailbox({ open, onImported }) {
         }
       }
 
-      // The scan's result is the file list, needed long after the scan job
-      // has stopped being the current one.
-      if (scanIdRef.current && (!current || current.kind !== 'scan')) {
+      /* The scan's result is the file list, needed long after the scan job has
+         stopped being the current one - but a completed scan's result is
+         fixed, so it is fetched once. This was the second of three requests
+         the poller made every tick with nothing running. */
+      if (scanIdRef.current && (!current || current.kind !== 'scan')
+          && settledScanRef.current !== scanIdRef.current) {
         const scan = await api.job(scanIdRef.current).catch(() => null);
-        if (scan) setScanJob(scan);
+        if (scan) {
+          setScanJob(scan);
+          if (!scan.active) settledScanRef.current = scanIdRef.current;
+        } else {
+          scanIdRef.current = null;
+          store({ scanJobId: null });
+        }
       }
       setError(null);
     } catch (e) {
@@ -194,6 +299,12 @@ export default function useMailbox({ open, onImported }) {
   }, [adopt, onImported]);
 
   const busy = Boolean(job?.active) || activeCount > 0;
+
+  /* Opening the modal used to kick off an alert scan on its own. Removed at
+     the user's request: a scan reads the mailbox and costs time, and starting
+     one because a window opened is the app deciding to do work nobody asked
+     for. Alerts are scanned when Transaction alerts is ticked on Source and
+     Scan is pressed, like every other source. */
 
   useEffect(() => {
     let cancelled = false;
@@ -215,10 +326,48 @@ export default function useMailbox({ open, onImported }) {
   // ---- derived ------------------------------------------------------------
 
   const scanResult = scanJob?.status === 'complete' ? scanJob.result : null;
+
+  /* Alerts arrive fully parsed inside the scan's own result - there is no file
+     to download, so nothing else in the chain would ever put them in staging.
+     Staged once per scan, keyed on the scan's id. */
+  const stagedAlertsRef = useRef(null);
+  useEffect(() => {
+    const alertRows = scanResult?.alerts;
+    if (!scanJob?.id || !alertRows?.length) return;
+    if (stagedAlertsRef.current === scanJob.id) return;
+    stagedAlertsRef.current = scanJob.id;
+    api.stageScanResults({
+      files: [],
+      /* Staged on whether the alert was UNDERSTOOD, not on whether an
+         account matched. "No account here ends 4345" is a statement about
+         the ledger, and in this flow the ledger does not exist yet - the
+         statement that would create that account is two steps away. Matching
+         happens when the ledger is built, where there is something to match
+         against. */
+      alerts: alertRows.filter(
+        (a) => a.amount && a.date_iso && a.account_suffix),
+    }).catch(() => { stagedAlertsRef.current = null; });
+  }, [scanJob?.id, scanResult]);
   const scanIntent = scanResult?.intent || 'statement';
 
-  const rows = useMemo(
-    () => (scanResult?.attachments || []), [scanResult]);
+  /* Everything every source's scan turned up, each row tagged with the source
+     that found it. The footer counts a selection made anywhere against this,
+     which is what makes ticking a file in one section enable the button. */
+  const rows = useMemo(() => {
+    const out = [];
+    const seen = new Set();
+    for (const [key, result] of Object.entries(sourceResults || {})) {
+      for (const row of result?.attachments || []) {
+        const id = `${row.message_id}:${row.filename}:${row.size}`;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push({ ...row, intent: row.intent || key });
+      }
+    }
+    if (out.length) return out;
+    // Nothing per-source yet (a scan started from the old single-scan path).
+    return scanResult?.attachments || [];
+  }, [sourceResults, scanResult]);
   /* Alerts come back already parsed, each carrying the decision the server
      made about it. Only the importable ones can be selected; the rest are
      shown with their reason, because a silent skip is indistinguishable from
@@ -228,8 +377,13 @@ export default function useMailbox({ open, onImported }) {
     () => alerts.filter((a) => a.status === 'imported'), [alerts]);
   const excluded = useMemo(() => scanResult?.excluded || [], [scanResult]);
   const ignoredCount = scanResult?.ignored_by_rule || 0;
-  const summary = job?.kind === 'process' && job.status === 'complete'
-    ? job.result : null;
+  /* An alerts run finishes with a result too, and excluding it here meant the
+     screen that reports what an import did had nothing to report after one -
+     it fell through to "that import produced no statements", which was both
+     wrong and the opposite of what had just happened. */
+  const summary = (job?.kind === 'stage_parse' || job?.kind === 'alerts'
+    || job?.kind === 'stage_process' || job?.kind === 'process')
+    && job.status === 'complete' ? job.result : null;
 
   const stage = useMemo(() => {
     if (!status?.available) return 'setup';
@@ -264,10 +418,96 @@ export default function useMailbox({ open, onImported }) {
     });
   }, []);
 
-  const setIntent = useCallback((next) => {
-    setIntentState(next);
-    store({ intent: next });
+  /* Toggling one source on or off. Never empty: a scan for nothing is not a
+     state worth being able to reach, so turning the last one off is refused
+     rather than producing a Scan button that cannot do anything. */
+  const toggleIntent = useCallback((key) => {
+    setChosenIntents((previous) => {
+      const next = new Set(previous);
+      if (next.has(key)) {
+        if (next.size === 1) return previous;
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      store({ intents: [...next] });
+      return next;
+    });
   }, []);
+
+
+  useEffect(() => {
+    if (!open) return undefined;
+    let live = true;
+    const ids = Object.entries(sourceJobs || {});
+    if (!ids.length) return undefined;
+    let timer = null;
+    const poll = async () => {
+      let stillRunning = false;
+      for (const [key, id] of ids) {
+        // eslint-disable-next-line no-await-in-loop
+        const current = await api.job(id).catch(() => null);
+        if (!live) return;
+        if (current?.active) { stillRunning = true; continue; }
+        if (current?.result) {
+          setSourceResults((previous) => (
+            previous[key]?.__id === id ? previous
+              : { ...previous, [key]: { ...current.result, __id: id } }));
+        }
+      }
+      if (stillRunning && live) timer = setTimeout(poll, 1200);
+    };
+    poll();
+    return () => { live = false; clearTimeout(timer); };
+  }, [open, sourceJobs]);
+
+  const refreshSections = useCallback(async () => {
+    try {
+      const { sections: next } = await api.stagingSections();
+      setSections(next || []);
+    } catch { /* a count that fails to load is not worth an error banner */ }
+  }, []);
+
+  useEffect(() => { if (open) refreshSections(); }, [open, refreshSections]);
+
+  /* Scan ONE source. Nothing else is touched, which is what makes the Retry
+     button in each section mean "just this one" - re-reading alerts must not
+     disturb the statement scan sitting beside it. */
+  const scanSource = useCallback(async (key) => {
+    setError(null);
+    const { months: m, maxMessages: cap } = settingsFor(key);
+    try {
+      const { job_id: id } = await api.gmailScan(cap, m, key);
+      setSourceJobs((previous) => {
+        const next = { ...previous, [key]: id };
+        store({ sourceJobs: next });
+        return next;
+      });
+      settledRef.current = null;
+      settledScanRef.current = null;
+      jobIdRef.current = id;
+      scanIdRef.current = id;
+      store({ jobId: id, scanJobId: id });
+      await tick();
+      return id;
+    } catch (e) { setError(e.message); return null; }
+  }, [settingsFor, tick]);
+
+  /* Read ONE source's staged files. Same reasoning as scanSource. */
+  const parseSource = useCallback(async (key) => {
+    setError(null);
+    try {
+      const { job_id: id } = await api.stagingParse(key);
+      if (id) {
+        jobIdRef.current = id;
+        settledRef.current = null;
+        store({ jobId: id });
+        await tick();
+      }
+      await refreshSections();
+      return id;
+    } catch (e) { setError(e.message); return null; }
+  }, [tick, refreshSections]);
 
   const startScan = useCallback(async () => {
     setError(null);
@@ -276,6 +516,8 @@ export default function useMailbox({ open, onImported }) {
       // Cleared rather than kept: results from the previous scan would
       // otherwise show under the new one's progress bar.
       scanIdRef.current = id;
+      settledRef.current = null;
+      settledScanRef.current = null;
       setScanJob(null);
       persistSelection(new Set());
       store({ scanJobId: id, jobId: id });
@@ -372,10 +614,14 @@ export default function useMailbox({ open, onImported }) {
   return {
     status, periods, intents, error, setError, stage, job, scanJob, busy,
     activeCount, rows, excluded, ignoredCount, summary,
-    intent, setIntent, scanIntent, alerts, importableAlerts, importAlerts,
+    intent, chosenIntents, toggleIntent, scanIntent,
+    alerts, importableAlerts, importAlerts,
     selection, setSelection: persistSelection,
     months, setLookback, maxMessages, setCap,
     ignoredSenders, setIgnored,
+    sections, refreshSections, sourceJobs, sourceResults,
+    settingsFor, setSourceSetting,
+    scanSource, parseSource,
     startScan, startImport, cancel, resume, reset, connect, refresh: tick,
   };
 }

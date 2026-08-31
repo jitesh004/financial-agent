@@ -73,10 +73,20 @@ def looks_like_portfolio(text: str, filename: str = "") -> bool:
 # Field readers
 # --------------------------------------------------------------------------
 
-#: An ISIN is two country letters, nine alphanumerics and a check digit. The
-#: format is strict enough to find one in unstructured text with no false
-#: positives worth worrying about.
-ISIN = re.compile(r"\b([A-Z]{2}[A-Z0-9]{9}\d)\b")
+#: An ISIN is two country letters, nine alphanumerics and a check digit.
+#:
+#: The two negative lookaheads are load-bearing. A MASKED ACCOUNT NUMBER has
+#: exactly this shape: "XXXXXXXX1951" is two letters, nine alphanumerics and a
+#: digit, and one appears on every bank statement that masks its own account
+#: number. Because an ISIN alone is treated as proof that a document is a
+#: securities statement, twelve months of ICICI savings statements - eighty
+#: transactions each - were routed to the holdings reader, which found no
+#: holdings and filed them as empty portfolios. Those transactions were never
+#: read at all.
+#:
+#: No real ISIN begins "XX" - not an assigned ISO 3166 country code - and none
+#: contains a run of masking characters.
+ISIN = re.compile(r"\b(?!XX)(?![A-Z0-9]*[X*]{4})([A-Z]{2}[A-Z0-9]{9}\d)\b")
 
 _NUMBER = re.compile(r"-?[\d,]+(?:\.\d+)?")
 _DATE_LINE = re.compile(
@@ -136,22 +146,40 @@ def parse_declared_total(text: str) -> Decimal | None:
     return max(values) if values else None
 
 
-#: Column header wording -> the field it holds. Matched as a substring, so
-#: "Closing Balance (Units)" and "Unit Balance" both land on units.
+#: Column header wording -> the field it holds, most specific first.
+#:
+#: Order is load-bearing. A CAS prints both "Cumulative Amount" (what was put
+#: in) and "Valuation" (what it is worth now); with a bare "amount" hint ranked
+#: above the invested ones, the money-in column was read as the holding's value
+#: and every position was reported at its cost with no gain.
 _COLUMN_HINTS: list[tuple[tuple[str, ...], str]] = [
     (("isin",), "isin"),
-    (("scheme name", "scheme", "security name", "instrument", "stock",
-      "company name", "description"), "instrument"),
-    (("symbol", "ticker", "trading symbol"), "symbol"),
-    (("folio", "account no", "client id", "dp id"), "folio"),
-    (("closing balance", "unit balance", "units", "quantity", "qty",
-      "free balance", "holdings"), "units"),
-    (("nav", "market price", "closing price", "price", "rate"), "nav"),
-    (("market value", "current value", "valuation", "value", "amount"), "value"),
-    (("average cost", "avg cost", "cost price", "purchase price",
-      "buy average"), "avg_cost"),
-    (("invested", "cost value", "total cost", "investment"), "invested"),
+    (("schemename", "securityname", "scheme", "instrument", "stock",
+      "companyname", "description", "securitydescription"), "instrument"),
+    (("symbol", "ticker", "tradingsymbol"), "symbol"),
+    (("folio", "accountno", "clientid", "dpid"), "folio"),
+    (("closingbalance", "closingunits", "unitbalance", "balanceunits",
+      "closing", "units", "quantity", "qty", "freebalance", "holdings",
+      "currentbal"), "units"),
+    (("nav", "marketprice", "closingprice", "closingrate", "price", "rate"),
+     "nav"),
+    (("cumulativeamount", "amountinvested", "investedvalue", "invested",
+      "costvalue", "totalcost", "investment", "purchasevalue"), "invested"),
+    (("averagecost", "avgcost", "costprice", "purchaseprice", "buyaverage",
+      "avgrate"), "avg_cost"),
+    (("valuation", "marketvalue", "currentvalue", "closingvalue", "value",
+      "amount"), "value"),
 ]
+
+#: Header cells arrive with spaces wedged inside words - "V a lu a tio n",
+#: "N A V" - because the PDF lays each glyph out separately and the extractor
+#: preserves the gaps. Matching on the raw text finds none of them, so every
+#: numeric column silently goes unmapped and the holding ends up with no units
+#: and no NAV. Both forms are compared: the squeezed one catches the split
+#: words, the spaced one keeps multi-word headers like "market value" working.
+def _header_forms(cell: Any) -> tuple[str, str]:
+    label = str(cell or "").strip().lower()
+    return re.sub(r"\s+", "", label), label
 
 
 def map_columns(header: Sequence[Any]) -> dict[int, str]:
@@ -164,13 +192,13 @@ def map_columns(header: Sequence[Any]) -> dict[int, str]:
     mapping: dict[int, str] = {}
     taken: set[str] = set()
     for index, cell in enumerate(header):
-        label = str(cell or "").strip().lower()
-        if not label:
+        squeezed, spaced = _header_forms(cell)
+        if not squeezed:
             continue
         for fragments, name in _COLUMN_HINTS:
             if name in taken:
                 continue
-            if any(fragment in label for fragment in fragments):
+            if any(f in squeezed or f in spaced for f in fragments):
                 mapping[index] = name
                 taken.add(name)
                 break

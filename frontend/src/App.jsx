@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import CreditReport from './components/CreditReport';
 import DataHub from './components/DataHub';
 import Debt from './components/Debt';
@@ -8,7 +8,6 @@ import ReviewHub from './components/ReviewHub';
 import Overview from './components/Overview';
 import Profile from './components/Profile';
 import Spending from './components/Spending';
-import Upload from './components/Upload';
 import { Callout, Empty, ThemeToggle } from './components/ui';
 import { api } from './lib';
 
@@ -67,8 +66,14 @@ export default function App() {
     localStorage.setItem('fa-theme', theme);
   }, [theme]);
 
+  // True once anything has been shown. A refresh after that point must not
+  // swap the whole of <main> for a spinner: doing so unmounts the tab the
+  // user is looking at, and a panel that reports what a run just did loses
+  // that report to the very refresh that proves the run worked.
+  const shown = useRef(false);
+
   const load = useCallback(async () => {
-    setLoading(true);
+    if (!shown.current) setLoading(true);
     try {
       const dashboard = await api.dashboard();
       setData(dashboard.status === 'ok' ? dashboard : null);
@@ -82,6 +87,7 @@ export default function App() {
       setError(e.message);
     } finally {
       setLoading(false);
+      shown.current = true;
     }
   }, []);
 
@@ -91,11 +97,6 @@ export default function App() {
   // because the header button needs the same answer, and because an import
   // that finishes while the modal is closed still has to refresh the ledger.
   const mailbox = useMailbox({ open: mailboxOpen, onImported: load });
-
-  const onComplete = (result) => {
-    setData(result);
-    setTab('overview');
-  };
 
   const hasData = Boolean(data?.analysis?.totals);
 
@@ -147,9 +148,6 @@ export default function App() {
 
         <MailboxButton mailbox={mailbox} onOpen={() => setMailboxOpen(true)} />
         <button className="btn" onClick={() => setShowProfile(true)}>Profile</button>
-        {hasData && (
-          <button className="btn" onClick={() => setData(null)}>Upload more</button>
-        )}
         <ThemeToggle theme={theme} onToggle={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))} />
       </header>
 
@@ -162,47 +160,36 @@ export default function App() {
           </div>
         ) : !hasData && !ALWAYS_AVAILABLE.includes(tab) ? (
           <>
-            <div style={{ maxWidth: 760, margin: '0 auto 22px', textAlign: 'center' }}>
-              <h1 style={{ fontSize: 26, fontWeight: 660, letterSpacing: '-.6px', margin: '18px 0 8px' }}>
+            {/* One way in. The drop zone that used to live here was a second
+                one - a file dropped on this page skipped the review that every
+                other import goes through, so the two routes could not both be
+                right. Uploading is now the first step of the same wizard, and
+                this page's job is to point at it. */}
+            <div style={{ maxWidth: 620, margin: '0 auto', textAlign: 'center',
+              padding: '40px 0' }}>
+              <h1 style={{ fontSize: 26, fontWeight: 660, letterSpacing: '-.6px',
+                margin: '0 0 10px' }}>
                 Understand where your money actually goes
               </h1>
-              <p style={{ color: 'var(--text-2)', fontSize: 15, lineHeight: 1.6, margin: 0 }}>
-                Upload bank, card, loan and investment statements in any format. Every
-                figure is reconciled against the balances your bank printed, so the
-                totals are checked rather than estimated.
+              <p style={{ color: 'var(--text-2)', fontSize: 15, lineHeight: 1.6,
+                margin: '0 0 20px' }}>
+                Read your bank, card, loan and investment statements — from your
+                mailbox or from files you have. Every figure is reconciled
+                against the balances your bank printed, and nothing counts until
+                you have seen what was read.
               </p>
-              <p style={{ color: 'var(--text-3)', fontSize: 13, marginTop: 8 }}>
-                Password-protected PDFs? Add your details in{' '}
+              {error && <Callout tone="warn" style={{ marginBottom: 16 }}>{error}</Callout>}
+              <button className="btn primary" style={{ fontSize: 14, padding: '8px 18px' }}
+                onClick={() => setMailboxOpen(true)}>
+                Import statements
+              </button>
+              <p style={{ color: 'var(--text-3)', fontSize: 13, marginTop: 16 }}>
+                Scan Gmail or add files from this computer — both start in the
+                same place. Password-protected PDFs open automatically once your
+                details are in{' '}
                 <button className="btn" style={{ padding: '2px 8px', fontSize: 12 }}
-                  onClick={() => setShowProfile(true)}>Profile</button>{' '}
-                and they'll open automatically.
+                  onClick={() => setShowProfile(true)}>Profile</button>.
               </p>
-            </div>
-            {error && <Callout tone="warn" style={{ marginBottom: 14 }}>{error}</Callout>}
-            {/* Wider than a typical form column: the Gmail review table carries
-                seven columns and is unusable squeezed into 820px. */}
-            <div style={{ maxWidth: 820, margin: '0 auto', display: 'grid', gap: 14 }}>
-              <Upload onComplete={onComplete} />
-              <div style={{ textAlign: 'center', color: 'var(--text-3)', fontSize: 12, textTransform: 'uppercase', letterSpacing: '.08em' }}>
-                or
-              </div>
-              {/* The import itself lives in the header modal now, reachable from
-                  every screen rather than only from this one - which was the
-                  odd part before: the page you could not get back to was the
-                  one that put the data there. */}
-              <div className="card" style={{ textAlign: 'center' }}>
-                <div className="card-title" style={{ marginBottom: 6 }}>
-                  Import from Gmail
-                </div>
-                <p style={{ color: 'var(--text-2)', fontSize: 13, margin: '0 0 14px' }}>
-                  Finds your bank and card statement emails, downloads the PDFs
-                  and parses them. Read-only access, and nothing is downloaded
-                  until you have seen the list and chosen.
-                </p>
-                <button className="btn primary" onClick={() => setMailboxOpen(true)}>
-                  Scan mailbox
-                </button>
-              </div>
             </div>
           </>
         ) : (
@@ -220,13 +207,13 @@ export default function App() {
             {tab === 'portfolio' && <Portfolio />}
             {tab === 'explore' && <Explore />}
             {tab === 'data' && <DataHub data={data} />}
-            {tab === 'settings' && <Settings />}
+            {tab === 'settings' && <Settings onLedgerChanged={load} />}
           </>
         )}
       </main>
 
       <MailboxModal mailbox={mailbox} open={mailboxOpen}
-        onClose={() => setMailboxOpen(false)} />
+        onClose={() => setMailboxOpen(false)} onUploaded={load} />
     </div>
   );
 }

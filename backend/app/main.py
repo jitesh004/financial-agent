@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse
 
 from . import storage
 from .api import (files_routes, gmail_routes, job_routes, query_routes,
-                  wealth_routes)
+                  settings_routes, staging_routes, wealth_routes)
 from .api import serializers as ser
 from .db.database import get_db
 from .db import repository as repo
@@ -108,6 +108,8 @@ app.include_router(files_routes.coverage_router)
 app.include_router(query_routes.router)
 app.include_router(job_routes.router)
 app.include_router(wealth_routes.router)
+app.include_router(settings_routes.router)
+app.include_router(staging_routes.router)
 
 
 class RunStore:
@@ -175,6 +177,13 @@ class RunStore:
         with self._lock:
             self._runs.clear()
             self._latest = None
+        # The stored payload is the same snapshot, and /api/dashboard prefers
+        # it over recomputing - so clearing only the in-memory copy invalidated
+        # nothing a reader could see.
+        try:
+            repo.clear_analysis_runs(get_db())
+        except Exception:  # pragma: no cover - never block a clear on this
+            log.warning("could not drop the stored analysis payload")
 
 
 runs = RunStore()
@@ -333,13 +342,38 @@ async def upload(
              "rejected": rejected},
         )
 
-    runs.create(run_id, len(tasks))
-    runs.update(run_id, warnings=rejected)
-    background.add_task(_run_analysis, run_id, tasks, use_llm, horizon_months,
-                        incremental=True)
+    # An upload is staged and read, not imported. It reaches the ledger the
+    # same way a downloaded statement does - by being ticked on Review and
+    # processed - so a file dragged in here changes no total until someone has
+    # seen what was in it.
+    from .db import staging as _staging
+    from .api.staging_routes import _run_parse
+
+    db = get_db()
+    staged_ids = []
+    for task in tasks:
+        try:
+            staged_ids.append(_staging.add(
+                db, file_hash(Path(task["path"])),
+                filename=task["filename"], path=task["path"],
+                origin="upload", kind="statement",
+                scan_intent="upload"))
+        except Exception:
+            log.exception("could not stage %s", task["filename"])
+    _staging.apply_supersession(db)
+
+    pending = _staging.unparsed(db)
+    job_id = None
+    if pending:
+        job = jobs.create("stage_parse", total=len(pending), phase="Queued",
+                          request={"count": len(pending)})
+        job_id = job.id
+        background.add_task(_run_parse, job.id)
 
     return {
         "run_id": run_id,
+        "job_id": job_id,
+        "staged": len(staged_ids),
         "accepted": [t["filename"] for t in tasks],
         "rejected": rejected,
         "status": "queued",

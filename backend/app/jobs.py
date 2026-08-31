@@ -479,6 +479,21 @@ class JobProgress:
             self.job.dirty = True
         self._persist_now()
 
+    def checkpoint(self, result: Any = None, message: str = "") -> None:
+        """Record a result without declaring the job finished.
+
+        A scan that covers several kinds of mail is one job with several
+        passes. Each pass has something to hand over, but only the last one
+        has finished - and a job that reports "complete" three times is a job
+        the UI moves past twice too early.
+        """
+        with self.job.lock:
+            self.job.result = result
+            if message:
+                self.job.message = message
+            self.job.dirty = True
+        self._persist_now()
+
     def fail(self, error: str) -> None:
         with self.job.lock:
             self.job.status = "failed"

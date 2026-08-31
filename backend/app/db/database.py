@@ -59,6 +59,13 @@ _TIER_PARSED = ("transactions", "statements", "holdings",
 #: statement the user no longer has a copy of is unrecoverable.
 _TIER_FILES = ("source_files",)
 
+#: The staging area. Deliberately NOT part of `parsed_data`: clearing the
+#: parsed ledger is how someone asks for a rebuild, and a rebuild needs the
+#: staged set to rebuild FROM. Wiping both would turn "recompute this" into
+#: "download and re-parse everything", which is minutes of work and a fresh
+#: dependence on Gmail still having the mail.
+_TIER_STAGING = ("staged_files",)
+
 #: Bought with real money. Never cleared as a side effect of anything else.
 _TIER_AI = ("ai_inferences", "merchant_categories")
 
@@ -77,7 +84,8 @@ _TIER_AI = ("ai_inferences", "merchant_categories")
 _TIER_DECISIONS = ("user_overrides", "claim_settlements", "transaction_splits",
                    "custom_categories", "recurring_series_overrides",
                    "claims", "split_rules", "settlement_group_legs",
-                   "settlement_groups", "dashboard_widgets", "dashboards")
+                   "settlement_groups", "dashboard_widgets", "dashboards",
+                   "app_settings")
 
 _TIER_IDENTITY = ("user_profile",)
 
@@ -88,10 +96,20 @@ _TIER_IDENTITY = ("user_profile",)
 CLEAR_SCOPES: dict[str, tuple[str, ...]] = {
     "derived": _TIER_DERIVED,
     "parsed_data": _TIER_DERIVED + _TIER_PARSED,
-    "files": _TIER_DERIVED + _TIER_PARSED + _TIER_FILES,
+    "files": _TIER_DERIVED + _TIER_PARSED + _TIER_STAGING + _TIER_FILES,
+    # Its own scope, because it is the one thing a rebuild cannot do without.
+    "staged_imports": _TIER_STAGING,
+    # What Process data replaces. Everything derived from documents, and
+    # nothing else - notably NOT `jobs`, which "parsed_data" includes as
+    # operational log. A rebuild runs INSIDE a job, so clearing that scope
+    # deleted the row of the job doing the clearing: it then ran to completion
+    # against a row that no longer existed, and the screen watching it waited
+    # forever for a status that was never going to be written.
+    "rebuild": ("transfer_pairs", "recurring_series", "analysis_runs")
+               + _TIER_PARSED,
     "ai_inferences": _TIER_AI,
     "decisions": _TIER_DECISIONS,
-    "everything": (_TIER_DERIVED + _TIER_PARSED + _TIER_FILES
+    "everything": (_TIER_DERIVED + _TIER_PARSED + _TIER_STAGING + _TIER_FILES
                    + _TIER_AI + _TIER_DECISIONS + _TIER_IDENTITY),
 }
 
@@ -588,6 +606,81 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_started ON jobs(started_at DESC);
 
+
+-- ---------------------------------------------------------------------------
+-- Application settings: a handful of switches the user owns.
+--
+-- Key/value rather than columns, because these are preferences rather than
+-- data: a new switch should not need a migration. Kept in the database and not
+-- in localStorage because they change what the SERVER does - whether a model
+-- is called and money is spent - so the browser cannot be the authority.
+-- ---------------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------------
+-- The staging area.
+--
+-- Everything a scan or an upload produces lands here FIRST, and nothing else
+-- in this schema reads it. That is the whole point: parsing a file used to be
+-- the same act as counting it, so a bad parse was already inside every total
+-- by the time anyone saw it. Now parsing fills this table, the ledger is built
+-- from it only when someone presses Process data, and what gets built is
+-- exactly the set of rows ticked here.
+--
+-- Identity is the file's content hash, so re-scanning a mailbox recognises
+-- what it has already read and re-parses nothing. A statement that is deleted
+-- and re-downloaded is the same entry, with the same selection.
+--
+-- `payload` holds the parse result verbatim. Storing it means Process data
+-- never re-reads a PDF, and the Review screen can summarise a file without
+-- deserialising anything - the summary columns beside it are enough.
+CREATE TABLE IF NOT EXISTS staged_files (
+    id            TEXT PRIMARY KEY,
+    file_hash     TEXT NOT NULL UNIQUE,
+    filename      TEXT NOT NULL,
+    origin        TEXT NOT NULL DEFAULT 'gmail',
+    -- Which scan turned this up, as opposed to what reading it revealed.
+    -- `kind` is the answer ('this is a portfolio'); `scan_intent` is the
+    -- question ('found while looking for investments'). The wizard needs
+    -- the question, because Choose and Parse show you what each scan
+    -- brought back - before anything has been read and can say what it is.
+    scan_intent   TEXT NOT NULL DEFAULT '',
+    kind          TEXT NOT NULL DEFAULT 'statement',
+    path          TEXT,
+    message_id    TEXT,
+    sender        TEXT NOT NULL DEFAULT '',
+    subject       TEXT NOT NULL DEFAULT '',
+    selected      INTEGER NOT NULL DEFAULT 1,
+    -- The staged statement that makes this entry redundant. Set on alerts once
+    -- a statement covering the same account and date arrives; such a row is
+    -- shown struck through rather than deleted, so the supersession is visible
+    -- rather than something that silently happened.
+    superseded_by TEXT REFERENCES staged_files(id) ON DELETE SET NULL,
+    parse_status  TEXT NOT NULL DEFAULT 'pending',
+    parse_message TEXT NOT NULL DEFAULT '',
+    parsed_at     TEXT,
+    account_label TEXT NOT NULL DEFAULT '',
+    account_key   TEXT NOT NULL DEFAULT '',
+    account_type  TEXT NOT NULL DEFAULT '',
+    period_start  TEXT,
+    period_end    TEXT,
+    row_count     INTEGER NOT NULL DEFAULT 0,
+    debits        TEXT NOT NULL DEFAULT '0',
+    credits       TEXT NOT NULL DEFAULT '0',
+    recon_status  TEXT NOT NULL DEFAULT '',
+    warnings      TEXT NOT NULL DEFAULT '[]',
+    payload       TEXT NOT NULL DEFAULT '{}',
+    added_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_staged_kind ON staged_files(kind, selected);
+CREATE INDEX IF NOT EXISTS idx_staged_account ON staged_files(account_key);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- ---------------------------------------------------------------------------
 -- Credit bureau reports.
 --
@@ -765,6 +858,7 @@ class Database:
             ("accounts", (("current_balance", "TEXT"), ("product_name", "TEXT"),
                          ("balance_as_of", "TEXT"))),
             ("user_profile", (("excluded_senders", "TEXT NOT NULL DEFAULT '[]'"),)),
+            ("staged_files", (("scan_intent", "TEXT NOT NULL DEFAULT ''"),)),
             ("source_files", (("period_hint", "TEXT"),)),
             ("transactions", (
                 ("is_mirror_leg", "INTEGER NOT NULL DEFAULT 0"),
