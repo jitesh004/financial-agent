@@ -480,7 +480,6 @@ def test_a_single_file_merge_populates_data_quality(tmp_path, monkeypatch):
 
     original_db = db_module._db
     original_client = gmail_routes_module._require_client
-    original_cache = gmail_routes_module.CACHE
     try:
         db = fresh_ledger()
         db_module._db = db
@@ -509,7 +508,6 @@ def test_a_single_file_merge_populates_data_quality(tmp_path, monkeypatch):
     finally:
         db_module._db = original_db
         gmail_routes_module._require_client = original_client
-        gmail_routes_module.CACHE = original_cache
         main_module.runs.clear()
 
 

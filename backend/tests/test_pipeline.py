@@ -907,7 +907,6 @@ def test_fetch_one_month_finds_and_merges_the_right_statement(tmp_path, monkeypa
 
     original_db = db_module._db
     original_client = gmail_routes_module._require_client
-    original_cache = gmail_routes_module.CACHE
     try:
         db = fresh_ledger()
         db_module._db = db
@@ -940,7 +939,6 @@ def test_fetch_one_month_finds_and_merges_the_right_statement(tmp_path, monkeypa
     finally:
         db_module._db = original_db
         gmail_routes_module._require_client = original_client
-        gmail_routes_module.CACHE = original_cache
 
 
 def test_fetch_one_month_rejects_a_wrong_month_match(tmp_path, monkeypatch):
@@ -957,7 +955,6 @@ def test_fetch_one_month_rejects_a_wrong_month_match(tmp_path, monkeypatch):
 
     original_db = db_module._db
     original_client = gmail_routes_module._require_client
-    original_cache = gmail_routes_module.CACHE
     try:
         db = fresh_ledger()
         db_module._db = db
@@ -983,7 +980,6 @@ def test_fetch_one_month_rejects_a_wrong_month_match(tmp_path, monkeypatch):
     finally:
         db_module._db = original_db
         gmail_routes_module._require_client = original_client
-        gmail_routes_module.CACHE = original_cache
 
 
 def test_fail_path_resolves_to_existing_row_when_hash_already_seen(tmp_path):
