@@ -412,6 +412,46 @@ def test_one_users_gmail_grant_is_invisible_to_another(client):
     assert client.get("/api/gmail/status").json()["connected"] is False
 
 
+def test_the_gmail_client_reads_the_signed_in_users_stored_grant():
+    """No credentials.json, no token file, no per-user Google Cloud setup.
+
+    The importer is handed a token store that resolves to whoever is signed
+    in, so scanning and downloading run on that person's grant and nobody
+    else's. This is the whole of what replaced the desktop OAuth flow.
+    """
+    from app.api.gmail_routes import _client
+
+    db = get_db()
+    assert _client().is_authorized() is False       # nothing granted yet
+
+    store.save_google_token(db, TENANT.get(), '{"token": "mine"}',
+                            " ".join(google.GMAIL_SCOPES))
+    assert _client().is_authorized() is True
+
+    # And it is genuinely per user, not a shared file.
+    fresh_ledger()
+    assert _client().is_authorized() is False
+
+
+def test_the_gmail_client_refuses_to_run_a_consent_flow():
+    """`authorize()` must never block on a browser.
+
+    The old client ran a loopback consent flow on the machine executing the
+    code, which on a server means popping a screen nobody can see. With no
+    stored grant the answer is now simply False.
+    """
+    from app.api.gmail_routes import _client
+
+    assert _client().authorize(interactive=True) is False
+
+
+def test_an_unreadable_stored_grant_does_not_crash_the_import():
+    from app.api.gmail_routes import _client
+
+    store.save_google_token(get_db(), TENANT.get(), "not json at all", "")
+    assert _client().authorize() is False
+
+
 def test_disconnecting_gmail_forgets_the_grant(client, monkeypatch):
     monkeypatch.setattr(google, "revoke", lambda token: None)
     db = get_db()
