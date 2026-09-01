@@ -12,6 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from tests.support import fresh_ledger  # noqa: E402
 from app.analytics.engine import analyze
 from app.analytics.periods import (
     assign_accounting_months,
@@ -19,7 +20,6 @@ from app.analytics.periods import (
     _circular_distance,
 )
 from app.analytics.recurring import RecurringSeries
-from app.db.database import Database
 from app.db import repository as repo
 from app.models.schemas import (
     Account, AccountType, Category, ConfidenceSource,
@@ -88,10 +88,9 @@ def _accounts():
     }
 
 
-import tempfile
 
 def _db():
-    return Database(Path(tempfile.mkdtemp()) / "accounting.db")
+    return fresh_ledger()
 
 
 # ==========================================================================

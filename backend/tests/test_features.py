@@ -18,6 +18,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
+from tests.support import fresh_ledger  # noqa: E402
 from app.graph.build import build_graph  # noqa: E402
 from app.ingestion import router  # noqa: E402
 from app.ingestion.passwords import (MAX_CANDIDATES, derive_passwords,  # noqa: E402
@@ -334,7 +335,11 @@ def test_gmail_service_is_built_per_thread():
     import threading
     from app.ingestion.gmail_source import GoogleGmailClient
 
-    client = GoogleGmailClient(Path("nope.json"), Path("nope.json"))
+    class _NoToken:
+        def load(self): return None
+        def save(self, token_json): pass
+
+    client = GoogleGmailClient(_NoToken())
     client._creds = object()
 
     seen: list[int] = []
@@ -651,14 +656,13 @@ def test_saving_the_profile_form_does_not_wipe_excluded_senders(tmp_path):
     every family and firm statement on the next scan.
     """
     from app.db import database as db_module
-    from app.db.database import Database
     from app.db import repository as repo
     from app.models.profile import UserProfile
     from fastapi.testclient import TestClient
     import app.main as main_module
 
     original_db = db_module._db
-    db_module._db = Database(tmp_path / "profile_api.db")
+    db_module._db = fresh_ledger()
     try:
         repo.save_profile(db_module._db, UserProfile(
             full_name="Old Name", excluded_senders=["rbl.bank", "estatements@indusind.com"],
@@ -680,11 +684,10 @@ def test_saving_the_profile_form_does_not_wipe_excluded_senders(tmp_path):
 
 def test_exclusions_round_trip_through_the_database(tmp_path):
     """The ignore list must survive a restart, alongside custom passwords."""
-    from app.db.database import Database
     from app.db import repository as repo
     from app.models.profile import UserProfile
 
-    db = Database(tmp_path / "t.db")
+    db = fresh_ledger()
     repo.save_profile(db, UserProfile(
         full_name="Test User",
         custom_passwords=["secret1"],
@@ -1435,11 +1438,10 @@ def test_account_identity_falls_back_to_product_name_then_blank():
 def test_upsert_account_keeps_two_same_bank_cards_separate_by_product_name(tmp_path):
     """The repository-level mirror of the identity test above - this is what
     actually decides whether two Gmail statements merge in the database."""
-    from app.db.database import Database
     from app.db import repository as repo
     from app.models.schemas import Account, AccountType
 
-    db = Database(tmp_path / "variant.db")
+    db = fresh_ledger()
     rewards_id = repo.upsert_account(db, Account(
         institution="Axis Bank", account_type=AccountType.CREDIT_CARD,
         product_name="Rewards"))

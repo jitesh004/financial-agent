@@ -9,6 +9,7 @@ import Overview from './components/Overview';
 import Profile from './components/Profile';
 import Spending from './components/Spending';
 import { Callout, Empty, ThemeToggle } from './components/ui';
+import AccountMenu from './components/AccountMenu';
 import { api } from './lib';
 
 import WorkflowNav from './components/WorkflowNav';
@@ -140,7 +141,7 @@ function NavDrawer({ groups, tab, reviewCount, onPick, onClose }) {
   );
 }
 
-export default function App() {
+export default function App({ openImport = false, onImportOpened }) {
   const [data, setData] = useState(null);
   const [tab, setTab] = useState('overview');
   // The member last used in each group. Bouncing between Ledger and Spending
@@ -188,6 +189,16 @@ export default function App() {
   }, []);
 
   useEffect(() => { load(); }, [load]);
+
+  // The wizard's "Import statements" button finishes onboarding and asks the
+  // app to open the import flow, rather than leaving someone who just said
+  // "yes, bring my statements in" looking at an empty dashboard.
+  useEffect(() => {
+    if (openImport) {
+      setMailboxOpen(true);
+      onImportOpened?.();
+    }
+  }, [openImport, onImportOpened]);
 
   // One poller for the whole app. Held here rather than inside the modal
   // because the header button needs the same answer, and because an import
@@ -297,8 +308,11 @@ export default function App() {
 
 
         <MailboxButton mailbox={mailbox} onOpen={() => setMailboxOpen(true)} />
-        <button className="btn" onClick={() => setShowProfile(true)}>Profile</button>
         <ThemeToggle theme={theme} onToggle={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))} />
+        {/* Profile moved inside the account menu: it is one of several things
+            that belong to "you" rather than to the ledger, and a header with a
+            button for each of them stops fitting on a laptop. */}
+        <AccountMenu onProfile={() => setShowProfile(true)} />
 
       </header>
 
@@ -336,10 +350,10 @@ export default function App() {
               </button>
               <p style={{ color: 'var(--text-3)', fontSize: 13, marginTop: 16 }}>
                 Scan Gmail or add files from this computer — both start in the
-                same place. Password-protected PDFs open automatically once your
-                details are in{' '}
+                same place. Password-protected PDFs open automatically once{' '}
                 <button className="btn" style={{ padding: '2px 8px', fontSize: 12 }}
-                  onClick={() => setShowProfile(true)}>Profile</button>.
+                  onClick={() => setShowProfile(true)}>your details</button>{' '}
+                are filled in.
               </p>
             </div>
           </>

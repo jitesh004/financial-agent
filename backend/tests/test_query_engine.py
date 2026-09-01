@@ -18,7 +18,6 @@ refused rather than interpreted.
 from __future__ import annotations
 
 import sys
-import tempfile
 import uuid
 from datetime import date, timedelta
 from decimal import Decimal
@@ -29,6 +28,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
+from tests.support import fresh_ledger  # noqa: E402
 from app.analytics import query as q  # noqa: E402
 from app.api import dashboard_templates as templates  # noqa: E402
 from app.db import repository as repo  # noqa: E402
@@ -58,7 +58,7 @@ START = date(2026, 1, 1)
 
 
 def _seed() -> Database:
-    db = Database(Path(tempfile.mkdtemp()) / "query.db")
+    db = fresh_ledger()
     with db.connection() as conn:
         for account_id, institution, kind, masked, product in ACCOUNTS:
             conn.execute(

@@ -1,116 +1,90 @@
-"""Check whether Gmail import is set up correctly, and say what to fix.
+"""Check whether Google sign-in and Gmail import are set up, and say what to fix.
 
 Run:  .venv/Scripts/python backend/tools/check_gmail_setup.py
 
 Every failure mode here produces a specific instruction rather than a stack
-trace, because the Google Cloud setup has several steps that each fail in a
-way that looks identical from inside the app ("it just doesn't connect").
+trace, because the Google Cloud setup has several steps that each fail in a way
+that looks identical from inside the app ("it just doesn't connect").
+
+The single most common one now is the client TYPE. This used to want a
+*Desktop* client, because the old Gmail import ran a loopback consent flow on
+the user's own machine. It now wants a *Web application* client, because
+sign-in and the mailbox grant both happen as a redirect through the browser -
+and a Desktop client rejects the redirect URI with `invalid_request` and no
+useful explanation.
 """
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-CREDENTIALS = ROOT / "credentials.json"
-TOKEN = ROOT / "data" / "gmail_token.json"
+sys.path.insert(0, str(ROOT / "backend"))
+
+from app.config import config  # noqa: E402
 
 OK, WARN, BAD = "[ OK ]", "[WARN]", "[FAIL]"
 
 
 def main() -> int:
-    print(f"Looking for credentials at: {CREDENTIALS}\n")
+    print("Checking Google configuration\n")
+    problems = 0
 
-    if not CREDENTIALS.exists():
-        print(f"{BAD} credentials.json not found.")
-        print()
-        print("  This file comes from Google Cloud Console. It identifies THIS APP")
-        print("  to Google - it is not your password and contains no personal data.")
-        print()
-        print("  See the 'Connecting Gmail' section of the README for the steps.")
-        print(f"  Save the downloaded file to exactly: {CREDENTIALS}")
-        return 1
-
-    try:
-        data = json.loads(CREDENTIALS.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        print(f"{BAD} credentials.json is not valid JSON: {exc}")
-        print("  Re-download it from Google Cloud Console without editing it.")
-        return 1
-
-    # A Desktop OAuth client is stored under "installed". A Web client uses
-    # "web" and will fail at the redirect step with an opaque error, so it is
-    # worth catching here rather than at connect time.
-    if "installed" in data:
-        client = data["installed"]
-        print(f"{OK} Found a Desktop OAuth client (correct type).")
-    elif "web" in data:
-        client = data["web"]
-        print(f"{BAD} This is a WEB application client, not a Desktop client.")
-        print("  The local sign-in flow needs a Desktop client.")
-        print("  In Google Cloud Console create a new OAuth client and choose")
-        print("  application type 'Desktop app', then replace this file.")
-        return 1
-    elif "type" in data and data.get("type") == "service_account":
-        print(f"{BAD} This is a SERVICE ACCOUNT key, not an OAuth client.")
-        print("  A service account cannot read your personal Gmail. Create an")
-        print("  OAuth client ID with application type 'Desktop app' instead.")
-        return 1
+    if config.GOOGLE_CLIENT_ID:
+        print(f"{OK}  GOOGLE_CLIENT_ID is set")
+        if not config.GOOGLE_CLIENT_ID.endswith(".apps.googleusercontent.com"):
+            print(f"{WARN}  ...but it does not look like a Google client id. "
+                  f"They end in .apps.googleusercontent.com.")
     else:
-        print(f"{BAD} Unrecognised credentials file.")
-        print(f"  Top-level keys found: {sorted(data.keys())}")
-        print("  Expected a key named 'installed' (a Desktop OAuth client).")
-        return 1
+        problems += 1
+        print(f"{BAD}  GOOGLE_CLIENT_ID is not set")
 
-    missing = [k for k in ("client_id", "client_secret", "auth_uri", "token_uri")
-               if not client.get(k)]
-    if missing:
-        print(f"{BAD} The client is missing required fields: {', '.join(missing)}")
-        print("  Re-download the JSON from Google Cloud Console.")
-        return 1
-
-    client_id = client["client_id"]
-    print(f"{OK} client_id looks well-formed ({client_id[:14]}…{client_id[-14:]})")
-
-    if not client_id.endswith(".apps.googleusercontent.com"):
-        print(f"{WARN} client_id doesn't end in .apps.googleusercontent.com -")
-        print("       double-check you downloaded the right file.")
-
-    # Token state
-    print()
-    if TOKEN.exists():
-        try:
-            token = json.loads(TOKEN.read_text(encoding="utf-8"))
-            scopes = token.get("scopes", [])
-            print(f"{OK} Already connected. Token stored at {TOKEN}")
-            print(f"       Scopes granted: {', '.join(scopes) or '(none listed)'}")
-            if any("readonly" not in s for s in scopes):
-                print(f"{WARN} A non-read-only scope is present. Delete the token")
-                print("       and reconnect to reset it to read-only.")
-            print()
-            print("  Gmail import is ready. Open the app and use 'Scan for statements'.")
-            print(f"  To disconnect: delete {TOKEN}")
-        except json.JSONDecodeError:
-            print(f"{WARN} Token file exists but is unreadable. Delete it and reconnect:")
-            print(f"       {TOKEN}")
+    if config.GOOGLE_CLIENT_SECRET:
+        print(f"{OK}  GOOGLE_CLIENT_SECRET is set")
     else:
-        print(f"{OK} Setup looks correct. Not connected yet.")
-        print()
-        print("  Next: start the app and click 'Connect Gmail'. A Google sign-in")
-        print("  page opens in your browser - approve it there. Nothing in this")
-        print("  app ever sees your Gmail password.")
-        print()
-        print("  If Google warns the app is unverified, that is expected: it is")
-        print("  your own private app. Choose Advanced -> Go to <app name>.")
+        problems += 1
+        print(f"{BAD}  GOOGLE_CLIENT_SECRET is not set")
 
-    # The Gmail API itself must be enabled on the project; that can only be
-    # confirmed by an actual call, so flag it as the usual next failure.
+    print(f"{OK}  Redirect URI: {config.oauth_redirect_uri}")
+    print("       This exact string must appear under 'Authorised redirect "
+          "URIs' on the OAuth client. Google matches it character for "
+          "character - a trailing slash or http vs https is a mismatch.")
+
+    if config.APP_BASE_URL.startswith("http://") \
+            and "localhost" not in config.APP_BASE_URL \
+            and "127.0.0.1" not in config.APP_BASE_URL:
+        problems += 1
+        print(f"{BAD}  FA_APP_BASE_URL is plain http on a non-local host. "
+              f"Google refuses non-https redirect URIs, and a session cookie "
+              f"for a financial app should never travel unencrypted.")
+
+    if config.APP_BASE_URL.startswith("https://") \
+            and not config.SESSION_COOKIE_SECURE:
+        print(f"{WARN}  The app is served over https but "
+              f"FA_SESSION_COOKIE_SECURE is off. Turn it on.")
+
+    if config.ALLOWED_SIGNINS:
+        print(f"{OK}  Sign-up is restricted to: "
+              f"{', '.join(config.ALLOWED_SIGNINS)}")
+    else:
+        print(f"{WARN}  Sign-up is open: anyone with a Google account can "
+              f"create an account here. Set FA_ALLOWED_SIGNINS to restrict it.")
+
     print()
-    print("  If connecting fails with 'Gmail API has not been used in project…',")
-    print("  enable the Gmail API for that project in the Google Cloud Console")
-    print("  API Library, wait a minute, then try again.")
+    if problems:
+        print(f"{problems} thing(s) to fix. In Google Cloud Console:")
+        print("  1. APIs & Services -> Library -> enable the Gmail API")
+        print("  2. OAuth consent screen -> External, add yourself as a test user")
+        print("  3. Credentials -> Create credentials -> OAuth client ID")
+        print("     Application type: WEB APPLICATION  <- not Desktop")
+        print(f"     Authorised redirect URI: {config.oauth_redirect_uri}")
+        print("  4. Put the client id and secret in .env as GOOGLE_CLIENT_ID "
+              "and GOOGLE_CLIENT_SECRET")
+        return 1
+
+    print("Configuration looks right. Open the app, sign in, and connect Gmail")
+    print("from the setup wizard or the import screen.")
     return 0
 
 

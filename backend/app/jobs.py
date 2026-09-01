@@ -11,9 +11,15 @@ worse than no bar, because it lies about whether anything is happening.
 The second rule, added once these jobs got long enough to outlive a browser
 session: **a job's state must survive the process that ran it.** In-memory
 progress is the fast path and stays authoritative while a job runs, but every
-job is mirrored to SQLite by a background flusher, so closing the UI and coming
-back - or restarting the API entirely - shows what actually happened rather
-than a 404. See `_Flusher`.
+job is mirrored to PostgreSQL by a background flusher, so closing the UI and
+coming back - or restarting the API entirely - shows what actually happened
+rather than a 404. See `_Flusher`.
+
+Every job now belongs to somebody. A job carries the id of the user who
+started it, captured at creation, because the flusher writes from its own
+timer thread long after the request that started the work has ended - and a
+write with no tenant bound would be refused by the row-level security policy
+rather than landing in the wrong account. See `Job.owner`.
 
 Writes are batched rather than synchronous. A four-hundred-file download calls
 `item()` four hundred times; committing each one would turn a progress report
@@ -31,7 +37,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-#: How often the flusher mirrors in-memory jobs to SQLite.
+#: How often the flusher mirrors in-memory jobs to the database.
 FLUSH_INTERVAL_SECONDS = 0.75
 
 #: Statuses that mean the job is no longer doing anything.
@@ -75,6 +81,12 @@ class Job:
     #: resumed - without it, all a restart can report is that something was
     #: running once.
     request: Any = None
+
+    #: The user this job belongs to, captured when it is created. The flusher
+    #: runs on a timer thread with no request context of its own, so it binds
+    #: this before writing; without it the write would be scoped to no tenant
+    #: and silently persist nothing.
+    owner: str | None = None
 
     #: The store that created this job, so finishing it can persist through
     #: the same one. Reaching for the module-level registry instead would be
@@ -255,10 +267,12 @@ class JobStore:
             ]
             pending_count = len(job.items)
 
-        # Written outside the job lock: a slow disk must not stall the worker
-        # thread that is trying to report its next item.
+        # Written outside the job lock: a slow write must not stall the
+        # worker thread that is trying to report its next item.
         from .db import repository as repo
-        repo.save_job(self._db(), header, new_items)
+        from .db.engine import tenant_scope
+        with tenant_scope(job.owner):
+            repo.save_job(self._db(), header, new_items)
 
         with job.lock:
             job.persisted_items = pending_count
@@ -275,26 +289,37 @@ class JobStore:
                           if job_id in self._jobs]
         return sum(1 for job in candidates if self.flush_job(job))
 
-    def recover(self) -> int:
+    def recover(self, owner: str | None = None) -> int:
         """Mark jobs left running by a dead process as interrupted.
 
-        Called once at startup. Returns how many were adjusted.
+        Called once per account at startup - `owner` names which one, because
+        the rows are behind row-level security and there is deliberately no
+        connection that can see every user's jobs at once. Returns how many
+        were adjusted.
         """
         if not self.persist:
             return 0
         from .db import repository as repo
+        from .db.engine import current_tenant, tenant_scope
         db = self._db()
-        count = repo.mark_unfinished_jobs_interrupted(db)
-        repo.prune_jobs(db)
+        with tenant_scope(owner or current_tenant()):
+            count = repo.mark_unfinished_jobs_interrupted(db)
+            repo.prune_jobs(db)
 
         # Memory has to agree with what was just written. At startup this is a
         # no-op because nothing is in memory yet, but leaving it out means the
-        # two disagree whenever recovery runs in a live process: SQLite says
-        # interrupted while `active()` still reports the job as running, so
-        # anything asking "is work happening?" gets the wrong answer.
+        # two disagree whenever recovery runs in a live process: the database
+        # says interrupted while `active()` still reports the job as running,
+        # so anything asking "is work happening?" gets the wrong answer.
+        #
+        # Only this owner's jobs: recovery is now called once per account, and
+        # sweeping every live job on each pass would have the first account's
+        # recovery cancel work the second account is in the middle of.
+        scope = owner or current_tenant()
         with self._lock:
             live = [self._jobs[job_id] for job_id in self._order
-                    if job_id in self._jobs]
+                    if job_id in self._jobs
+                    and (scope is None or self._jobs[job_id].owner == scope)]
         for job in live:
             with job.lock:
                 if job.status in ("queued", "running"):
@@ -310,9 +335,14 @@ class JobStore:
     # ---- registry ----------------------------------------------------------
 
     def create(self, kind: str, total: int = 0, phase: str = "",
-               request: Any = None) -> Job:
+               request: Any = None, owner: str | None = None) -> Job:
+        from .db.engine import current_tenant
         job = Job(id=str(uuid.uuid4()), kind=kind, total=total, phase=phase,
-                  request=request, store=self)
+                  request=request, store=self,
+                  # Captured here, in the request that asked for the work,
+                  # because by the time the flusher writes the row there is no
+                  # request left to ask.
+                  owner=owner or current_tenant())
         with self._lock:
             self._jobs[job.id] = job
             self._order.append(job.id)
@@ -334,7 +364,10 @@ class JobStore:
 
         This is what makes a job id outlive both the eviction cap and the
         process: the poller keeps working after a restart instead of getting a
-        404 for work that demonstrably happened.
+        404 for work that demonstrably happened. The stored read needs no
+        tenant of its own - it happens inside the polling request, which
+        already has one, and the policy is what stops it returning somebody
+        else's job.
         """
         job = self.get(job_id)
         if job is not None:

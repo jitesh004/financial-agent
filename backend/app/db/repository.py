@@ -1,7 +1,13 @@
-"""Read/write the domain model to SQLite.
+"""Read/write the domain model to PostgreSQL.
 
 Conversion between Decimal and TEXT happens exclusively here, so no other
 module has to remember that money is stored as a string.
+
+Nothing in this module names a user. Which person's rows a call can see is
+decided by the row-level security policy on every table, from the tenant that
+`db/engine.py` binds to the connection - so a query written here cannot read
+across accounts even by mistake, and adding a new one does not mean
+remembering a WHERE clause.
 """
 
 from __future__ import annotations
@@ -9,12 +15,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Iterable, Sequence
+
+import psycopg
 
 from ..models.schemas import (Account, AccountType, Category, ConfidenceSource,
                               Direction, ReconciliationResult,
@@ -47,6 +54,17 @@ def _d(value: Any) -> date | None:
     return date.fromisoformat(str(value)[:10])
 
 
+def _row_dict(row) -> dict[str, Any]:
+    """A result row as a plain dict, without the tenancy column.
+
+    Every table carries `user_id`, but it is bookkeeping for the row-level
+    security policy rather than part of the domain - and a `SELECT *` that
+    passes straight into an API response should not be shipping a UUID nobody
+    asked for (the JSON encoder does not know what to do with one either).
+    """
+    return {k: v for k, v in zip(row.keys(), row) if k != "user_id"}
+
+
 def _new_id() -> str:
     return str(uuid.uuid4())
 
@@ -54,10 +72,9 @@ def _new_id() -> str:
 def _col(row, name: str, default: Any = None) -> Any:
     """Read a column that a given query may not have selected.
 
-    `sqlite3.Row` raises IndexError rather than returning None for an absent
-    key. Every caller here selects `*` against a migrated schema, so the
-    columns are present in practice - this keeps a partial SELECT, or a
-    database opened before its migration ran, from raising instead of simply
+    A result row raises KeyError rather than returning None for an absent
+    key. Every caller here selects `*`, so the columns are present in
+    practice - this keeps a partial SELECT from raising instead of simply
     falling back to the field default.
     """
     try:
@@ -232,13 +249,38 @@ def save_statement(
     recon = reconciliation or statement.reconciliation
 
     with db.connection() as conn:
+        # SQLite's INSERT OR REPLACE displaced a row colliding on ANY unique
+        # index, not just the primary key, and this table has two: the id and
+        # the content hash. ON CONFLICT can only name one of them, so the
+        # hash collision is resolved first and explicitly - re-ingesting a
+        # statement under a fresh id replaces the old one (and its rows, by
+        # cascade) rather than failing on the hash index.
+        if statement.file_hash:
+            conn.execute(
+                "DELETE FROM statements WHERE file_hash = ? AND id != ?",
+                (statement.file_hash, statement_id))
         conn.execute(
-            """INSERT OR REPLACE INTO statements
+            """INSERT INTO statements
                (id, account_id, source_filename, source_format, file_hash,
                 period_start, period_end, opening_balance, closing_balance,
                 extractor_used, recon_status, recon_discrepancy, recon_message,
                 parse_warnings, ingested_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT (user_id, id) DO UPDATE SET
+                   account_id        = excluded.account_id,
+                   source_filename   = excluded.source_filename,
+                   source_format     = excluded.source_format,
+                   file_hash         = excluded.file_hash,
+                   period_start      = excluded.period_start,
+                   period_end        = excluded.period_end,
+                   opening_balance   = excluded.opening_balance,
+                   closing_balance   = excluded.closing_balance,
+                   extractor_used    = excluded.extractor_used,
+                   recon_status      = excluded.recon_status,
+                   recon_discrepancy = excluded.recon_discrepancy,
+                   recon_message     = excluded.recon_message,
+                   parse_warnings    = excluded.parse_warnings,
+                   ingested_at       = excluded.ingested_at""",
             (statement_id, account_id, statement.source_filename,
              statement.source_format.value, statement.file_hash,
              statement.period_start.isoformat() if statement.period_start else None,
@@ -263,7 +305,7 @@ def get_statements(db: Database) -> list[dict[str, Any]]:
         ).fetchall()
     out = []
     for r in rows:
-        d = dict(r)
+        d = _row_dict(r)
         d["parse_warnings"] = json.loads(d.get("parse_warnings") or "[]")
         out.append(d)
     return out
@@ -280,6 +322,16 @@ _TXN_COLUMNS = (
     "is_mirror_leg, transfer_pair_id, recurring_series_id, reference, source_row, "
     "fingerprint, accounting_month, needs_review, review_reason, flow_role, "
     "excluded, note, source, superseded, category_rule, direction_reason"
+)
+
+#: The DO UPDATE half of the upsert, derived from the column list above so the
+#: two cannot drift. Re-saving a row the ledger already holds - the same parse
+#: run twice, a retry after a partial failure - overwrites it in place, which
+#: is what INSERT OR REPLACE did.
+_TXN_UPSERT = ", ".join(
+    f"{column} = excluded.{column}"
+    for column in (c.strip() for c in _TXN_COLUMNS.split(","))
+    if column != "id"
 )
 
 
@@ -305,37 +357,47 @@ def save_transactions(db: Database, transactions: Sequence[Transaction]) -> int:
         ))
 
     placeholders = ",".join(["?"] * len(_TXN_COLUMNS.split(",")))
-    stmt = f"INSERT OR REPLACE INTO transactions ({_TXN_COLUMNS}) VALUES ({placeholders})"
+    stmt = (f"INSERT INTO transactions ({_TXN_COLUMNS}) VALUES ({placeholders})"
+            f" ON CONFLICT (user_id, id) DO UPDATE SET {_TXN_UPSERT}")
     with db.connection() as conn:
         try:
-            conn.executemany(stmt, rows)
-        except sqlite3.IntegrityError:
-            # executemany gives no way to tell which of N rows was the
-            # offender - every previous fix for a FOREIGN KEY failure here
-            # (a dangling account_id, then a dangling statement_id) was found
-            # by guesswork against a bare error naming neither the row nor
-            # the column. Falling back to one row at a time trades speed
-            # (only taken on the rare row that actually violates something)
-            # for a diagnosis this specific, and for not losing the other
-            # 2000+ perfectly good rows in the same batch to one bad one.
-            known_accounts = {r["id"] for r in conn.execute("SELECT id FROM accounts")}
-            known_statements = {r["id"] for r in conn.execute("SELECT id FROM statements")}
-            saved = 0
-            for row, txn in zip(rows, transactions):
-                try:
+            # A SAVEPOINT of its own, so a batch that fails can be abandoned
+            # without abandoning the surrounding transaction. PostgreSQL - -
+            # unlike SQLite - refuses every further statement on a connection
+            # whose transaction has hit an error, so without this the recovery
+            # below could not run at all.
+            with conn.transaction():
+                conn.executemany(stmt, rows)
+            return len(rows)
+        except psycopg.IntegrityError:
+            pass
+
+        # executemany gives no way to tell which of N rows was the
+        # offender - every previous fix for a FOREIGN KEY failure here
+        # (a dangling account_id, then a dangling statement_id) was found
+        # by guesswork against a bare error naming neither the row nor
+        # the column. Falling back to one row at a time trades speed
+        # (only taken on the rare row that actually violates something)
+        # for a diagnosis this specific, and for not losing the other
+        # 2000+ perfectly good rows in the same batch to one bad one.
+        known_accounts = {r["id"] for r in conn.execute("SELECT id FROM accounts")}
+        known_statements = {r["id"] for r in conn.execute("SELECT id FROM statements")}
+        saved = 0
+        for row, txn in zip(rows, transactions):
+            try:
+                with conn.transaction():
                     conn.execute(stmt, row)
-                    saved += 1
-                except sqlite3.IntegrityError as exc:
-                    log.error(
-                        "dropping transaction %s (%s %r) - %s. account_id=%r "
-                        "(known=%s), statement_id=%r (known=%s)",
-                        txn.id, txn.txn_date, txn.raw_description[:60], exc,
-                        txn.account_id, txn.account_id in known_accounts,
-                        txn.statement_id, (txn.statement_id in known_statements
-                                          if txn.statement_id else "n/a - was None"),
-                    )
-            return saved
-    return len(rows)
+                saved += 1
+            except psycopg.IntegrityError as exc:
+                log.error(
+                    "dropping transaction %s (%s %r) - %s. account_id=%r "
+                    "(known=%s), statement_id=%r (known=%s)",
+                    txn.id, txn.txn_date, txn.raw_description[:60], exc,
+                    txn.account_id, txn.account_id in known_accounts,
+                    txn.statement_id, (txn.statement_id in known_statements
+                                      if txn.statement_id else "n/a - was None"),
+                )
+        return saved
 
 
 def update_transaction_categories(db: Database, transactions: Iterable[Transaction]) -> int:
@@ -522,7 +584,7 @@ def get_transfer_pair(db: Database, pair_id: str) -> dict[str, Any] | None:
         row = conn.execute(
             "SELECT * FROM transfer_pairs WHERE pair_id = ?",
             (pair_id,)).fetchone()
-    return dict(row) if row else None
+    return _row_dict(row) if row else None
 
 
 def count_transactions(
@@ -649,7 +711,7 @@ def save_merchant_categories(
             """INSERT INTO merchant_categories
                    (merchant_key, category, source, confidence, hit_count, updated_at)
                VALUES (?,?,?,?,1,datetime('now'))
-               ON CONFLICT(merchant_key) DO UPDATE SET
+               ON CONFLICT (user_id, merchant_key) DO UPDATE SET
                    category   = CASE WHEN merchant_categories.source = 'user'
                                      THEN merchant_categories.category
                                      ELSE excluded.category END,
@@ -683,9 +745,16 @@ def save_transfer_pairs(db: Database, pairs: Sequence[Any]) -> int:
     with db.connection() as conn:
         conn.execute("DELETE FROM transfer_pairs")
         conn.executemany(
-            """INSERT OR REPLACE INTO transfer_pairs
+            """INSERT INTO transfer_pairs
                (pair_id, debit_txn_id, credit_txn_id, amount, day_gap, kind, confidence)
-               VALUES (?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT (user_id, pair_id) DO UPDATE SET
+                   debit_txn_id  = excluded.debit_txn_id,
+                   credit_txn_id = excluded.credit_txn_id,
+                   amount        = excluded.amount,
+                   day_gap       = excluded.day_gap,
+                   kind          = excluded.kind,
+                   confidence    = excluded.confidence""",
             rows,
         )
     return len(rows)
@@ -768,7 +837,7 @@ def upsert_source_file(db: Database, record: SourceFileRecord) -> str:
                 institution_guess, account_type_guess, account_id, statement_id,
                 transaction_count, error_message, period_hint, last_attempted_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
-               ON CONFLICT(id) DO UPDATE SET
+               ON CONFLICT (user_id, id) DO UPDATE SET
                  filename=excluded.filename, filepath=excluded.filepath,
                  file_hash=excluded.file_hash, source=excluded.source,
                  sender=excluded.sender, message_id=excluded.message_id,
@@ -874,7 +943,7 @@ def save_profile(db: Database, profile) -> None:
                    (id, full_name, date_of_birth, pan, mobile, custom_passwords,
                     excluded_senders, updated_at)
                VALUES ('me', ?, ?, ?, ?, ?, ?, datetime('now'))
-               ON CONFLICT(id) DO UPDATE SET
+               ON CONFLICT (user_id, id) DO UPDATE SET
                    full_name = excluded.full_name,
                    date_of_birth = excluded.date_of_birth,
                    pan = excluded.pan,
@@ -914,7 +983,7 @@ def get_recurring_series(db: Database) -> list[dict[str, Any]]:
         ).fetchall()
     out = []
     for r in rows:
-        d = dict(r)
+        d = _row_dict(r)
         o_label = d.pop("o_label")
         o_category = d.pop("o_category")
         o_is_active = d.pop("o_is_active")
@@ -1020,7 +1089,7 @@ def save_override(db: Database, record: OverrideRecord) -> None:
             """INSERT INTO user_overrides
                    (fingerprint, account_key, txn_date, amount, direction, desc_hash)
                VALUES (?,?,?,?,?,?)
-               ON CONFLICT(fingerprint) DO UPDATE SET
+               ON CONFLICT (user_id, fingerprint) DO UPDATE SET
                    account_key = excluded.account_key,
                    txn_date    = excluded.txn_date,
                    amount      = excluded.amount,
@@ -1111,7 +1180,7 @@ def save_analysis_run(db: Database, run_id: str, status: str, file_count: int,
         conn.execute(
             """INSERT INTO analysis_runs (id, status, file_count, summary_json, error)
                VALUES (?,?,?,?,?)
-               ON CONFLICT(id) DO UPDATE SET
+               ON CONFLICT (user_id, id) DO UPDATE SET
                    status       = excluded.status,
                    file_count   = excluded.file_count,
                    summary_json = COALESCE(excluded.summary_json, analysis_runs.summary_json),
@@ -1128,7 +1197,7 @@ def get_latest_analysis_run(db: Database) -> tuple[str, dict] | None:
         row = conn.execute(
             """SELECT id, summary_json FROM analysis_runs
                 WHERE status = 'complete' AND summary_json IS NOT NULL
-                ORDER BY created_at DESC, rowid DESC LIMIT 1"""
+                ORDER BY created_at DESC, seq DESC LIMIT 1"""
         ).fetchone()
     if not row:
         return None
@@ -1161,7 +1230,7 @@ def prune_analysis_runs(db: Database, keep: int = 20) -> int:
         cur = conn.execute(
             """DELETE FROM analysis_runs WHERE id NOT IN (
                    SELECT id FROM analysis_runs
-                    ORDER BY created_at DESC, rowid DESC LIMIT ?)""",
+                    ORDER BY created_at DESC, seq DESC LIMIT ?)""",
             (keep,),
         )
         return cur.rowcount
@@ -1185,11 +1254,13 @@ def save_settlement_groups(db, groups: list, legs: list) -> None:
 def get_custom_categories(db) -> list[dict]:
     with db.connection() as conn:
         rows = conn.execute("SELECT * FROM custom_categories ORDER BY name ASC").fetchall()
-    return [dict(r) for r in rows]
+    return [_row_dict(r) for r in rows]
 
 def add_custom_category(db, name: str, color: str = "#6b7280", icon: str = "Tag") -> None:
     with db.connection() as conn:
-        conn.execute("INSERT OR IGNORE INTO custom_categories (name, color, icon) VALUES (?, ?, ?)", (name.strip().lower(), color, icon))
+        conn.execute("INSERT INTO custom_categories (name, color, icon)"
+                     " VALUES (?, ?, ?) ON CONFLICT (user_id, name) DO NOTHING",
+                     (name.strip().lower(), color, icon))
 
 def delete_custom_category(db, name: str) -> None:
     with db.connection() as conn:
@@ -1197,7 +1268,8 @@ def delete_custom_category(db, name: str) -> None:
 
 def update_recurring_series_override(db, series_id: str, payload: dict) -> None:
     with db.connection() as conn:
-        conn.execute("INSERT OR IGNORE INTO recurring_series_overrides (series_id) VALUES (?)", (series_id,))
+        conn.execute("INSERT INTO recurring_series_overrides (series_id) VALUES (?)"
+                     " ON CONFLICT (user_id, series_id) DO NOTHING", (series_id,))
         updates = []
         params = []
         for k, v in payload.items():
@@ -1222,7 +1294,7 @@ def get_claim(db, claim_id: str) -> dict:
     with db.connection() as conn:
         r = conn.execute("SELECT * FROM claims WHERE id = ?", (claim_id,)).fetchone()
         if not r: return None
-        d = dict(r)
+        d = _row_dict(r)
         d['amount'] = _dec(d['amount'])
         d['settled_amount'] = _dec(d['settled_amount'])
         return d
@@ -1286,7 +1358,7 @@ def get_claim_settlements(db, claim_id: str) -> list:
         rows = conn.execute("SELECT * FROM claim_settlements WHERE claim_id = ?", (claim_id,)).fetchall()
         out = []
         for r in rows:
-            d = dict(r)
+            d = _row_dict(r)
             if 'amount' in d: d['amount'] = _dec(d['amount'])
             if 'settled_amount' in d: d['settled_amount'] = _dec(d['settled_amount'])
             out.append(d)
@@ -1300,7 +1372,7 @@ def get_claims(db, status: str = None) -> list:
             rows = conn.execute("SELECT * FROM claims").fetchall()
         out = []
         for r in rows:
-            d = dict(r)
+            d = _row_dict(r)
             if 'amount' in d: d['amount'] = _dec(d['amount'])
             if 'settled_amount' in d: d['settled_amount'] = _dec(d['settled_amount'])
             out.append(d)
@@ -1375,7 +1447,7 @@ def get_splits(db, parent_fingerprint: str) -> list:
         rows = conn.execute("SELECT * FROM transaction_splits WHERE parent_fingerprint = ?", (parent_fingerprint,)).fetchall()
         out = []
         for r in rows:
-            d = dict(r)
+            d = _row_dict(r)
             if 'amount' in d: d['amount'] = _dec(d['amount'])
             if 'settled_amount' in d: d['settled_amount'] = _dec(d['settled_amount'])
             out.append(d)
@@ -1397,7 +1469,7 @@ def get_all_splits(db) -> dict[str, list[dict]]:
         ).fetchall()
     out: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
-        d = dict(r)
+        d = _row_dict(r)
         d["amount"] = _dec(d["amount"])
         out[d["parent_fingerprint"]].append(d)
     return dict(out)
@@ -1480,7 +1552,7 @@ def save_ai_inference(db, fingerprint: str, result: dict) -> None:
         conn.execute(
             "INSERT INTO ai_inferences (cache_key, kind, input_hash, result_json)"
             " VALUES (?, ?, ?, ?)"
-            " ON CONFLICT(cache_key) DO UPDATE SET"
+            " ON CONFLICT (user_id, cache_key) DO UPDATE SET"
             "   result_json = excluded.result_json,"
             "   hit_count = ai_inferences.hit_count + 1",
             (_identity_key(fingerprint), _IDENTITY_KIND, fingerprint,
@@ -1795,7 +1867,7 @@ def save_job(db: Database, header: dict[str, Any],
             " total, message, started_at, finished_at, result_json,"
             " request_json, errors_json, warnings_json, updated_at)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))"
-            " ON CONFLICT(id) DO UPDATE SET"
+            " ON CONFLICT (user_id, id) DO UPDATE SET"
             "   kind = excluded.kind, status = excluded.status,"
             "   phase = excluded.phase, current = excluded.current,"
             "   total = excluded.total, message = excluded.message,"
@@ -1814,8 +1886,12 @@ def save_job(db: Database, header: dict[str, Any],
         )
         if items:
             conn.executemany(
-                "INSERT OR REPLACE INTO job_items (job_id, seq, name, key,"
-                " status, detail, cached) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO job_items (job_id, seq, name, key,"
+                " status, detail, cached) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (user_id, job_id, seq) DO UPDATE SET"
+                "   name = excluded.name, key = excluded.key,"
+                "   status = excluded.status, detail = excluded.detail,"
+                "   cached = excluded.cached",
                 [(header["id"], item["seq"], item["name"], item.get("key", ""),
                   item["status"], item.get("detail", ""),
                   1 if item.get("cached") else 0)
@@ -2133,7 +2209,7 @@ def save_portfolio_statement(db: Database, statement: Any, account_id: str | Non
                 "INSERT INTO holdings (id, statement_id, account_id, isin,"
                 " symbol, instrument, kind, folio, units, avg_cost, nav, value,"
                 " invested, as_of) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT(account_id, isin, folio, as_of) DO UPDATE SET"
+                " ON CONFLICT (user_id, account_id, isin, folio, as_of) DO UPDATE SET"
                 "   statement_id = excluded.statement_id,"
                 "   units = excluded.units, nav = excluded.nav,"
                 "   value = excluded.value, avg_cost = excluded.avg_cost,"
@@ -2183,7 +2259,7 @@ def get_portfolio_statements(db: Database) -> list[dict[str, Any]]:
     with db.connection() as conn:
         rows = conn.execute(
             "SELECT * FROM portfolio_statements ORDER BY as_of DESC").fetchall()
-    return [dict(r) for r in rows]
+    return [_row_dict(r) for r in rows]
 
 
 # --------------------------------------------------------------------------
@@ -2232,7 +2308,7 @@ def save_settings(db: Database, values: dict[str, Any]) -> dict[str, Any]:
             conn.execute(
                 "INSERT INTO app_settings (key, value, updated_at)"
                 " VALUES (?, ?, datetime('now'))"
-                " ON CONFLICT(key) DO UPDATE SET value = excluded.value,"
+                " ON CONFLICT (user_id, key) DO UPDATE SET value = excluded.value,"
                 "   updated_at = datetime('now')",
                 (key, stored))
     return get_settings(db)

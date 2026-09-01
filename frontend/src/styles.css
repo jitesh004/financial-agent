@@ -826,3 +826,200 @@ select option {
 .xp-modal.mailbox { width: min(1180px, 100%); }
 .xp-modal.mailbox .xp-modal-body { display: flex; flex-direction: column; gap: 12px; }
 .xp-modal.mailbox .card { border: none; padding: 0; background: transparent; }
+
+
+/* ===================================================================
+   Signing in, and first-run setup
+
+   Both are full-page and both sit outside the app shell, so they set their
+   own centred layout rather than inheriting .main's. Every measure here is
+   in one place because these two screens are the only ones a person sees
+   before they have any reason to trust the software.
+   =================================================================== */
+
+/* The half-second before the session answers. A spinner and nothing else:
+   guessing at which screen comes next and being wrong is a visible flash of
+   the sign-in page for someone who is already signed in. */
+.boot {
+  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  background: var(--bg);
+}
+
+.signin, .onboarding {
+  min-height: 100vh; background: var(--bg); color: var(--text);
+  display: flex; align-items: center; justify-content: center;
+  padding: 32px 16px;
+}
+
+.signin-panel {
+  width: min(460px, 100%); text-align: center;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 14px; box-shadow: var(--shadow); padding: 36px 32px 28px;
+}
+
+.signin-brand {
+  display: inline-flex; align-items: center; gap: 9px;
+  font-size: 17px; font-weight: 640; letter-spacing: -.2px;
+  color: var(--text); margin-bottom: 22px;
+}
+
+.signin-panel h1 {
+  font-size: 21px; font-weight: 660; letter-spacing: -.5px;
+  line-height: 1.3; margin: 0 0 10px;
+}
+.signin-lead {
+  font-size: 13.5px; line-height: 1.6; color: var(--text-2); margin: 0 0 22px;
+}
+.signin-error { text-align: left; margin-bottom: 16px; }
+
+/* Google's own guidance is that the mark sits left of the label on a button
+   wide enough to read comfortably. */
+.signin-google {
+  width: 100%; justify-content: center; gap: 10px;
+  display: inline-flex; align-items: center;
+  font-size: 14px; padding: 10px 18px;
+}
+.signin-google svg { flex: none; }
+
+.signin-scope {
+  font-size: 12px; line-height: 1.55; color: var(--text-3); margin: 12px 0 0;
+}
+
+.signin-points {
+  list-style: none; margin: 24px 0 0; padding: 20px 0 0;
+  border-top: 1px solid var(--border);
+  text-align: left; display: grid; gap: 12px;
+}
+.signin-points li { font-size: 12.5px; line-height: 1.55; color: var(--text-2); }
+.signin-points strong { color: var(--text); font-weight: 600; }
+
+/* ---------- The wizard ---------- */
+
+.onboarding-panel {
+  width: min(640px, 100%);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 14px; box-shadow: var(--shadow); padding: 28px 30px 26px;
+}
+
+.onboarding-head { display: flex; align-items: flex-start; gap: 16px; }
+.onboarding-head h1 {
+  font-size: 19px; font-weight: 650; letter-spacing: -.4px; margin: 0 0 5px;
+}
+.onboarding-head p {
+  font-size: 13px; line-height: 1.55; color: var(--text-2); margin: 0;
+}
+/* Present from the first screen, not revealed at the end. Someone who wants
+   to get straight to their data should be able to see that they can. */
+.onboarding-skip { flex: none; font-size: 12px; }
+
+.onboarding-steps {
+  list-style: none; display: flex; gap: 6px; flex-wrap: wrap;
+  margin: 22px 0; padding: 0 0 18px; border-bottom: 1px solid var(--border);
+}
+.onboarding-steps button {
+  appearance: none; cursor: pointer; font-family: inherit;
+  display: inline-flex; align-items: center; gap: 8px;
+  background: transparent; border: none; padding: 6px 10px 6px 6px;
+  border-radius: 999px; font-size: 12.5px; font-weight: 550;
+  color: var(--text-3);
+}
+.onboarding-steps button:hover { color: var(--text-2); }
+.onboarding-steps .current button { color: var(--text); }
+.onboarding-steps .done button { color: var(--text-2); }
+
+.onboarding-dot {
+  width: 20px; height: 20px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 650;
+  background: var(--surface-2); border: 1px solid var(--border-strong);
+  color: var(--text-3);
+}
+.onboarding-steps .current .onboarding-dot {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.onboarding-steps .done .onboarding-dot {
+  background: var(--positive-soft); border-color: transparent;
+  color: var(--positive);
+}
+
+.onboarding-step h2 {
+  font-size: 15px; font-weight: 640; letter-spacing: -.2px; margin: 0 0 8px;
+}
+.onboarding-lead {
+  font-size: 13px; line-height: 1.6; color: var(--text-2); margin: 0 0 14px;
+}
+.onboarding-lead code, .onboarding-points code {
+  font-family: var(--mono); font-size: 12px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 4px; padding: 1px 5px;
+}
+
+.onboarding-points {
+  list-style: none; margin: 0; padding: 0; display: grid; gap: 10px;
+}
+.onboarding-points li {
+  font-size: 12.5px; line-height: 1.55; color: var(--text-2);
+  padding-left: 16px; position: relative;
+}
+.onboarding-points li::before {
+  content: ''; position: absolute; left: 0; top: 7px;
+  width: 5px; height: 5px; border-radius: 50%; background: var(--border-strong);
+}
+.onboarding-points strong { color: var(--text); font-weight: 600; }
+
+.field { display: grid; gap: 5px; }
+.field > span { font-size: 12px; font-weight: 550; color: var(--text-2); }
+
+.onboarding-actions {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--border);
+}
+
+@media (max-width: 560px) {
+  .signin-panel, .onboarding-panel { padding: 26px 20px 22px; }
+  .onboarding-head { flex-direction: column; gap: 10px; }
+}
+
+
+/* ===================================================================
+   The account menu
+   =================================================================== */
+
+.account { position: relative; flex: none; }
+
+.account-button {
+  appearance: none; cursor: pointer; padding: 0; overflow: hidden;
+  width: 30px; height: 30px; border-radius: 50%;
+  border: 1px solid var(--border-strong); background: var(--surface-2);
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.account-button:hover { border-color: var(--accent); }
+.account-button img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.account-initials {
+  font-size: 11px; font-weight: 650; color: var(--text-2); letter-spacing: .2px;
+}
+
+.account-menu {
+  position: absolute; right: 0; top: calc(100% + 8px); z-index: 60;
+  min-width: 220px; padding: 6px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  display: grid; gap: 1px;
+}
+.account-who { padding: 8px 10px 10px; }
+.account-name { font-size: 13px; font-weight: 600; }
+.account-email {
+  font-size: 12px; color: var(--text-3);
+  /* A long Workspace address must not widen the menu off the screen edge. */
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.account-menu button {
+  appearance: none; cursor: pointer; font-family: inherit; text-align: left;
+  background: transparent; border: none; border-radius: var(--radius-sm);
+  padding: 8px 10px; font-size: 12.5px; color: var(--text-2);
+}
+.account-menu button:hover:not(:disabled) {
+  background: var(--surface-2); color: var(--text);
+}
+.account-menu button:disabled { opacity: .5; cursor: not-allowed; }
+.account-rule { height: 1px; background: var(--border); margin: 5px 0; }

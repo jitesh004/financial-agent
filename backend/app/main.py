@@ -4,8 +4,12 @@ Analysis runs in a background thread rather than blocking the upload request:
 parsing a decade of statements takes minutes, and an HTTP request that hangs
 that long dies to a proxy timeout. The frontend polls /api/runs/{id} instead.
 
-Results are held in memory for the active session AND persisted to SQLite, so
-a restart doesn't lose the ledger.
+Results are held in memory for the active session AND persisted to PostgreSQL,
+so a restart doesn't lose the ledger.
+
+Every /api route except health and the sign-in endpoints requires a session,
+and which user's rows a request can reach is decided by the database rather
+than by this file - see auth/session.py and db/engine.py.
 """
 
 from __future__ import annotations
@@ -27,9 +31,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from . import storage
-from .api import (files_routes, gmail_routes, job_routes, query_routes,
-                  rules_routes, settings_routes, staging_routes,
+from .api import (auth_routes, files_routes, gmail_routes, job_routes,
+                  query_routes, rules_routes, settings_routes, staging_routes,
                   wealth_routes)
+from .auth.session import AuthContextMiddleware
 from .api import serializers as ser
 from .db.database import get_db
 from .db import repository as repo
@@ -76,7 +81,13 @@ async def lifespan(_: FastAPI):
     resume it and pretending nothing was lost.
     """
     try:
-        stopped = jobs.recover()
+        # Once per account. `jobs` are per-user rows behind row-level
+        # security, so there is no connection that can see all of them at
+        # once - which is the point. Sweeping the user list is how a
+        # cross-tenant maintenance pass is done here, deliberately one tenant
+        # at a time rather than by handing anything a key to the whole table.
+        db = get_db()
+        stopped = sum(jobs.recover(owner) for owner in db.known_tenants())
         if stopped:
             log.info("marked %d job(s) interrupted from a previous run", stopped)
     except Exception:  # bookkeeping must never block startup
@@ -103,6 +114,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Added after CORS so it runs inside it: a 401 still needs the CORS headers,
+# or the browser reports an opaque network error instead of "sign in".
+app.add_middleware(AuthContextMiddleware)
+
+app.include_router(auth_routes.router)
+app.include_router(auth_routes.onboarding_router)
 app.include_router(gmail_routes.router)
 app.include_router(files_routes.router)
 app.include_router(files_routes.coverage_router)
@@ -1156,22 +1173,17 @@ def restore_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.delete("/api/data/snapshots/{name}")
 def delete_snapshot(name: str) -> dict[str, Any]:
-    """Delete a specific snapshot file."""
-    db = get_db()
-    backups = db.path.parent / "backups"
-    target = backups / name
-    
-    # Path traversal protection - ensure it's in the backups dir
+    """Delete one of the signed-in user's snapshots.
+
+    The name arrives from an HTTP request, so `Database.delete_snapshot`
+    resolves it against that user's own snapshot directory and refuses
+    anything that lands outside - which now also means one user cannot delete
+    another's backups by guessing at a path.
+    """
     try:
-        if not target.resolve().is_relative_to(backups.resolve()):
-            raise HTTPException(400, "Invalid snapshot name")
-    except ValueError:
-        pass # python < 3.9 might not have is_relative_to, but 3.12 does
-        
-    if not target.exists():
-        raise HTTPException(404, "Snapshot not found")
-        
-    target.unlink()
+        get_db().delete_snapshot(name)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
     return {"status": "deleted"}
 
 
@@ -1364,11 +1376,14 @@ def _llm_status() -> tuple[str, bool]:
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    import os
     db = get_db()
     return {
         "status": "ok",
-        "database": str(db.path),
+        "database": "postgresql",
+        # Zero when nobody is signed in: this endpoint is public so a load
+        # balancer can probe it, and with no tenant bound the row-level
+        # security policy matches nothing - which is the correct answer to
+        # "how many transactions can this caller see".
         "transactions_stored": repo.count_transactions(db),
         # Reports the provider actually in use. This checked
         # ANTHROPIC_API_KEY, which nothing reads any more, so health said

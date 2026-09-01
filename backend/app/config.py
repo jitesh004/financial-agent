@@ -31,7 +31,73 @@ def _env(*names: str, default: str | None = None) -> str | None:
     return default
 
 
+def _flag(*names: str, default: bool = False) -> bool:
+    raw = _env(*names, default='true' if default else 'false')
+    return (raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
 class Config:
+    # ---- storage ---------------------------------------------------------
+
+    #: Where statement files, caches and per-user snapshots live. The ledger
+    #: itself is in PostgreSQL now; this is the durable file store beside it.
+    DATA_DIR = _env('FA_DATA_DIR', default=str(_root_dir / 'data'))
+
+    #: The ledger. Point this at a copy to try a migration, reproduce a bug or
+    #: demo with sample statements without going near the real database.
+    #:
+    #: The role in this URL must NOT be a superuser and must not hold
+    #: BYPASSRLS: PostgreSQL exempts both from row-level security, which is
+    #: what keeps one signed-in user out of another's statements. The app
+    #: refuses to start otherwise - see db/engine.assert_isolation_enforced.
+    DATABASE_URL = _env(
+        'FA_DATABASE_URL', 'DATABASE_URL',
+        default='postgresql://financial_agent:financial_agent'
+                '@localhost:5432/financial_agent',
+    )
+    DB_POOL_SIZE = int(_env('FA_DB_POOL_SIZE', default='10') or 10)
+
+    #: Last resort for a genuinely single-user deployment where nobody wants
+    #: to create a second database role. Logs a warning on every boot rather
+    #: than being quietly settable and forgotten.
+    ALLOW_UNENFORCED_ISOLATION = _flag('FA_ALLOW_UNENFORCED_ISOLATION')
+
+    # ---- sign-in ---------------------------------------------------------
+
+    #: Where the browser reaches this app. The Google redirect URI is built
+    #: from it, and it has to match a URI registered on the OAuth client.
+    APP_BASE_URL = (_env('FA_APP_BASE_URL',
+                         default='http://localhost:5173') or '').rstrip('/')
+
+    GOOGLE_CLIENT_ID = _env('GOOGLE_CLIENT_ID')
+    GOOGLE_CLIENT_SECRET = _env('GOOGLE_CLIENT_SECRET')
+
+    #: Cookie lifetime. A financial ledger is not a thing to stay signed into
+    #: on a shared machine for a month.
+    SESSION_TTL_HOURS = int(_env('FA_SESSION_TTL_HOURS', default='72') or 72)
+    SESSION_COOKIE = _env('FA_SESSION_COOKIE', default='fa_session')
+    #: Off by default so http://localhost works; must be on behind TLS, and
+    #: docker-compose.prod.yml sets it.
+    SESSION_COOKIE_SECURE = _flag('FA_SESSION_COOKIE_SECURE')
+
+    #: Optional allowlist. Empty means anyone with a Google account may sign
+    #: up; otherwise a comma-separated list of email addresses or @domains.
+    ALLOWED_SIGNINS = tuple(
+        part.strip().lower()
+        for part in (_env('FA_ALLOWED_SIGNINS', default='') or '').split(',')
+        if part.strip()
+    )
+
+    @property
+    def google_configured(self) -> bool:
+        return bool(self.GOOGLE_CLIENT_ID and self.GOOGLE_CLIENT_SECRET)
+
+    @property
+    def oauth_redirect_uri(self) -> str:
+        return f"{self.APP_BASE_URL}/api/auth/google/callback"
+
+    # ---- models ----------------------------------------------------------
+
     LLM_PROVIDER = (_env('LLM_PROVIDER', default='gemini') or 'gemini').lower()
 
     GEMINI_API_KEY = _env('GEMINI_API_KEY')

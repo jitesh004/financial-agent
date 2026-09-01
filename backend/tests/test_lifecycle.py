@@ -9,7 +9,6 @@ correction someone typed and a PDF they no longer have a copy of cannot.
 
 from __future__ import annotations
 
-import sqlite3
 import sys
 import tempfile
 from datetime import date
@@ -21,13 +20,15 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
+from tests.support import fresh_ledger  # noqa: E402
 from app.db.database import CLEAR_SCOPES, MAX_SNAPSHOTS, Database  # noqa: E402
 from app.models.schemas import (Account, AccountType, Category,  # noqa: E402
                                 Direction, Transaction)
 
 
-def _fresh_db(name: str = "lifecycle.db") -> Database:
-    return Database(Path(tempfile.mkdtemp()) / name)
+def _fresh_db() -> Database:
+    """A ledger with nothing in it - now a new tenant, not a new file."""
+    return fresh_ledger()
 
 
 def _txn(account_id: str = "a1", amount: str = "450.00",
@@ -356,65 +357,60 @@ def test_snapshots_are_pruned_to_the_keep_count():
 # Migration and persistence
 # --------------------------------------------------------------------------
 
-LEGACY_SCHEMA = """
-    CREATE TABLE accounts (id TEXT PRIMARY KEY, institution TEXT);
-    CREATE TABLE transactions (
-        id TEXT PRIMARY KEY, account_id TEXT, statement_id TEXT,
-        txn_date TEXT NOT NULL, value_date TEXT, raw_description TEXT NOT NULL,
-        normalized_description TEXT DEFAULT '', merchant TEXT,
-        amount TEXT NOT NULL, direction TEXT NOT NULL, balance_after TEXT,
-        currency TEXT DEFAULT 'INR', category TEXT DEFAULT 'uncategorized',
-        category_source TEXT DEFAULT 'default', category_confidence REAL DEFAULT 0.0,
-        is_internal_transfer INTEGER DEFAULT 0, transfer_pair_id TEXT,
-        recurring_series_id TEXT, reference TEXT, source_row INTEGER);
-    INSERT INTO accounts VALUES ('a1','Axis');
-    INSERT INTO transactions (id, account_id, txn_date, raw_description,
-                              amount, direction)
-         VALUES ('t1','a1','2026-03-04','SWIGGY','450.00','debit');
-"""
+def test_the_schema_has_every_column_analytics_depends_on():
+    """Applying the schema must produce every column the ledger reads.
 
-
-def test_the_migration_adds_every_column_analytics_depends_on():
-    """A database created before these columns existed must gain them without
-    losing a row - is_mirror_leg in particular, whose absence made a dashboard
-    rebuilt after a restart disagree with the one computed at ingestion."""
-    path = Path(tempfile.mkdtemp()) / "legacy.db"
-    legacy = sqlite3.connect(path)
-    legacy.executescript(LEGACY_SCHEMA)
-    legacy.commit()
-    legacy.close()
-
-    db = Database(path)
-    Database(path)  # twice: the migration has to be idempotent
-
+    These columns arrived one at a time, each behind a SQLite ALTER in a
+    hand-written migration; the PostgreSQL schema declares them outright.
+    What has to stay true is the same either way - is_mirror_leg in
+    particular, whose absence made a dashboard rebuilt after a restart
+    disagree with the one computed at ingestion.
+    """
+    db = _fresh_db()
+    db.ensure_schema()
     with db.connection() as conn:
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}
-        rows = conn.execute("SELECT COUNT(*) c FROM transactions").fetchone()["c"]
-        broken = conn.execute("PRAGMA foreign_key_check").fetchall()
+        cols = {r["column_name"] for r in conn.execute(
+            "SELECT column_name FROM information_schema.columns"
+            " WHERE table_name = 'transactions'")}
 
     for column in ("is_mirror_leg", "fingerprint", "accounting_month",
                    "needs_review", "review_reason", "flow_role", "excluded",
-                   "note"):
-        assert column in cols, f"{column} was not migrated in"
-    assert rows == 1, "migration must not lose data"
-    assert not broken
+                   "note", "source", "superseded", "category_rule",
+                   "direction_reason", "user_id"):
+        assert column in cols, f"{column} is missing from transactions"
 
 
-def test_indexes_over_migrated_columns_are_created_after_the_alters():
-    """SCHEMA runs before the migration, and its CREATE TABLE is a no-op on an
-    existing database - so an index there naming a newly-added column asks for
-    a column that does not exist yet and aborts the whole script."""
-    path = Path(tempfile.mkdtemp()) / "legacy.db"
-    legacy = sqlite3.connect(path)
-    legacy.executescript(LEGACY_SCHEMA)
-    legacy.commit()
-    legacy.close()
+def test_applying_the_schema_twice_changes_nothing():
+    """ensure_schema runs on every boot, and re-applies the RLS policies.
 
-    db = Database(path)  # must not raise
+    Every statement in it has to be idempotent, or the second start of a
+    working deployment is the one that fails.
+    """
+    from app.db.database import Database
+    from app.db.engine import current_tenant
+
+    db = _fresh_db()
+    tenant = current_tenant()
     with db.connection() as conn:
-        names = {r["name"] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index'")}
-    assert "idx_txn_fingerprint" in names
+        conn.execute("INSERT INTO accounts (id, institution) VALUES (?, ?)",
+                     ("a1", "Axis"))
+
+    # A second Database against the same URL re-runs the whole script.
+    Database(db.dsn)
+    Database(db.dsn)
+
+    with db.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM accounts").fetchone()[0] == 1
+        indexes = {r["indexname"] for r in conn.execute(
+            "SELECT indexname FROM pg_indexes WHERE tablename = 'transactions'")}
+        policies = {r["policyname"] for r in conn.execute(
+            "SELECT policyname FROM pg_policies WHERE tablename = 'transactions'")}
+    assert "idx_txn_fingerprint" in indexes
+    assert policies == {"transactions_tenant"}, (
+        "re-applying the schema must leave exactly one policy per table, not "
+        "stack a second copy on top")
+    assert current_tenant() == tenant
 
 
 def test_is_mirror_leg_survives_a_save_and_reload():
@@ -530,8 +526,11 @@ def test_storage_reports_replaceable_and_irreplaceable_separately():
     try:
         storage.STATEMENT_STORE = tmp / "store"
         storage.GMAIL_CACHE = tmp / "cache"
-        storage.GMAIL_CACHE.mkdir(parents=True)
-        (storage.GMAIL_CACHE / "icici.pdf").write_bytes(b"x" * 10)
+        # Both stores hang off the signed-in user now, so the fixture writes
+        # into this tenant's own subdirectory - which is also the assertion
+        # that the counts below are one person's, not the whole server's.
+        storage.gmail_cache().mkdir(parents=True)
+        (storage.gmail_cache() / "icici.pdf").write_bytes(b"x" * 10)
 
         source = tmp / "amex.pdf"
         source.write_bytes(b"y" * 20)

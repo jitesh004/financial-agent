@@ -1,17 +1,49 @@
-version: "3.8"
 services:
+  # The ledger. A server rather than a file, because the app now serves
+  # several people signing in at once - and because per-user separation is
+  # enforced by PostgreSQL's row-level security rather than by every query
+  # remembering a WHERE clause. See backend/app/db/engine.py.
+  db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Creates the `financial_agent` database and the ORDINARY role the app
+      # connects as. Read the comments in it before changing either.
+      - ./deploy/postgres-init.sql:/docker-entrypoint-initdb.d/10-financial-agent.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d financial_agent"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    ports:
+      # Exposed for psql and for running the test suite against it. Drop this
+      # line if you do not want the database reachable from the host.
+      - "5432:5432"
+
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
     volumes:
       - ./backend:/app
       - ./data:/data
-      - ./credentials.json:/credentials.json:ro
     ports:
       - "8078:8078"
     environment:
       - PYTHONUNBUFFERED=1
+      - FA_DATABASE_URL=postgresql://financial_agent:financial_agent@db:5432/financial_agent
+      - FA_DATA_DIR=/data
+      - FA_APP_BASE_URL=${FA_APP_BASE_URL:-http://localhost:5173}
+      # Sign-in is Google-only. Without these the app runs and says so on the
+      # sign-in screen rather than failing at Google with "invalid_client".
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - FA_ALLOWED_SIGNINS=${FA_ALLOWED_SIGNINS:-}
     command: uvicorn app.main:app --host 0.0.0.0 --port 8078 --reload
 
   frontend:
@@ -25,3 +57,6 @@ services:
       - "5173:5173"
     environment:
       - VITE_API_PROXY_TARGET=http://backend:8078
+
+volumes:
+  pgdata:

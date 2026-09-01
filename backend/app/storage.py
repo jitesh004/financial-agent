@@ -11,16 +11,24 @@ They used to be written to `data/uploads/<run_id>/<name>`, and the "start over"
 button deleted every one of those directories outright. Clearing a derived
 ledger destroyed the only copy of its own source.
 
-Files now live at `data/statements/<first2>/<sha256><ext>`:
+Files now live at `data/statements/<user>/<first2>/<sha256><ext>`:
 
+  - Under the owner, because these are somebody's bank statements and the app
+    now serves more than one person. Content addressing alone would have two
+    users sharing a single copy of an identical file - convenient, and exactly
+    the kind of convenience that turns into one account's deletion removing
+    another's only copy.
   - Addressed by content, so re-uploading the same statement resolves to the
     same path instead of accumulating copies under new run ids.
   - Not tied to a run, so nothing that clears run data can take them with it.
   - Sharded by the first two hex characters, so a few thousand files do not
     land in one directory.
 
-The Gmail cache is left exactly where it is. It is already flat and already
-run-independent, and moving files a working system is pointing at buys nothing.
+The Gmail cache is under the owner for the same reason.
+
+Which user that is comes from the same tenant the database layer uses, rather
+than from an argument threaded through every call site - so a caller cannot
+forget it, and there is one answer to "whose files are these" per request.
 """
 
 from __future__ import annotations
@@ -29,10 +37,34 @@ import logging
 import shutil
 from pathlib import Path
 
+from .config import config
+from .db.engine import IsolationError, current_tenant
+
 log = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parents[2]
-STATEMENT_STORE = ROOT / "data" / "statements"
+DATA_DIR = Path(config.DATA_DIR)
+STATEMENT_STORE = DATA_DIR / "statements"
+#: Where Gmail downloads land, per user. Reached through `gmail_cache()`
+#: rather than directly, so nothing can read across accounts by accident.
+GMAIL_CACHE = DATA_DIR / "gmail_cache"
+
+
+
+def _owned(base: Path) -> Path:
+    """`base` narrowed to the signed-in user's own directory."""
+    tenant = current_tenant()
+    if not tenant:
+        raise IsolationError(
+            "file storage needs a signed-in user; no tenant is bound")
+    return base / tenant
+
+
+def statement_store() -> Path:
+    return _owned(STATEMENT_STORE)
+
+
+def gmail_cache() -> Path:
+    return _owned(GMAIL_CACHE)
 
 
 def store_path(digest: str, suffix: str = ".pdf") -> Path:
@@ -40,7 +72,7 @@ def store_path(digest: str, suffix: str = ".pdf") -> Path:
     if not digest or len(digest) < 2:
         raise ValueError("a content hash is required to place a file")
     suffix = suffix if suffix.startswith(".") else f".{suffix}"
-    return STATEMENT_STORE / digest[:2] / f"{digest}{suffix}"
+    return statement_store() / digest[:2] / f"{digest}{suffix}"
 
 
 def store_file(source: Path, digest: str) -> Path:
@@ -74,10 +106,6 @@ def adopt(source: Path, digest: str, *, remove_source: bool = False) -> Path:
     return target
 
 
-#: Where Gmail downloads have always landed. Flat and run-independent
-#: already, so files here are left in place rather than migrated.
-GMAIL_CACHE = ROOT / "data" / "gmail_cache"
-
 
 def _files_under(root: Path) -> list[Path]:
     if not root.is_dir():
@@ -87,8 +115,8 @@ def _files_under(root: Path) -> list[Path]:
 
 
 def stored_files() -> list[Path]:
-    """Every statement file the app owns, across both stores."""
-    return _files_under(STATEMENT_STORE) + _files_under(GMAIL_CACHE)
+    """Every statement file this user owns, across both stores."""
+    return _files_under(statement_store()) + _files_under(gmail_cache())
 
 
 def store_stats() -> dict[str, int]:
@@ -99,8 +127,8 @@ def store_stats() -> dict[str, int]:
     from a bank that does not email them - may be the only copy in existence,
     and no clearing action should treat the two the same way.
     """
-    uploaded = _files_under(STATEMENT_STORE)
-    cached = _files_under(GMAIL_CACHE)
+    uploaded = _files_under(statement_store())
+    cached = _files_under(gmail_cache())
     return {
         "count": len(uploaded) + len(cached),
         "bytes": sum(p.stat().st_size for p in uploaded + cached),

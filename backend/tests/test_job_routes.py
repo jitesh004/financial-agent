@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
+from tests.support import fresh_ledger  # noqa: E402
 from app.db import database, repository as repo  # noqa: E402
 from app.jobs import JobProgress, jobs  # noqa: E402
 from app.main import app  # noqa: E402
@@ -28,7 +29,7 @@ def db(monkeypatch, tmp_path):
     Patched onto the module global rather than through get_db(path), which
     would swap the singleton for every test that runs after this one.
     """
-    fresh = database.Database(tmp_path / "api.db")
+    fresh = fresh_ledger()
     monkeypatch.setattr(database, "_db", fresh)
     return fresh
 

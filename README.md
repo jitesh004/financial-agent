@@ -4,8 +4,9 @@ Upload bank, credit card, loan and investment statements in any format. Get a
 reconciled, auditable picture of where your money actually goes — plus loan
 amortization, recurring commitments and a cashflow forecast.
 
-Built on **LangGraph** (orchestration), **FastAPI** + **SQLite** (backend),
-and **React** + **Recharts** (frontend). Runs entirely on your machine.
+Built on **LangGraph** (orchestration), **FastAPI** + **PostgreSQL** (backend),
+and **React** + **Recharts** (frontend). Sign in with Google; every account's
+ledger is isolated from every other by the database itself.
 
 ---
 
@@ -75,8 +76,34 @@ written narrative and the unknown-merchant tail.
 
 ## Quick start
 
+The fastest path — PostgreSQL, the API and the UI together:
+
+```bash
+cp .env.example .env          # then fill in the two Google values
+docker compose up
+```
+
+Open <http://localhost:5173>, sign in, and the setup wizard takes it from
+there.
+
+### Or run it without Docker
+
+You need a PostgreSQL 15 or newer server. Create the database and the
+**ordinary, non-superuser role** the app connects as:
+
+```bash
+psql -U postgres -f deploy/postgres-init.sql
+```
+
+That role matters. PostgreSQL exempts superusers — and any role holding
+`BYPASSRLS` — from every row-level security policy, and those policies are the
+whole of this app's per-user separation. Connect as one and everybody sees
+everybody's statements; the app checks at startup and refuses to serve rather
+than run that way.
+
 ```bash
 python -m venv .venv && .venv/Scripts/pip install -r backend/requirements.txt
+cp .env.example .env
 ```
 
 ```bash
@@ -95,11 +122,96 @@ Start the UI (terminal 2):
 npm install --prefix frontend && npm run dev --prefix frontend
 ```
 
-Open <http://localhost:5173> and drop the files from `data/samples/` onto the
-upload area.
+Open <http://localhost:5173>, sign in, and drop the files from `data/samples/`
+into the import wizard.
 
-Optional — for the written narrative, copy `.env.example` to `.env` and add an
-`ANTHROPIC_API_KEY`.
+Optional — for the written narrative, add a `GEMINI_API_KEY` to `.env`.
+
+---
+
+## Signing in
+
+Sign-in is Google OAuth, and it asks for **identity only** — `openid email
+profile`, which is your name and email address and nothing else. Reading your
+mailbox is a *separate* permission, requested later during setup and
+declinable without losing anything but the mailbox import.
+
+You supply your own Google OAuth client, so no third party is ever in the
+middle:
+
+1. Go to <https://console.cloud.google.com> and create a project.
+2. **Credentials → Create credentials → OAuth client ID.**
+   Application type: **Web application** — this matters; a Desktop client
+   rejects the redirect and says almost nothing about why.
+3. Add `http://localhost:5173/api/auth/google/callback` under *Authorised
+   redirect URIs* (in production, the same path on your own domain, over
+   https).
+4. Put the client id and secret in `.env` as `GOOGLE_CLIENT_ID` and
+   `GOOGLE_CLIENT_SECRET`, and set `FA_APP_BASE_URL` to where the browser
+   reaches the app.
+
+Check it with:
+
+```bash
+.venv/Scripts/python backend/tools/check_gmail_setup.py
+```
+
+By default anyone with a Google account can sign up. Set `FA_ALLOWED_SIGNINS`
+to a comma-separated list of addresses or `@domains` to restrict it.
+
+**Sessions** are server-side, in a `HttpOnly`, `SameSite=Lax` cookie, and only
+the SHA-256 of the token is stored — a leaked database backup does not hand
+over live sessions. That is also what makes *Sign out on every device* work at
+all: a self-contained JWT cannot be withdrawn before it expires.
+
+### First run
+
+After the first sign-in there is a three-step wizard, and every step is
+skippable because the app genuinely works without any of them:
+
+| Step | What it buys you |
+|---|---|
+| **Your details** | Name, date of birth, PAN, mobile — what password-protected statements are unlocked with |
+| **Your mailbox** | Read-only Gmail access, so statements are found rather than downloaded by hand |
+| **First import** | Opens the import wizard |
+
+Re-run it any time from the account menu → *Run setup again*.
+
+---
+
+## Your data, and everybody else's
+
+The app now serves several people from one database, which makes separation a
+correctness property rather than an assumption. It is enforced in one place:
+
+- Every table holding user data carries a `user_id`, defaulted from the
+  signed-in user and covered by a PostgreSQL **row-level security** policy of
+  `user_id = current_tenant()`. A query cannot read across accounts even if
+  someone forgets a `WHERE` clause, and an insert naming the wrong owner is
+  rejected outright.
+- The tenant is bound per request by the auth middleware. Bind nothing and the
+  policy matches nothing: the failure mode is an empty screen, never someone
+  else's money.
+- The API is **closed by default**. Everything under `/api` except health and
+  the sign-in endpoints answers 401 without a session, so a new route cannot be
+  born unprotected.
+- Statement files, the Gmail cache and snapshots are stored under the owner,
+  and deleting an account takes all of it with it.
+
+`backend/app/db/engine.py` is the file to read first.
+
+### Coming from the SQLite version
+
+Your ledger is not lost. Sign in once to create your account, then:
+
+```bash
+.venv/Scripts/python backend/tools/migrate_sqlite_to_postgres.py \
+    --email you@example.com --dry-run
+```
+
+Drop `--dry-run` to import. It copies every table, relocates the statement
+files under your user, leaves the SQLite file and the original file tree
+untouched, and is safe to run twice.
 
 ---
 
@@ -120,16 +232,18 @@ Optional — for the written narrative, copy `.env.example` to `.env` and add an
 
 ## Protected PDFs, deduplication, and Gmail import
 
-**Password-protected statements open automatically.** Enter your details once in
-**Profile** (name, date of birth, PAN, mobile). Indian banks build statement
+**Password-protected statements open automatically.** Enter your details once
+during setup, or later from the account menu → **Your details** (name, date of
+birth, PAN, mobile). Indian banks build statement
 passwords from these — the classic format is the first four letters of your name
 plus your date of birth, e.g. `jite0602`. The app generates a small, bounded set
 of candidates *from those templates* and tries them against your own protected
 files. This is not password cracking: it only ever runs on files you uploaded,
 uses only your own details, generates dozens of format-based candidates (never a
-brute-force space), and a wrong guess simply moves on. Your PII stays in the
-local database, is used only to open files, and never reaches any model or
-network call. A working password is logged only in redacted form (`j*******`).
+brute-force space), and a wrong guess simply moves on. Your PII is stored
+against your own account, is used only to open your own files, and never
+reaches any model or network call. A working password is logged only in
+redacted form (`j*******`).
 
 **Deduplication is content-based, at three layers.** The same file added twice —
 *even renamed* — is caught by its content hash and counted once. Statements that
@@ -141,13 +255,15 @@ replaces its old rows via a unique-hash index rather than doubling them.
 statement yourself, connect Gmail and the app finds your bank/card statement
 emails, downloads the PDF attachments, and analyzes them. The security model:
 
-- **OAuth, read-only.** Sign-in happens on Google's own consent screen — the app
-  never sees your Gmail password. The scope is `gmail.readonly`, so it can read
-  and download but can never send, delete, or modify mail.
+- **A separate grant, read-only.** Signing in asks only for your name and email
+  address. Mailbox access is a second consent you give deliberately, on
+  Google's own screen, and the scope is `gmail.readonly` — it can read and
+  download, and can never send, delete or modify mail.
 - **You review before anything downloads.** *Scan* lists what it found; you tick
   which statements to import; only then are they pulled.
-- **Local token.** The OAuth token lives in a local file and is used only from
-  your machine.
+- **A token per person.** The grant is held against your account and used only
+  on your behalf. **Disconnect** in Settings deletes it here *and* revokes it at
+  Google.
 
 Without setup, the manual upload path is unaffected. The whole fetch → filter →
 download → parse path is covered by offline tests using a fake Gmail client, so
@@ -155,55 +271,32 @@ it's verifiable without a Google account.
 
 ### Connecting Gmail
 
-**What `credentials.json` actually is.** It is *not* your password, and it holds
-none of your personal data. It's a small file from Google that identifies *this
-app* to Google — like an app's ID card. When you later click "Connect Gmail",
-Google shows you its own sign-in page; you approve there, and Google hands back
-a token. Your Gmail password never touches this code.
+Gmail uses the **same OAuth client as signing in** — see [Signing
+in](#signing-in) above for creating it. Two extra steps are needed before the
+mailbox scope will work:
 
-Google requires this because it won't let arbitrary software ask for your mail —
-the app has to be registered first. Registering is free and takes a few minutes.
+1. **Enable the Gmail API.** In Google Cloud Console, search "Gmail API", open
+   it and click **Enable**. Skip this and connecting fails with "Gmail API has
+   not been used in project…".
+2. **Add yourself as a test user.** *OAuth consent screen* (newer consoles call
+   it **Google Auth Platform → Audience**) → user type **External** → under
+   *Test users*, **Add users** and add your own Gmail address. Without this,
+   Google blocks your own sign-in.
 
-**Step by step:**
+Then, in the app: the setup wizard's **Your mailbox** step, or **Connect Gmail**
+on the import screen. Google will warn the app is *unverified* — expected, it is
+your own private app, published to nobody. Choose **Advanced → Go to \<app
+name\> (unsafe)** and approve the read-only access. Then **Scan for
+statements**, review the list, tick what you want, and **Import & analyze**.
 
-1. Go to <https://console.cloud.google.com> and sign in.
-2. Create a project (top bar → project dropdown → **New Project**). Name it
-   anything, e.g. `financial-agent`.
-3. **Enable the Gmail API.** Search "Gmail API" in the top search bar, open it,
-   click **Enable**. (Skip this and connecting fails with "Gmail API has not
-   been used in project…".)
-4. **Configure the consent screen.** Find *OAuth consent screen* (newer consoles
-   call this **Google Auth Platform → Branding / Audience**).
-   - User type: **External**
-   - Fill in app name and your email where asked
-   - Under **Audience / Test users**, click **Add users** and add your own Gmail
-     address. Without this, Google blocks your own sign-in.
-5. **Create the client.** Go to **Credentials** (or *Google Auth Platform →
-   Clients*) → **Create Credentials** → **OAuth client ID**.
-   - Application type: **Desktop app** ← this matters; a "Web application"
-     client will fail at the redirect step
-   - Click **Create**, then **Download JSON**
-6. Save that file as `credentials.json` in the project root, next to `README.md`:
-   `D:\python\financial-agent\credentials.json`
-
-**Check it worked:**
+Check the configuration at any time with:
 
 ```bash
 .venv/Scripts/python backend/tools/check_gmail_setup.py
 ```
 
-This tells you exactly what's wrong if anything is — wrong client type, service
-account key by mistake, malformed file, or missing fields.
-
-7. Start the app, open the upload screen, click **Connect Gmail**. A Google page
-   opens in your browser. Google will warn the app is *unverified* — that's
-   expected, it's your own private app, published to nobody. Choose
-   **Advanced → Go to \<app name\> (unsafe)** and approve the read-only access.
-8. Click **Scan for statements**, review the list, tick what you want, and
-   **Import & analyze**.
-
-**To disconnect:** delete `data/gmail_token.json`. That revokes this app's
-access locally; you can also remove it from your Google account at
+**To disconnect:** Settings → Disconnect Gmail. That deletes the stored grant
+and revokes it at Google; you can also remove it yourself at
 <https://myaccount.google.com/permissions>.
 
 ## Supported formats
@@ -248,7 +341,7 @@ Each feature earns its place:
 | Conditional edges + cycle | A statement that doesn't balance goes back through extraction |
 | Reducers (`operator.add`) | Parallel branches merge into one `statements` list |
 | Route-around | Skip the model entirely when rules resolved everything |
-| SQLite checkpointer | Ten years of statements is slow; a crash must not discard the parsing work |
+| PostgreSQL checkpointer | Ten years of statements is slow; a crash must not discard the parsing work |
 
 Nodes are deliberately thin. All real logic lives in `ingestion/`,
 `normalize/`, `reconcile/`, `categorize/` and `analytics/` as plain functions
@@ -269,10 +362,11 @@ backend/app/
   analytics/             Cashflow, recurring, loans, forecast
   graph/                 LangGraph state, nodes, assembly
   llm/                   Anthropic client (with redaction) + narrative
-  db/                    SQLite schema and repository
+  db/                    PostgreSQL schema, engine and repository
+  auth/                  Google sign-in, sessions, onboarding
   api/, main.py          FastAPI
 backend/tools/           Synthetic fixture generator
-backend/tests/           56 tests, including fault injection
+backend/tests/           657 tests, including fault injection and isolation
 frontend/src/            React UI
 ```
 
@@ -281,6 +375,16 @@ frontend/src/            React UI
 ```bash
 .venv/Scripts/python -m pytest backend/tests -q
 ```
+
+The suite needs a PostgreSQL it can create a database on; it builds
+`financial_agent_test` under an ordinary role, uses it, and drops it. Point it
+somewhere else with `FA_TEST_ADMIN_URL`, or at an existing database with
+`FA_TEST_DATABASE_URL`.
+
+**Every test runs as its own user.** That is what replaced "a fresh SQLite file
+per test": each test gets a tenant of its own and the database keeps its rows
+private, so the isolation guarantee is exercised on every single test rather
+than in one dedicated case.
 
 The fixtures are generated from a 12-month simulation with **known ground
 truth**, so tests assert against independently derivable figures rather than
@@ -298,9 +402,12 @@ whatever the code happened to produce. Key invariants:
 
 ## Privacy and scope
 
-Everything runs locally; the SQLite file never leaves your machine. Account
-numbers are masked to the last four digits at ingestion and never stored in
-full. Text is redacted again before any model call.
+Your data lives in your own PostgreSQL database — the one you or your operator
+run — and reaches nothing else. Account numbers are masked to the last four
+digits at ingestion and never stored in full. Text is redacted again before any
+model call. Where the app is shared with other people, no query of theirs can
+reach a row of yours: see [Your data, and everybody
+else's](#your-data-and-everybody-elses).
 
 This tool reports facts about your own statements and states mechanical
 trade-offs. It does not give personalized investment advice, and the system

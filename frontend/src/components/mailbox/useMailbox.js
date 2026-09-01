@@ -626,11 +626,13 @@ export default function useMailbox({ open, onImported }) {
     store({ jobId: null, scanJobId: null });
   }, [persistSelection]);
 
-  const connect = useCallback(async () => {
+  /* Leaves the page: consent is Google's own screen. The browser comes back
+     to this URL with ?gmail=connected, and the status poll picks the grant up
+     from there - so there is nothing to await here. */
+  const connect = useCallback(() => {
     setError(null);
-    try { await api.gmailConnect(); await refreshStatus(); }
-    catch (e) { setError(e.message); }
-  }, [refreshStatus]);
+    api.gmailConnect();
+  }, []);
 
   const setLookback = useCallback((next) => {
     setMonths(next);

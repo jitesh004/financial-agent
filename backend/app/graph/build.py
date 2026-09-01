@@ -159,17 +159,24 @@ def build_graph(checkpointer: Any = None):
     return graph.compile(checkpointer=checkpointer)
 
 
-def build_checkpointer(path: str | None = None):
-    """SQLite checkpointer so a long ingestion run can resume after a crash.
+def build_checkpointer(dsn: str | None = None):
+    """PostgreSQL checkpointer so a long ingestion run can resume after a crash.
 
-    Returns a context manager; the caller owns the connection lifetime.
+    Returns a context manager; the caller owns the connection lifetime, and
+    is responsible for calling `.setup()` on the saver once before first use.
+
+    The checkpoint tables are LangGraph's own and sit outside this app's
+    row-level security, so a checkpoint is addressed only by its thread id -
+    which is a run id, minted per ingestion and never guessable or listed
+    anywhere a user can reach. A run's checkpoint holds parse state for the
+    files of exactly one run, so nothing crosses accounts by being stored
+    here; it is simply not the place to look one up from.
     """
-    from langgraph.checkpoint.sqlite import SqliteSaver
+    from langgraph.checkpoint.postgres import PostgresSaver
 
-    from ..db.database import DEFAULT_DB_PATH
+    from ..config import config
 
-    target = path or str(DEFAULT_DB_PATH.parent / "graph_checkpoints.sqlite")
-    return SqliteSaver.from_conn_string(target)
+    return PostgresSaver.from_conn_string(dsn or config.DATABASE_URL)
 
 
 _compiled = None

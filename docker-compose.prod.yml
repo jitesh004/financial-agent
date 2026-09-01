@@ -1,16 +1,43 @@
-version: "3.8"
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      # Set POSTGRES_PASSWORD and FA_DB_PASSWORD in a .env beside this file.
+      # The second is the password of the ordinary role the app connects as -
+      # see deploy/postgres-init.sql for why the app is not the superuser.
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/postgres-init.sql:/docker-entrypoint-initdb.d/10-financial-agent.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d financial_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
     volumes:
       - ./data:/data
-      - ./credentials.json:/credentials.json:ro
     ports:
       - "8078:8078"
     environment:
       - PYTHONUNBUFFERED=1
+      - FA_DATABASE_URL=postgresql://financial_agent:${FA_DB_PASSWORD:?set FA_DB_PASSWORD}@db:5432/financial_agent
+      - FA_DATA_DIR=/data
+      - FA_APP_BASE_URL=${FA_APP_BASE_URL:?set FA_APP_BASE_URL}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:?set GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:?set GOOGLE_CLIENT_SECRET}
+      - FA_ALLOWED_SIGNINS=${FA_ALLOWED_SIGNINS:-}
+      # The session cookie must be Secure once the app is behind TLS, which in
+      # production it always is.
+      - FA_SESSION_COOKIE_SECURE=true
     restart: unless-stopped
 
   frontend:
@@ -22,3 +49,6 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+
+volumes:
+  pgdata:

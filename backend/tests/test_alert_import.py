@@ -28,6 +28,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
+from tests.support import fresh_ledger  # noqa: E402
 from app.db import database, repository as repo  # noqa: E402
 from app.ingestion.gmail_source import FoundAlert, message_body  # noqa: E402
 from app.models.schemas import (Account, AccountType, Direction,  # noqa: E402
@@ -208,7 +209,7 @@ def test_a_statement_row_for_a_different_payment_does_not_block_the_alert():
 
 @pytest.fixture()
 def db(tmp_path):
-    return database.Database(tmp_path / "alerts.db")
+    return fresh_ledger()
 
 
 def _seed(db) -> Account:
