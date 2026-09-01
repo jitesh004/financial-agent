@@ -341,3 +341,70 @@ def find_header_row(rows: list[list[str]], max_scan: int = 15,
         if score > best_score:
             best_score, best_idx = score, i
     return best_idx
+
+
+# --------------------------------------------------------------------------
+# A header row that reached the data
+# --------------------------------------------------------------------------
+
+#: Words that appear in a column title but are not themselves column aliases.
+#: "Bank" and "Cheque No" head the payment-slip block on a card statement;
+#: "Particulars" and "Closing" head columns whose alias is a different word.
+#: None of them is a plausible merchant name on its own, which is what makes
+#: them safe to treat as header vocabulary.
+_HEADER_ONLY_WORDS: frozenset[str] = frozenset({
+    "bank", "branch", "particulars", "narration", "chq", "cheque", "no", "nos",
+    "due", "min", "minimum", "max", "closing", "opening", "total", "sl", "srl",
+    "sr", "serial", "statement", "summary", "detail", "details", "payment",
+    "payments", "dr", "cr", "withdrawal", "withdrawals", "deposit", "deposits",
+    "outstanding", "limit", "available", "points", "period", "from", "to",
+})
+
+_ALIAS_WORDS: frozenset[str] = frozenset(
+    word for aliases in COLUMN_ALIASES.values()
+    for alias in aliases for word in alias.split())
+
+#: A PDF extraction runs column titles together when it loses the gaps between
+#: cells: "PaymentDueDate", "Min.AmountDue", "ChequeNo". Split on the case
+#: change so each title can be recognised as the words it is.
+_RUN_TOGETHER = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _header_words(text: str) -> list[str]:
+    out: list[str] = []
+    for token in re.split(r"[\s./,\-()]+", text or ""):
+        if token.strip():
+            out += [part.lower() for part in _RUN_TOGETHER.split(token) if part]
+    return out
+
+
+def is_header_text(text: str) -> bool:
+    """True when a whole DESCRIPTION is nothing but column titles.
+
+    `looks_like_header` asks the same question of a row of separate cells. This
+    asks it of one string, which is what survives when the extractor collapses
+    a header row into a single cell - and then the row below it is read as a
+    transaction whose narration is the header.
+
+    Seen on a card statement's payment slip:
+
+        PaymentDueDate  Min.AmountDue  ChequeNo  Date  Bank  Amount
+        05/07/2026      735.00
+
+    read as a 735.00 purchase from a merchant called "PaymentDueDate
+    Min.AmountDue ChequeNo Date Bank Amount", three months running. The
+    payment due date became the transaction date and the MINIMUM AMOUNT DUE
+    became the amount - a figure that is not a transaction at all.
+
+    Deliberately strict: EVERY word must be header vocabulary. A narration
+    with one column word in it is a real transaction - "CREDIT BALANCE REFUND"
+    and "CREDIT CARD PAYMENT" both are - and dropping those would be far worse
+    than keeping a header. Measured against 504 real narrations, this drops
+    none of them.
+    """
+    words = _header_words(text)
+    if len(words) < 3:
+        # Two words is not enough evidence: "Deposit Balance" could be either,
+        # and a real narration that short is common.
+        return False
+    return all(w in _ALIAS_WORDS or w in _HEADER_ONLY_WORDS for w in words)

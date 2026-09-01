@@ -16,30 +16,27 @@ import { Callout, Chip } from '../ui';
  * the same Review before any of it counts.
  */
 
-const PERIODS = [
-  { label: '1 month', months: 1 },
-  { label: '3 months', months: 3 },
-  { label: '6 months', months: 6 },
-  { label: '12 months', months: 12 },
-  { label: '2 years', months: 24 },
-  { label: '5 years', months: 60 },
-  { label: 'Everything', months: null },
-];
-
 const CAPS = [250, 500, 1000, 2500, 5000];
 
-/* The list, plus whatever this source is actually set to. A <select> cannot
-   display a value that is not among its options - it silently shows the first
-   one instead, which is how a 2-month cap came to read "1 month". */
-function periodsFor(months) {
-  if (months == null || PERIODS.some((p) => p.months === months)) return PERIODS;
+/* The windows the server offers, plus whatever this source is actually set
+   to. A <select> cannot display a value that is not among its options - it
+   silently shows the first one instead, which is how a 2-month cap came to
+   read "1 month".
+ *
+   The list itself comes from the server (`GET /api/gmail/periods`), which is
+   the only place it is decided. A local copy lived here and had already
+   drifted from it: it was missing "3 years" and "10 years" entirely, and
+   relabelled the server's "1 year" as "12 months". */
+function periodsFor(periods, months) {
+  const list = periods?.length ? periods : [{ label: 'Everything', months: null }];
+  if (months == null || list.some((p) => p.months === months)) return list;
   const extra = { label: `${months} month${months === 1 ? '' : 's'}`, months };
-  return [...PERIODS, extra].sort((a, b) => (a.months ?? 1e9) - (b.months ?? 1e9));
+  return [...list, extra].sort((a, b) => (a.months ?? 1e9) - (b.months ?? 1e9));
 }
 
 export default function SourceSections({
-  intents, chosen, onToggle, settingsFor, onSetting, sections, onUploaded,
-  onFilesChange,
+  intents, periods, chosen, onToggle, settingsFor, onSetting, sections,
+  onUploaded, onFilesChange,
 }) {
   const staged = Object.fromEntries(
     (sections || []).map((s) => [s.key, s]));
@@ -95,7 +92,7 @@ export default function SourceSections({
                         capped at 2 months, the list offered 1/3/6/12, and the
                         browser fell back to the first - displaying "1 month"
                         for a scan that would read 2. */}
-                    {periodsFor(settings.months).map((p) => (
+                    {periodsFor(periods, settings.months).map((p) => (
                       <option key={p.label} value={p.months ?? ''}>{p.label}</option>
                     ))}
                   </select>

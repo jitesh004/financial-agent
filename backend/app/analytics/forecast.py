@@ -30,6 +30,27 @@ from .recurring import RecurringSeries
 
 ZERO = Decimal("0")
 
+#: The narrowest a low/high band may be, as a share of the median month.
+#:
+#: Four near-identical months would otherwise produce a band of almost nothing,
+#: which reads as a promise. Next month is not knowable to the rupee, and a
+#: forecast that implies it is has told a more damaging lie than one that says
+#: "somewhere in this range".
+MIN_BAND_SHARE = Decimal("0.15")
+
+#: What makes a forecast trustworthy, in the two dimensions that matter:
+#: how much history there is, and how steady the spending in it was.
+#: `volatility` is the standard deviation of monthly spend over its mean.
+HIGH_CONFIDENCE_MONTHS = 6
+HIGH_CONFIDENCE_SERIES = 3
+HIGH_CONFIDENCE_VOLATILITY = 0.25
+MEDIUM_CONFIDENCE_MONTHS = 3
+MEDIUM_CONFIDENCE_VOLATILITY = 0.45
+
+#: A recurring series has to be at least this certain before the forecast
+#: treats it as committed money rather than as a pattern it noticed.
+COMMITTED_SERIES_CONFIDENCE = 0.6
+
 
 @dataclass
 class ForecastMonth:
@@ -201,7 +222,7 @@ def _distribution(values: list[Decimal]) -> tuple[Decimal, Decimal, Decimal]:
     low = min(values)
     high = max(values)
 
-    min_band = median * Decimal("0.15")
+    min_band = median * MIN_BAND_SHARE
     if median - low < min_band:
         low = median - min_band
     if high - median < min_band:
@@ -213,7 +234,8 @@ def _distribution(values: list[Decimal]) -> tuple[Decimal, Decimal, Decimal]:
 def _confidence(history: list[MonthlyFlow], series: list[RecurringSeries]) -> str:
     """How much the forecast should be trusted, in plain words."""
     months = len(history)
-    active = [s for s in series if s.is_active and s.confidence >= 0.6]
+    active = [s for s in series
+              if s.is_active and s.confidence >= COMMITTED_SERIES_CONFIDENCE]
 
     spends = [float(m.spend) for m in history if m.spend > 0]
     volatility = 0.0
@@ -221,9 +243,12 @@ def _confidence(history: list[MonthlyFlow], series: list[RecurringSeries]) -> st
         mean = statistics.mean(spends)
         volatility = statistics.pstdev(spends) / mean if mean else 0.0
 
-    if months >= 6 and len(active) >= 3 and volatility < 0.25:
+    if (months >= HIGH_CONFIDENCE_MONTHS
+            and len(active) >= HIGH_CONFIDENCE_SERIES
+            and volatility < HIGH_CONFIDENCE_VOLATILITY):
         return "high"
-    if months >= 3 and volatility < 0.45:
+    if (months >= MEDIUM_CONFIDENCE_MONTHS
+            and volatility < MEDIUM_CONFIDENCE_VOLATILITY):
         return "medium"
     return "low"
 

@@ -3,7 +3,7 @@ import {
   Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Line, ComposedChart,
   ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
-import { colorFor, compact, dateLabel, money, monthLabel, pct, titleCase } from '../lib';
+import { colorFor, compact, count, dateLabel, money, monthLabel, pct, titleCase } from '../lib';
 import { BarList, Callout, Card, ChartTooltip, Chip, Stat, axisProps, moneyAxis } from './ui';
 import Claims from './Claims';
 import Forecast from './Forecast';
@@ -66,7 +66,7 @@ export default function Overview({ data }) {
         <Stat
           label="Invested"
           value={totals.invested}
-          note={`${totals.transaction_count?.toLocaleString('en-IN')} transactions analyzed`}
+          note={`${count(totals.transaction_count)} transactions analyzed`}
         />
       </div>
 

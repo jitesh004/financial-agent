@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { dateLabel, formatBytes } from '../lib';
 import { Chip, Empty } from './ui';
+import { CATEGORY_TONE } from './mailbox/parts';
 
 /* Statement list grouped by institution.
 
@@ -9,10 +10,6 @@ import { Chip, Empty } from './ui';
    without hunting. Grouping by sender and sorting each group by date turns it
    into something you can actually audit - each group reads as "this account,
    these months". */
-
-const CATEGORY_TONE = {
-  bank: 'accent', card: 'pos', loan: 'warn', broker: '', unknown: '',
-};
 
 const rowKey = (r) => `${r.message_id}:${r.filename}:${r.size}`;
 

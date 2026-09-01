@@ -327,6 +327,7 @@ export default function MailboxModal({ mailbox, open, onClose, onUploaded }) {
           {view === 'source' && (
             <SourceSections
               intents={intents}
+              periods={periods}
               chosen={chosen}
               onToggle={toggleIntent}
               settingsFor={mailbox.settingsFor}

@@ -8,8 +8,13 @@ import { rowKey } from './useMailbox';
    takes what it draws as props, which is what let the state move to the server
    without any of this having to change. */
 
-const CATEGORY_TONE = {
-  bank: 'accent', card: 'pos', loan: 'warn', broker: '', unknown: '',
+/* Sender category -> chip tone. The categories are the backend's
+   (`rules.institutions.CLASSIFY_ORDER`), so all of them must be here: a
+   missing key renders an undefined tone, which is how bureau rows lost
+   their colour. */
+export const CATEGORY_TONE = {
+  bank: 'accent', card: 'pos', loan: 'warn', bureau: 'neg', broker: '',
+  unknown: '',
 };
 
 export function StageStrip({ active }) {

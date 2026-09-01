@@ -21,10 +21,13 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Sequence
+
+from ..normalize import parsers
+from ..rules import institutions
 
 log = logging.getLogger(__name__)
 
@@ -32,14 +35,14 @@ log = logging.getLogger(__name__)
 # Layout detection
 # --------------------------------------------------------------------------
 
+#: (layout, provider, fragments) in the order they are tried - first match
+#: wins, so the depository layout must be tested before the generic broker one.
+#: Derived: each issuer's layout is recorded on its `rules.institutions`
+#: record, and the document phrases that identify a layout without naming
+#: anyone are in `institutions.LAYOUT_ORDER`.
 LAYOUT_SIGNATURES: list[tuple[str, str, tuple[str, ...]]] = [
-    ("cas", "CDSL/NSDL", ("consolidated account statement", "cdsl", "nsdl",
-                          "demat account", "depository")),
-    ("cams", "CAMS", ("cams", "camsonline", "karvy", "consolidated portfolio")),
-    ("kfintech", "KFintech", ("kfintech", "kfin technologies")),
-    ("broker", "Broker", ("holdings statement", "portfolio holdings",
-                          "zerodha", "groww", "upstox", "angel one",
-                          "icici direct", "kotak securities", "5paisa")),
+    (layout, provider, fragments)
+    for layout, provider, fragments in institutions.portfolio_layouts()
 ]
 
 
@@ -125,7 +128,6 @@ def looks_like_portfolio(text: str, filename: str = "") -> bool:
 #: contains a run of masking characters.
 ISIN = re.compile(r"\b(?!XX)(?![A-Z0-9]*[X*]{4})([A-Z]{2}[A-Z0-9]{9}\d)\b")
 
-_NUMBER = re.compile(r"-?[\d,]+(?:\.\d+)?")
 _DATE_LINE = re.compile(
     r"(?:as\s+on|as\s+at|statement\s+date|valuation\s+date|holdings?\s+as\s+on)"
     r"\D{0,20}(\d{1,2}[-/\s][A-Za-z0-9]{2,9}[-/\s]\d{2,4}|\d{4}-\d{2}-\d{2})",
@@ -160,33 +162,23 @@ def to_decimal(raw: Any) -> Decimal | None:
     None rather than zero, throughout: a blank NAV column means the statement
     did not print one, and a zero there would silently value the holding at
     nothing and drag the whole portfolio total down with it.
+
+    Signed, unlike the statement side: a negative quantity is a real thing on
+    a securities document, where on a bank statement a leading minus means
+    "debit" and the sign is carried by the direction instead.
     """
-    if raw is None:
-        return None
-    text = str(raw).strip()
-    if not text or text in {"-", "--", "N/A", "NA", "nil", "Nil"}:
-        return None
-    match = _NUMBER.search(text.replace(" ", ""))
-    if not match:
-        return None
-    try:
-        return Decimal(match.group(0).replace(",", ""))
-    except InvalidOperation:
-        return None
+    return parsers.signed_money(raw)
 
 
 def parse_as_of(text: str) -> date | None:
+    """The date this snapshot was taken, from its own "as on" line.
+
+    The label match stays here - it is what distinguishes the valuation date
+    from the dozen other dates on a CAS - while reading the token it captured
+    is the shared reader's job.
+    """
     match = _DATE_LINE.search(text)
-    if not match:
-        return None
-    token = match.group(1).strip().replace("/", "-").replace(" ", "-")
-    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%d-%m-%Y", "%d-%b-%y", "%d-%m-%y",
-                "%Y-%m-%d"):
-        try:
-            return datetime.strptime(token, fmt).date()
-        except ValueError:
-            continue
-    return None
+    return parsers.parse_date(match.group(1)) if match else None
 
 
 def parse_declared_total(text: str) -> Decimal | None:

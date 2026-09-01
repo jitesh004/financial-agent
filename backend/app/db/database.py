@@ -183,6 +183,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     category               TEXT NOT NULL DEFAULT 'uncategorized',
     category_source        TEXT NOT NULL DEFAULT 'default',
     category_confidence    REAL NOT NULL DEFAULT 0.0,
+    category_rule          TEXT NOT NULL DEFAULT '',
+    direction_reason       TEXT NOT NULL DEFAULT '',
     is_internal_transfer   INTEGER NOT NULL DEFAULT 0,
     -- The duplicate leg of an internal move. Analytics counts exactly one leg
     -- of a transfer as a real cash movement; without this column every
@@ -877,6 +879,15 @@ class Database:
                 # replaced it. Kept rather than deleted, so the alert that
                 # arrived first stays auditable.
                 ("superseded", "INTEGER NOT NULL DEFAULT 0"),
+                # WHICH rule decided the category. `category_source` already
+                # said a rule did it; this says which one, so "why is this
+                # Dining?" has an answer the user can read. The categorizer
+                # has always computed it and always threw it away.
+                ("category_rule", "TEXT NOT NULL DEFAULT ''"),
+                # Why the row is money in or money out. Direction is the
+                # one field whose mistake lands on both sides of every
+                # total at once, so it carries its reasoning too.
+                ("direction_reason", "TEXT NOT NULL DEFAULT ''"),
             )),
             ("transaction_splits", (
                 ("origin_date", "TEXT NOT NULL DEFAULT ''"),

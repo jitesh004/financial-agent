@@ -22,6 +22,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 from ..models.schemas import Category, Direction, Transaction
+from ..rules import formats
 
 #: Cadences we recognise, in days, with a tolerance for weekends/holidays.
 CADENCES: list[tuple[str, int, int]] = [
@@ -40,8 +41,11 @@ MIN_CONFIDENCE = 0.25
 #: Utilities drift a lot month to month; a subscription barely moves.
 AMOUNT_VARIANCE_TOLERANCE = 0.35
 
-_MONTHS = r'\b(?:JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER|JAN|FEB|MAR|APR|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\b'
-_RAILS = r'\b(?:UPI|NEFT|RTGS|IMPS|ACH|CMS|MMT|NA)\b'
+#: Month names and rail codes both live in rules.formats - four modules used
+#: to carry their own copy of the month list, and one of them was missing the
+#: full names.
+_MONTHS = formats.MONTH_TOKEN.pattern
+_RAILS = formats.SIGNATURE_RAIL_PATTERN.pattern
 _SIGNATURE_NOISE = re.compile(rf'\b\d+\b|\b[A-Z0-9]*\d[A-Z0-9]*\b|{_MONTHS}|{_RAILS}', re.IGNORECASE)
 
 

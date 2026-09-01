@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from ..models.schemas import Category, ConfidenceSource, Direction, Transaction
+from ..rules import formats
 
 
 @dataclass(frozen=True)
@@ -93,11 +94,12 @@ RULES: list[Rule] = [
     # BillPay settlement on the card itself. Both settle spending that the card
     # statement has already counted, so treating them as fresh spending
     # double-counts every bill: CRED alone accounted for 4.08 lakh.
-    _r(r"\bCREDIT\s+CARD\s+PAYMENT\b|\bCARD\s+PAYMENT\b|\bPAYMENT\s+RECEIVED\b|"
-       r"\bAUTOPAY\b.*\bCARD\b|\bCC\s+PAYMENT\b|\bBPPY\b|\bCRED\b|\bCRED\.CLUB\b|"
-       r"\bBILLPAY\b|\bBBPS[\s\-]*(?:PAYMENT|PMT)\b|\bAMEX\b|"
-       r"\bAMERICAN\s+EXPRESS\b",
-       Category.CC_PAYMENT, 0.93),
+    # The bill-payment wording is shared with the direction reader and the
+    # settlement gate (rules.formats.BILL_PAYMENT_MARKERS); what is added here
+    # is the wording that only means "card bill" in a CATEGORY context.
+    _r("|".join(formats.BILL_PAYMENT_MARKERS
+                + formats.CATEGORY_ONLY_BILL_MARKERS),
+       Category.CC_PAYMENT, 0.93, label="card bill payment"),
     # HSBC abbreviates it to "BBPS PMT" where every other issuer writes
     # "BBPS PAYMENT". The rule above missed that one spelling, so four bill
     # payments totalling 83,105 fell through to the unexplained-credit
@@ -323,10 +325,14 @@ def categorize_by_rules(transactions: list[Transaction]) -> int:
         match = apply_rules(txn)
         if match is None:
             continue
-        category, confidence, _label = match
+        category, confidence, label = match
         txn.category = category
         txn.category_source = ConfidenceSource.RULE
         txn.category_confidence = confidence
+        # Kept, not dropped. "Categorised by a rule" is only half an answer;
+        # a user looking at a row they disagree with needs to know WHICH rule,
+        # and the match already knows.
+        txn.category_rule = label
         settled += 1
     return settled
 

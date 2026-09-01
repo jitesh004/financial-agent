@@ -23,8 +23,9 @@ from decimal import Decimal
 from ..models.schemas import (Account, AccountType, Direction, ExtractedTable,
                               ExtractionResult, LIABILITY_TYPES, SourceFormat,
                               Statement, Transaction)
+from ..rules import directions, formats
 from .column_map import (ColumnMapping, find_header_row, infer_roles_from_data,
-                         looks_like_header, map_columns)
+                         is_header_text, looks_like_header, map_columns)
 from .metadata import StatementMetadata, extract_metadata
 from .parsers import (infer_date_order, normalize_description, parse_amount,
                       parse_date, parse_signed_amount, redact_account_numbers)
@@ -129,6 +130,9 @@ def normalize(
         default_year = meta.period_end.year
     elif meta.period_start:
         default_year = meta.period_start.year
+    # A quarterly, half-yearly or annual statement can cross a year boundary,
+    # and then one year is not enough to place "15 May" - see parsers._year_for.
+    period = (meta.period_start, meta.period_end)
 
     examples = sum(1 for t in extraction.tables if _is_worked_example(t))
     candidates = _rank_tables(extraction.tables, default_year=default_year)
@@ -151,6 +155,7 @@ def normalize(
     transactions, warnings = _rows_to_transactions(
         merged_rows, best_mapping, account_type, meta.currency,
         opening_balance=meta.opening_balance, default_year=default_year,
+        period=period,
     )
     statement.transactions = transactions
     statement.parse_warnings.extend(warnings)
@@ -861,6 +866,7 @@ def _rows_to_transactions(
     currency: str,
     opening_balance: Decimal | None = None,
     default_year: int | None = None,
+    period: tuple[date | None, date | None] | None = None,
 ) -> tuple[list[Transaction], list[str]]:
     warnings: list[str] = []
     transactions: list[Transaction] = []
@@ -879,10 +885,11 @@ def _rows_to_transactions(
     skipped_no_amount = 0
 
     skipped_balance_marker = 0
+    skipped_header_row = 0
 
     for i, row in enumerate(rows):
         txn_date = parse_date(_cell(row, date_col), day_first=day_first,
-                              default_year=default_year)
+                              default_year=default_year, period=period)
         if txn_date is None:
             skipped_no_date += 1
             continue
@@ -895,7 +902,17 @@ def _rows_to_transactions(
             skipped_balance_marker += 1
             continue
 
-        amount, direction = _resolve_amount(row, mapping, is_liability)
+        # A header row that the extractor collapsed into one cell. The row
+        # under it then reads as a transaction whose narration is the header
+        # and whose "amount" is a summary figure - on a card statement's
+        # payment slip, the MINIMUM AMOUNT DUE. Three of those sat in a real
+        # ledger as 735.00, 734.00 and 732.00 of spending.
+        if is_header_text(raw_desc_probe):
+            skipped_header_row += 1
+            continue
+
+        amount, direction, direction_reason = _resolve_amount(
+            row, mapping, is_liability)
         if amount is None:
             skipped_no_amount += 1
             continue
@@ -929,9 +946,11 @@ def _rows_to_transactions(
         # salary credit is booked as spending: measured against real statements
         # this produced money-in of 1,009 against money-out of 1.01 crore.
         if not mapping.split_amount_columns:
-            hinted = _direction_from_description(raw_desc, is_liability)
+            hinted, hint_reason = _direction_from_description(
+                raw_desc, is_liability)
             if hinted is not None:
                 direction = hinted
+                direction_reason = hint_reason
 
         # Signed: an overdraft or a cumulative outflow is genuinely negative.
         balance = parse_signed_amount(_cell(row, mapping.get("balance")))
@@ -939,11 +958,12 @@ def _rows_to_transactions(
         transactions.append(Transaction(
             txn_date=txn_date,
             value_date=parse_date(_cell(row, mapping.get("value_date")), day_first=day_first,
-                                  default_year=default_year),
+                                  default_year=default_year, period=period),
             raw_description=raw_desc,
             normalized_description=normalize_description(raw_desc),
             amount=amount,
             direction=direction,
+            direction_reason=direction_reason,
             balance_after=balance,
             currency=currency,
             reference=_cell(row, mapping.get("reference")) or None,
@@ -961,6 +981,12 @@ def _rows_to_transactions(
         warnings.append(
             f"{skipped_balance_marker} brought/carried-forward row(s) skipped - "
             f"they restate a balance rather than record a transaction."
+        )
+    if skipped_header_row:
+        warnings.append(
+            f"{skipped_header_row} row(s) skipped whose description was nothing "
+            f"but column titles - a header the extractor collapsed into one "
+            f"cell, with a summary figure beneath it rather than a transaction."
         )
 
     if skipped_no_date:
@@ -1021,11 +1047,10 @@ _CREDIT_WORDS = re.compile(
 #: which lands on ICICI as "UPI/CRED Club/cred.club@axis/payment on/...".
 #: '\bcred\b' cannot match inside "credit" - the word boundary requires a
 #: non-word character after the d.
-_CARD_BILL_PAYMENT = re.compile(
-    r"\bbppy\b|\bcc\s*payment\b|\bcredit\s*card\s*payment\b|\bcard\s*payment\b"
-    r"|\bcred\b|\bcred\.club\b|\bbillpay\b|\bpayment\s*[-,]?\s*thank\s*you\b",
-    re.IGNORECASE,
-)
+#: Shared with the categorizer and the settlement gate - see
+#: rules.formats.BILL_PAYMENT_MARKERS. The three used to spell this out
+#: separately and had drifted apart.
+_CARD_BILL_PAYMENT = formats.BILL_PAYMENT
 #: Explicit outgoing markers, which beat a coincidental credit word.
 _DEBIT_WORDS = re.compile(
     r"\bpayment\s+(made|to|of)\b|\bpurchase\b|\bwithdrawal\b|\batm\b|\bpos\b"
@@ -1034,26 +1059,33 @@ _DEBIT_WORDS = re.compile(
 )
 
 
-def _direction_from_description(description: str, is_liability: bool) -> Direction | None:
+def _direction_from_description(
+    description: str, is_liability: bool
+) -> tuple[Direction | None, str]:
     """Infer direction from wording when column position cannot say.
 
     Only consulted for single-amount-column layouts. Debit wording is checked
     first so "EMI PAYMENT RECEIVED BY BANK" is not read as money coming in.
     Returns None when the wording is genuinely ambiguous, leaving the caller's
     default in place rather than inventing a direction.
+
+    Returns the reason alongside the answer, because a direction inferred from
+    wording is the weakest of the real signals and the row is worth flagging as
+    such - see rules.directions.
     """
     if not description:
-        return None
+        return None, directions.DEFAULTED
     # Checked first, and the only place is_liability changes the answer: a bill
     # payment moves the balance in opposite directions on the card and on the
     # account paying it.
     if _CARD_BILL_PAYMENT.search(description):
-        return Direction.CREDIT if is_liability else Direction.DEBIT
+        return ((Direction.CREDIT if is_liability else Direction.DEBIT),
+                directions.BILL_PAYMENT)
     if _DEBIT_WORDS.search(description) and not _CREDIT_WORDS.search(description):
-        return Direction.DEBIT
+        return Direction.DEBIT, directions.NARRATION
     if _CREDIT_WORDS.search(description):
-        return Direction.CREDIT
-    return None
+        return Direction.CREDIT, directions.NARRATION
+    return None, directions.DEFAULTED
 
 
 def _apply_balance_deltas(
@@ -1094,6 +1126,9 @@ def _apply_balance_deltas(
                     (Direction.CREDIT if rising else Direction.DEBIT)
                 if txn.direction != wanted:
                     txn.direction = wanted
+                    # The bank's own arithmetic beats every reading of its
+                    # wording, so this replaces whatever reason was recorded.
+                    txn.direction_reason = directions.RUNNING_BALANCE
                     corrected += 1
         previous = current
 
@@ -1130,36 +1165,41 @@ def _resolve_amount(
                 debit = None
 
         if debit:
-            return debit, Direction.DEBIT
+            return debit, Direction.DEBIT, directions.COLUMN
         if credit:
             # On a liability statement, a credit-column entry is a bill payment
             # or refund flowing back to the user's benefit.
-            return credit, Direction.CREDIT
-        return None, Direction.DEBIT
+            return credit, Direction.CREDIT, directions.COLUMN
+        return None, Direction.DEBIT, directions.DEFAULTED
 
     amount_col = mapping.get("amount")
     parsed = parse_amount(_cell(row, amount_col))
     if parsed.value is None:
-        return None, Direction.DEBIT
+        return None, Direction.DEBIT, directions.DEFAULTED
 
     direction = Direction.DEBIT
+    reason = directions.DEFAULTED
     if parsed.explicit_direction == "credit":
         direction = Direction.CREDIT
+        reason = directions.CELL_MARKER
     elif parsed.explicit_direction == "debit":
         direction = Direction.DEBIT
+        reason = directions.CELL_MARKER
     else:
         type_text = _cell(row, mapping.get("type")).lower()
         if type_text:
             if any(k in type_text for k in ("cr", "credit", "deposit", "in")):
                 direction = Direction.CREDIT
+                reason = directions.TYPE_COLUMN
             elif any(k in type_text for k in ("dr", "debit", "withdraw", "out")):
                 direction = Direction.DEBIT
+                reason = directions.TYPE_COLUMN
 
     if is_liability:
         # A positive amount on a card statement is a charge against the user.
         direction = Direction.DEBIT if direction == Direction.DEBIT else Direction.CREDIT
 
-    return parsed.value, direction
+    return parsed.value, direction, reason
 
 
 # --------------------------------------------------------------------------

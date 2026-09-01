@@ -22,9 +22,12 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+from ..normalize import parsers
+from ..rules import formats, institutions
 
 log = logging.getLogger(__name__)
 
@@ -33,11 +36,11 @@ log = logging.getLogger(__name__)
 # --------------------------------------------------------------------------
 
 #: Fragments that identify the issuer, checked against the text and filename.
+#: Derived from the four registry records that carry a `bureau_key`; a score
+#: app like OneScore mails about your credit file without being a bureau, and
+#: is deliberately findable by a scan but not nameable here.
 BUREAU_SIGNATURES: list[tuple[str, tuple[str, ...]]] = [
-    ("cibil", ("cibil", "transunion")),
-    ("crif", ("crif", "high mark", "highmark")),
-    ("experian", ("experian",)),
-    ("equifax", ("equifax",)),
+    (key, fragments) for key, fragments in institutions.bureau_signatures()
 ]
 
 
@@ -69,15 +72,11 @@ def looks_like_bureau_report(text: str, filename: str = "") -> bool:
 # Value readers
 # --------------------------------------------------------------------------
 
-_MONEY = re.compile(r"(?:rs\.?|inr|₹)?\s*([\d,]+(?:\.\d{1,2})?)", re.IGNORECASE)
-_DATE_PATTERNS = (
-    (re.compile(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})"), ("d", "m", "y")),
-    (re.compile(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})"), ("y", "m", "d")),
-    (re.compile(r"(\d{1,2})[-\s]([A-Za-z]{3})[-\s](\d{2,4})"), ("d", "b", "y")),
-)
-_MONTHS = {m: i for i, m in enumerate(
-    ["jan", "feb", "mar", "apr", "may", "jun",
-     "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+# Both readers delegate to `normalize.parsers` - the same code that reads a
+# bank statement cell. They used to be private reimplementations here, and the
+# date one knew three shapes where the shared reader knows ten: "Aug 29, 2026",
+# "15.01.2026" and "15-01-26" all appear on real reports and all produced no
+# date at all.
 
 
 def parse_money(raw: str | None) -> Decimal | None:
@@ -85,60 +84,49 @@ def parse_money(raw: str | None) -> Decimal | None:
 
     Returns None rather than zero for anything unreadable: a bureau printing
     "-" for a closed account's balance means "nothing reported", and recording
-    that as ₹0 would put a confident figure where there is none.
+    that as zero would put a confident figure where there is none.
     """
-    if not raw:
-        return None
-    match = _MONEY.search(raw.replace(" ", ""))
-    if not match:
-        return None
-    try:
-        return Decimal(match.group(1).replace(",", ""))
-    except InvalidOperation:
-        return None
+    return parsers.money(raw)
 
 
 def parse_date(raw: str | None) -> date | None:
-    if not raw:
-        return None
-    for pattern, order in _DATE_PATTERNS:
-        match = pattern.search(raw)
-        if not match:
-            continue
-        parts = dict(zip(order, match.groups()))
-        try:
-            year = int(parts["y"])
-            if year < 100:
-                year += 2000 if year < 50 else 1900
-            month = (_MONTHS.get(parts["b"][:3].lower(), 0) if "b" in parts
-                     else int(parts["m"]))
-            if not 1 <= month <= 12:
-                continue
-            return date(year, month, int(parts["d"]))
-        except (ValueError, KeyError):
-            continue
-    return None
+    """The date inside a bureau field value, or None."""
+    return parsers.find_date(raw or "")
 
 
-#: Bureau account-type wording -> this app's AccountType values. Everything a
-#: bureau calls a loan really is one; the distinction that matters downstream is
-#: only ever card vs loan vs other.
-_TYPE_MAP: list[tuple[tuple[str, ...], str]] = [
-    (("credit card", "creditcard", "charge card"), "credit_card"),
-    (("housing loan", "home loan", "mortgage"), "home_loan"),
-    (("auto loan", "car loan", "two-wheeler", "vehicle"), "auto_loan"),
-    (("personal loan", "consumer loan", "business loan", "gold loan",
-      "education loan", "loan against", "overdraft"), "personal_loan"),
-    (("savings", "current account"), "savings"),
-]
+#: Wording a bureau uses that the statement reader has no reason to know.
+#: A bureau names the credit FACILITY ("Overdraft", "Loan Against Property");
+#: a statement letterhead names the PRODUCT. Everything the two do share is in
+#: `metadata.ACCOUNT_TYPE_PATTERNS`, which this defers to - the two lists were
+#: independent and had already disagreed: a bureau line reading "Wallet"
+#: mapped to "unknown" here and to WALLET there.
+_BUREAU_ONLY_TYPES: tuple[tuple[str, str], ...] = (
+    ("overdraft", "personal_loan"),
+    # A bureau names the FACILITY, so a bare "Vehicle" or "Two-Wheeler" is
+    # the account type. In statement prose they are just words, which is why
+    # they cannot go in the shared list.
+    ("two-wheeler", "auto_loan"),
+    ("vehicle", "auto_loan"),
+    ("loan against", "personal_loan"),
+    ("business loan", "personal_loan"),
+    ("charge card", "credit_card"),
+)
 
 
 def map_account_type(raw: str) -> str:
+    """Bureau account-type wording -> this app's AccountType values.
+
+    Everything a bureau calls a loan really is one; the distinction that
+    matters downstream is only ever card vs loan vs other.
+    """
     lowered = (raw or "").lower()
-    for fragments, mapped in _TYPE_MAP:
-        if any(fragment in lowered for fragment in fragments):
+    for fragment, mapped in _BUREAU_ONLY_TYPES:
+        if fragment in lowered:
             return mapped
-    return "unknown"
+
+    from ..normalize.metadata import detect_account_type
+    detected = detect_account_type(lowered)
+    return detected.value if detected else "unknown"
 
 
 #: Corporate suffixes that carry no identity. Stripped so "HDFC BANK LTD" and
@@ -163,17 +151,17 @@ def lender_key(name: str) -> str:
     return "".join(words[:2])
 
 
-_DIGITS = re.compile(r"\d")
-
-
 def number_suffix(masked: str) -> str:
     """The last four digits of an account number, or "".
 
     Bureaus mask differently from statements - XXXXXX1234, ****1234, or the
     full number - and the trailing digits are the only part that survives both.
+
+    Shared with the statement and alert readers, because this is the key the
+    three of them join on. Three implementations of it was three chances for a
+    match to fail with nothing to show for it.
     """
-    digits = "".join(_DIGITS.findall(masked or ""))
-    return digits[-4:] if len(digits) >= 4 else ""
+    return formats.last_four(masked)
 
 
 # --------------------------------------------------------------------------

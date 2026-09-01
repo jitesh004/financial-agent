@@ -780,8 +780,12 @@ def test_direction_inferred_from_description(description, expected):
     from app.models.schemas import Direction
     from app.normalize.normalizer import _direction_from_description
 
-    result = _direction_from_description(description, is_liability=False)
+    # Returns (direction, reason) since a direction read off wording is the
+    # weakest of the real signals and the row is worth flagging as such.
+    result, reason = _direction_from_description(description, is_liability=False)
     assert (result.value if result else None) == expected
+    assert reason, "every outcome names a reason, including the default"
+
 
 
 def test_running_balance_overrides_a_wrong_direction():

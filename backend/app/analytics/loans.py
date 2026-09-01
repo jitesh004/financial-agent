@@ -13,15 +13,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 
 from ..models.schemas import Account, Category, Direction, LOAN_TYPES, Transaction
+from ..rules import formats
 
-CENT = Decimal("0.01")
-
-
-def _q(value: Decimal) -> Decimal:
-    return value.quantize(CENT, rounding=ROUND_HALF_UP)
+#: See rules.formats - one rounding rule for every figure this app reports.
+CENT = formats.CENT
+_q = formats.to_paise
 
 
 @dataclass
@@ -79,7 +78,7 @@ def infer_rate_from_transactions(
     # divided by was wrong, and a wrong rate is worse than no rate.
     if annual <= 0 or annual > 60:
         return None
-    return annual.quantize(Decimal("0.01"))
+    return _q(annual)
 
 
 def months_to_payoff(

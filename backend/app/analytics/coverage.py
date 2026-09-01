@@ -10,10 +10,11 @@ ledger, so a best-effort heuristic here is the right trade-off.
 
 from __future__ import annotations
 
-import calendar
 import re
 from datetime import date
 from typing import Any
+
+from ..rules import formats
 
 #: `\b` treats "_" as a word character, so it does not mark a boundary right
 #: after "Statement_OCT2025" or "...90_17-09-2025" - the underscore-heavy
@@ -30,8 +31,11 @@ _MTH_PATTERN = re.compile(
     rf"|MTH[\s_-]?(\d{{2}})[\s_-]?(\d{{4}}){_NOT_BEFORE_DIGIT}",
     re.IGNORECASE,
 )
-_MONTH_NAMES = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
-_MONTH_ABBR = {m.lower(): i for i, m in enumerate(calendar.month_abbr) if m}
+#: The fourth copy of the month vocabulary, now the shared one - see
+#: rules.formats. The stdlib's lists were correct but they are not the same
+#: set: they carry no "sept", which real statements do print.
+_MONTH_NAMES = formats.MONTHS
+_MONTH_ABBR = formats.MONTHS
 #: "OCT2025", "December 2025", "Dec_2025", "Dec-2025".
 _MONTH_NAME_YEAR = re.compile(
     _NOT_AFTER_LETTER

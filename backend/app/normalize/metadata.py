@@ -17,64 +17,16 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from ..models.schemas import AccountType
+from ..rules import institutions
 from .parsers import parse_amount, parse_date
 
 #: Institution name fragments -> canonical display name.
-INSTITUTIONS: dict[str, str] = {
-    "hdfc": "HDFC Bank",
-    "icici": "ICICI Bank",
-    "state bank of india": "State Bank of India",
-    "sbi": "State Bank of India",
-    "axis": "Axis Bank",
-    "kotak": "Kotak Mahindra Bank",
-    "yes bank": "Yes Bank",
-    "yesbank": "Yes Bank",
-    "yes.bank": "Yes Bank",
-    "indusind": "IndusInd Bank",
-    "idfc": "IDFC First Bank",
-    "punjab national": "Punjab National Bank",
-    "bank of baroda": "Bank of Baroda",
-    "canara": "Canara Bank",
-    "union bank": "Union Bank of India",
-    "citibank": "Citibank",
-    "standard chartered": "Standard Chartered",
-    "american express": "American Express",
-    "amex": "American Express",
-    "bajaj": "Bajaj Finserv",
-    "tata capital": "Tata Capital",
-    "lic housing": "LIC Housing Finance",
-    "cred.club": "CRED",
-    "paytm": "Paytm",
-    "phonepe": "PhonePe",
-    "razorpay": "Razorpay",
-    "zerodha": "Zerodha",
-    "groww": "Groww",
-    "cams": "CAMS",
-    "kfintech": "KFintech",
-    # Added after real statements showed up under a raw email address or, worse,
-    # the wrong bank. Fragments must work both in statement TEXT ("HSBC India")
-    # and in a sender domain ("mail.hsbc.co.in").
-    "hsbc": "HSBC",
-    "rbl": "RBL Bank",
-    "slice": "slice",
-    "bobcard": "BOBCARD",
-    "idfc first": "IDFC First Bank",
-    "idfcfirst": "IDFC First Bank",
-    "au small": "AU Small Finance Bank",
-    "aubank": "AU Small Finance Bank",
-    "bandhan": "Bandhan Bank",
-    "federal bank": "Federal Bank",
-    "federalbank": "Federal Bank",
-    "dbs": "DBS Bank",
-    "onecard": "OneCard",
-    "sbicard": "SBI Card",
-    "dhan": "Dhan",
-    "upstox": "Upstox",
-    "5paisa": "5paisa",
-    "angelone": "Angel One",
-    "paytmmoney": "Paytm Money",
-    "protean": "Protean NPS",
-}
+#:
+#: Derived from `rules.institutions`, which is the single place an institution
+#: is described. This mapping used to be maintained by hand alongside five
+#: other lists of the same banks, and it had drifted: an alert scan could find
+#: Bank of Baroda but this could not name it, so it displayed as a raw domain.
+INSTITUTIONS: dict[str, str] = institutions.display_names()
 
 #: Card product names, curated the same way as INSTITUTIONS above: a fragment
 #: found in the statement's own letterhead, mapped to its canonical display
@@ -152,7 +104,9 @@ ACCOUNT_TYPE_PATTERNS: list[tuple[str, AccountType]] = [
     (r"\bpersonal\s+loan\b|\bconsumer\s+loan\b", AccountType.PERSONAL_LOAN),
     (r"\bauto\s+loan\b|\bcar\s+loan\b|\bvehicle\s+loan\b|\btwo.wheeler\s+loan\b",
      AccountType.AUTO_LOAN),
-    (r"\bcredit\s+card\b|\bcard\s+statement\b|\bcard\s+number\b|\bpayment\s+due\s+date\b",
+    # "creditcard" run together is how a bureau prints it and how some
+    # statement letterheads do; \s* rather than \s+ covers both.
+    (r"\bcredit\s*card\b|\bcard\s+statement\b|\bcard\s+number\b|\bpayment\s+due\s+date\b",
      AccountType.CREDIT_CARD),
     (r"\bmutual\s+fund\b|\bfolio\b|\bnav\b|\bdemat\b|\bportfolio\b|\bsip\b|"
      r"\bconsolidated\s+account\s+statement\b|\bunits?\s+held\b", AccountType.INVESTMENT),
@@ -321,6 +275,50 @@ def detect_account_type(text: str, filename: str = "") -> AccountType | None:
     return None
 
 
+#: Labels that identify an account, IN PRECEDENCE ORDER, each with what it is
+#: in plain words. `_find_labeled` tries them in this order and returns the
+#: first that matches, so the order IS the rule - which is why it is a named
+#: table rather than a list inside the function, and why the Rules screen
+#: prints it.
+#:
+#: Card first, always. HDFC's Marriott card statement prints both, one line
+#: apart:
+#:
+#:     Credit Card No.            00361147XXXX6885
+#:     Alternate Account Number   0001015980001716889
+#:
+#: With the generic label first the card was filed as XXXX6889 - a number that
+#: identifies something else entirely. Its fifteen transaction alerts all said
+#: 6885 and every one of them was refused, for belonging to an account that
+#: did not exist.
+ACCOUNT_NUMBER_LABELS: list[tuple[str, str]] = [
+    (r"card\s*(?:number|no\.?|#)",
+     "The card's own number. Always wins - a card statement that also prints "
+     "an account number is naming two different things."),
+    (r"account\s*(?:number|no\.?|#)", "A plain account number."),
+    (r"a/?c\s*(?:number|no\.?)", "The abbreviated form of the same."),
+    (r"loan\s*account\s*(?:number|no\.?)", "A loan's own account number."),
+    (r"folio\s*(?:number|no\.?)", "A mutual fund folio."),
+    (r"membership\s*(?:number|no\.?)", "What some issuers call a card."),
+]
+
+#: Labels whose value identifies the PERSON or the DOCUMENT, never the
+#: account. Published because "why is my salary account split in two?" has
+#: this as its answer often enough to be worth stating.
+NEVER_AN_ACCOUNT_NUMBER: list[tuple[str, str]] = [
+    ("Customer ID / Cust ID / CRN / CKYC",
+     "One customer ID covers every account the bank holds for you. ICICI "
+     "prints the account number plainly some months and only the Cust ID on "
+     "others; reading the ID as an account number filed half of one salary "
+     "account's statements under XXXX9341 and half under XXXX1951, "
+     "double-counting every overlapping month."),
+    ("Alternate / secondary / previous / linked / former",
+     "A qualifier that demotes the label after it. \"Alternate Account "
+     "Number\" names a real field, but not the one that identifies the "
+     "account."),
+]
+
+
 def detect_account_number(text: str, labeled_only: bool = False) -> str | None:
     """Return a masked account/card number - never the full value.
 
@@ -357,12 +355,7 @@ def detect_account_number(text: str, labeled_only: bool = False) -> str | None:
     # that identifies something else entirely. Its fifteen transaction alerts
     # all said 6885 and every one of them was refused, for belonging to an
     # account that did not exist.
-    labeled = _find_labeled(text, [
-        r"card\s*(?:number|no\.?|#)",
-        r"account\s*(?:number|no\.?|#)", r"a/?c\s*(?:number|no\.?)",
-        r"loan\s*account\s*(?:number|no\.?)",
-        r"folio\s*(?:number|no\.?)", r"membership\s*(?:number|no\.?)",
-    ])
+    labeled = _find_labeled(text, [label for label, _ in ACCOUNT_NUMBER_LABELS])
     if labeled:
         # Take the digits of a single account-shaped TOKEN, not every digit in
         # the window. Sweeping up the whole window turned ICICI's "Statement

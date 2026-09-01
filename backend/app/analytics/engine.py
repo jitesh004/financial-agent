@@ -17,18 +17,22 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 
 from ..models.schemas import (Account, AccountType, CATEGORY_GROUPS, Category,
                               CONTRA_EXPENSE_ROLES, Direction, FlowRole,
                               INCOME_CATEGORIES, LIABILITY_TYPES, Transaction)
+from ..rules import formats
 
-CENT = Decimal("0.01")
+#: Shared with the loan calculator and every other place a figure is rounded -
+#: see rules.formats. Kept under these names because callers import them here.
+CENT = formats.CENT
 ZERO = Decimal("0")
 
 
 def q(value: Decimal) -> Decimal:
-    return Decimal(value).quantize(CENT, rounding=ROUND_HALF_UP)
+    """Round to paise. One implementation, in rules.formats."""
+    return formats.to_paise(Decimal(value))
 
 
 def _month_key(d: date) -> str:

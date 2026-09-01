@@ -4,6 +4,11 @@
    colours are low-contrast and the accent colours are reserved for data. */
 
 :root {
+  /* Tells the browser which way to draw the parts it owns: a <select>'s open
+     menu, a date picker, scrollbars, form control internals. Without this a
+     dropdown on a dark page opens a white menu, and no amount of CSS on the
+     <select> itself changes that - the menu is not ours to style. */
+  color-scheme: light;
   --bg: #f6f7f9;
   --surface: #ffffff;
   --surface-2: #fbfbfd;
@@ -38,6 +43,7 @@
 }
 
 [data-theme="dark"] {
+  color-scheme: dark;
   --bg: #0e1117;
   --surface: #161b23;
   --surface-2: #1b212b;
@@ -130,7 +136,6 @@ body {
   width: 26px; height: 26px; border-radius: 7px; flex: none;
   background: linear-gradient(135deg, var(--accent), var(--c2));
 }
-.header-spacer { flex: 1; }
 
 /* Scrollable at narrow widths, but without a visible scrollbar sitting under
    the tabs — it reads as a broken layout rather than an affordance. */
@@ -172,6 +177,99 @@ body {
 }
 .tab:hover { background: var(--surface-2); color: var(--text); }
 .tab[aria-selected="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+
+/* ---------- Grouped navigation ----------
+   Groups and the active group's members share ONE row. Measured: the header
+   is ~1254px, its brand and right-hand controls take ~335px, and the two
+   segments together need about 650px - so this fits where a flat strip of
+   thirteen did not, and costs no extra height. */
+.nav {
+  display: flex; align-items: center; gap: 10px;
+  flex: 1; min-width: 0; margin: 0 16px;
+  /* Wraps rather than scrolls. A hidden-scrollbar strip is what hid nine
+     tabs in the first place: items past the edge did not read as cut off,
+     they read as absent. Wrapping costs a row only when one is genuinely
+     needed, and never hides anything. */
+  flex-wrap: wrap;
+}
+.nav-groups, .nav-members {
+  display: flex; align-items: center; gap: 3px; flex-shrink: 0;
+}
+/* A group is context, not the destination, so it sits quieter than the
+   member you are actually on. */
+.tab.group { font-size: 12.5px; color: var(--text-3); padding: 6px 10px; }
+.tab.group:hover { color: var(--text-2); }
+.tab.group[aria-selected="true"] {
+  background: transparent; color: var(--text-1); font-weight: 650;
+}
+.nav-divider {
+  width: 1px; align-self: stretch; margin: 6px 2px;
+  background: var(--border); flex-shrink: 0;
+}
+.nav-count { margin-left: 6px; padding: 0 6px; }
+
+/* ---------- Narrow viewports ----------
+   Below this the inline nav is replaced by a drawer. It is not a preference:
+   at 375px the members row alone needs 326px, so with the brand and the
+   header controls the nav had nowhere to go and pushed the page sideways. */
+.nav-toggle { display: none; font-size: 15px; }
+
+@media (max-width: 720px) {
+  .nav { display: none; }
+  .nav-toggle { display: inline-flex; }
+  .header { flex-wrap: nowrap; gap: 8px; padding: 10px 12px; }
+  .brand { flex: 1; min-width: 0; }
+}
+
+.drawer-backdrop {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(0, 0, 0, .45);
+  backdrop-filter: blur(2px);
+  display: flex;
+}
+.drawer {
+  width: min(78vw, 300px);
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  padding: 14px 12px 28px;
+  overflow-y: auto;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.drawer-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 10px;
+}
+.drawer-title {
+  font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--text-3);
+}
+.drawer-group { margin-bottom: 14px; }
+.drawer-group-label {
+  font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--text-3); padding: 0 10px 6px;
+}
+.drawer-item {
+  appearance: none; border: 0; background: transparent; cursor: pointer;
+  display: flex; align-items: center; width: 100%;
+  padding: 10px 10px; border-radius: var(--radius-sm);
+  color: var(--text-2); font-size: 14px; font-weight: 500;
+  font-family: inherit; text-align: left;
+}
+.drawer-item:hover { background: var(--surface-2); color: var(--text); }
+.drawer-item[aria-current="page"] {
+  background: var(--accent-soft); color: var(--accent); font-weight: 650;
+}
+.drawer-item .nav-count { margin-left: auto; }
+
+
+/* The divider only makes sense while both segments share a line. Below this
+   the nav has wrapped, and a rule floating at the end of a row is noise. */
+@media (max-width: 1120px) {
+  .nav { gap: 4px 10px; }
+  .nav-divider { display: none; }
+  .nav-groups { width: 100%; }
+}
+
 
 /* ---------- Layout ---------- */
 
@@ -295,12 +393,101 @@ tbody tr:hover td { background: var(--surface-2); }
 .seg-btn:hover { background: var(--surface-2); }
 .seg-btn.active { background: var(--accent); color: #fff; }
 
-select, input[type="text"], input[type="search"] {
-  font-family: inherit; font-size: 13px; color: var(--text);
-  padding: 7px 10px; border-radius: var(--radius-sm);
-  border: 1px solid var(--border-strong); background: var(--surface);
+/* ---------- Form controls ----------
+
+   Every text-like control, not a list of the types someone remembered.
+
+   The old selector was `select, input[type="text"], input[type="search"]`,
+   which missed 25 controls: seventeen <input>s written with no `type` at all
+   (they default to text, but the attribute selector does not match them), five
+   date inputs, two number inputs and a textarea. Each of those fell through to
+   the browser default and rendered WHITE on a dark page.
+
+   `:where()` keeps this at zero specificity so a component can still override
+   any of it with a plain class, which several do. */
+:where(
+  input:not([type]),
+  input[type="text"], input[type="search"], input[type="email"],
+  input[type="password"], input[type="url"], input[type="tel"],
+  input[type="number"], input[type="date"], input[type="month"],
+  input[type="time"], input[type="datetime-local"],
+  textarea, select
+) {
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  min-width: 0;
+  max-width: 100%;
 }
-select:focus, input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+:where(input, textarea, select):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+/* Focus without the ring for a pointer click, but keep it for a keyboard
+   user - the ring is navigation, not decoration. */
+:where(input, textarea, select):focus { border-color: var(--accent); }
+
+:where(input, textarea)::placeholder { color: var(--text-3); opacity: 1; }
+
+:where(input, textarea, select):disabled {
+  opacity: .55;
+  cursor: not-allowed;
+  background: var(--surface-2);
+}
+
+textarea { resize: vertical; line-height: 1.5; }
+
+/* A date input's own calendar and spinner glyphs are drawn by the browser in
+   its own colours. `color-scheme` on the root (below) makes them follow the
+   theme; this makes the picker button visible enough to find. */
+input[type="date"]::-webkit-calendar-picker-indicator,
+input[type="time"]::-webkit-calendar-picker-indicator {
+  cursor: pointer;
+  opacity: .6;
+}
+input[type="date"]::-webkit-calendar-picker-indicator:hover,
+input[type="time"]::-webkit-calendar-picker-indicator:hover { opacity: 1; }
+
+/* ---------- Dropdowns ----------
+
+   A <select>'s OPEN menu is drawn by the operating system and cannot be
+   styled - but it does follow `color-scheme`, which is why that property is
+   set on the root. Without it a dropdown on this dark page opened a white
+   menu with dark text, which is the single worst-looking thing in the app.
+
+   What is styleable is the closed state: the native arrow is replaced with
+   one drawn here so it matches the text colour and the theme. */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 28px;
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position:
+    calc(100% - 15px) calc(50% + 1px),
+    calc(100% - 10px) calc(50% + 1px);
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  cursor: pointer;
+}
+select:hover { border-color: var(--accent); }
+/* The arrow is drawn from the border box, so a select with its own background
+   needs the gradients composited over it rather than replacing it. */
+select:disabled { cursor: not-allowed; }
+
+/* An <option> inherits almost nothing, and on some platforms defaults to a
+   white row. Stating both makes the menu legible wherever it is drawn. */
+select option {
+  background: var(--surface);
+  color: var(--text);
+}
+
 
 /* ---------- Dropzone ---------- */
 
@@ -531,11 +718,14 @@ select:focus, input:focus { outline: 2px solid var(--accent); outline-offset: -1
 }
 .xp-hint { font-size: 11.5px; color: var(--text-3); line-height: 1.45; }
 
+/* Explore's controls sit on a card, so they take the raised surface - but
+   everything else (placeholder, disabled, focus, the select arrow) comes from
+   the shared rules above rather than being restated here and drifting. */
 .xp-input, .xp-select {
-  background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
-  border-radius: 7px; padding: 6px 8px; font: inherit; font-size: 13px; min-width: 0;
+  background: var(--surface-2); border-color: var(--border);
+  border-radius: 7px; padding: 6px 8px;
 }
-.xp-input:focus, .xp-select:focus { outline: none; border-color: var(--accent); }
+.xp-select { padding-right: 26px; }
 .xp-select.slim, .xp-input.slim { padding: 4px 6px; font-size: 12px; }
 
 .xp-row { display: flex; gap: 6px; align-items: center; }

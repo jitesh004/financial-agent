@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, dateLabel, money, titleCase } from '../lib';
+import { api, count, dateLabel, money, titleCase } from '../lib';
 import { downloadCsv, toCsv, usePrefs } from '../prefs';
 import { Callout, Card, Chip, Empty, PromptButton } from './ui';
 
@@ -13,6 +13,170 @@ const SOURCE_TONE = {
 const SOURCE_LABEL = {
   rule: 'rule', merchant_cache: 'learned', llm: 'AI', user: 'you', default: 'guess',
 };
+
+/* Why this row has the category it has, in one sentence.
+ *
+ * "Categorised by a rule" is only half an answer - the half that does not
+ * help someone who disagrees with it. The categorizer has always known which
+ * of its 51 rules fired; it used to discard the label, and now records it.
+ *
+ * Rows categorised before that change have the source but not the rule, and
+ * this says so rather than claiming no rule matched - which would be a
+ * confident wrong answer about the app's own reasoning. */
+function whyCategorised(t) {
+  if (t.category_rule) return `Matched the rule: ${t.category_rule}`;
+  switch (t.category_source) {
+    case 'rule':
+      return 'A rule decided this, but which one was not recorded. '
+        + 'Rebuilding the ledger captures it.';
+    case 'merchant_cache':
+      return 'Learned from a choice you made on this merchant before.';
+    case 'llm': return 'Suggested by the model, not by a rule.';
+    case 'user': return 'You set this.';
+    default: return 'No rule matched - this is the fallback category.';
+  }
+}
+
+/* What the app decided about one row, and on what evidence.
+ *
+ * Three questions that used to have one visible answer between them: what is
+ * it, which way did the money go, and what is it part of. Each is read from
+ * what was stored at import time rather than recomputed - a recomputed answer
+ * could differ from the one that produced the numbers on screen, and then this
+ * panel would be explaining a ledger that does not exist. */
+
+const STRENGTH_TONE = ['', 'pos', 'pos', '', 'warn', 'neg'];
+
+function Explanation({ row, data }) {
+  if (!data) {
+    return (
+      <div style={{ padding: '12px 14px', color: 'var(--text-3)', fontSize: 13 }}>
+        <span className="spinner" style={{ width: 11, height: 11, marginRight: 8 }} />
+        Reading what was recorded…
+      </div>
+    );
+  }
+  if (data.error) {
+    return (
+      <div style={{ padding: '12px 14px' }}>
+        <Callout tone="neg">{data.error}</Callout>
+      </div>
+    );
+  }
+
+  const box = {
+    padding: '14px 16px',
+    background: 'var(--bg-2, rgba(127,127,127,.05))',
+    borderTop: '1px solid var(--border)',
+    display: 'grid',
+    gap: 16,
+  };
+  const head = {
+    fontSize: 11, letterSpacing: '.08em', textTransform: 'uppercase',
+    color: 'var(--text-3)', marginBottom: 6,
+  };
+  const note = { fontSize: 12.5, color: 'var(--text-2)', marginTop: 4, maxWidth: '70ch' };
+
+  const c = data.category;
+  const d = data.direction;
+  const x = data.transfer;
+
+  return (
+    <div style={box}>
+      <div>
+        <div style={head}>What it is</div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <Chip tone="accent">{titleCase(c.value)}</Chip>
+          <Chip>{SOURCE_LABEL[c.source] || c.source}</Chip>
+          {c.confidence > 0 && (
+            <span style={{ fontSize: 12, color: 'var(--text-3)' }}>
+              {Math.round(c.confidence * 100)}% confident
+            </span>
+          )}
+        </div>
+        {c.rule ? (
+          <div style={note}>
+            Matched the rule <strong>{c.rule}</strong>
+            {c.pattern && <span title={c.pattern}> — hover for the full pattern</span>}.
+          </div>
+        ) : c.source === 'rule' ? (
+          <div style={note}>
+            A rule decided this, but which one was not recorded — the row was
+            categorised before the app started keeping that. Rebuilding the
+            ledger captures it.
+          </div>
+        ) : null}
+      </div>
+
+      <div>
+        <div style={head}>Which way the money went</div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <Chip tone={d.value === 'credit' ? 'pos' : 'neg'}>
+            {d.value === 'credit' ? 'money in' : 'money out'}
+          </Chip>
+          {d.reason && (
+            <Chip tone={STRENGTH_TONE[d.reason.strength] || ''}>
+              {d.reason.label}
+            </Chip>
+          )}
+        </div>
+        <div style={note}>
+          {d.reason
+            ? d.reason.detail
+            : 'The reason was not recorded — this row was read before the app '
+              + 'started keeping it. Rebuilding the ledger captures it.'}
+        </div>
+      </div>
+
+      <div>
+        <div style={head}>What it is part of</div>
+        {x ? (
+          <>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <Chip tone="accent">{titleCase(x.kind || 'matched')}</Chip>
+              {x.confidence != null && (
+                <span style={{ fontSize: 12, color: 'var(--text-3)' }}>
+                  {Math.round(x.confidence * 100)}% confident
+                  {x.day_gap != null && `, ${x.day_gap} day${x.day_gap === 1 ? '' : 's'} apart`}
+                </span>
+              )}
+              <Chip tone={x.counted ? '' : 'warn'}>
+                {x.counted ? 'counted once, here' : 'not counted — the other leg is'}
+              </Chip>
+            </div>
+            <div style={note}>{x.what_it_means}</div>
+            <table style={{ marginTop: 8 }}>
+              <thead>
+                <tr><th>Date</th><th>Leg</th><th className="right">Amount</th></tr>
+              </thead>
+              <tbody>
+                {x.legs.map((leg) => (
+                  <tr key={leg.id} style={{ fontWeight: leg.is_this_row ? 600 : 400 }}>
+                    <td className="nowrap">{dateLabel(leg.date)}</td>
+                    <td>
+                      {leg.description}
+                      {leg.is_this_row && (
+                        <Chip style={{ marginLeft: 6, fontSize: 11 }}>this row</Chip>
+                      )}
+                    </td>
+                    <td className="right nowrap">
+                      {leg.direction === 'credit' ? '+' : '−'}{money(leg.amount)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </>
+        ) : (
+          <div style={note}>
+            Not matched to anything. It counts on its own — as
+            {' '}{row.direction === 'credit' ? 'money in' : 'money out'}.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 const SORT_FIELDS = [
   ['date', 'Date'],
@@ -67,6 +231,11 @@ export default function TransactionsTable({
   // Row selection for bulk edits. Distinct from `selected`, which is the
   // set of ACCOUNTS in scope for this view.
   const [picked, setPicked] = useState(() => new Set());
+  // Which row's "why" panel is open, and what it said. One at a time: the
+  // panel is tall, and two open at once pushes the row you were reading off
+  // the screen.
+  const [explaining, setExplaining] = useState(null);
+  const [explanation, setExplanation] = useState(null);
   const [bulkCat, setBulkCat] = useState('');
   const [prefs] = usePrefs();
   const pageSize = Number(prefs.pageSize) || PAGE;
@@ -116,6 +285,10 @@ export default function TransactionsTable({
 
   // Search filters the loaded page only. Pushing it server-side would be the
   // next step; for now the UI says so rather than pretending it searched all.
+  // The detail row spans the table, so it has to agree with the header - which
+  // has two optional columns.
+  const columnCount = 7 + (prefs.showRole ? 1 : 0) + (prefs.showBalance ? 1 : 0);
+
   const visible = useMemo(() => {
     const base = prefs.hideExcluded ? rows.filter((r) => !r.excluded) : rows;
     if (!search.trim()) return base;
@@ -157,6 +330,17 @@ export default function TransactionsTable({
       setError(e.message);
     } finally {
       setSaving(null);
+    }
+  }
+
+  async function toggleExplain(id) {
+    if (explaining === id) { setExplaining(null); return; }
+    setExplaining(id);
+    setExplanation(null);
+    try {
+      setExplanation(await api.explainTransaction(id));
+    } catch (e) {
+      setExplanation({ error: e.message });
     }
   }
 
@@ -230,7 +414,7 @@ export default function TransactionsTable({
   return (
     <>
       <div className="section-title">
-        {title} {total > 0 && `· ${total.toLocaleString('en-IN')} total`}
+        {title} {total > 0 && `· ${count(total)} total`}
       </div>
 
       {accounts.length > 1 && (
@@ -420,8 +604,8 @@ export default function TransactionsTable({
               </thead>
               <tbody>
                 {visible.map((t) => (
+                  <React.Fragment key={t.id}>
                   <tr
-                    key={t.id}
                     style={{
                       opacity: t.excluded ? 0.45 : 1,
                       lineHeight: compact ? 1.15 : undefined,
@@ -469,7 +653,8 @@ export default function TransactionsTable({
                           ))}
                         </select>
                         {prefs.showSource && (
-                          <Chip tone={SOURCE_TONE[t.category_source]}>
+                          <Chip tone={SOURCE_TONE[t.category_source]}
+                            title={whyCategorised(t)}>
                             {SOURCE_LABEL[t.category_source] || t.category_source}
                           </Chip>
                         )}
@@ -514,6 +699,14 @@ export default function TransactionsTable({
                       >
                         {t.excluded ? '↺' : '⊘'}
                       </button>
+                      <button
+                        className="btn icon"
+                        title="Why is this row the way it is?"
+                        aria-expanded={explaining === t.id}
+                        onClick={() => toggleExplain(t.id)}
+                      >
+                        ?
+                      </button>
                       {t.direction === 'debit' && !t.is_internal_transfer && (
                         <PromptButton
                           className="btn icon"
@@ -528,6 +721,14 @@ export default function TransactionsTable({
                       )}
                     </td>
                   </tr>
+                  {explaining === t.id && (
+                    <tr>
+                      <td colSpan={columnCount} style={{ padding: 0 }}>
+                        <Explanation row={t} data={explanation} />
+                      </td>
+                    </tr>
+                  )}
+                  </React.Fragment>
                 ))}
               </tbody>
             </table>

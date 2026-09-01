@@ -26,6 +26,8 @@ from datetime import date
 from pathlib import Path
 
 from ..models.profile import UserProfile
+from ..rules import institutions
+from ..rules import passwords as formats
 
 log = logging.getLogger(__name__)
 
@@ -256,46 +258,26 @@ def redact_candidate(password: str) -> str:
     return f"{password[0]}{'*' * (len(password) - 1)}"
 
 
+def _explain(label: str, note: str = "") -> str:
+    """A format's explanation, with any issuer-specific detail appended."""
+    text = formats.BY_LABEL[label].explanation
+    return f"{text} ({note})" if note else text
+
+
 #: Published password rules, shown in the UI so a user can see WHY a file will
-#: open (or why it won't) before anything is tried. Matched on sender/filename
-#: fragments. Descriptions are the bank's own documented format.
+#: open (or why it won't) before anything is tried.
+#:
+#: Derived: the format each issuer uses is recorded on its `rules.institutions`
+#: record, and the wording of each format is in `rules.passwords`. This used to
+#: be a third hand-written list of the same banks, in which "First 4 letters of
+#: your name + DDMM" appeared twelve times in three different wordings.
 PASSWORD_RULES: list[tuple[tuple[str, ...], str, str]] = [
-    (("hdfc",), "Name(4) + DDMM",
-     "First 4 letters of your name in CAPS + date of birth as DDMM"),
-    (("icici",), "Name(4) + DDMM",
-     "First 4 letters of your name in lowercase + date of birth as DDMM"),
-    (("sbi", "onlinesbi"), "DDMMYYYY",
-     "Date of birth as DDMMYYYY"),
-    (("axis",), "Name(4) + DDMM",
-     "First 4 letters of your name + date of birth as DDMM"),
-    (("kotak",), "Name(4) + DDMM", "First 4 letters of name + DDMM"),
-    (("indusind",), "Name(4) + DDMM", "First 4 letters of name + DDMM"),
-    (("idfc",), "Mobile(10)", "Your registered 10-digit mobile number"),
-    (("pnb", "punjab"), "DDMMYYYY", "Date of birth as DDMMYYYY"),
-    (("baroda", "bob"), "Name(4) + DDMM", "First 4 letters of name + DDMM"),
-    (("yes",), "Name(4) + DDMM", "First 4 letters of name + DDMM"),
-    (("hsbc",), "DDMMYYYY", "Date of birth as DDMMYYYY"),
-    (("rbl",), "Name(4) + DDMM", "First 4 letters of name + DDMM"),
-    (("slice",), "PAN", "Your PAN in uppercase"),
-    (("amex", "americanexpress"), "Card(4) + DDMM",
-     "Last 4 digits of the card + date of birth as DDMM"),
-    (("cams", "kfintech", "cdsl", "nsdl", "protean", "mfcentral"), "PAN",
-     "Your PAN in uppercase"),
-    (("zerodha", "upstox", "5paisa", "dhan", "paytmmoney", "angel"), "PAN",
-     "Your PAN in uppercase"),
-    (("bajaj", "tatacapital", "lichousing"), "Name(4) + DDMM",
-     "First 4 letters of name + DDMM"),
-    # Bureaus lock their reports with the details they hold on file rather
-    # than anything account-specific, so PAN and full date of birth are the
-    # two that matter and neither shares a format with a bank statement.
-    (("cibil", "transunion"), "DDMMYYYY", "Date of birth as DDMMYYYY"),
-    (("experian",), "PAN", "Your PAN in uppercase"),
-    (("crif", "highmark"), "DDMMYYYY", "Date of birth as DDMMYYYY"),
-    (("equifax",), "PAN", "Your PAN in uppercase"),
+    (fragments, label, _explain(label, note))
+    for fragments, label, note in institutions.password_rules()
 ]
 
 #: Shown when nothing matches - we still try the full candidate set.
-UNKNOWN_RULE = ("Unknown", "Format not documented here; all known formats are tried")
+UNKNOWN_RULE = (formats.UNKNOWN.label, formats.UNKNOWN.explanation)
 
 
 def password_hint(sender: str = "", filename: str = "") -> tuple[str, str]:
@@ -305,11 +287,11 @@ def password_hint(sender: str = "", filename: str = "") -> tuple[str, str]:
     the whole candidate set - the hint tells the user what to expect, it does
     not restrict what gets attempted.
     """
-    haystack = f"{sender} {filename}".lower()
-    for fragments, label, explanation in PASSWORD_RULES:
-        if any(fragment in haystack for fragment in fragments):
-            return label, explanation
-    return UNKNOWN_RULE
+    haystack = f"{sender} {filename}"
+    label = institutions.password_format_for(haystack)
+    if not label:
+        return UNKNOWN_RULE
+    return label, _explain(label, institutions.password_note_for(haystack))
 
 
 def profile_can_satisfy(profile: UserProfile | None, label: str) -> bool:
@@ -317,24 +299,22 @@ def profile_can_satisfy(profile: UserProfile | None, label: str) -> bool:
 
     Lets the UI mark a file as "you're missing your PAN for this one" before the
     user waits for a download and a failed parse.
+
+    What each format needs is declared on the format itself. It used to be
+    inferred by looking for substrings inside the label, so renaming a label
+    silently changed which profile fields the app believed it required.
     """
     if profile is None:
         return False
-    needs_name = "Name" in label
-    needs_dob = "DDMM" in label or "DDMMYYYY" in label
-    needs_pan = "PAN" in label
-    needs_mobile = "Mobile" in label
-
-    if needs_name and not profile.full_name:
-        return False
-    if needs_dob and profile.date_of_birth is None:
-        return False
-    if needs_pan and not profile.pan:
-        return False
-    if needs_mobile and not profile.mobile:
-        return False
-    if label == "Unknown":
+    if label == formats.UNKNOWN.label:
         return profile.has_password_material()
+
+    spec = formats.BY_LABEL.get(label)
+    if spec is None:
+        return True
+    for field in spec.needs:
+        if not getattr(profile, field, None):
+            return False
     return True
 
 

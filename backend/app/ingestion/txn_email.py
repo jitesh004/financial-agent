@@ -24,9 +24,12 @@ import html
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from datetime import date
+from decimal import Decimal
 from typing import Iterable
+
+from ..normalize import parsers
+from ..rules import formats
 
 log = logging.getLogger(__name__)
 
@@ -65,37 +68,29 @@ _DATE_TOKEN = (r"(\d{1,2}[-/ ][A-Za-z]{3,9}[-/ ]\d{2,4}"
                r"|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}"
                r"|\d{4}-\d{2}-\d{2})")
 
-_MONTHS = {m: i for i, m in enumerate(
-    ["jan", "feb", "mar", "apr", "may", "jun",
-     "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+
+# The three readers below delegate to `normalize.parsers`, the same code that
+# reads a statement cell. They were private strptime lists here, and a format
+# the statement side learned - "15.01.2026", say - had to be learned again.
 
 
 def parse_amount(raw: str) -> Decimal | None:
-    try:
-        return Decimal(raw.replace(",", "").strip())
-    except (InvalidOperation, AttributeError):
-        return None
+    return parsers.money(raw)
 
 
 def parse_date(raw: str | None, fallback: date | None = None) -> date | None:
-    """A date out of any of the shapes Indian banks put in an alert."""
+    """A date out of any of the shapes Indian banks put in an alert.
+
+    `fallback` is the email's own received date. It supplies the year for a
+    bare "15-Aug" - which is how half these alerts are written - and is the
+    answer when nothing parses at all, since an alert with an unreadable date
+    still happened on the day it arrived.
+    """
     if not raw:
         return fallback
-    # Commas first: "Aug 29, 2026" has to become "Aug-29-2026", not
-    # "Aug-29,-2026", or every ICICI card alert falls back to the email's date.
-    token = re.sub(r"[\s,]+", "-", raw.strip().replace("/", "-")).strip("-")
-    for fmt in ("%d-%b-%Y", "%d-%b-%y", "%d-%B-%Y", "%d-%m-%Y", "%d-%m-%y",
-                "%Y-%m-%d", "%d-%b", "%b-%d-%Y", "%B-%d-%Y", "%b-%d-%y"):
-        try:
-            parsed = datetime.strptime(token, fmt).date()
-        except ValueError:
-            continue
-        if fmt == "%d-%b" and fallback:
-            # A day and month with no year: the alert was sent this year, and
-            # the fallback (the email's own date) is the only source for it.
-            parsed = parsed.replace(year=fallback.year)
-        return parsed
-    return fallback
+    parsed = parsers.parse_date(
+        str(raw), default_year=fallback.year if fallback else None)
+    return parsed if parsed else fallback
 
 
 #: A date introduced by "on" is the transaction's own; a bare one might be a
@@ -118,15 +113,14 @@ def date_in(text: str) -> str | None:
     return match.group(1) if match else None
 
 
-_MASK = re.compile(r"(?:x{2,}|\*{2,}|XX)?(\d{4})\b", re.IGNORECASE)
-
-
 def parse_account(raw: str | None) -> str:
-    """The last four digits of whatever account an alert names."""
-    if not raw:
-        return ""
-    match = _MASK.search(raw.strip())
-    return match.group(1) if match else ""
+    """The last four digits of whatever account an alert names.
+
+    The same reader the statement and bureau sides use. This is the key all
+    three join on - an alert is matched to an account by these four digits and
+    refused if they name nothing - so they must extract it identically.
+    """
+    return formats.last_four(raw)
 
 
 # --------------------------------------------------------------------------

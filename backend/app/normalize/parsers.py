@@ -15,19 +15,17 @@ Two deliberate choices:
 from __future__ import annotations
 
 import re
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal, InvalidOperation
+
+from ..rules import formats
 
 # --------------------------------------------------------------------------
 # Dates
 # --------------------------------------------------------------------------
 
-_MONTHS = {
-    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
-    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
-    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10,
-    "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
-}
+#: Shared with every other reader - see rules.formats.
+_MONTHS = formats.MONTHS
 
 #: (regex, handler-key). Ordered most-specific first.
 _DATE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -49,6 +47,11 @@ _DATE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # on purpose, tried last, and only ever resolves with a `default_year`
     # supplied by the caller - see parse_date.
     (re.compile(r"^([A-Za-z]{3,9})[-/.\s,]+(\d{1,2})$"), "monthd_noyear"),
+    # 18-Jun - the same omission the other way round, which is how bank alert
+    # emails write it ("debited from A/c XX1234 on 15-Aug"). This lived in
+    # txn_email as a private strptime format list; the two shapes belong
+    # together, and neither resolves without a `default_year`.
+    (re.compile(r"^(\d{1,2})[-/.\s,]+([A-Za-z]{3,9})$"), "dmonth_noyear"),
 ]
 
 _DATE_NOISE = re.compile(r"\s+\d{1,2}:\d{2}(:\d{2})?\s*(AM|PM)?$", re.IGNORECASE)
@@ -61,8 +64,33 @@ def _expand_year(y: int) -> int:
     return 1900 + y if y >= 70 else 2000 + y
 
 
+def _year_for(month: int, day: int, default_year: int,
+              period: tuple[date | None, date | None] | None) -> int:
+    """Which year a yearless date belongs to.
+
+    `default_year` unless the statement spans a year boundary, in which case
+    the year that puts the date inside the period wins. A statement covering
+    April 2025 to March 2026 prints "15 May" for a row in 2025; taking the
+    period's end year would date it May 2026, two months after the statement
+    closed, and the row would then be dropped as out of period.
+    """
+    if not period:
+        return default_year
+    start, end = period
+    if not start or not end or start.year == end.year:
+        return default_year
+    for candidate in (start.year, end.year):
+        try:
+            if start <= date(candidate, month, day) <= end:
+                return candidate
+        except ValueError:
+            continue  # 29 Feb in a non-leap candidate
+    return default_year
+
+
 def parse_date(value: str, day_first: bool = True,
-               default_year: int | None = None) -> date | None:
+               default_year: int | None = None,
+               period: tuple[date | None, date | None] | None = None) -> date | None:
     """Parse a statement date cell. Returns None rather than raising.
 
     A None here is a signal to the caller that the row is probably not a
@@ -74,6 +102,13 @@ def parse_date(value: str, day_first: bool = True,
     that pattern never matches, and it is deliberately left unresolved
     rather than guessed at: a caller with no year to offer should keep
     treating the row as unparseable, the same as it always has.
+
+    `period` fixes the one case a single `default_year` cannot: a statement
+    that spans a year boundary. A quarterly statement covering Nov to Jan, or
+    an annual one covering April to March, prints "15 May" for a row that
+    belongs to the EARLIER year - and resolving it to the period's end year
+    puts it after the statement closed, where `_drop_rows_after_period` then
+    discards it. Given the period, the year that lands the date inside it wins.
     """
     if value is None:
         return None
@@ -113,9 +148,17 @@ def parse_date(value: str, day_first: bool = True,
                     continue
                 mo = _MONTHS.get(m.group(1).lower(), 0)
                 d = int(m.group(2))
-                y = default_year
                 if not mo:
                     continue
+                y = _year_for(mo, d, default_year, period)
+            elif kind == "dmonth_noyear":
+                if default_year is None:
+                    continue
+                d = int(m.group(1))
+                mo = _MONTHS.get(m.group(2).lower(), 0)
+                if not mo:
+                    continue
+                y = _year_for(mo, d, default_year, period)
             else:  # ambiguous
                 a, b = int(m.group(1)), int(m.group(2))
                 y = _expand_year(int(m.group(3)))
@@ -129,6 +172,36 @@ def parse_date(value: str, day_first: bool = True,
         except (ValueError, TypeError):
             continue
     return None
+
+
+#: A date-shaped run, for finding one inside prose rather than parsing a cell
+#: that is entirely a date. Deliberately permissive - whatever it finds is
+#: handed to `parse_date`, which is the thing that decides if it is real.
+_DATE_IN_TEXT = re.compile(
+    rf"\b(\d{{1,2}}[-/. ]{{1,2}}(?:{formats.MONTH_ALTERNATION})[-/. ]{{1,2}}\d{{2,4}}"
+    rf"|(?:{formats.MONTH_ALTERNATION})[-/. ,]{{1,2}}\d{{1,2}},?\s*\d{{2,4}}"
+    rf"|\d{{4}}-\d{{1,2}}-\d{{1,2}}"
+    rf"|\d{{1,2}}[-/.]\d{{1,2}}[-/.]\d{{2,4}}"
+    rf"|\d{{1,2}}[-/. ](?:{formats.MONTH_ALTERNATION}))\b",
+    re.IGNORECASE,
+)
+
+
+def find_date(text: str, day_first: bool = True,
+              default_year: int | None = None) -> date | None:
+    """The first date inside a longer string, or None.
+
+    `parse_date` is anchored: it answers "is this cell a date". Bureau reports
+    and alert emails ask the other question - "there is a date somewhere in
+    this sentence" - and each had grown its own smaller pattern set to answer
+    it. The bureau one knew five shapes and returned None for "Aug 29, 2026",
+    "15.01.2026" and "15-01-26", all of which appear on real reports.
+    """
+    match = _DATE_IN_TEXT.search(text or "")
+    if not match:
+        return None
+    return parse_date(match.group(1), day_first=day_first,
+                      default_year=default_year)
 
 
 def infer_date_order(values: list[str]) -> bool:
@@ -378,11 +451,9 @@ def parse_indian_shorthand(text: str) -> Decimal | None:
 # --------------------------------------------------------------------------
 
 #: Payment-rail prefixes that carry no merchant information.
-_RAIL_PREFIXES = re.compile(
-    r"^\s*(UPI|IMPS|NEFT|RTGS|POS|ATM|ACH|ECS|NACH|MMT|INF|TRF|BIL|CHQ|CASH|MPS|VIN|SI)"
-    r"[\s/\-:]+",
-    re.IGNORECASE,
-)
+#: See rules.formats.PREFIX_RAILS - the names live there because three
+#: modules strip or match on them and each used to spell its own list.
+_RAIL_PREFIXES = formats.PREFIX_RAIL_PATTERN
 _REF_NUMBERS = re.compile(r"\b\d{8,}\b")
 _MULTISPACE = re.compile(r"\s+")
 #: Payment aggregators that prefix the merchant they collected for. The "X6098Z"
@@ -483,3 +554,27 @@ def extract_merchant(raw: str) -> str | None:
 
     # Merchant names are usually the first 1-3 alphabetic words after the rail.
     return " ".join(words[:3])
+
+
+def money(raw: object) -> Decimal | None:
+    """A plain rupee figure out of a cell, or None.
+
+    The same reader as `parse_amount`, without the direction - which is what
+    a bureau balance, a NAV and an alert amount each want. None rather than
+    zero for anything blank: see `formats.NO_FIGURE`.
+    """
+    return parse_amount("" if raw is None else str(raw)).value
+
+
+def signed_money(raw: object) -> Decimal | None:
+    """`money`, but a leading minus survives.
+
+    Holdings keep their sign - a negative quantity is a real thing on a
+    contract note - while a bank statement's "-500" is a debit of 500 and the
+    sign is carried by the direction instead.
+    """
+    parsed = parse_amount("" if raw is None else str(raw))
+    if parsed.value is None:
+        return None
+    negative = parsed.explicit_direction == "debit" and "-" in str(raw)
+    return -parsed.value if negative else parsed.value

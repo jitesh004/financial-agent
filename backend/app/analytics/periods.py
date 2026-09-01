@@ -9,6 +9,26 @@ from .recurring import RecurringSeries
 logger = logging.getLogger(__name__)
 
 
+#: A monthly series has to be seen this many times before its payday can be
+#: estimated at all. Two occurrences give a midpoint, not an anchor.
+MIN_OCCURRENCES_TO_SHIFT = 3
+
+#: Which days count as "the end of the month" and "the start of it".
+#:
+#: A salary anchored on or after MONTH_END that arrives on or before
+#: MONTH_START belongs to the PREVIOUS month - pay for August that landed on
+#: 1 September is August's pay. The mirror case is a salary anchored at the
+#: start of the month that arrives on the 25th or later: that is next month's,
+#: paid early.
+#:
+#: Named because they are also what the Rules screen prints. A number typed
+#: twice is a number that eventually disagrees with itself.
+MONTH_END_ANCHOR = 24
+MONTH_START_ANCHOR = 6
+ARRIVED_EARLY_FROM = 25
+ARRIVED_LATE_UNTIL = 6
+
+
 def _circular_distance(a: int, b: int, period: int = 31) -> int:
     """Distance between two days on a circle."""
     diff = abs(a - b)
@@ -104,7 +124,8 @@ def assign_accounting_months(
 
     # 2. Drift correction
     for series in recurring_series:
-        if series.cadence_name != "monthly" or series.occurrences < 3:
+        if (series.cadence_name != "monthly"
+                or series.occurrences < MIN_OCCURRENCES_TO_SHIFT):
             continue
 
         members = [txn_by_id[tid] for tid in series.transaction_ids if tid in txn_by_id]
@@ -123,9 +144,13 @@ def assign_accounting_months(
             calendar_month[id(txn)] = original_month
 
             delta = 0
-            if anchor >= 24 and day <= 6:
+            if anchor >= MONTH_END_ANCHOR and day <= ARRIVED_LATE_UNTIL:
+                # Paid at month end, arrived in the first days of the next -
+                # it is the previous month's pay.
                 delta = -1
-            elif anchor <= 6 and day >= 25:
+            elif anchor <= MONTH_START_ANCHOR and day >= ARRIVED_EARLY_FROM:
+                # Paid at month start, arrived at the end of the one before -
+                # next month's pay, early.
                 delta = 1
 
             if delta != 0:

@@ -279,7 +279,7 @@ _TXN_COLUMNS = (
     "category, category_source, category_confidence, is_internal_transfer, "
     "is_mirror_leg, transfer_pair_id, recurring_series_id, reference, source_row, "
     "fingerprint, accounting_month, needs_review, review_reason, flow_role, "
-    "excluded, note, source, superseded"
+    "excluded, note, source, superseded, category_rule, direction_reason"
 )
 
 
@@ -300,7 +300,8 @@ def save_transactions(db: Database, transactions: Sequence[Transaction]) -> int:
             txn.source_row,
             txn.fingerprint, txn.accounting_month, int(txn.needs_review),
             txn.review_reason, txn.flow_role, int(txn.excluded), txn.note,
-            txn.source, int(txn.superseded),
+            txn.source, int(txn.superseded), txn.category_rule,
+            txn.direction_reason,
         ))
 
     placeholders = ",".join(["?"] * len(_TXN_COLUMNS.split(",")))
@@ -488,6 +489,42 @@ def get_transactions(
     return [_row_to_transaction(r) for r in rows]
 
 
+def get_transaction(db: Database, txn_id: str) -> Transaction | None:
+    """One transaction by id, or None."""
+    with db.connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM transactions WHERE id = ?", (txn_id,)).fetchone()
+    return _row_to_transaction(row) if row else None
+
+
+def transactions_in_pair(db: Database, pair_id: str) -> list[Transaction]:
+    """Every leg of one transfer or settlement group.
+
+    Read from the transactions themselves rather than from `transfer_pairs`,
+    which only records the two ends of a 1:1 match. A multi-leg settlement -
+    one bank debit covering three cards - has no pair row per leg, and asking
+    the pairs table would report a group of two for a group of four.
+    """
+    if not pair_id:
+        return []
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM transactions WHERE transfer_pair_id = ? "
+            "ORDER BY txn_date, id", (pair_id,)).fetchall()
+    return [_row_to_transaction(r) for r in rows]
+
+
+def get_transfer_pair(db: Database, pair_id: str) -> dict[str, Any] | None:
+    """The recorded match for a pair id: kind, day gap and confidence."""
+    if not pair_id:
+        return None
+    with db.connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM transfer_pairs WHERE pair_id = ?",
+            (pair_id,)).fetchone()
+    return dict(row) if row else None
+
+
 def count_transactions(
     db: Database,
     account_id: str | Sequence[str] | None = None,
@@ -525,6 +562,8 @@ def _row_to_transaction(row) -> Transaction:
         category=row["category"],
         category_source=ConfidenceSource(row["category_source"]),
         category_confidence=row["category_confidence"],
+        category_rule=_col(row, "category_rule", ""),
+        direction_reason=_col(row, "direction_reason", ""),
         is_internal_transfer=bool(row["is_internal_transfer"]),
         is_mirror_leg=bool(_col(row, "is_mirror_leg")),
         transfer_pair_id=row["transfer_pair_id"],

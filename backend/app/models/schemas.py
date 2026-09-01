@@ -318,6 +318,13 @@ class Transaction(BaseModel):
     category: str = Category.UNCATEGORIZED
     category_source: ConfidenceSource = ConfidenceSource.DEFAULT
     category_confidence: float = 0.0
+    #: Which rule decided it, when a rule did. Empty otherwise.
+    #: `category_source` says a rule fired; this says which one.
+    category_rule: str = ""
+    #: Why this row is money in or money out - a code from rules.directions.
+    #: Direction is the one field where a mistake lands on both sides of every
+    #: total at once, so it carries its reasoning.
+    direction_reason: str = ""
 
     #: Set by reconcile.transfers when this row is one leg of an internal move.
     is_internal_transfer: bool = False

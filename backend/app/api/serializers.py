@@ -81,6 +81,9 @@ def transaction_json(txn: Transaction) -> dict[str, Any]:
         "balance_after": num(txn.balance_after),
         "category": txn.category,
         "category_source": txn.category_source.value,
+        # Which rule fired, so "why is this Dining?" has an answer.
+        "category_rule": txn.category_rule,
+        "direction_reason": txn.direction_reason,
         "category_confidence": round(txn.category_confidence, 2),
         "is_internal_transfer": txn.is_internal_transfer,
         "is_mirror_leg": txn.is_mirror_leg,

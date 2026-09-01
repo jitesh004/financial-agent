@@ -36,6 +36,7 @@ from ..models.schemas import (
     Account, AccountType, Category, ConfidenceSource,
     Direction, FlowRole, Transaction,
 )
+from ..rules import formats, institutions
 
 log = logging.getLogger(__name__)
 
@@ -46,12 +47,28 @@ log = logging.getLogger(__name__)
 #: Narrations that independently identify a payment rail — the gate that
 #: must open before any multi-leg group is attempted.  A coincidental
 #: subset sum with none of these words in the narration must NOT match.
+#:
+#: The bill-payment wordings come from rules.formats: a core shared with the
+#: direction reader and the categorizer, plus the two this gate alone accepts
+#: (Dreamplug is CRED's payment entity; a bare "BBPS" is enough to attempt a
+#: group even though it is not enough to name a category). A masked card
+#: number is settlement's own signal and means nothing to the other two.
+_SETTLEMENT_MARKERS = (formats.BILL_PAYMENT_MARKERS
+                       + formats.SETTLEMENT_ONLY_BILL_MARKERS
+                       + (r'XXXX\d{4}',))
+
+#: The issuer half used to be eight bank names typed out here - a ninth copy
+#: of the institution list, and an incomplete one: a Yes Bank, IDFC or Bank of
+#: Baroda card bill named its issuer in the narration and still could not open
+#: this gate, so those bills were never settled against the card.
+#:
+#: Only word-safe issuer tokens are used. "yes" and "bob" are registry
+#: fragments and ordinary English words, and `\bYES\b` in a narration filter
+#: would open the gate on any sentence containing the word "yes".
 PAYMENT_RAIL_PATTERNS = re.compile(
-    r'\bCRED\b|\bCRED\.CLUB\b|\bDREAMPLUG\b|\bBBPS\b|\bBILLPAY\b|\bBPPY\b'
-    r'|\bAMEX\b|\bAMERICAN\s+EXPRESS\b'
-    r'|\bAXIS\b|\bHDFC\b|\bICICI\b|\bSBI\b|\bKOTAK\b|\bINDUSIND\b|\bRBL\b|\bHSBC\b'
-    r'|\bCARD\s+PAYMENT\b|\bCREDIT\s+CARD\s+PAYMENT\b|\bCC\s+PAYMENT\b'
-    r'|XXXX\d{4}',
+    '|'.join(_SETTLEMENT_MARKERS
+             + tuple(rf'\b{re.escape(word)}\b'
+                     for word in institutions.narration_words())),
     re.IGNORECASE,
 )
 

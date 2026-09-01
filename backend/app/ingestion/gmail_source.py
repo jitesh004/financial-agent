@@ -33,23 +33,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from ..rules import institutions
+
 log = logging.getLogger(__name__)
 
 # Read-only. This is a hard ceiling: even a compromised token cannot send or
 # delete mail, only read it.
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
-#: Senders and subjects that mark an email as carrying a statement. Tuned to be
-#: inclusive - a false positive just downloads a PDF the parser later ignores,
-#: while a false negative silently drops a real statement.
-STATEMENT_SENDERS = [
-    "hdfcbank", "icicibank", "axisbank", "sbi", "onlinesbi", "kotak",
-    "yesbank", "indusind", "idfcfirstbank", "pnb", "bankofbaroda", "canarabank",
-    "sc.com", "citi", "americanexpress", "bajajfinserv", "tatacapital",
-    "cams", "kfintech", "camsonline", "nsdl", "cdsl", "zerodha", "groww",
-    "angelone", "angelbroking", "upstox", "5paisa", "dhan.co", "paytmmoney",
-    "statements", "estatement", "e-statement", "creditcard",
-]
+#: Who and what a scan looks for.
+#:
+#: The issuer lists are DERIVED from `rules.institutions` - see that module for
+#: why. What stays here is the wording: the subject phrases that mark an email
+#: as carrying one kind of document rather than another. Those are properties
+#: of the document, not of the bank that sent it, so they belong next to the
+#: filter that reads them.
+
+#: Statement senders, as a local acceptance test. Inclusive on purpose - a
+#: false positive downloads a PDF the parser later ignores, while a false
+#: negative silently drops a real statement.
+STATEMENT_SENDERS = list(institutions.fragments_for_scan(
+    institutions.SENDS_STATEMENT))
 STATEMENT_KEYWORDS = [
     "statement", "e-statement", "estatement", "account statement",
     "credit card statement", "loan statement", "portfolio statement",
@@ -66,12 +70,6 @@ _SUBJECT_TERMS = (
     "monthly statement", "transaction statement", "funds statement",
 )
 
-_FROM_TERMS = (
-    "bank", "creditcard", "creditcardstatement", "statements", "estatement",
-    "e-statement", "loanestatement", "cams", "kfintech", "cdsl", "nsdl",
-    "alerts", "noreply", "donotreply",
-)
-
 #: Excluded at query level - promotional mail is the single biggest source of
 #: false positives, and Gmail can filter it far more cheaply than we can.
 _QUERY_EXCLUSIONS = "-category:promotions -category:social -in:spam -in:trash"
@@ -84,11 +82,6 @@ _BUREAU_SUBJECT_TERMS = (
     "credit report", "credit information report", "credit score",
     "cibil report", "cibil score", "experian credit", "crif report",
     "equifax credit", "your credit health", "annual credit report",
-)
-
-_BUREAU_FROM_TERMS = (
-    "cibil", "transunion", "crif", "crifhighmark", "experian", "equifax",
-    "creditreport", "creditscore", "onescore", "creditvidya", "bureau",
 )
 
 #: Transaction alerts. Deliberately NOT `has:attachment` - the whole point of
@@ -106,33 +99,12 @@ _INVESTMENT_SUBJECT_TERMS = (
     "transaction statement", "account statement",
 )
 
-_INVESTMENT_FROM_TERMS = (
-    "zerodha", "upstox", "5paisa", "dhan.co", "paytmmoney", "angelbroking",
-    "angeltrade", "groww", "icicidirect", "kotaksecurities", "sharekhan",
-    "motilaloswal", "angelone", "cdslstatement", "cdslindia", "nsdl",
-    "proteantech", "kfintech", "camsonline", "cams.", "mfcentral",
-)
-
-
 _ALERT_SUBJECT_TERMS = (
     "transaction alert", "debited", "credited", "spent on", "txn alert",
     "transaction on", "payment of", "upi transaction", "debit alert",
     "credit alert", "card transaction", "withdrawn",
 )
 
-#: Deliberately NOT the generic mailer words. "noreply", "alert" and
-#: "notification" are how every SaaS product on earth addresses you, and with
-#: them in the list a scan for transaction alerts came back with LinkedIn,
-#: Zoom, OpenAI, Glassdoor and a jobs board - 25 of 227 results were not from
-#: a financial institution at all. Only issuers that actually send alerts.
-_ALERT_FROM_TERMS = (
-    "hdfcbank", "icicibank", "icici.bank", "sbi.bank", "onlinesbi", "alerts.sbi",
-    "axisbank", "axis.bank", "kotak", "yes.bank", "yesbank", "indusind",
-    "idfcfirst", "idfc", "pnb", "bankofbaroda", "bob.bank", "bobworld",
-    "canarabank", "unionbank", "rblbank", "rbl.bank", "federalbank", "aubank",
-    "bandhanbank", "southindianbank", "hsbc", "sbicard", "bobcard", "onecard",
-    "amex", "americanexpress", "slice", "cred.club", "paytmbank",
-)
 
 #: The three things a scan can look for. Each is a different kind of document
 #: with a different reader behind it, so the search that finds one is no use
@@ -143,7 +115,7 @@ SCAN_INTENTS: dict[str, dict[str, object]] = {
         "description": "Bank, card, loan and portfolio statement PDFs.",
         "needs_attachment": True,
         "subjects": _SUBJECT_TERMS,
-        "senders": _FROM_TERMS,
+        "senders": institutions.query_senders(institutions.SENDS_STATEMENT),
         "max_months": None,
     },
     "bureau": {
@@ -153,7 +125,7 @@ SCAN_INTENTS: dict[str, dict[str, object]] = {
                        "ever reaches you for.",
         "needs_attachment": True,
         "subjects": _BUREAU_SUBJECT_TERMS,
-        "senders": _BUREAU_FROM_TERMS,
+        "senders": institutions.query_senders(institutions.SENDS_BUREAU),
         "max_months": None,
     },
     "investment": {
@@ -163,7 +135,7 @@ SCAN_INTENTS: dict[str, dict[str, object]] = {
                        "and the rest.",
         "needs_attachment": True,
         "subjects": _INVESTMENT_SUBJECT_TERMS,
-        "senders": _INVESTMENT_FROM_TERMS,
+        "senders": institutions.query_senders(institutions.SENDS_INVESTMENT),
         "max_months": None,
     },
     "transactional": {
@@ -172,7 +144,7 @@ SCAN_INTENTS: dict[str, dict[str, object]] = {
                        "a payment. Covers the gap before a statement is cut.",
         "needs_attachment": False,
         "subjects": _ALERT_SUBJECT_TERMS,
-        "senders": _ALERT_FROM_TERMS,
+        "senders": institutions.query_senders(institutions.SENDS_ALERT),
         # Hard-capped. Alerts are unreconciled by nature and only earn their
         # place by being fresher than the statement; a year of them would be a
         # year of unchecked figures sitting next to checked ones.
@@ -238,31 +210,8 @@ PERIOD_OPTIONS: list[tuple[str, int | None]] = [
 #: Used to import selectively - a weekly broker funds statement is a different
 #: kind of document from a bank statement and rarely yields a useful ledger.
 SENDER_CATEGORIES: dict[str, tuple[str, ...]] = {
-    "bank": (
-        "hdfcbank", "icicibank", "sbi.bank", "onlinesbi", "alerts.sbi",
-        "axis.bank", "axisbank", "kotak", "yes.bank", "yesbank", "indusind",
-        "idfcfirst", "pnbmail", "pnb.bank", "bankofbaroda", "canarabank",
-        "unionbank", "slice.bank", "rbl.bank", "rblbank", "federalbank",
-        "aubank", "bandhanbank", "estatement", "statement@",
-    ),
-    "card": (
-        "creditcardstatement", "creditcard", "cards@", "bobcard", "sbicard",
-        "amex", "americanexpress", "hsbc", "onecard", "cred.club",
-    ),
-    "loan": (
-        "loanestatement", "loanstatement", "bajajfinserv", "tatacapital",
-        "lichousing", "hdfcltd", "homeloan",
-    ),
-    "bureau": (
-        "cibil", "transunion", "crif", "crifhighmark", "experian", "equifax",
-        "onescore", "creditreport", "creditscore",
-    ),
-    "broker": (
-        "zerodha", "upstox", "5paisa", "dhan.co", "paytmmoney", "angelbroking",
-        "angeltrade", "groww", "icicidirect", "kotaksecurities", "sharekhan",
-        "motilaloswal", "angelone", "cdslstatement", "cdslindia", "nsdl", "proteantech",
-        "kfintech", "camsonline", "cams.", "mfcentral",
-    ),
+    kind: institutions.fragments_for_kind(kind)
+    for kind in institutions.CLASSIFY_ORDER
 }
 
 
@@ -278,43 +227,22 @@ def institution_for_sender(sender: str) -> str:
     Resolving from the domain also merges an institution's multiple mailers -
     icicibank.com and icici.bank.in are one bank, not two.
     """
-    from ..normalize.metadata import INSTITUTIONS
-
-    lowered = (sender or "").lower()
-    best_length = 0
-    best_name = ""
-    for fragment, name in INSTITUTIONS.items():
-        # Longest match wins, so "bank of baroda" beats a stray "bank".
-        if fragment in lowered and len(fragment) > best_length:
-            best_length, best_name = len(fragment), name
-
-    if best_name:
-        return best_name
+    name = institutions.name_for(sender)
+    if name:
+        return name
 
     # Fall back to a readable display name, then to the domain.
-    if "<" in sender:
+    if "<" in (sender or ""):
         display = sender.split("<")[0].strip().strip('"')
         if display and "@" not in display:
             return display
-    import re as _re
-    domain = _re.search(r"@([\w.-]+)", sender or "")
+    domain = re.search(r"@([\w.-]+)", sender or "")
     return domain.group(1) if domain else (sender or "Unknown")
 
 
 def classify_sender(sender: str) -> str:
-    """Bucket a sender into bank / card / loan / broker / unknown.
-
-    Checked most-specific first: a credit-card mailer at a bank's domain must
-    classify as a card, not as that bank's savings account.
-    """
-    lowered = (sender or "").lower()
-    # Bureau first: a bureau mails from addresses that look like a bank's,
-    # and misfiling one as a bank statement sends it to a reader that will
-    # find no transactions in it and call that a parse failure.
-    for category in ("bureau", "card", "loan", "broker", "bank"):
-        if any(fragment in lowered for fragment in SENDER_CATEGORIES[category]):
-            return category
-    return "unknown"
+    """Bucket a sender into bank / card / loan / broker / bureau / unknown."""
+    return institutions.classify(sender)
 
 
 @dataclass
@@ -679,7 +607,9 @@ def statement_rejection_reason(sender: str, subject: str,
         for pattern, reason in REJECTION_RULES:
             if pattern.search(subject):
                 return reason
-        if any(t in haystack for t in _BUREAU_SUBJECT_TERMS) or any(t in haystack for t in _BUREAU_FROM_TERMS):
+        bureau_senders = institutions.query_senders(institutions.SENDS_BUREAU)
+        if (any(t in haystack for t in _BUREAU_SUBJECT_TERMS)
+                or any(t in haystack for t in bureau_senders)):
             return None
         return "no bureau signal"
 

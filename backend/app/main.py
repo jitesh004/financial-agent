@@ -28,7 +28,8 @@ from fastapi.responses import JSONResponse
 
 from . import storage
 from .api import (files_routes, gmail_routes, job_routes, query_routes,
-                  settings_routes, staging_routes, wealth_routes)
+                  rules_routes, settings_routes, staging_routes,
+                  wealth_routes)
 from .api import serializers as ser
 from .db.database import get_db
 from .db import repository as repo
@@ -110,6 +111,7 @@ app.include_router(job_routes.router)
 app.include_router(wealth_routes.router)
 app.include_router(settings_routes.router)
 app.include_router(staging_routes.router)
+app.include_router(rules_routes.router)
 
 
 class RunStore:

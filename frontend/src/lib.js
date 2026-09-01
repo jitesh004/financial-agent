@@ -16,6 +16,13 @@ export function money(value, precise = false) {
   return (precise ? inrPrecise : inr).format(value);
 }
 
+/* A plain count with Indian grouping - 1,23,456, not 123,456. Not money, so
+   it carries no rupee sign. Three components each spelled out the locale. */
+export function count(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) return '—';
+  return Number(value).toLocaleString('en-IN');
+}
+
 /* Compact form for axis ticks and tight tiles, in Indian units. A crore axis
    labelled "12,00,00,000" is unreadable; "₹12Cr" is not. */
 export function compact(value) {
@@ -185,6 +192,15 @@ const jsonPost = (path, body) => request(path, {
   headers: { 'Content-Type': 'application/json' },
   body: body === undefined ? undefined : JSON.stringify(body),
 });
+
+/* The rules the app runs on you. Read-only: these live in code, reviewed and
+   tested, and an editable copy would be a second source of truth for every
+   one of them. */
+api.rules = () => request('/api/rules');
+/* What the app decided about ONE row - its category rule, why it is money
+   in or out, and the transfer group it belongs to. */
+api.explainTransaction = (id) => request(`/api/rules/explain/${id}`);
+api.testRules = (example) => jsonPost('/api/rules/test', example);
 
 api.gmailStatus = () => request('/api/gmail/status');
 api.gmailConnect = () => jsonPost('/api/gmail/connect');
