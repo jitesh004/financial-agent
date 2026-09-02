@@ -7,11 +7,15 @@ services:
     image: postgres:16-alpine
     environment:
       - POSTGRES_PASSWORD=postgres
+      # The app role's password. Defaulted here so development needs no
+      # secrets; the init script reads it, so the role and the connection
+      # string below can never disagree.
+      - FA_DB_PASSWORD=${FA_DB_PASSWORD:-financial_agent}
     volumes:
       - pgdata:/var/lib/postgresql/data
       # Creates the `financial_agent` database and the ORDINARY role the app
       # connects as. Read the comments in it before changing either.
-      - ./deploy/postgres-init.sql:/docker-entrypoint-initdb.d/10-financial-agent.sql:ro
+      - ./deploy/postgres-init.sh:/docker-entrypoint-initdb.d/10-financial-agent.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d financial_agent"]
       interval: 3s
@@ -36,7 +40,7 @@ services:
       - "8078:8078"
     environment:
       - PYTHONUNBUFFERED=1
-      - FA_DATABASE_URL=postgresql://financial_agent:financial_agent@db:5432/financial_agent
+      - FA_DATABASE_URL=postgresql://financial_agent:${FA_DB_PASSWORD:-financial_agent}@db:5432/financial_agent
       - FA_DATA_DIR=/data
       - FA_APP_BASE_URL=${FA_APP_BASE_URL:-http://localhost:5173}
       # Sign-in is Google-only. Without these the app runs and says so on the
