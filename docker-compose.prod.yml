@@ -41,7 +41,11 @@ services:
       # The session cookie must be Secure once the app is behind TLS, which in
       # production it always is.
       - FA_SESSION_COOKIE_SECURE=true
-    entrypoint: ["sh", "/app/docker-entrypoint.sh"]
+    entrypoint: ["python", "/app/docker-entrypoint.py"]
+    # Spelled out because Compose's `entrypoint` override also CLEARS the
+    # image's CMD - so relying on the Dockerfile's would start the entrypoint
+    # with no command to hand over to. No --reload here: this is production.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8078"]
     restart: unless-stopped
 
   frontend:

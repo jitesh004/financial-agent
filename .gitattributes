@@ -1,0 +1,11 @@
+# Shell scripts keep LF whatever the host does.
+#
+# Git for Windows checks files out with CRLF by default. A shell script that
+# reaches a Linux container or the deployment VM that way fails on its first
+# line: dash reads `set -e` as `set -e\r` and reports "set: Illegal option -".
+*.sh text eol=lf
+
+# Same reasoning for anything else read by a shell or a Linux daemon.
+Dockerfile* text eol=lf
+*.Caddyfile text eol=lf
+Caddyfile   text eol=lf

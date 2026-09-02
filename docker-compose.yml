@@ -47,7 +47,7 @@ services:
     # The entrypoint refuses with an actionable message if the image is older
     # than the code - see backend/docker-entrypoint.sh for why that is worth
     # a guard rather than a bare ModuleNotFoundError.
-    entrypoint: ["sh", "/app/docker-entrypoint.sh"]
+    entrypoint: ["python", "/app/docker-entrypoint.py"]
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8078", "--reload"]
 
   frontend:
