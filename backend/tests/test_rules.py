@@ -1154,3 +1154,114 @@ def test_every_input_in_the_app_is_a_shape_the_stylesheet_covers():
              "monotone"}
     missing = [t for t in sorted(used) if f'input[type="{t}"]' not in css]
     assert not missing, missing
+
+
+# --------------------------------------------------------------------------
+# A holdings statement is not a bank statement
+# --------------------------------------------------------------------------
+
+def test_an_unreadable_file_is_not_called_a_statement():
+    """The statement reader is the deliberate fallback for anything
+    unrecognised, so "I could not open this" and "this is a statement" used to
+    be the same answer - and the fallback reader always finds something."""
+    from app.ingestion import router
+
+    assert router.classify_document("", "mystery.pdf") == router.DOC_UNREADABLE
+    assert router.classify_document("   \n ", "x.pdf") == router.DOC_UNREADABLE
+
+
+def test_a_record_of_trades_never_routes_to_the_statement_reader():
+    from app.ingestion import router
+
+    for text in ["Contract Note for the trades below",
+                 "ANNUAL GLOBAL TRANSACTION STATEMENT Segment: Future & Option"]:
+        assert router.classify_document(text, "note.pdf") == router.DOC_PORTFOLIO
+
+
+def test_an_amount_that_is_a_slice_of_the_filename_is_not_money():
+    """A Zerodha holdings statement names itself after its DP and client ids:
+
+        transaction-with-holding-statement_UC9050-1208160028236891.pdf
+
+    Read as a bank statement that produced two debits of 60,028,236,891 -
+    120 billion of money out against an actual 75 lakh."""
+    from app.normalize.normalizer import _amount_came_from_the_filename
+
+    name = "transaction-with-holding-statement_UC9050-1208160028236891.pdf"
+    assert _amount_came_from_the_filename(Decimal("60028236891"), name)
+    # A real amount that happens to share a few digits is untouched, and a
+    # short run is never evidence.
+    assert not _amount_came_from_the_filename(Decimal("1208"), name)
+    assert not _amount_came_from_the_filename(Decimal("167489.00"), name)
+    assert not _amount_came_from_the_filename(Decimal("60028236891"), "")
+
+
+def test_only_a_readable_statement_contributes_transactions():
+    """The guard that was already there and never tested: a file the run did
+    not read as a usable statement contributes nothing to the ledger, whatever
+    else its record says."""
+    from app.graph.nodes import merge_ledger
+
+    def entry(status, rows):
+        from app.models.schemas import (Account, AccountType, Direction,
+                                        Statement, Transaction)
+        acct = Account(institution="Test", account_type=AccountType.SAVINGS,
+                       account_number_masked="XXXX1234")
+        stmt = Statement(source_filename=f"{status}.pdf")
+        # Distinct rows: identical ones on one account are indistinguishable
+        # from duplicates, and this test is about STATUS, not deduplication.
+        stmt.transactions = [
+            Transaction(txn_date=date(2026, 6, i + 1),
+                        raw_description=f"{status} row {i}",
+                        normalized_description=f"{status} row {i}",
+                        amount=Decimal(100 + i), direction=Direction.DEBIT)
+            for i in range(rows)]
+        return {"filename": f"{status}.pdf", "attempt": 1, "status": status,
+                "statement": stmt, "account": acct}
+
+    out = merge_ledger({"statements": [
+        entry("ok", 2), entry("unreconciled", 1),
+        entry("failed", 5), entry("not_a_statement", 5),
+        entry("needs_password", 5),
+    ]})
+    assert len(out["transactions"]) == 3
+
+
+def test_a_labelled_alert_is_read_as_well_as_a_sentence():
+    """Axis does not write a sentence, it writes a form. Every other template
+    reads "207.46 spent on card XX5207 at BOOKMYSHOW"; this body has no verb
+    at all, so not one of them matched and every Axis card alert was skipped
+    silently. The SUBJECT is a sentence, which is what makes it easy to miss:
+    the email looks parseable and the body is not."""
+    from app.ingestion import txn_email
+
+    body = ("01-09-2026 Dear Jitesh Agarwal, Here's the summary of your Axis "
+            "Bank Credit Card Transaction: Transaction Amount: INR 207.46 "
+            "Merchant Name: BOOKMYSHOW Axis Bank Credit Card No. XX5207 "
+            "Date & Time: 01-09-2026, 14:13:19 IST Available Limit*: "
+            "INR 359814.54")
+    a = txn_email.parse_alert(body)
+    assert a is not None
+    assert a.template == "card-labelled-summary"
+    assert a.amount == Decimal("207.46")
+    assert a.account_suffix == "5207"
+    # The merchant runs to the issuer's own "Card No." phrase. A lazy capture
+    # stopped at two characters here ("BO"), because the filler that followed
+    # absorbed the rest of the name.
+    assert a.counterparty == "BOOKMYSHOW"
+    # The available limit must not be mistaken for the amount.
+    assert a.amount != Decimal("359814.54")
+
+
+def test_the_card_number_connector_covers_how_banks_write_it():
+    """"card no. XX5207" matched the sentence but captured no account, so the
+    alert arrived with an amount, a payee and a date and was thrown away by
+    match_account with "the alert names no account number"."""
+    from app.ingestion import txn_email
+
+    for wording in ["card no. XX5207", "card no XX5207", "card number XX5207",
+                    "card XX5207", "card ending XX5207",
+                    "card ending with XX5207"]:
+        body = f"INR 207.46 spent on credit {wording} at AMAZON on 12-08-26."
+        a = txn_email.parse_alert(body)
+        assert a is not None and a.account_suffix == "5207", wording

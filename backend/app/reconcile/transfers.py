@@ -461,6 +461,49 @@ def _balances_agree(a: Transaction, b: Transaction) -> bool:
     return a.balance_after is None and b.balance_after is None
 
 
+#: How much narration two rows must share before a matching running balance
+#: is taken as proof they are one row.
+#:
+#: Measured on a real ledger. Pairs that were genuinely different payments -
+#: same amount, same day, same account, on a card statement whose balance
+#: column is not a running balance at all - shared 4 to 6 characters. Pairs
+#: that were one row cut at different points shared 12 or more.
+#:
+#: Set at the true minimum rather than in the middle of that gap, because the
+#: middle is not empty: two different stalls billing the same amount on the
+#: same day read "CHAI STALL ONE" and "CHAI STALL TWO", which share eleven.
+#: A shared merchant NAME is not evidence; a shared bank reference is, and
+#: those run long.
+_SHARED_RUN_FLOOR = 12
+
+
+def _longest_shared_run(a: str, b: str) -> int:
+    """Length of the longest run of characters the two have in common.
+
+    A prefix test only catches truncation at the END. Real statements clip
+    the other way just as often - one extraction keeps the head of a
+    narration and the next keeps its tail, overlapping in the middle:
+
+        UPI/AMOL BALAS/amol222patil@o/Fridge/BANK OF BA/XXXX8667/HDF
+                                             BA/XXXX8667/HDFe180beb4f7e94a4
+
+    Neither prefixes the other, and they are one payment.
+    """
+    if not a or not b:
+        return 0
+    previous = [0] * (len(b) + 1)
+    best = 0
+    for i in range(1, len(a) + 1):
+        current = [0] * (len(b) + 1)
+        for j in range(1, len(b) + 1):
+            if a[i - 1] == b[j - 1]:
+                current[j] = previous[j - 1] + 1
+                if current[j] > best:
+                    best = current[j]
+        previous = current
+    return best
+
+
 def _is_same_row(a: Transaction, b: Transaction) -> bool:
     """Whether two rows of identical account/date/amount/direction are one row.
 
@@ -482,4 +525,23 @@ def _is_same_row(a: Transaction, b: Transaction) -> bool:
     if da[:60] == db[:60]:
         return True
     short, long_ = (da, db) if len(da) <= len(db) else (db, da)
-    return len(short) >= 18 and long_.startswith(short)
+    if len(short) >= 18 and long_.startswith(short):
+        return True
+
+    # A matching running balance is the strong evidence, and it unlocks a
+    # weaker reading of the narration. Two credits of the same amount into
+    # one account on one day CANNOT both leave the same closing balance - the
+    # second would leave it higher by the amount. So when the balances agree
+    # exactly, a shared run of narration is enough; the pair need not prefix
+    # each other.
+    #
+    # Found 32 of these in a real ledger, worth 4.14 lakh of phantom money -
+    # including one salary counted twice because the monthly statement wrote
+    # "NEFT-CMS1812612535608-CUBYTS TECHNOLOGIES..." and the quarterly one
+    # wrote "TECHNOLOGIES PRIVATELIMI- JITESHSALJUN26CMS1-".
+    both_balances = a.balance_after is not None and b.balance_after is not None
+    if both_balances:
+        return _longest_shared_run(da, db) >= _SHARED_RUN_FLOOR
+    # With no balance to check against, the prefix rule above is the only
+    # evidence there is, and it has already said no.
+    return False

@@ -147,6 +147,9 @@ def extract(
 DOC_STATEMENT = "statement"
 DOC_BUREAU = "bureau"
 DOC_PORTFOLIO = "portfolio"
+#: Nothing came out of the file. Distinct from "statement" on purpose - see
+#: classify_document.
+DOC_UNREADABLE = "unreadable"
 
 
 def classify_document(text: str, filename: str = "") -> str:
@@ -159,10 +162,22 @@ def classify_document(text: str, filename: str = "") -> str:
     one with a reconciliation gate to catch its own mistakes.
     """
     from .bureau import looks_like_bureau_report
-    from .portfolio import looks_like_portfolio
+    from .portfolio import looks_like_portfolio, looks_like_trades
+
+    # An empty extraction is not a bank statement, it is an unread file.
+    # Falling through to the statement reader made "I could not open this"
+    # and "this is a statement" the same answer, and the statement reader is
+    # the one with a fallback for everything.
+    if not (text or "").strip():
+        return DOC_UNREADABLE
 
     if looks_like_bureau_report(text, filename):
         return DOC_BUREAU
+    # A record of TRADES is neither a ledger nor a portfolio: its quantities
+    # are what changed hands and its "rate" may be a strike price. Checked
+    # before the holdings test, which fires on a contract note too.
+    if looks_like_trades(text):
+        return DOC_PORTFOLIO
     if looks_like_portfolio(text, filename):
         return DOC_PORTFOLIO
     return DOC_STATEMENT
