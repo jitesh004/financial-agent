@@ -77,6 +77,16 @@ class RecurringSeries:
                 ).quantize(Decimal("0.01"))
 
 
+def _magnitude(amount: Decimal) -> int:
+    """How many digits the amount has, as a coarse size band.
+
+    Coarse on purpose. It has to separate charges that are plainly different
+    things while keeping one that merely changed - a raise, a rent increase -
+    in a single series.
+    """
+    return len(str(int(abs(amount))))
+
+
 def _signature(txn: Transaction) -> str:
     """A stable key for 'the same charge, recurring'.
 
@@ -85,7 +95,24 @@ def _signature(txn: Transaction) -> str:
     series as NETFLIX in February.
     """
     if txn.category == Category.SALARY:
-        return "SALARY"
+        # Payroll narrations change every month - "NEFT-CMS1812612535608-
+        # CUBYTS TECHNOLOGIES" one month, "TECHNOLOGIES PRIVATELIMI-
+        # JITESHSALJUL26CMS2" the next - so the words cannot key the series
+        # and the category has to.
+        #
+        # But the category alone put every salary-labelled row in ONE group,
+        # including two 12,000 person-to-person transfers the user had
+        # themselves marked as salary. Median gap across the merged set was
+        # 20 days, which is not monthly, so no series was found at all - and
+        # with no series there is no drift correction, so a payroll credit
+        # landing on 1 August stayed in August instead of counting as July's
+        # pay. August showed two salaries and July showed none.
+        #
+        # Order of magnitude separates them and nothing else has to: 12,000
+        # and 167,489 are plainly not the same charge, while a raise from
+        # 167,489 to 185,000 stays in one series where an exact-amount key
+        # would split it.
+        return f"SALARY/{_magnitude(txn.amount)}"
 
     base = txn.normalized_description or txn.raw_description or ""
     base = _SIGNATURE_NOISE.sub("", base.upper())

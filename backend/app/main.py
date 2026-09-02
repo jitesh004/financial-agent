@@ -602,6 +602,11 @@ def _persist(state: dict[str, Any]) -> None:
 _PARSE_STATUS = {
     "ok": "parsed", "unreconciled": "unreconciled",
     "failed": "failed", "needs_password": "needs_password",
+    # Read successfully; it simply is not a bank statement. Recorded as
+    # parsed rather than failed because nothing went wrong - a credit report
+    # and a holdings statement are real documents with their own readers, and
+    # calling them failures sends someone hunting for a bug that is not there.
+    "not_a_statement": "parsed",
 }
 
 

@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { formatBytes, money } from '../../lib';
-import { Callout, Chip, Empty } from '../ui';
+import { Callout, Chip, Empty, PromptButton } from '../ui';
+import { CATEGORY_TONE } from './parts';
 import { rowKey } from './useMailbox';
 
 /* Step 3: what each scan found, one collapsible section per source.
@@ -255,19 +256,155 @@ function Section({ source, result, mineRows, selected, onToggle,
   );
 }
 
+/* The filters the old single-screen mailbox had, back in the step that
+ * actually chooses files.
+ *
+ * They were lost when the six-step wizard replaced that screen: FilterBar and
+ * four sibling components were left imported and never rendered, and the last
+ * surviving effect of the type filter was a stale default that silently
+ * hid every broker statement - removed when it turned out to be why the
+ * Download button would not enable.
+ *
+ * What they are for: a scan for statements finds a year of weekly broker
+ * funds statements and a bank's loan mailers alongside the statements you
+ * actually want. Narrowing by TYPE is how you say "not those" once, rather
+ * than unticking sixty rows.
+ */
+function ChooseFilters({
+  rows, search, onSearch, hiddenTypes, onToggleType,
+  ignoredSenders, onIgnore, onClearIgnored, ignoredCount,
+}) {
+  const counts = rows.reduce((acc, r) => {
+    const cat = r.category || 'unknown';
+    acc[cat] = (acc[cat] || 0) + 1;
+    return acc;
+  }, {});
+  const types = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  const senders = [...new Set(rows.map((r) => senderDomain(r.sender)))]
+    .filter(Boolean).sort();
+
+  return (
+    <div className="file-group" style={{ padding: '10px 12px', display: 'grid', gap: 9 }}>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+        <input
+          type="search"
+          placeholder="Search filename, sender or subject…"
+          value={search}
+          onChange={(e) => onSearch(e.target.value)}
+          style={{ flex: 1, minWidth: 200 }}
+        />
+        <PromptButton
+          className="btn"
+          title="Never offer this sender again, in this or any future scan"
+          placeholder="Sender to ignore, e.g. bajajfinserv"
+          submitLabel="Ignore"
+          onSubmit={onIgnore}
+        >
+          Ignore a sender
+        </PromptButton>
+      </div>
+
+      {types.length > 1 && (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+          <span style={{ fontSize: 12, color: 'var(--text-3)' }}>Type:</span>
+          {types.map(([cat, n]) => {
+            const off = hiddenTypes.has(cat);
+            return (
+              <button
+                key={cat}
+                onClick={() => onToggleType(cat)}
+                className={`chip ${off ? '' : CATEGORY_TONE[cat] || 'accent'}`}
+                style={{ cursor: 'pointer', opacity: off ? 0.4 : 1, border: 0 }}
+                title={off ? `Show ${cat} again` : `Hide every ${cat} document`}
+              >
+                {off ? '✕ ' : '✓ '}{cat} ({n})
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {ignoredSenders?.length > 0 && (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+          <span style={{ fontSize: 12, color: 'var(--text-3)' }}>
+            Never offered{ignoredCount ? ` · ${ignoredCount} skipped this scan` : ''}:
+          </span>
+          {ignoredSenders.map((f) => <Chip key={f} tone="warn">{f}</Chip>)}
+          <button className="btn" style={{ padding: '2px 9px', fontSize: 11.5 }}
+            onClick={onClearIgnored}>
+            Clear
+          </button>
+        </div>
+      )}
+
+      {senders.length > 0 && (
+        <div className="xp-hint" style={{ textTransform: 'none' }}>
+          {senders.length} sender{senders.length === 1 ? '' : 's'} in these results.
+        </div>
+      )}
+    </div>
+  );
+}
+
+//: The part of a sender worth showing - the domain, since the display name
+//: is whatever the bank felt like that month.
+function senderDomain(sender) {
+  const m = /@([\w.-]+)/.exec(sender || '');
+  return m ? m[1] : (sender || '').trim();
+}
+
 export default function ChooseSections({
   intents, chosen, sections, sourceResults, rows, selected, onToggle,
-  onToggleMany,
+  onToggleMany, ignoredSenders, ignoredCount, onIgnore, onClearIgnored,
 }) {
+  const [search, setSearch] = useState('');
+  const [hiddenTypes, setHiddenTypes] = useState(() => new Set());
+
+  const toggleType = (cat) => setHiddenTypes((prev) => {
+    const next = new Set(prev);
+    if (next.has(cat)) next.delete(cat); else next.add(cat);
+    return next;
+  });
+
+  /* Filtering hides rows; it never unticks them. A row you already chose and
+     then filtered out of view stays chosen - the alternative is a filter that
+     silently changes what you are about to import, which is the fault that
+     made the Download button refuse to enable. */
+  const allRows = rows || [];
+  const needle = search.trim().toLowerCase();
+  const visibleRows = allRows.filter((r) => {
+    if (hiddenTypes.has(r.category || 'unknown')) return false;
+    if (!needle) return true;
+    return `${r.filename} ${r.sender} ${r.subject}`.toLowerCase().includes(needle);
+  });
+  const hiddenCount = allRows.length - visibleRows.length;
   // Grouped by the source each document was attributed to, so every file
   // appears exactly once across the sections.
-  const byIntent = (rows || []).reduce((acc, r) => {
+  const byIntent = visibleRows.reduce((acc, r) => {
     const key = r.intent || 'statement';
     (acc[key] = acc[key] || []).push(r);
     return acc;
   }, {});
   const staged = Object.fromEntries((sections || []).map((s) => [s.key, s]));
   const picked = intents.filter((one) => chosen.has(one.key));
+  const filters = (
+    <>
+      <ChooseFilters
+        rows={allRows}
+        search={search} onSearch={setSearch}
+        hiddenTypes={hiddenTypes} onToggleType={toggleType}
+        ignoredSenders={ignoredSenders} ignoredCount={ignoredCount}
+        onIgnore={onIgnore} onClearIgnored={onClearIgnored}
+      />
+      {hiddenCount > 0 && (
+        <Callout tone="warn">
+          {hiddenCount} document{hiddenCount === 1 ? '' : 's'} hidden by the
+          filters above. Hiding does not untick anything - what you have
+          already chosen is still chosen.
+        </Callout>
+      )}
+    </>
+  );
 
   if (!picked.length) {
     return (
@@ -284,6 +421,8 @@ export default function ChooseSections({
         refused. Tick what to download and read — nothing is read, and nothing
         counts, until you say so.
       </p>
+
+      {filters}
 
       {picked.map((one) => (
         <Section key={one.key} source={one} result={sourceResults?.[one.key]}

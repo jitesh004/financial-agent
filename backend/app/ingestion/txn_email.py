@@ -128,6 +128,19 @@ def parse_account(raw: str | None) -> str:
 # --------------------------------------------------------------------------
 
 
+#: What a bank writes between the word "card" and its last four digits.
+#:
+#: The templates allowed "ending" and "ending with" and nothing else, so
+#: "credit card no. XX5207" - Axis's own wording - matched the sentence but
+#: captured NO account. The alert then had an amount, a payee and a date, and
+#: was thrown away by `match_account` with "the alert names no account
+#: number". Three spellings of the same connector cost every one of those
+#: alerts.
+_CARD_NUMBER_LEAD = (
+    r"(?:ending\s*(?:with\s*)?|(?:no\.?|number|num|#)\s*[:.\-]?\s*)?"
+)
+
+
 @dataclass(frozen=True)
 class Template:
     """One issuer's alert sentence.
@@ -173,7 +186,7 @@ TEMPLATES: list[Template] = [
         "card-spend", "debit", kind="card",
         pattern=_compile(
             rf"{_AMOUNT}\s*(?:has been |is |was )?(?:spent|used|charged|debited)\s*(?:on|at|using)?\s*"
-            rf"(?:your\s*)?(?:.{{0,50}}?card\s*)?(?:ending\s*(?:with\s*)?)?"
+            rf"(?:your\s*)?(?:.{{0,50}}?card\s*)?{_CARD_NUMBER_LEAD}"
             rf"(?P<account>[\w*x]*\d{{4}})?"
             rf".{{0,80}}?(?:at|towards|for)\s+(?P<payee>[\w@.\-& ]{{2,60}}?)"
             rf"(?:\s+on\s+{_DATE_TOKEN})?[\s.]")),
@@ -205,11 +218,37 @@ TEMPLATES: list[Template] = [
             rf"(?:has\s+been\s+|is\s+|was\s+)?debited\s+(?:for|with)\s+{_AMOUNT}"
             rf"(?:\s+towards\s+(?P<payee>[^.]{{2,90}}?))?[.\s]")),
     Template(
+        "card-labelled-summary", "debit", kind="card",
+        # Axis does not write a sentence. It writes a form:
+        #
+        #     Transaction Amount: INR 207.46
+        #     Merchant Name:      BOOKMYSHOW
+        #     Axis Bank Credit Card No. XX5207
+        #     Date & Time:        01-09-2026, 14:13:19 IST
+        #
+        # Every other template here reads a SENTENCE - "207.46 spent on card
+        # XX5207 at BOOKMYSHOW" - and this body contains no verb at all, so
+        # not one of them matched and every Axis card alert was skipped
+        # silently. The subject line IS a sentence, which is what makes the
+        # gap easy to miss: the email looks parseable and the body is not.
+        pattern=_compile(
+            rf"transaction\s+amount\s*[:\-]?\s*{_AMOUNT}"
+            rf".{{0,80}}?merchant\s+name\s*[:\-]?\s*"
+            # The merchant runs until the issuer's own "… Card No." phrase.
+            # A lazy capture followed by optional filler stops at two
+            # characters - the filler happily absorbs the rest of the name -
+            # so the boundary is a lookahead, and the \s+ in front of it
+            # forces the match to land on a whole word rather than mid-name.
+            rf"(?P<payee>[^:]{{2,60}}?)"
+            rf"(?=\s+(?:[A-Za-z]+\s+){{0,4}}card\s+(?:no|number|#))"
+            rf"\s+(?:[A-Za-z]+\s+){{0,4}}card\s+{_CARD_NUMBER_LEAD}"
+            rf"(?P<account>[\w*x]*\d{{4}})")),
+    Template(
         "card-used-at", "debit", kind="card",
         # HSBC: "your HSBC Credit Card xx1751 was used for a transaction of
         #        INR 1069.80 at TATVARTHA HEALTH on 31/08/26."
         pattern=_compile(
-            rf"card\s+(?:ending\s*(?:with\s*)?)?(?P<account>[\w*x]*\d{{4}})\s+"
+            rf"card\s+{_CARD_NUMBER_LEAD}(?P<account>[\w*x]*\d{{4}})\s+"
             rf"(?:has\s+been\s+|was\s+|is\s+)?used\s+for\s+a\s+transaction\s+of\s+"
             rf"{_AMOUNT}\s+at\s+(?P<payee>[^.]{{2,70}}?)\s+on\s+{_DATE_TOKEN}")),
     Template(
@@ -217,7 +256,7 @@ TEMPLATES: list[Template] = [
         # ICICI: "...Credit Card XX5001 has been used for a transaction of
         #         INR 658.44 on Aug 29, 2026 at 06:09:23. Info: AMAZON PAY..."
         pattern=_compile(
-            rf"card\s+(?:ending\s*(?:with\s*)?)?(?P<account>[\w*x]*\d{{4}})\s+"
+            rf"card\s+{_CARD_NUMBER_LEAD}(?P<account>[\w*x]*\d{{4}})\s+"
             rf"(?:has\s+been\s+|was\s+|is\s+)?used\s+for\s+a\s+transaction\s+of\s+"
             rf"{_AMOUNT}\s+on\s+{_DATE_TOKEN}"
             rf"(?:.{{0,40}}?info\s*:\s*(?P<payee>[^.]{{2,70}}?)\s*[.])?")),

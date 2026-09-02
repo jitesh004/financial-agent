@@ -155,7 +155,7 @@ def normalize(
     transactions, warnings = _rows_to_transactions(
         merged_rows, best_mapping, account_type, meta.currency,
         opening_balance=meta.opening_balance, default_year=default_year,
-        period=period,
+        period=period, filename=filename,
     )
     statement.transactions = transactions
     statement.parse_warnings.extend(warnings)
@@ -859,6 +859,34 @@ def _is_only_a_timestamp(text: str) -> bool:
     return bool(_TIMESTAMP_ONLY.match(stripped))
 
 
+#: A digit run long enough that finding it in both the amount and the file's
+#: own name cannot be a coincidence. Six digits is a hundred thousand rupees;
+#: shorter runs collide with real amounts constantly.
+_FILENAME_DIGITS_FLOOR = 6
+
+
+def _amount_came_from_the_filename(amount: Decimal, filename: str) -> bool:
+    """Whether this "amount" is really a slice of the file's own name.
+
+    Broker and depository files name themselves after account identifiers:
+
+        transaction-with-holding-statement_UC9050-1208160028236891.pdf
+
+    Read as a bank statement, that yielded a 60,028,236,891 debit - the
+    client ID with a digit of the DP ID in front of it. The reader had no way
+    to know, because as a number it is perfectly well formed.
+
+    The file's name is not evidence about the money inside it, so a figure
+    that appears in both is not a transaction.
+    """
+    if not filename:
+        return False
+    digits = str(int(abs(amount)))
+    if len(digits) < _FILENAME_DIGITS_FLOOR:
+        return False
+    return digits in re.sub(r"\D", "", filename)
+
+
 def _rows_to_transactions(
     rows: list[list[str]],
     mapping: ColumnMapping,
@@ -867,8 +895,10 @@ def _rows_to_transactions(
     opening_balance: Decimal | None = None,
     default_year: int | None = None,
     period: tuple[date | None, date | None] | None = None,
+    filename: str = "",
 ) -> tuple[list[Transaction], list[str]]:
     warnings: list[str] = []
+    skipped_from_filename = 0
     transactions: list[Transaction] = []
 
     rows = _fold_credit_markers(rows)
@@ -918,6 +948,9 @@ def _rows_to_transactions(
             continue
         if amount == 0:
             continue  # zero-value rows are statement furniture, not transactions
+        if _amount_came_from_the_filename(amount, filename):
+            skipped_from_filename += 1
+            continue
 
         raw_desc = raw_desc_probe
         if _is_only_a_timestamp(raw_desc):
@@ -981,6 +1014,12 @@ def _rows_to_transactions(
         warnings.append(
             f"{skipped_balance_marker} brought/carried-forward row(s) skipped - "
             f"they restate a balance rather than record a transaction."
+        )
+    if skipped_from_filename:
+        warnings.append(
+            f"{skipped_from_filename} row(s) skipped whose amount is a digit "
+            f"run out of this file's own name - an account or client id read "
+            f"as money, not a transaction."
         )
     if skipped_header_row:
         warnings.append(
