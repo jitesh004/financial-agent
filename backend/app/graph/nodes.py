@@ -159,6 +159,39 @@ def ingest_file(state: FileTask) -> dict:
         )
         return {"statements": [result], "errors": [result["message"]]}
 
+    # Which reader this document belongs to.
+    #
+    # This path had NO routing at all: it opened the file and handed it
+    # straight to normalize(), the bank-statement reader. Every holdings
+    # statement, contract note and credit report in the mailbox went through
+    # it, and the statement reader always finds SOMETHING.
+    #
+    # A Zerodha "Transaction with Holding Statement" produced two rows of
+    # 60,028,236,891 - not money, but a slice of its own filename, which
+    # encodes Zerodha's DP ID and client ID:
+    #
+    #     transaction-with-holding-statement_UC9050-1208160028236891.pdf
+    #                                               ^DP ID^ ^client ID^
+    #
+    # Money out for the year read 120 BILLION against an actual 75 lakh.
+    #
+    # The staging pipeline has always routed correctly; `classify_document`
+    # existed for exactly this and had no callers. This is the second reader
+    # of the same documents, and it now asks the same question.
+    kind = router.classify_document(router.text_of(extraction), filename)
+    if kind != router.DOC_STATEMENT:
+        # Read, understood, and counted for nothing here. A bureau report and
+        # a holdings statement are both real documents with their own readers
+        # and their own tables; what they are not is a ledger, and inventing
+        # transactions from one is worse than ignoring it.
+        result["status"] = "not_a_statement"
+        result["transaction_count"] = 0
+        result["message"] = (
+            f"{filename}: read as a {kind} document, not a bank statement, "
+            f"so it contributes no transactions here."
+        )
+        return {"statements": [result], "warnings": [result["message"]]}
+
     hint = state.get("account_type_hint")
     statement, account = normalize(
         extraction, filename,

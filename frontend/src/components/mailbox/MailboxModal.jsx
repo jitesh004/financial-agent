@@ -12,7 +12,6 @@ import Upload from '../Upload';
 import JobProgress from '../JobProgress';
 import { Callout, Chip, ConfirmButton, Empty } from '../ui';
 import {
-  AttachmentTable, ExcludedPanel, FilterBar, ResultTable, SelectionSummary,
   SetupInstructions, StageStrip, StepRail,
 } from './parts';
 import { rowKey, stoppedNote } from './useMailbox';
@@ -375,6 +374,11 @@ export default function MailboxModal({ mailbox, open, onClose, onUploaded }) {
               selected={selection}
               onToggle={toggleRow}
               onToggleMany={toggleMany}
+              ignoredSenders={mailbox.ignoredSenders}
+              ignoredCount={mailbox.ignoredCount}
+              onIgnore={(who) => who && mailbox.setIgnored(
+                [...new Set([...(mailbox.ignoredSenders || []), who.trim()])])}
+              onClearIgnored={() => mailbox.setIgnored([])}
             />
           )}
 
