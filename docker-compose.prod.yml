@@ -4,11 +4,14 @@ services:
     environment:
       # Set POSTGRES_PASSWORD and FA_DB_PASSWORD in a .env beside this file.
       # The second is the password of the ordinary role the app connects as -
-      # see deploy/postgres-init.sql for why the app is not the superuser.
+      # see deploy/postgres-init.sh for why the app is not the superuser.
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      # Read by the init script when it creates the app role, so the role's
+      # password and the connection string below come from one variable.
+      - FA_DB_PASSWORD=${FA_DB_PASSWORD:?set FA_DB_PASSWORD}
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./deploy/postgres-init.sql:/docker-entrypoint-initdb.d/10-financial-agent.sql:ro
+      - ./deploy/postgres-init.sh:/docker-entrypoint-initdb.d/10-financial-agent.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d financial_agent"]
       interval: 5s

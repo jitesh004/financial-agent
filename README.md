@@ -97,7 +97,7 @@ You need a PostgreSQL 15 or newer server. Create the database and the
 **ordinary, non-superuser role** the app connects as:
 
 ```bash
-psql -U postgres -f deploy/postgres-init.sql
+FA_DB_PASSWORD=financial_agent bash deploy/postgres-init.sh
 ```
 
 That role matters. PostgreSQL exempts superusers — and any role holding
