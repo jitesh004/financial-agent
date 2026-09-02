@@ -9,7 +9,6 @@ correction someone typed and a PDF they no longer have a copy of cannot.
 
 from __future__ import annotations
 
-import sqlite3
 import sys
 import tempfile
 from datetime import date
@@ -21,13 +20,16 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from app.db.database import CLEAR_SCOPES, MAX_SNAPSHOTS, Database  # noqa: E402
+from tests.support import fresh_ledger  # noqa: E402
+from app.db.database import (CLEAR_SCOPES, MAX_SNAPSHOTS,  # noqa: E402
+                             Database, get_db)
 from app.models.schemas import (Account, AccountType, Category,  # noqa: E402
                                 Direction, Transaction)
 
 
-def _fresh_db(name: str = "lifecycle.db") -> Database:
-    return Database(Path(tempfile.mkdtemp()) / name)
+def _fresh_db() -> Database:
+    """A ledger with nothing in it - now a new tenant, not a new file."""
+    return fresh_ledger()
 
 
 def _txn(account_id: str = "a1", amount: str = "450.00",
@@ -356,65 +358,60 @@ def test_snapshots_are_pruned_to_the_keep_count():
 # Migration and persistence
 # --------------------------------------------------------------------------
 
-LEGACY_SCHEMA = """
-    CREATE TABLE accounts (id TEXT PRIMARY KEY, institution TEXT);
-    CREATE TABLE transactions (
-        id TEXT PRIMARY KEY, account_id TEXT, statement_id TEXT,
-        txn_date TEXT NOT NULL, value_date TEXT, raw_description TEXT NOT NULL,
-        normalized_description TEXT DEFAULT '', merchant TEXT,
-        amount TEXT NOT NULL, direction TEXT NOT NULL, balance_after TEXT,
-        currency TEXT DEFAULT 'INR', category TEXT DEFAULT 'uncategorized',
-        category_source TEXT DEFAULT 'default', category_confidence REAL DEFAULT 0.0,
-        is_internal_transfer INTEGER DEFAULT 0, transfer_pair_id TEXT,
-        recurring_series_id TEXT, reference TEXT, source_row INTEGER);
-    INSERT INTO accounts VALUES ('a1','Axis');
-    INSERT INTO transactions (id, account_id, txn_date, raw_description,
-                              amount, direction)
-         VALUES ('t1','a1','2026-03-04','SWIGGY','450.00','debit');
-"""
+def test_the_schema_has_every_column_analytics_depends_on():
+    """Applying the schema must produce every column the ledger reads.
 
-
-def test_the_migration_adds_every_column_analytics_depends_on():
-    """A database created before these columns existed must gain them without
-    losing a row - is_mirror_leg in particular, whose absence made a dashboard
-    rebuilt after a restart disagree with the one computed at ingestion."""
-    path = Path(tempfile.mkdtemp()) / "legacy.db"
-    legacy = sqlite3.connect(path)
-    legacy.executescript(LEGACY_SCHEMA)
-    legacy.commit()
-    legacy.close()
-
-    db = Database(path)
-    Database(path)  # twice: the migration has to be idempotent
-
+    These columns arrived one at a time, each behind a SQLite ALTER in a
+    hand-written migration; the PostgreSQL schema declares them outright.
+    What has to stay true is the same either way - is_mirror_leg in
+    particular, whose absence made a dashboard rebuilt after a restart
+    disagree with the one computed at ingestion.
+    """
+    db = _fresh_db()
+    db.ensure_schema()
     with db.connection() as conn:
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}
-        rows = conn.execute("SELECT COUNT(*) c FROM transactions").fetchone()["c"]
-        broken = conn.execute("PRAGMA foreign_key_check").fetchall()
+        cols = {r["column_name"] for r in conn.execute(
+            "SELECT column_name FROM information_schema.columns"
+            " WHERE table_name = 'transactions'")}
 
     for column in ("is_mirror_leg", "fingerprint", "accounting_month",
                    "needs_review", "review_reason", "flow_role", "excluded",
-                   "note"):
-        assert column in cols, f"{column} was not migrated in"
-    assert rows == 1, "migration must not lose data"
-    assert not broken
+                   "note", "source", "superseded", "category_rule",
+                   "direction_reason", "user_id"):
+        assert column in cols, f"{column} is missing from transactions"
 
 
-def test_indexes_over_migrated_columns_are_created_after_the_alters():
-    """SCHEMA runs before the migration, and its CREATE TABLE is a no-op on an
-    existing database - so an index there naming a newly-added column asks for
-    a column that does not exist yet and aborts the whole script."""
-    path = Path(tempfile.mkdtemp()) / "legacy.db"
-    legacy = sqlite3.connect(path)
-    legacy.executescript(LEGACY_SCHEMA)
-    legacy.commit()
-    legacy.close()
+def test_applying_the_schema_twice_changes_nothing():
+    """ensure_schema runs on every boot, and re-applies the RLS policies.
 
-    db = Database(path)  # must not raise
+    Every statement in it has to be idempotent, or the second start of a
+    working deployment is the one that fails.
+    """
+    from app.db.database import Database
+    from app.db.engine import current_tenant
+
+    db = _fresh_db()
+    tenant = current_tenant()
     with db.connection() as conn:
-        names = {r["name"] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index'")}
-    assert "idx_txn_fingerprint" in names
+        conn.execute("INSERT INTO accounts (id, institution) VALUES (?, ?)",
+                     ("a1", "Axis"))
+
+    # A second Database against the same URL re-runs the whole script.
+    Database(db.dsn)
+    Database(db.dsn)
+
+    with db.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM accounts").fetchone()[0] == 1
+        indexes = {r["indexname"] for r in conn.execute(
+            "SELECT indexname FROM pg_indexes WHERE tablename = 'transactions'")}
+        policies = {r["policyname"] for r in conn.execute(
+            "SELECT policyname FROM pg_policies WHERE tablename = 'transactions'")}
+    assert "idx_txn_fingerprint" in indexes
+    assert policies == {"transactions_tenant"}, (
+        "re-applying the schema must leave exactly one policy per table, not "
+        "stack a second copy on top")
+    assert current_tenant() == tenant
 
 
 def test_is_mirror_leg_survives_a_save_and_reload():
@@ -530,8 +527,11 @@ def test_storage_reports_replaceable_and_irreplaceable_separately():
     try:
         storage.STATEMENT_STORE = tmp / "store"
         storage.GMAIL_CACHE = tmp / "cache"
-        storage.GMAIL_CACHE.mkdir(parents=True)
-        (storage.GMAIL_CACHE / "icici.pdf").write_bytes(b"x" * 10)
+        # Both stores hang off the signed-in user now, so the fixture writes
+        # into this tenant's own subdirectory - which is also the assertion
+        # that the counts below are one person's, not the whole server's.
+        storage.gmail_cache().mkdir(parents=True)
+        (storage.gmail_cache() / "icici.pdf").write_bytes(b"x" * 10)
 
         source = tmp / "amex.pdf"
         source.write_bytes(b"y" * 20)
@@ -606,3 +606,109 @@ def test_the_inventory_names_what_each_action_preserves():
     assert by_scope["everything"]["confirm_phrase"] == "DELETE EVERYTHING"
     for action in by_scope.values():
         assert action["description"], "an action with no explanation is a trap"
+
+
+# ---------------------------------------------------------------------------
+# Previewing what a clearing action would destroy
+#
+# Three of the seven scopes had no preview at all: the endpoint carried a
+# branch per scope and the UI a hardcoded list of four, and neither was
+# extended when scopes were added. "Preview data" on the staged imports - the
+# statements downloaded from Gmail - answered `{}`, which the browser rendered
+# as an empty box. Both ends are now driven by CLEAR_SCOPES; these tests are
+# what stop them drifting apart again.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def api_client():
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    return TestClient(app)
+
+
+def test_every_clearing_scope_can_be_previewed():
+    from app.main import PREVIEW_COLUMNS
+
+    for scope, tables in CLEAR_SCOPES.items():
+        previewable = [t for t in tables if t in PREVIEW_COLUMNS]
+        assert previewable, (
+            f"scope {scope!r} would delete {tables} and none of them has "
+            f"preview columns, so the user cannot see what they are losing")
+
+
+def test_every_table_a_scope_deletes_has_preview_columns():
+    """The drift guard, in the direction that actually bit.
+
+    A table added to a tier without an entry here is silently invisible in
+    every preview that covers it.
+    """
+    from app.main import PREVIEW_COLUMNS
+
+    deletable = {t for tables in CLEAR_SCOPES.values() for t in tables}
+    missing = sorted(deletable - set(PREVIEW_COLUMNS))
+    assert not missing, f"no preview columns for: {', '.join(missing)}"
+
+
+def test_preview_columns_name_only_tables_something_clears():
+    from app.main import PREVIEW_COLUMNS
+
+    deletable = {t for tables in CLEAR_SCOPES.values() for t in tables}
+    stray = sorted(set(PREVIEW_COLUMNS) - deletable)
+    assert not stray, f"preview columns for tables no scope clears: {stray}"
+
+
+def test_the_staged_imports_preview_shows_the_downloaded_files(api_client):
+    """The reported bug: Gmail-downloaded statements had no preview."""
+    from app.db import staging
+
+    db = get_db()
+    staging.add(db, "hash-downloaded", filename="icici_card.pdf",
+                origin="gmail", kind="statement", account_label="ICICI Card",
+                row_count=42, parse_status="ok")
+
+    body = api_client.get("/api/data/preview/staged_imports").json()
+    assert "staged_files" in body, body
+    assert body["staged_files"][0]["filename"] == "icici_card.pdf"
+
+
+def test_a_preview_never_echoes_a_stored_file_password(api_client):
+    """source_files.password is plaintext by design, and stays out of here.
+
+    The columns are an allowlist rather than `SELECT *` precisely so that a
+    preview cannot start leaking a column added later.
+    """
+    from app.db import repository as repo
+
+    repo.upsert_source_file(get_db(), repo.SourceFileRecord(
+        id="sf-secret", filename="locked.pdf", file_hash="h-secret",
+        password="jite0602", parse_status="parsed"))
+
+    for scope in ("files", "everything"):
+        assert "jite0602" not in api_client.get(
+            f"/api/data/preview/{scope}").text
+
+
+def test_the_factory_reset_preview_leads_with_the_irreplaceable(api_client):
+    """Ordered by what it costs to get the data back, not by table name.
+
+    Someone reading this preview is about to lose everything; the rows nothing
+    can regenerate are the ones worth seeing first.
+    """
+    from app.db import repository as repo
+
+    db = get_db()
+    repo.add_custom_category(db, "Sabbatical")
+    repo.save_merchant_categories(db, {"swiggy": (Category.DINING, 0.9, "llm")})
+    repo.upsert_source_file(db, repo.SourceFileRecord(
+        id="sf-1", filename="a.pdf", file_hash="h1", parse_status="parsed"))
+
+    tables = list(api_client.get("/api/data/preview/everything").json())
+    assert tables.index("custom_categories") < tables.index("merchant_categories")
+    assert tables.index("merchant_categories") < tables.index("source_files")
+
+
+def test_an_unknown_preview_scope_is_refused(api_client):
+    response = api_client.get("/api/data/preview/nonsense")
+    assert response.status_code == 400
+    assert "Unknown scope" in response.text

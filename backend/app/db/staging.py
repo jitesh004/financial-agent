@@ -44,8 +44,18 @@ def _more_specific(incoming: str, stored: str | None) -> bool:
             > _SOURCE_SPECIFICITY.get(stored or "", 0))
 
 
+def _entry_dict(row: Any) -> dict[str, Any]:
+    """A staged row as a plain dict, without the tenancy column.
+
+    `user_id` is how the row-level security policy finds the row; it is not
+    something the Review screen has any use for, and it would otherwise travel
+    all the way into the JSON the browser gets.
+    """
+    return {k: v for k, v in zip(row.keys(), row) if k != "user_id"}
+
+
 def _row_to_entry(row: Any) -> dict[str, Any]:
-    entry = dict(row)
+    entry = _entry_dict(row)
     entry["selected"] = bool(entry.get("selected"))
     for field in ("warnings", "payload"):
         raw = entry.get(field)
@@ -206,7 +216,7 @@ def all_entries(db: Database, *, selected_only: bool = False,
         rows = conn.execute(sql, args).fetchall()
     out = []
     for row in rows:
-        entry = dict(row)
+        entry = _entry_dict(row)
         entry["selected"] = bool(entry.get("selected"))
         try:
             entry["warnings"] = json.loads(entry.get("warnings") or "[]")

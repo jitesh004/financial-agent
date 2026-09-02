@@ -9,7 +9,6 @@ assert the property the feature was supposed to deliver.
 from __future__ import annotations
 
 import sys
-import tempfile
 from collections import Counter
 from datetime import date
 from decimal import Decimal
@@ -17,10 +16,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from tests.support import fresh_ledger  # noqa: E402
+from app import storage  # noqa: E402
 from app.analytics.engine import analyze  # noqa: E402
 from app.analytics.periods import assign_accounting_months  # noqa: E402
 from app.analytics.recurring import RecurringSeries  # noqa: E402
-from app.db.database import CLEAR_SCOPES, Database  # noqa: E402
+from app.db.database import CLEAR_SCOPES, TENANT_TABLES  # noqa: E402
 from app.models.schemas import (Category, Direction, FlowRole,  # noqa: E402
                                 Transaction, derive_flow_role)
 
@@ -184,7 +185,7 @@ def test_enrich_supplies_statement_periods_to_the_coverage_gate():
     from app.db import repository as repo
     from app.pipeline import enrich as enrich_mod
 
-    db = Database(Path(tempfile.mkdtemp()) / "cov.db")
+    db = fresh_ledger()
     seen = {}
 
     original = enrich_mod.__dict__.get("match_settlements")
@@ -214,7 +215,7 @@ def test_enrich_supplies_statement_periods_to_the_coverage_gate():
 def test_statement_periods_loader_groups_by_account():
     from app.db import repository as repo
 
-    db = Database(Path(tempfile.mkdtemp()) / "periods.db")
+    db = fresh_ledger()
     with db.connection() as conn:
         conn.execute("INSERT INTO accounts (id, institution) VALUES ('a1','Axis')")
         conn.execute(
@@ -311,17 +312,28 @@ def test_redaction_still_strips_the_original_identifiers():
 def test_every_table_belongs_to_some_clearing_scope():
     """`custom_categories` and `recurring_series_overrides` were in none, so a
     factory reset left them behind and the workspace did not actually return
-    to its first-run state."""
-    db = Database(Path(tempfile.mkdtemp()) / "scopes.db")
+    to its first-run state.
+
+    Checked against TENANT_TABLES rather than against every table in the
+    database: the identity tables (users, sessions, the OAuth grant) are not
+    a user's data to clear, and deleting the account is a different action
+    with its own confirmation.
+    """
+    db = fresh_ledger()
     with db.connection() as conn:
-        tables = {r["name"] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%'")}
+        # Every table the policies were applied to really exists - the
+        # assertion that TENANT_TABLES has not drifted from schema.sql.
+        present = {r["tablename"] for r in conn.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname = current_schema()")}
+    assert not (set(TENANT_TABLES) - present), (
+        f"TENANT_TABLES names tables that do not exist: "
+        f"{sorted(set(TENANT_TABLES) - present)}")
 
     covered: set[str] = set()
     for names in CLEAR_SCOPES.values():
         covered |= set(names)
 
+    tables = set(TENANT_TABLES)
     assert not (tables - covered), (
         f"no clearing scope reaches {sorted(tables - covered)}")
     assert not (covered - tables), (
@@ -329,7 +341,7 @@ def test_every_table_belongs_to_some_clearing_scope():
 
 
 def test_a_factory_reset_empties_every_table():
-    db = Database(Path(tempfile.mkdtemp()) / "factory.db")
+    db = fresh_ledger()
     with db.connection() as conn:
         conn.execute("INSERT INTO custom_categories (name) VALUES ('Pets')")
         conn.execute(
@@ -408,7 +420,7 @@ def test_bulk_update_actually_changes_the_named_rows(tmp_path):
 
     previous = db_module._db
     try:
-        db_module._db = Database(tmp_path / "bulk.db")
+        db_module._db = fresh_ledger()
         db = db_module._db
         repo.upsert_account(db, Account(
             id="acc-bulk", institution="Axis Bank",
@@ -458,7 +470,6 @@ def test_a_single_file_merge_populates_data_quality(tmp_path, monkeypatch):
         _pytest.skip("run backend/tools/generate_samples.py first")
 
     from app.db import database as db_module
-    from app.db.database import Database
     from app.db import repository as repo
     from app.ingestion.gmail_source import FakeGmailClient
     from app.ingestion import router as ingest_router
@@ -469,11 +480,10 @@ def test_a_single_file_merge_populates_data_quality(tmp_path, monkeypatch):
 
     original_db = db_module._db
     original_client = gmail_routes_module._require_client
-    original_cache = gmail_routes_module.CACHE
     try:
-        db = Database(tmp_path / "dataquality.db")
+        db = fresh_ledger()
         db_module._db = db
-        monkeypatch.setattr(gmail_routes_module, "CACHE", tmp_path / "cache")
+        monkeypatch.setattr(storage, "GMAIL_CACHE", tmp_path / "cache")
 
         statement, account = normalize(
             ingest_router.extract(sample_path), sample_path.name)
@@ -498,7 +508,6 @@ def test_a_single_file_merge_populates_data_quality(tmp_path, monkeypatch):
     finally:
         db_module._db = original_db
         gmail_routes_module._require_client = original_client
-        gmail_routes_module.CACHE = original_cache
         main_module.runs.clear()
 
 
@@ -519,12 +528,11 @@ def test_marking_a_transaction_as_a_claim_stops_it_counting_as_spend():
     from app import main as main_module
     from app.db import repository as repo
     import app.db.database as db_module
-    from app.db.database import Database
     from app.models.schemas import Account, AccountType, Category, Direction, Transaction
 
     previous = db_module._db
     try:
-        db_module._db = Database(Path(tempfile.mkdtemp()) / "x.db")
+        db_module._db = fresh_ledger()
         db = db_module._db
         repo.upsert_account(db, Account(
             id="a1", institution="Axis Bank", account_type=AccountType.CREDIT_CARD,
@@ -561,14 +569,13 @@ def test_a_claim_decision_survives_a_full_reenrichment():
     from app import main as main_module
     from app.db import repository as repo
     import app.db.database as db_module
-    from app.db.database import Database
     from app.models.schemas import Account, AccountType, Category, Direction, Transaction
     from app.pipeline.enrich import enrich_ledger
     from fastapi.testclient import TestClient
 
     previous = db_module._db
     try:
-        db_module._db = Database(Path(tempfile.mkdtemp()) / "x.db")
+        db_module._db = fresh_ledger()
         db = db_module._db
         repo.upsert_account(db, Account(
             id="a1", institution="Axis Bank", account_type=AccountType.CREDIT_CARD,
@@ -606,13 +613,12 @@ def test_splitting_a_transaction_changes_the_category_breakdown():
     from app import main as main_module
     from app.db import repository as repo
     import app.db.database as db_module
-    from app.db.database import Database
     from app.models.schemas import Account, AccountType, Category, Direction, Transaction
     from app.pipeline.enrich import enrich_ledger
 
     previous = db_module._db
     try:
-        db_module._db = Database(Path(tempfile.mkdtemp()) / "x.db")
+        db_module._db = fresh_ledger()
         db = db_module._db
         repo.upsert_account(db, Account(
             id="a1", institution="Axis Bank", account_type=AccountType.SAVINGS))
@@ -656,12 +662,11 @@ def test_split_amounts_must_sum_to_the_parent_within_rounding():
     from app import main as main_module
     from app.db import repository as repo
     import app.db.database as db_module
-    from app.db.database import Database
     from app.models.schemas import Account, AccountType, Category, Direction, Transaction
 
     previous = db_module._db
     try:
-        db_module._db = Database(Path(tempfile.mkdtemp()) / "x.db")
+        db_module._db = fresh_ledger()
         db = db_module._db
         repo.upsert_account(db, Account(id="a1", institution="Axis Bank",
                                         account_type=AccountType.SAVINGS))
@@ -698,12 +703,11 @@ def test_settling_a_claim_uses_the_field_name_the_frontend_actually_sends():
     from app import main as main_module
     from app.db import repository as repo
     import app.db.database as db_module
-    from app.db.database import Database
     from app.models.schemas import Account, AccountType, Category, Direction, Transaction
 
     previous = db_module._db
     try:
-        db_module._db = Database(Path(tempfile.mkdtemp()) / "x.db")
+        db_module._db = fresh_ledger()
         db = db_module._db
         repo.upsert_account(db, Account(
             id="a1", institution="Axis Bank", account_type=AccountType.CREDIT_CARD,
@@ -751,12 +755,11 @@ def test_writing_off_a_claim_restores_the_purchase_as_real_spending():
     from app import main as main_module
     from app.db import repository as repo
     import app.db.database as db_module
-    from app.db.database import Database
     from app.models.schemas import Account, AccountType, Category, Direction, Transaction
 
     previous = db_module._db
     try:
-        db_module._db = Database(Path(tempfile.mkdtemp()) / "x.db")
+        db_module._db = fresh_ledger()
         db = db_module._db
         repo.upsert_account(db, Account(
             id="a1", institution="Axis Bank", account_type=AccountType.CREDIT_CARD,
@@ -806,12 +809,11 @@ def test_looks_right_in_the_review_queue_actually_clears_needs_review():
     from app import main as main_module
     from app.db import repository as repo
     import app.db.database as db_module
-    from app.db.database import Database
     from app.models.schemas import Account, AccountType, Category, Direction, Transaction
 
     previous = db_module._db
     try:
-        db_module._db = Database(Path(tempfile.mkdtemp()) / "x.db")
+        db_module._db = fresh_ledger()
         db = db_module._db
         repo.upsert_account(db, Account(
             id="a1", institution="Axis Bank", account_type=AccountType.SAVINGS))
@@ -850,12 +852,11 @@ def test_renaming_a_recurring_series_shows_up_without_a_full_reprocess():
     from app import main as main_module
     from app.db import repository as repo
     import app.db.database as db_module
-    from app.db.database import Database
     from app.analytics.recurring import RecurringSeries
 
     previous = db_module._db
     try:
-        db_module._db = Database(Path(tempfile.mkdtemp()) / "x.db")
+        db_module._db = fresh_ledger()
         db = db_module._db
         series = RecurringSeries(
             id="s1", account_id=None, label="NETFLIX", category="entertainment",
@@ -1018,7 +1019,7 @@ def test_an_unmatched_card_settlement_is_flagged_for_review():
     from app.db import repository as repo
     from app.pipeline.enrich import enrich_ledger
 
-    db = Database(Path(tempfile.mkdtemp()) / "cc.db")
+    db = fresh_ledger()
 
     unmatched_debit = Transaction(
         id="d1", account_id="a1", txn_date=date(2026, 3, 4),

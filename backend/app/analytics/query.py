@@ -126,8 +126,11 @@ FIELDS: dict[str, Field] = {f.key: f for f in [
           "substr(t.txn_date, 1, 4) || '-Q' ||"
           " CAST((CAST(substr(t.txn_date, 6, 2) AS INTEGER) + 2) / 3 AS INTEGER)"),
     Field("date", "Date", "Time", "t.txn_date", type="date"),
+    # EXTRACT(DOW) numbers the days the same way SQLite's strftime('%w')
+    # did - 0 is Sunday - so the CASE below did not have to be renumbered
+    # when this moved to PostgreSQL.
     Field("day_of_week", "Day of week", "Time",
-          "CASE CAST(strftime('%w', t.txn_date) AS INTEGER)"
+          "CASE CAST(EXTRACT(DOW FROM CAST(t.txn_date AS DATE)) AS INTEGER)"
           " WHEN 0 THEN 'Sunday' WHEN 1 THEN 'Monday' WHEN 2 THEN 'Tuesday'"
           " WHEN 3 THEN 'Wednesday' WHEN 4 THEN 'Thursday' WHEN 5 THEN 'Friday'"
           " ELSE 'Saturday' END",
@@ -443,9 +446,10 @@ def compile_query(spec: dict[str, Any], today: date | None = None) -> Compiled:
         if not field.groupable:
             raise QueryError(f"'{field.label}' cannot be grouped by")
         select.append(f"{field.sql} AS d{i}")
-        # Grouping by ordinal rather than repeating the expression: several of
-        # these are long CASE statements and SQLite would otherwise have to be
-        # trusted to match them textually.
+        # Grouping by ordinal rather than repeating the expression: several
+        # of these are long CASE statements, and the ordinal is both shorter
+        # to read in the SQL the Explore tab shows the user and immune to the
+        # expression being matched textually.
         group_by.append(str(i + 1))
         columns.append({"key": key, "label": field.label, "role": "dimension",
                         "type": field.type})
@@ -667,10 +671,15 @@ def schema(db) -> dict[str, Any]:
         ]
         custom = [r["name"] for r in conn.execute(
             "SELECT name FROM custom_categories ORDER BY name").fetchall()]
+        # The alias is filtered in an outer query rather than in the same
+        # WHERE: standard SQL resolves WHERE before the select list exists, so
+        # `WHERE m != ''` is only legal where the alias has already been
+        # computed - which is one level out.
         months = [r["m"] for r in conn.execute(
-            "SELECT DISTINCT CASE WHEN accounting_month != '' THEN accounting_month"
-            " ELSE substr(txn_date, 1, 7) END AS m FROM transactions"
-            " WHERE m != '' ORDER BY m DESC"
+            "SELECT m FROM ("
+            "  SELECT DISTINCT CASE WHEN accounting_month != '' THEN accounting_month"
+            "  ELSE substr(txn_date, 1, 7) END AS m FROM transactions"
+            ") months WHERE m != '' ORDER BY m DESC"
         ).fetchall()]
         institutions = [r["institution"] for r in conn.execute(
             "SELECT DISTINCT institution FROM accounts ORDER BY institution"

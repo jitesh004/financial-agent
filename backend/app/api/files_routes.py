@@ -415,7 +415,8 @@ def _fetch_one_month(job_id: str, account_id: str, month: str) -> dict[str, Any]
     if account is None:
         return {"status": "failed", "message": "That account no longer exists."}
 
-    from .gmail_routes import _require_client, CACHE
+    from ..storage import gmail_cache
+    from .gmail_routes import _require_client
     try:
         client = _require_client()
     except Exception as exc:
@@ -443,7 +444,7 @@ def _fetch_one_month(job_id: str, account_id: str, month: str) -> dict[str, Any]
 
     tried = []
     for att in found.attachments:
-        [saved] = download_to_cache(client, [att], CACHE)
+        [saved] = download_to_cache(client, [att], gmail_cache())
         path = Path(saved.saved_path)
         digest = ingest_router.file_hash(path)
         cached_pw = repo.get_cached_password(db, digest)

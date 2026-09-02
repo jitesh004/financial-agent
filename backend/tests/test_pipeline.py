@@ -21,6 +21,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
+from tests.support import fresh_ledger  # noqa: E402
+from app import storage  # noqa: E402
 from app.categorize.rules import categorize_by_rules  # noqa: E402
 from app.graph.build import build_graph  # noqa: E402
 from app.ingestion import router  # noqa: E402
@@ -525,10 +527,9 @@ def _seed_transactions(db, rows):
 def test_multi_account_filter_uses_an_in_clause(tmp_path):
     """Selecting several accounts must return rows from ALL of them, not just
     the first - a bare '= ?' silently drops every account after the first."""
-    from app.db.database import Database
     from app.db import repository as repo
 
-    db = Database(tmp_path / "multi.db")
+    db = fresh_ledger()
     for aid in ("a1", "a2", "a3"):
         repo.upsert_account(db, Account(institution=aid, account_type=AccountType.SAVINGS,
                                         account_number_masked=aid))
@@ -545,10 +546,9 @@ def test_multi_account_filter_uses_an_in_clause(tmp_path):
 
 
 def test_sort_by_amount_descending(tmp_path):
-    from app.db.database import Database
     from app.db import repository as repo
 
-    db = Database(tmp_path / "sort.db")
+    db = fresh_ledger()
     repo.upsert_account(db, Account(institution="X", account_type=AccountType.SAVINGS,
                                     account_number_masked="X1"))
     aid = repo.get_accounts(db)[0].id
@@ -564,10 +564,9 @@ def test_sort_by_amount_descending(tmp_path):
 def test_upi_rail_filter(tmp_path):
     """The card/UPI split: a UPI transaction can happen on ANY account type,
     not just a wallet, so the filter has to key off the narration."""
-    from app.db.database import Database
     from app.db import repository as repo
 
-    db = Database(tmp_path / "upi.db")
+    db = fresh_ledger()
     repo.upsert_account(db, Account(institution="X", account_type=AccountType.CREDIT_CARD,
                                     account_number_masked="X1"))
     aid = repo.get_accounts(db)[0].id
@@ -583,10 +582,9 @@ def test_upi_rail_filter(tmp_path):
 
 
 def test_statement_id_filter_drills_into_one_file(tmp_path):
-    from app.db.database import Database
     from app.db import repository as repo
 
-    db = Database(tmp_path / "stmt.db")
+    db = fresh_ledger()
     repo.upsert_account(db, Account(institution="X", account_type=AccountType.SAVINGS,
                                     account_number_masked="X1"))
     aid = repo.get_accounts(db)[0].id
@@ -614,10 +612,9 @@ def test_source_file_upserts_by_content_hash_not_filename(tmp_path):
     """Gmail attachment names are not stable across a re-download; the file's
     bytes are. Keying on the hash is what lets the SAME file re-appear under a
     different name and still be recognised as already seen."""
-    from app.db.database import Database
     from app.db import repository as repo
 
-    db = Database(tmp_path / "files.db")
+    db = fresh_ledger()
     first_id = repo.upsert_source_file(db, repo.SourceFileRecord(
         id="ignored", filename="statement_v1.pdf", file_hash="abc123",
         parse_status="parsed",
@@ -635,10 +632,9 @@ def test_working_password_is_never_erased_by_a_later_failed_attempt(tmp_path):
     """A retry that fails (e.g. the profile's DOB was cleared) must not forget
     a password that is known to work - that would make the file permanently
     slower to open again for no reason."""
-    from app.db.database import Database
     from app.db import repository as repo
 
-    db = Database(tmp_path / "pw.db")
+    db = fresh_ledger()
     fid = repo.upsert_source_file(db, repo.SourceFileRecord(
         id="f1", filename="card.pdf", file_hash="h1",
         password="jite0602", password_status="open", parse_status="parsed",
@@ -653,10 +649,9 @@ def test_working_password_is_never_erased_by_a_later_failed_attempt(tmp_path):
 
 
 def test_get_cached_password_returns_none_when_never_solved(tmp_path):
-    from app.db.database import Database
     from app.db import repository as repo
 
-    db = Database(tmp_path / "pw2.db")
+    db = fresh_ledger()
     assert repo.get_cached_password(db, "never-seen-hash") is None
     repo.upsert_source_file(db, repo.SourceFileRecord(
         id="f1", filename="x.pdf", file_hash="h2", password="secret99",
@@ -669,10 +664,9 @@ def test_transfer_pairs_do_not_duplicate_across_repeated_saves(tmp_path):
     same logical pair twice must not leave two rows behind - a retry endpoint
     that recomputes transfers over the whole ledger calls this every time."""
     from types import SimpleNamespace
-    from app.db.database import Database
     from app.db import repository as repo
 
-    db = Database(tmp_path / "pairs.db")
+    db = fresh_ledger()
     repo.upsert_account(db, Account(institution="X", account_type=AccountType.SAVINGS,
                                     account_number_masked="X1"))
     aid = repo.get_accounts(db)[0].id
@@ -708,11 +702,10 @@ def _isolated_app_db(tmp_path, name="files_api.db"):
     own try/finally, mirroring test_saving_the_profile_form_does_not_wipe_.
     """
     from app.db import database as db_module
-    from app.db.database import Database
     from fastapi.testclient import TestClient
     import app.main as main_module
 
-    db_module._db = Database(tmp_path / name)
+    db_module._db = fresh_ledger()
     return TestClient(main_module.app), db_module._db
 
 
@@ -837,10 +830,9 @@ def test_upi_rail_filter_still_respects_the_account_filter(tmp_path):
     for every lowercase "upi"-prefixed row, so a card's UPI-only view pulled
     in UPI rows from every OTHER account too - a scoped view showing MORE
     rows than the same accounts' unfiltered view."""
-    from app.db.database import Database
     from app.db import repository as repo
 
-    db = Database(tmp_path / "upi_scope.db")
+    db = fresh_ledger()
     for aid in ("card", "other"):
         repo.upsert_account(db, Account(institution=aid, account_type=AccountType.CREDIT_CARD,
                                         account_number_masked=aid))
@@ -906,7 +898,6 @@ def test_fetch_one_month_finds_and_merges_the_right_statement(tmp_path, monkeypa
     AND month, then merge - all offline, no real Gmail needed."""
     _require_samples()
     from app.db import database as db_module
-    from app.db.database import Database
     from app.db import repository as repo
     from app.ingestion.gmail_source import FakeGmailClient
     from app.ingestion import router as ingest_router
@@ -916,11 +907,10 @@ def test_fetch_one_month_finds_and_merges_the_right_statement(tmp_path, monkeypa
 
     original_db = db_module._db
     original_client = gmail_routes_module._require_client
-    original_cache = gmail_routes_module.CACHE
     try:
-        db = Database(tmp_path / "fetch.db")
+        db = fresh_ledger()
         db_module._db = db
-        monkeypatch.setattr(gmail_routes_module, "CACHE", tmp_path / "cache")
+        monkeypatch.setattr(storage, "GMAIL_CACHE", tmp_path / "cache")
 
         sample_path = SAMPLES / "icici_credit_card_2025_2026.pdf"
 
@@ -949,7 +939,6 @@ def test_fetch_one_month_finds_and_merges_the_right_statement(tmp_path, monkeypa
     finally:
         db_module._db = original_db
         gmail_routes_module._require_client = original_client
-        gmail_routes_module.CACHE = original_cache
 
 
 def test_fetch_one_month_rejects_a_wrong_month_match(tmp_path, monkeypatch):
@@ -957,7 +946,6 @@ def test_fetch_one_month_rejects_a_wrong_month_match(tmp_path, monkeypatch):
     reported as not found, not silently merged into the wrong grid cell."""
     _require_samples()
     from app.db import database as db_module
-    from app.db.database import Database
     from app.db import repository as repo
     from app.ingestion.gmail_source import FakeGmailClient
     from app.ingestion import router as ingest_router
@@ -967,11 +955,10 @@ def test_fetch_one_month_rejects_a_wrong_month_match(tmp_path, monkeypatch):
 
     original_db = db_module._db
     original_client = gmail_routes_module._require_client
-    original_cache = gmail_routes_module.CACHE
     try:
-        db = Database(tmp_path / "fetch_wrong.db")
+        db = fresh_ledger()
         db_module._db = db
-        monkeypatch.setattr(gmail_routes_module, "CACHE", tmp_path / "cache2")
+        monkeypatch.setattr(storage, "GMAIL_CACHE", tmp_path / "cache2")
 
         sample_path = SAMPLES / "icici_credit_card_2025_2026.pdf"
         statement, account = normalize(ingest_router.extract(sample_path), sample_path.name)
@@ -993,7 +980,6 @@ def test_fetch_one_month_rejects_a_wrong_month_match(tmp_path, monkeypatch):
     finally:
         db_module._db = original_db
         gmail_routes_module._require_client = original_client
-        gmail_routes_module.CACHE = original_cache
 
 
 def test_fail_path_resolves_to_existing_row_when_hash_already_seen(tmp_path):
@@ -1006,12 +992,11 @@ def test_fail_path_resolves_to_existing_row_when_hash_already_seen(tmp_path):
     each time - and the failure path used to look up the record by that new
     id instead of whatever id the write actually landed on.
     """
-    from app.db.database import Database
     from app.db import repository as repo
     from app.ingestion import router as ingest_router
     from app.api.files_routes import merge_extracted_file_into_ledger
 
-    db = Database(tmp_path / "fail_path.db")
+    db = fresh_ledger()
     sample_path = SAMPLES / "icici_credit_card_2025_2026.pdf"
     _require_samples()
     extraction = ingest_router.extract(sample_path)
@@ -1033,94 +1018,19 @@ def test_fail_path_resolves_to_existing_row_when_hash_already_seen(tmp_path):
     assert len(repo.list_source_files(db)) == 1
 
 
-def test_accounts_unique_constraint_migrates_without_breaking_foreign_keys(tmp_path):
-    """Simulates a real pre-existing database created before product_name
-    existed: the OLD 3-column UNIQUE constraint, accounts already holding
-    data, and other tables already holding rows that reference them by id.
+def test_two_same_bank_cards_coexist_when_only_the_product_name_differs():
+    """The reason the accounts unique key includes `product_name`.
 
-    This is exactly the upgrade path a real user's database goes through.
-    The first, broken version of this migration renamed `accounts` away
-    before other tables' foreign keys were repointed, which SQLite responded
-    to by silently rewriting `source_files.account_id REFERENCES
-    accounts(id)` to point at the doomed `accounts_old` - so every insert
-    into source_files started failing with "no such table: accounts_old"
-    the moment the temporary table was dropped.
+    HSBC masks its card number so completely no digit survives extraction. On
+    the old three-column key both of someone's HSBC cards hashed to the same
+    account identity, so the second one violated the unique index and the
+    insert failed outright - and before that, silently merged two cards'
+    transactions into one account.
     """
-    import sqlite3
-    from app.db.database import Database
     from app.db import repository as repo
-
-    db_path = tmp_path / "legacy.db"
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript("""
-        CREATE TABLE accounts (
-            id TEXT PRIMARY KEY,
-            institution TEXT NOT NULL DEFAULT 'Unknown',
-            account_type TEXT NOT NULL DEFAULT 'unknown',
-            account_number_masked TEXT NOT NULL DEFAULT '',
-            holder_name TEXT,
-            currency TEXT NOT NULL DEFAULT 'INR',
-            current_balance TEXT,
-            principal_outstanding TEXT,
-            interest_rate TEXT,
-            emi_amount TEXT,
-            tenure_months_remaining INTEGER,
-            credit_limit TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            UNIQUE (institution, account_type, account_number_masked)
-        );
-        CREATE TABLE source_files (
-            id TEXT PRIMARY KEY,
-            filename TEXT NOT NULL,
-            filepath TEXT NOT NULL DEFAULT '',
-            file_hash TEXT NOT NULL DEFAULT '',
-            source TEXT NOT NULL DEFAULT 'upload',
-            sender TEXT NOT NULL DEFAULT '',
-            message_id TEXT NOT NULL DEFAULT '',
-            size_bytes INTEGER,
-            password TEXT,
-            password_status TEXT NOT NULL DEFAULT 'unknown',
-            parse_status TEXT NOT NULL DEFAULT 'pending',
-            institution_guess TEXT NOT NULL DEFAULT '',
-            account_type_guess TEXT NOT NULL DEFAULT '',
-            account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL,
-            statement_id TEXT,
-            transaction_count INTEGER NOT NULL DEFAULT 0,
-            error_message TEXT NOT NULL DEFAULT '',
-            first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
-            last_attempted_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        INSERT INTO accounts (id, institution, account_type, account_number_masked)
-        VALUES ('acc-1', 'Old Bank', 'savings', 'XXXX1111');
-        INSERT INTO source_files (id, filename, account_id)
-        VALUES ('file-1', 'old.pdf', 'acc-1');
-    """)
-    conn.commit()
-    conn.close()
-
-    # Opening it through the real Database class runs every migration,
-    # including the accounts rebuild, against this legacy schema.
-    db = Database(db_path)
-
-    # The pre-existing row and its foreign-key link both survived.
-    with db.connection() as conn:
-        row = conn.execute("SELECT * FROM accounts WHERE id = 'acc-1'").fetchone()
-        assert row["institution"] == "Old Bank"
-        linked = conn.execute(
-            "SELECT account_id FROM source_files WHERE id = 'file-1'").fetchone()
-        assert linked["account_id"] == "acc-1"
-
-    # The actual regression: inserting a NEW source_files row (any row at
-    # all) used to raise "no such table: accounts_old" here.
-    repo.upsert_source_file(db, repo.SourceFileRecord(
-        id="file-2", filename="new.pdf", file_hash="h2", parse_status="parsed",
-    ))
-    assert len(repo.list_source_files(db)) == 2
-
-    # And the whole point of the migration: two same-bank cards distinguished
-    # only by product name can now coexist.
     from app.models.schemas import Account, AccountType
+
+    db = fresh_ledger()
     id_a = repo.upsert_account(db, Account(
         institution="New Bank", account_type=AccountType.CREDIT_CARD,
         product_name="Rewards"))
@@ -1128,3 +1038,56 @@ def test_accounts_unique_constraint_migrates_without_breaking_foreign_keys(tmp_p
         institution="New Bank", account_type=AccountType.CREDIT_CARD,
         product_name="Privilege"))
     assert id_a != id_b
+
+    # And the same card seen again attaches to the account it already has,
+    # rather than minting a third.
+    assert repo.upsert_account(db, Account(
+        institution="New Bank", account_type=AccountType.CREDIT_CARD,
+        product_name="Rewards")) == id_a
+
+
+def test_the_same_account_identity_can_exist_in_two_accounts_at_once():
+    """One person's HDFC savings account must not collide with another's.
+
+    The unique key is per user. Before that it was global, and the second
+    person to upload a statement from the same bank - with the same masked
+    number, which is only four digits - would have had the insert refused.
+    """
+    from app.db import repository as repo
+    from app.models.schemas import Account, AccountType
+
+    identity = dict(institution="HDFC", account_type=AccountType.SAVINGS,
+                    account_number_masked="XXXX1111")
+
+    first = fresh_ledger()
+    mine = repo.upsert_account(first, Account(**identity))
+
+    second = fresh_ledger()
+    theirs = repo.upsert_account(second, Account(**identity))
+
+    assert mine != theirs
+    # And neither can see the other's.
+    assert [a.institution for a in repo.get_accounts(second)] == ["HDFC"]
+
+
+def test_a_files_link_to_its_account_survives_a_round_trip():
+    """source_files.account_id is a foreign key into the user's own accounts."""
+    from app.db import repository as repo
+
+    db = fresh_ledger()
+    with db.connection() as conn:
+        conn.execute(
+            "INSERT INTO accounts (id, institution, account_type,"
+            " account_number_masked) VALUES (?, ?, ?, ?)",
+            ("acc-1", "Old Bank", "savings", "XXXX1111"))
+
+    repo.upsert_source_file(db, repo.SourceFileRecord(
+        id="file-1", filename="old.pdf", file_hash="h1", account_id="acc-1"))
+    repo.upsert_source_file(db, repo.SourceFileRecord(
+        id="file-2", filename="new.pdf", file_hash="h2", parse_status="parsed"))
+
+    assert len(repo.list_source_files(db)) == 2
+    with db.connection() as conn:
+        linked = conn.execute(
+            "SELECT account_id FROM source_files WHERE id = 'file-1'").fetchone()
+    assert linked["account_id"] == "acc-1"

@@ -1,15 +1,15 @@
 anthropic==0.125.0
 fastapi==0.141.1
 google-api-python-client==2.199.0
-google-auth-oauthlib==1.4.1
 google-auth==2.57.0
 langchain-anthropic==1.6.1
 langchain-core==1.6.0
-langgraph-checkpoint-sqlite==3.1.1
+langgraph-checkpoint-postgres==3.1.2
 langgraph==1.2.11
 openpyxl==3.1.5
 pandas==3.0.5
 pdfplumber==0.11.10
+psycopg[binary,pool]==3.2.3
 pydantic==2.13.4
 pypdf==6.16.2
 pytest==9.1.1
@@ -18,5 +18,6 @@ python-docx==1.2.0
 python-dotenv==1.2.3
 python-multipart==0.0.32
 reportlab==5.0.1
+requests==2.34.2
 uvicorn==0.52.4
 xlrd==2.0.2

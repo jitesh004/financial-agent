@@ -15,6 +15,11 @@ const TONE = {
   ai_inferences: 'warn', decisions: 'warn', everything: 'neg',
 };
 
+/* Rows per table the preview endpoint returns. Must match
+   PREVIEW_ROW_LIMIT in backend/app/main.py - it is only used to decide
+   whether to render the count as "200+". */
+const PREVIEW_CAP = 200;
+
 export default function DataManager() {
   const [inv, setInv] = useState(null);
   const [error, setError] = useState(null);
@@ -174,21 +179,27 @@ export default function DataManager() {
               >
                 {a.label}
               </button>
-              {['ai_inferences', 'parsed_data', 'decisions', 'files'].includes(a.scope) && (
-                  <button className="btn" style={{ fontSize: 12, padding: '2px 8px' }} onClick={() => loadPreview(a.scope)}>
-                    {expandedPreview === a.scope ? 'Hide preview' : 'Preview data'}
-                  </button>
-              )}
+              {/* Every scope, not a hand-maintained subset. This list used to
+                  name four of the seven, so the three it left out - including
+                  the statements downloaded from Gmail - had no way to be
+                  looked at before being deleted. */}
+              <button className="btn" style={{ fontSize: 12, padding: '2px 8px' }} onClick={() => loadPreview(a.scope)}>
+                {expandedPreview === a.scope ? 'Hide preview' : 'Preview data'}
+              </button>
             </div>
 
             {expandedPreview === a.scope && (
               <div style={{ flexBasis: '100%', marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--surface-2)' }}>
-                {previewData ? (
+                {previewData && Object.keys(previewData).length === 0 ? (
+                  <div style={{ color: 'var(--text-3)', fontSize: 13 }}>
+                    Nothing stored — this action would delete no rows.
+                  </div>
+                ) : previewData ? (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 24, paddingBottom: 12 }}>
                     {Object.entries(previewData).map(([tableName, rows]) => (
                       <div key={tableName}>
                         <div style={{ marginBottom: 8, fontWeight: 600, color: 'var(--text-1)', textTransform: 'capitalize' }}>
-                          {tableName.replace(/_/g, ' ')} <span style={{ color: 'var(--text-3)', fontWeight: 'normal' }}>({rows.length}{rows.length === 500 ? '+' : ''} rows)</span>
+                          {tableName.replace(/_/g, ' ')} <span style={{ color: 'var(--text-3)', fontWeight: 'normal' }}>({rows.length}{rows.length >= PREVIEW_CAP ? '+' : ''} rows)</span>
                         </div>
                         {rows.length === 0 ? (
                           <div style={{ color: 'var(--text-3)', fontSize: 13, fontStyle: 'italic' }}>Table is empty.</div>

@@ -14,14 +14,19 @@ files are actually on disk.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 
+from ..auth import google as google_auth
+from ..auth import store as auth_store
+from ..config import config
 from ..db.database import get_db
 from ..db import repository as repo
+from ..db.engine import current_tenant
 from ..ingestion.gmail_source import (PERIOD_OPTIONS, SCAN_INTENTS,
                                       FoundAlert, FoundAttachment,
                                       GoogleGmailClient, build_query,
@@ -32,28 +37,48 @@ from ..ingestion.passwords import (derive_passwords, password_hint,
                                    resolve_password_status)
 from ..jobs import JobProgress, jobs
 from ..pipeline import alerts as alerts_pipeline
+from ..storage import gmail_cache
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/gmail", tags=["gmail"])
 
 ROOT = Path(__file__).resolve().parents[3]
-CREDENTIALS = ROOT / "credentials.json"
-TOKEN = ROOT / "data" / "gmail_token.json"
-CACHE = ROOT / "data" / "gmail_cache"
+
+
+class _DatabaseTokenStore:
+    """One user's Gmail grant, held in `google_tokens`.
+
+    Replaces the single `data/gmail_token.json`: with several people signed
+    in, one file meant whoever connected last owned everybody's import.
+    """
+
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+
+    def load(self) -> str | None:
+        return auth_store.get_google_token(get_db(), self.user_id)
+
+    def save(self, token_json: str) -> None:
+        auth_store.save_google_token(get_db(), self.user_id, token_json)
+
+    def forget(self) -> None:
+        auth_store.delete_google_token(get_db(), self.user_id)
 
 
 def _client() -> GoogleGmailClient | None:
-    if not CREDENTIALS.exists() and not TOKEN.exists():
+    """A Gmail client for whoever is signed in, or None if nobody is."""
+    tenant = current_tenant()
+    if not tenant:
         return None
-    return GoogleGmailClient(CREDENTIALS, TOKEN)
+    return GoogleGmailClient(_DatabaseTokenStore(tenant))
 
 
 def _require_client() -> GoogleGmailClient:
     client = _client()
-    if client is None or not client.is_authorized():
-        raise HTTPException(400, "Gmail is not connected.")
-    client.authorize(interactive=False)
+    if client is None or not client.authorize():
+        raise HTTPException(
+            400, "Gmail is not connected. Connect it from the import screen.")
     return client
 
 
@@ -63,38 +88,44 @@ def _require_client() -> GoogleGmailClient:
 
 @router.get("/status")
 def status() -> dict[str, Any]:
-    client = _client()
-    cached = len(list(CACHE.glob("*.pdf"))) if CACHE.exists() else 0
+    cache = gmail_cache()
+    cached = len(list(cache.glob("*.pdf"))) if cache.exists() else 0
     profile = repo.get_profile(get_db())
+    client = _client()
     return {
-        "available": CREDENTIALS.exists(),
+        "available": config.google_configured,
         "connected": bool(client and client.is_authorized()),
         "cached_files": cached,
         "profile_ready": profile.has_password_material(),
+        # Where to send the browser to grant read access. A URL rather than a
+        # POST that "connects": consent happens on Google's own page, and the
+        # server cannot open a browser on the user's machine.
+        "connect_url": "/api/auth/google/start?purpose=gmail",
         "setup_hint": (
-            None if CREDENTIALS.exists() else
-            "Gmail import needs a Google Cloud OAuth client saved as "
-            "credentials.json in the project root."
+            None if config.google_configured else
+            "Gmail import needs the same Google OAuth client the app signs in "
+            "with. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET."
         ),
     }
 
 
-@router.post("/connect")
-def connect() -> dict[str, Any]:
-    client = _client()
-    if client is None:
-        raise HTTPException(400, "No credentials.json found.")
-    try:
-        client.authorize(interactive=True)
-    except Exception as exc:
-        raise HTTPException(400, f"Authorization failed: {exc}")
-    return {"status": "connected"}
-
-
 @router.post("/disconnect")
 def disconnect() -> dict[str, str]:
-    """Remove the stored token. Cached files are kept."""
-    TOKEN.unlink(missing_ok=True)
+    """Forget this user's Gmail grant. Cached files are kept.
+
+    The grant is also revoked at Google, so disconnecting here really does
+    end the app's access rather than merely hiding it from this screen.
+    """
+    tenant = current_tenant()
+    db = get_db()
+    stored = auth_store.get_google_token(db, tenant)
+    if stored:
+        try:
+            token = json.loads(stored)
+            google_auth.revoke(token.get("refresh_token") or token.get("token") or "")
+        except (TypeError, ValueError):
+            log.warning("stored Gmail token was unreadable; deleting it anyway")
+    auth_store.delete_google_token(db, tenant)
     return {"status": "disconnected"}
 
 
@@ -457,7 +488,7 @@ def _run_scan(job_id: str, max_messages: int, months: int | None = None,
         progress.bump_total(max(1, len(result.attachments)))
         progress.phase("Classifying attachments")
 
-        cached_names = {p.name for p in CACHE.glob("*.pdf")} if CACHE.exists() else set()
+        cache = gmail_cache()
 
         rows = []
         ignored = 0
@@ -470,8 +501,8 @@ def _run_scan(job_id: str, max_messages: int, months: int | None = None,
                 continue
             label, explanation = password_hint(att.sender, att.filename)
             is_cached = bool(
-                list(CACHE.glob(att.cache_glob()))
-            ) if CACHE.exists() else False
+                list(cache.glob(att.cache_glob()))
+            ) if cache.exists() else False
 
             rows.append({
                 "message_id": att.message_id,
@@ -643,7 +674,8 @@ def _run_download(job_id: str, selected: list[dict[str, Any]],
                 key=f"{att.message_id}/{att.filename}",
             )
 
-        saved = download_to_cache(client, attachments, CACHE, progress=on_item)
+        saved = download_to_cache(client, attachments, gmail_cache(),
+                                  progress=on_item)
 
         fresh = sum(1 for a in saved if not a.from_cache)
         by_name = {(a.get("message_id"), a.get("filename")): a.get("intent")

@@ -408,13 +408,14 @@ export function SetupInstructions() {
     <Card title="Import from Gmail" sub="Setup needed">
       <p style={{ color: 'var(--text-2)', fontSize: 13, marginTop: 0 }}>
         Finds your bank and card statement emails, downloads the PDFs and analyzes
-        them. Access is <strong>read-only</strong>, and sign-in happens on Google’s
+        them. Access is <strong>read-only</strong>, and consent happens on Google’s
         own page — this app never sees your Gmail password.
       </p>
       <Callout>
-        <strong>What you need:</strong> a file called <code>credentials.json</code>.
-        It isn’t your password — it’s a free ID card from Google that registers
-        this app so Google will accept the sign-in.
+        <strong>What you need:</strong> the same Google OAuth client the app
+        signs in with, configured on the server. It isn’t anyone’s password —
+        it’s a free ID card from Google that registers this app so Google will
+        accept the sign-in.
       </Callout>
       <ol style={{ color: 'var(--text-2)', fontSize: 13, lineHeight: 1.75, paddingLeft: 20 }}>
         <li>Open <a href="https://console.cloud.google.com" target="_blank" rel="noreferrer"
@@ -423,8 +424,11 @@ export function SetupInstructions() {
         <li>Open the <strong>OAuth consent screen</strong>, choose <strong>External</strong>,
           and add your own Gmail under <strong>Test users</strong>.</li>
         <li><strong>Credentials → Create Credentials → OAuth client ID</strong>,
-          type <strong>Desktop app</strong>, then <strong>Download JSON</strong>.</li>
-        <li>Save it as <code>credentials.json</code> in the project root and restart the API.</li>
+          type <strong>Web application</strong>, and add{' '}
+          <code>{`${window.location.origin}/api/auth/google/callback`}</code>{' '}
+          under <strong>Authorised redirect URIs</strong>.</li>
+        <li>Set <code>GOOGLE_CLIENT_ID</code> and <code>GOOGLE_CLIENT_SECRET</code>{' '}
+          in the server’s <code>.env</code>, and restart the API.</li>
       </ol>
       <Callout>
         Check it with{' '}

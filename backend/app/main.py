@@ -4,8 +4,12 @@ Analysis runs in a background thread rather than blocking the upload request:
 parsing a decade of statements takes minutes, and an HTTP request that hangs
 that long dies to a proxy timeout. The frontend polls /api/runs/{id} instead.
 
-Results are held in memory for the active session AND persisted to SQLite, so
-a restart doesn't lose the ledger.
+Results are held in memory for the active session AND persisted to PostgreSQL,
+so a restart doesn't lose the ledger.
+
+Every /api route except health and the sign-in endpoints requires a session,
+and which user's rows a request can reach is decided by the database rather
+than by this file - see auth/session.py and db/engine.py.
 """
 
 from __future__ import annotations
@@ -27,11 +31,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from . import storage
-from .api import (files_routes, gmail_routes, job_routes, query_routes,
-                  rules_routes, settings_routes, staging_routes,
+from .api import (auth_routes, files_routes, gmail_routes, job_routes,
+                  query_routes, rules_routes, settings_routes, staging_routes,
                   wealth_routes)
+from .auth.session import AuthContextMiddleware
 from .api import serializers as ser
-from .db.database import get_db
+from .db.database import CLEAR_SCOPES, get_db
 from .db import repository as repo
 from .graph.build import build_graph
 from .ingestion.router import SUPPORTED_EXTENSIONS, file_hash
@@ -76,7 +81,13 @@ async def lifespan(_: FastAPI):
     resume it and pretending nothing was lost.
     """
     try:
-        stopped = jobs.recover()
+        # Once per account. `jobs` are per-user rows behind row-level
+        # security, so there is no connection that can see all of them at
+        # once - which is the point. Sweeping the user list is how a
+        # cross-tenant maintenance pass is done here, deliberately one tenant
+        # at a time rather than by handing anything a key to the whole table.
+        db = get_db()
+        stopped = sum(jobs.recover(owner) for owner in db.known_tenants())
         if stopped:
             log.info("marked %d job(s) interrupted from a previous run", stopped)
     except Exception:  # bookkeeping must never block startup
@@ -103,6 +114,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Added after CORS so it runs inside it: a 401 still needs the CORS headers,
+# or the browser reports an opaque network error instead of "sign in".
+app.add_middleware(AuthContextMiddleware)
+
+app.include_router(auth_routes.router)
+app.include_router(auth_routes.onboarding_router)
 app.include_router(gmail_routes.router)
 app.include_router(files_routes.router)
 app.include_router(files_routes.coverage_router)
@@ -1081,22 +1098,94 @@ def data_inventory() -> dict[str, Any]:
 
 
 
+#: What is worth showing about each table when a clearing action is about to
+#: delete it. Only these columns are ever selected, so a preview cannot
+#: accidentally start echoing a column added later - `source_files.password`
+#: is the one that matters there, and it is deliberately absent.
+#:
+#: `user_profile` shows the name and the date it changed but NOT the PAN: a
+#: preview exists to say what you are about to lose, and "your identity
+#: details, last edited on..." says it without putting a PAN in a table
+#: somebody might screenshot.
+PREVIEW_COLUMNS: dict[str, str] = {
+    # Authored by a human - the rows a preview matters most for.
+    "user_overrides": "fingerprint, category, flow_role, note, excluded, updated_at",
+    "claims": "counterparty, direction, amount, settled_amount, status, opened_on",
+    "claim_settlements": "claim_id, method, amount, settled_on",
+    "transaction_splits": "parent_fingerprint, amount, category, note",
+    "split_rules": "label, match_text, mine_pct, counterparty, active",
+    "settlement_groups": "kind, total_amount, residual, confirmed, created_at",
+    "settlement_group_legs": "group_id, fingerprint, side",
+    "custom_categories": "name, color, icon, created_at",
+    "recurring_series_overrides": "series_id, label, category, is_active, deleted",
+    "dashboards": "name, description, is_default, position, updated_at",
+    "dashboard_widgets": "dashboard_id, title, type, position",
+    "app_settings": "key, value, updated_at",
+    "user_profile": "full_name, date_of_birth, updated_at",
+    # Bought with real money.
+    "merchant_categories": "merchant_key, category, hit_count, updated_at",
+    "ai_inferences": "cache_key, kind, provider, model, created_at, hit_count",
+    # Downloaded, and irreplaceable if the mail is gone.
+    "source_files": "filename, size_bytes, parse_status, transaction_count",
+    "staged_files": ("filename, kind, account_label, parse_status, row_count,"
+                     " period_start, period_end, added_at"),
+    # Reproducible from the files, at the cost of CPU.
+    "accounts": "product_name, account_number_masked, account_type, institution",
+    "statements": "source_filename, period_start, period_end, recon_status",
+    "transactions": "id, txn_date, amount, merchant, category, flow_role",
+    "bureau_reports": "bureau, score, pulled_on, holder_name, source_filename",
+    "bureau_accounts": ("lender, account_type, number_suffix, status,"
+                        " current_balance, match_status"),
+    "portfolio_statements": "provider, as_of, declared_value, recon_status, source_filename",
+    "holdings": "instrument, isin, folio, units, nav, value, as_of",
+    # Derived, and cheap to rebuild.
+    "transfer_pairs": "amount, kind, day_gap, confidence",
+    "recurring_series": "label, category, direction, median_amount, cadence_days, next_expected",
+    "analysis_runs": "id, created_at, status, file_count",
+    "jobs": "id, kind, status, phase, message, updated_at",
+    "job_items": "job_id, seq, name, status, detail",
+}
+
+#: Rows per table. Keep in step with PREVIEW_CAP in DataManager.jsx, which
+#: uses it to decide whether to render the count as "200+".
+PREVIEW_ROW_LIMIT = 200
+
+
 @app.get("/api/data/preview/{scope}")
 def preview_data(scope: str) -> dict[str, Any]:
-    db = get_db()
-    preview = {}
-    with db.connection() as conn:
-        if scope == "ai_inferences":
-            preview["merchant_categories"] = [dict(row) for row in conn.execute("SELECT merchant_key, category, hit_count, updated_at FROM merchant_categories LIMIT 500").fetchall()]
-            preview["ai_inferences"] = [dict(row) for row in conn.execute("SELECT cache_key, kind, provider, model, created_at, hit_count FROM ai_inferences LIMIT 500").fetchall()]
-        elif scope == "decisions":
-            preview["user_overrides"] = [dict(row) for row in conn.execute("SELECT fingerprint, category, flow_role, note, excluded, updated_at FROM user_overrides LIMIT 500").fetchall()]
-        elif scope == "parsed_data":
-            preview["transactions"] = [dict(row) for row in conn.execute("SELECT id, txn_date, amount, merchant, category, flow_role FROM transactions LIMIT 500").fetchall()]
-            preview["accounts"] = [dict(row) for row in conn.execute("SELECT product_name, account_number_masked, account_type, institution FROM accounts LIMIT 500").fetchall()]
-        elif scope == "files":
-            preview["source_files"] = [dict(row) for row in conn.execute("SELECT filename, size_bytes, parse_status, transaction_count FROM source_files LIMIT 500").fetchall()]
+    """A sample of what clearing `scope` would delete, table by table.
+
+    Driven by CLEAR_SCOPES rather than a branch per scope, which is how three
+    of the seven scopes came to have no preview at all: the buttons were added
+    to the UI and the endpoint was never extended, so "Preview data" on the
+    staged imports - the statements downloaded from Gmail - returned an empty
+    object and rendered as an empty box. Reading the tier straight from the
+    same constant the clearing itself uses means a scope cannot be previewed
+    incompletely again.
+
+    Tables are returned in PREVIEW_COLUMNS order, which runs from
+    irreplaceable to cheaply rebuilt - so the widest scope, the factory reset,
+    leads with the rows nothing can bring back. Empty tables are omitted
+    rather than listed: a factory reset spans twenty-nine of them, and a wall
+    of "Table is empty" buries the four that actually hold something.
+    """
+    tables = CLEAR_SCOPES.get(scope)
+    if tables is None:
+        raise HTTPException(
+            400, f"Unknown scope '{scope}'. Valid: {', '.join(CLEAR_SCOPES)}")
+
+    preview: dict[str, Any] = {}
+    with get_db().connection() as conn:
+        for table in PREVIEW_COLUMNS:
+            if table not in tables:
+                continue
+            rows = conn.execute(
+                f"SELECT {PREVIEW_COLUMNS[table]} FROM {table}"
+                f" LIMIT {PREVIEW_ROW_LIMIT}").fetchall()
+            if rows:
+                preview[table] = [dict(row) for row in rows]
     return preview
+
 
 @app.post("/api/data/clear/{scope}")
 def clear_data(scope: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1161,22 +1250,17 @@ def restore_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.delete("/api/data/snapshots/{name}")
 def delete_snapshot(name: str) -> dict[str, Any]:
-    """Delete a specific snapshot file."""
-    db = get_db()
-    backups = db.path.parent / "backups"
-    target = backups / name
-    
-    # Path traversal protection - ensure it's in the backups dir
+    """Delete one of the signed-in user's snapshots.
+
+    The name arrives from an HTTP request, so `Database.delete_snapshot`
+    resolves it against that user's own snapshot directory and refuses
+    anything that lands outside - which now also means one user cannot delete
+    another's backups by guessing at a path.
+    """
     try:
-        if not target.resolve().is_relative_to(backups.resolve()):
-            raise HTTPException(400, "Invalid snapshot name")
-    except ValueError:
-        pass # python < 3.9 might not have is_relative_to, but 3.12 does
-        
-    if not target.exists():
-        raise HTTPException(404, "Snapshot not found")
-        
-    target.unlink()
+        get_db().delete_snapshot(name)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
     return {"status": "deleted"}
 
 
@@ -1369,11 +1453,14 @@ def _llm_status() -> tuple[str, bool]:
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    import os
     db = get_db()
     return {
         "status": "ok",
-        "database": str(db.path),
+        "database": "postgresql",
+        # Zero when nobody is signed in: this endpoint is public so a load
+        # balancer can probe it, and with no tenant bound the row-level
+        # security policy matches nothing - which is the correct answer to
+        # "how many transactions can this caller see".
         "transactions_stored": repo.count_transactions(db),
         # Reports the provider actually in use. This checked
         # ANTHROPIC_API_KEY, which nothing reads any more, so health said

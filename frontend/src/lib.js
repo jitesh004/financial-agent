@@ -70,8 +70,19 @@ export function colorFor(index) {
 
 /* ---------- API ---------- */
 
+/* Called when the server says the session is gone. Set by the auth provider
+   so a 401 anywhere in the app lands on the sign-in screen instead of
+   surfacing as "401 Unauthorized" inside whatever panel happened to ask. */
+let onUnauthorized = null;
+export function setUnauthorizedHandler(handler) { onUnauthorized = handler; }
+
 async function request(path, options = {}) {
-  const response = await fetch(path, options);
+  /* same-origin so the session cookie travels; the API is reached through the
+     dev server's proxy and through nginx in production, never cross-origin. */
+  const response = await fetch(path, { credentials: 'same-origin', ...options });
+  if (response.status === 401 && !path.startsWith('/api/auth/')) {
+    onUnauthorized?.();
+  }
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
     try {
@@ -185,6 +196,24 @@ api.saveProfile = (profile) => request('/api/profile', {
 });
 
 
+/* ---------- Signing in ---------- */
+
+api.session = () => request('/api/auth/session');
+api.authConfig = () => request('/api/auth/config');
+api.logout = () => jsonPost('/api/auth/logout');
+api.logoutEverywhere = () => jsonPost('/api/auth/logout-all');
+api.activeSessions = () => request('/api/auth/sessions');
+api.deleteAccount = (confirmEmail) =>
+  jsonPost('/api/auth/delete-account', { confirm_email: confirmEmail });
+
+/* ---------- Onboarding ---------- */
+
+api.onboarding = () => request('/api/onboarding');
+api.onboardingStep = (step) => jsonPost('/api/onboarding/step', { step });
+api.onboardingComplete = () => jsonPost('/api/onboarding/complete');
+api.onboardingReopen = () => jsonPost('/api/onboarding/reopen');
+
+
 /* ---------- Gmail (staged, job-based) ---------- */
 
 const jsonPost = (path, body) => request(path, {
@@ -203,7 +232,14 @@ api.explainTransaction = (id) => request(`/api/rules/explain/${id}`);
 api.testRules = (example) => jsonPost('/api/rules/test', example);
 
 api.gmailStatus = () => request('/api/gmail/status');
-api.gmailConnect = () => jsonPost('/api/gmail/connect');
+/* A full-page navigation, not a fetch. Consent happens on Google's own page,
+   and the server has no browser of its own to open one in - which is what the
+   old POST /api/gmail/connect quietly assumed. `redirect_to` is where Google
+   sends the browser after the grant. */
+api.gmailConnect = (redirectTo = window.location.pathname) => {
+  window.location.href =
+    `/api/auth/google/start?purpose=gmail&redirect_to=${encodeURIComponent(redirectTo)}`;
+};
 api.gmailDisconnect = () => jsonPost('/api/gmail/disconnect');
 api.gmailPeriods = () => request('/api/gmail/periods');
 api.gmailIgnored = () => request('/api/gmail/ignored');

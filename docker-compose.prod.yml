@@ -1,24 +1,88 @@
-version: "3.8"
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      # Set POSTGRES_PASSWORD and FA_DB_PASSWORD in a .env beside this file.
+      # The second is the password of the ordinary role the app connects as -
+      # see deploy/postgres-init.sql for why the app is not the superuser.
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/postgres-init.sql:/docker-entrypoint-initdb.d/10-financial-agent.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d financial_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
     volumes:
       - ./data:/data
-      - ./credentials.json:/credentials.json:ro
-    ports:
-      - "8078:8078"
+    # Deliberately NOT published to the host. The frontend container reaches
+    # it over the compose network; publishing 8078 would expose the API
+    # directly, bypassing the TLS Caddy terminates in front of it.
+    expose:
+      - "8078"
     environment:
       - PYTHONUNBUFFERED=1
+      - FA_DATABASE_URL=postgresql://financial_agent:${FA_DB_PASSWORD:?set FA_DB_PASSWORD}@db:5432/financial_agent
+      - FA_DATA_DIR=/data
+      - FA_APP_BASE_URL=${FA_APP_BASE_URL:?set FA_APP_BASE_URL}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:?set GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:?set GOOGLE_CLIENT_SECRET}
+      - FA_ALLOWED_SIGNINS=${FA_ALLOWED_SIGNINS:-}
+      # The session cookie must be Secure once the app is behind TLS, which in
+      # production it always is.
+      - FA_SESSION_COOKIE_SECURE=true
+    entrypoint: ["python", "/app/docker-entrypoint.py"]
+    # Spelled out because Compose's `entrypoint` override also CLEARS the
+    # image's CMD - so relying on the Dockerfile's would start the entrypoint
+    # with no command to hand over to. No --reload here: this is production.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8078"]
     restart: unless-stopped
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    ports:
-      - "80:80"
+    # Also unpublished: Caddy is the only thing that should answer from the
+    # public internet, so the certificate covers every request.
+    expose:
+      - "80"
     depends_on:
       - backend
     restart: unless-stopped
+
+  # TLS terminator and the only container with published ports. Obtains and
+  # renews a Let's Encrypt certificate by itself - see deploy/Caddyfile.
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - frontend
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - FA_DOMAIN=${FA_DOMAIN:?set FA_DOMAIN, e.g. finance.example.com}
+      - FA_TLS_EMAIL=${FA_TLS_EMAIL:?set FA_TLS_EMAIL for Let's Encrypt}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Named volumes, because losing these means re-requesting certificates
+      # on every restart and running into Let's Encrypt's rate limit.
+      - caddy_data:/data
+      - caddy_config:/config
+      - caddy_logs:/var/log/caddy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
+  caddy_logs:

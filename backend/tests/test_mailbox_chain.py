@@ -21,6 +21,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
+from tests.support import fresh_ledger  # noqa: E402
+from app import storage  # noqa: E402
 from app.api import gmail_routes  # noqa: E402
 from app.db import database, repository as repo  # noqa: E402
 from app.ingestion.gmail_source import FakeGmailClient  # noqa: E402
@@ -39,17 +41,25 @@ def _pdf(name: str) -> bytes:
 
 @pytest.fixture()
 def db(monkeypatch, tmp_path):
-    fresh = database.Database(tmp_path / "chain.db")
+    fresh = fresh_ledger()
     monkeypatch.setattr(database, "_db", fresh)
     return fresh
 
 
 @pytest.fixture()
 def cache(monkeypatch, tmp_path):
-    """Downloads land in a temp cache, never the user's real one."""
-    target = tmp_path / "cache"
-    target.mkdir()
-    monkeypatch.setattr(gmail_routes, "CACHE", target)
+    """Downloads land in a temp cache, never the user's real one.
+
+    The cache is per user now (`storage.gmail_cache()` appends the tenant), so
+    what gets redirected is the root it hangs off, and the returned path is
+    this test's own subdirectory of it.
+    """
+    from app.db.engine import current_tenant
+
+    root = tmp_path / "cache"
+    monkeypatch.setattr(storage, "GMAIL_CACHE", root)
+    target = root / current_tenant()
+    target.mkdir(parents=True)
     return target
 
 

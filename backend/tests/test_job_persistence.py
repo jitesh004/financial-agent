@@ -14,7 +14,6 @@ rather than left showing a progress bar that can never move again.
 from __future__ import annotations
 
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -23,6 +22,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
+from tests.support import fresh_ledger  # noqa: E402
 from app.db import repository as repo  # noqa: E402
 from app.db.database import Database  # noqa: E402
 from app.jobs import JobProgress, JobStore  # noqa: E402
@@ -30,7 +30,7 @@ from app.jobs import JobProgress, JobStore  # noqa: E402
 
 @pytest.fixture()
 def db() -> Database:
-    return Database(Path(tempfile.mkdtemp()) / "jobs.db")
+    return fresh_ledger()
 
 
 @pytest.fixture()

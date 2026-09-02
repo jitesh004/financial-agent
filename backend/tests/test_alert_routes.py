@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
+from tests.support import fresh_ledger  # noqa: E402
 from app.api import gmail_routes  # noqa: E402
 from app.db import database, repository as repo  # noqa: E402
 from app.jobs import jobs  # noqa: E402
@@ -70,7 +71,7 @@ class FakeAlertMailbox:
 
 @pytest.fixture()
 def db(monkeypatch, tmp_path):
-    fresh = database.Database(tmp_path / "alert_routes.db")
+    fresh = fresh_ledger()
     monkeypatch.setattr(database, "_db", fresh)
     repo.upsert_account(fresh, Account(
         id="acc-hdfc", institution="HDFC Bank",

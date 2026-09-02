@@ -16,6 +16,7 @@ total on any tab until someone has looked at it and said yes.
 from __future__ import annotations
 
 import logging
+import uuid
 from collections import defaultdict
 from decimal import Decimal
 from pathlib import Path
@@ -33,6 +34,20 @@ from ..pipeline import staging_pipeline as pipeline
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/staging", tags=["staging"])
+
+
+#: Staging's parse statuses in the registry's words. They very nearly agree -
+#: `ok` and `empty` are the two that do not. `empty` means read and understood
+#: with nothing in it that counts (a contract note, a trades report), which is
+#: a success, not a failure: calling it one sends someone hunting a bug that
+#: is not there. Same reasoning as main._PARSE_STATUS, whose vocabulary this
+#: shares.
+_REGISTRY_STATUS = {
+    pipeline.STATUS_OK: "parsed",
+    pipeline.STATUS_EMPTY: "parsed",
+    pipeline.STATUS_FAILED: "failed",
+    pipeline.STATUS_LOCKED: "needs_password",
+}
 
 
 KIND_LABELS = {
@@ -438,6 +453,13 @@ def _run_process(job_id: str) -> None:
         progress.start(len(selected), "Rebuilding your ledger")
 
         built = pipeline.materialise(db, progress=progress.phase)
+        # Registered here rather than after the analysis: when nothing parses
+        # there is no ledger to publish, and those are exactly the runs whose
+        # documents someone needs to see on the Files screen.
+        try:
+            _register_documents(db)
+        except Exception:  # pragma: no cover - the registry is not the ledger
+            log.exception("could not record the file registry")
         transactions = built.pop("_transactions", [])
         accounts = built.pop("_accounts", {})
         progress.advance(len(selected))
@@ -515,6 +537,81 @@ def _run_process(job_id: str) -> None:
     except Exception as exc:
         log.exception("staged process failed")
         progress.fail(f"{type(exc).__name__}: {exc}")
+
+
+def _register_documents(db) -> None:
+    """Record every staged document in the file registry.
+
+    `source_files` is what the Data tab's "Files & passwords" screen reads,
+    and it is the ONLY table that remembers a document which failed to parse
+    or is still locked - `statements` and `transactions` hold successes
+    exclusively.
+
+    The old import path wrote it, in `main._save_file_registry`. The staged
+    path - which is now how everything arrives - never did. So on any ledger
+    built through the wizard that screen was empty: no files, and therefore no
+    password box, because the box is rendered per file row. A fresh database
+    (a Docker volume, say) showed nothing there no matter how much was
+    imported, while the ledger beside it was fully populated.
+
+    Every staged document is registered, not only the ticked ones: a document
+    someone untick-ed because it would not parse is exactly the one they came
+    to this screen to fix. Alerts are skipped - they are not files.
+    """
+    # Superseded rows are left out: one is a worse copy of a statement that
+    # arrived twice, and the pipeline already ignores it. Listing both would
+    # put the same month on screen twice with no way to tell which counted.
+    entries = [e for e in staging.all_entries(db)
+               if e["kind"] != "alert" and not e["superseded_by"]]
+    if not entries:
+        return
+
+    # A staged entry's id becomes its statement's id (see
+    # staging_pipeline.materialise), so the drill-down needs no join. Guard it
+    # the way _save_file_registry does: an entry can carry an id without a
+    # statement row ever having been written for it, and pointing the registry
+    # at one of those is a dangling foreign key.
+    with db.connection() as conn:
+        written = {r["id"] for r in
+                   conn.execute("SELECT id FROM statements").fetchall()}
+
+    for entry in entries:
+        status = _REGISTRY_STATUS.get(entry["parse_status"] or "", "failed")
+        if status == "parsed" and entry["recon_status"] == "unreconciled":
+            status = "unreconciled"
+        period = (entry["period_start"] or "")[:7] or None
+        # staged_files carries no size, but the file itself is still on disk
+        # for anything downloaded this run. Without this the whole Size column
+        # reads as a dash. A cleared cache just leaves it that way again.
+        size = None
+        if entry["path"]:
+            try:
+                size = Path(entry["path"]).stat().st_size
+            except OSError:
+                pass
+        repo.upsert_source_file(db, repo.SourceFileRecord(
+            id=str(uuid.uuid4()),   # ignored when the hash already resolves one
+            filename=entry["filename"] or "",
+            filepath=entry["path"] or "",
+            file_hash=entry["file_hash"] or "",
+            source=entry["origin"] or "gmail",
+            size_bytes=size,
+            sender=entry["sender"] or "",
+            message_id=entry["message_id"] or "",
+            # Staging derives a password from the profile at read time and
+            # keeps no copy, so there is none to report here. "locked" and
+            # "unknown" are both honest; a made-up "open" would not be.
+            password_status=("locked" if status == "needs_password"
+                             else "unknown"),
+            parse_status=status,
+            institution_guess=entry["account_label"] or "",
+            account_type_guess=entry["account_type"] or "",
+            statement_id=(entry["id"] if entry["id"] in written else None),
+            transaction_count=entry["row_count"] or 0,
+            error_message=entry["parse_message"] or "",
+            period_hint=period,
+        ))
+    repo.backfill_source_file_account_ids(db)
 
 
 def _as_date(value: Any):

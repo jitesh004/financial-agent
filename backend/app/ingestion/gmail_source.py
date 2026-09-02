@@ -11,17 +11,22 @@ The security model is the important part:
     scoped token. The scope is `gmail.readonly`, so it can read and download but
     can never send, delete, or modify anything.
 
-  - **Local tokens.** The OAuth token is stored in a local file and used only to
-    call Google's API from this machine. It is never sent anywhere else.
+  - **A token per person.** The grant is held against the signed-in user and
+    used only to call Google's API on their behalf. It used to be one file on
+    disk, which was right for a program on one person's laptop and wrong the
+    moment this became something several people sign into - whoever connected
+    last would have owned everyone's import. `TokenStore` is the seam: the
+    server hands in a store that reads and writes that user's row.
 
   - **The user stays in control.** Fetching lists what it found and downloads
     attachments (a permissioned action) - the caller decides whether to then
     analyse them. Nothing is auto-sent or auto-deleted, ever.
 
-To actually connect, the user supplies their own Google Cloud OAuth client
-(`credentials.json`); see setup notes in the README. Without it, everything here
-is inert and the manual upload path is unaffected. A `FakeGmailClient` mirrors
-the real client's surface so the flow is fully testable offline.
+Connecting happens through the app's own Google sign-in (see `auth/google.py`),
+as a second, separate grant the user makes deliberately - not bundled into
+signing in. Without a configured OAuth client everything here is inert and the
+manual upload path is unaffected. A `FakeGmailClient` mirrors the real client's
+surface so the flow is fully testable offline.
 """
 
 from __future__ import annotations
@@ -29,11 +34,14 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
 from ..rules import institutions
+
+from ..config import config
 
 log = logging.getLogger(__name__)
 
@@ -319,60 +327,154 @@ class GmailClient(Protocol):
 # Real client
 # --------------------------------------------------------------------------
 
-class GoogleGmailClient:
-    """Real Gmail API client backed by an OAuth token.
+class TokenStore(Protocol):
+    """Where one user's Gmail grant is kept.
 
-    Construction never triggers a browser flow; call `authorize()` explicitly
-    for that, so the read path can't accidentally pop a consent screen.
+    An interface rather than a path, so the client does not care whether the
+    grant lives in a database row (the server) or a file (a script, a test).
     """
 
-    def __init__(self, credentials_path: Path, token_path: Path):
-        self.credentials_path = Path(credentials_path)
-        self.token_path = Path(token_path)
+    def load(self) -> str | None:
+        """The stored authorized-user JSON, or None if never connected."""
+
+    def save(self, token_json: str) -> None:
+        """Persist a refreshed grant."""
+
+    def forget(self) -> None:
+        """Discard a grant Google has told us is dead.
+
+        Separate from the user asking to disconnect: this is the app noticing
+        that a stored token can no longer be refreshed, so that the import
+        screen stops claiming to be connected.
+        """
+
+
+class FileTokenStore:
+    """A grant in a JSON file.
+
+    Kept for `backend/tools/`, which run as one person against their own
+    mailbox from a shell and have no signed-in user to look up.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def load(self) -> str | None:
+        return self.path.read_text() if self.path.exists() else None
+
+    def save(self, token_json: str) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(token_json)
+        # A token is a credential: keep it readable only by this user where
+        # the OS supports it. Best-effort; harmless where it doesn't.
+        try:
+            self.path.chmod(0o600)
+        except OSError:
+            pass
+
+    def forget(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+
+#: What Google says when a refresh token is expired, revoked, or was issued
+#: to a grant the user has since withdrawn. Anything else - a timeout, a 503,
+#: DNS - means try again later rather than make the user re-consent.
+_DEAD_GRANT_MARKERS = ("invalid_grant", "invalid_request", "unauthorized_client")
+
+
+def _grant_is_dead(exc: Exception) -> bool:
+    """Whether a RefreshError means the grant is gone for good.
+
+    google-auth reports both permanent and transient failures as the same
+    exception type, so the distinction has to come from the payload. Read
+    conservatively: an error this cannot classify is treated as transient,
+    because discarding a working grant costs the user a re-consent while
+    keeping a dead one costs only one more failed refresh.
+    """
+    text = " ".join(str(arg) for arg in exc.args).lower()
+    return any(marker in text for marker in _DEAD_GRANT_MARKERS)
+
+
+class GoogleGmailClient:
+    """Real Gmail API client backed by one user's OAuth token.
+
+    Construction never reaches the network; call `authorize()` explicitly, so
+    the read path cannot accidentally spend a token refresh.
+
+    There is no consent flow here any more. Obtaining a grant is the web
+    OAuth round trip in `auth/google.py` - a server cannot open a browser on
+    the user's machine, and the old `InstalledAppFlow` would have popped a
+    consent screen on the host nobody can see.
+    """
+
+    def __init__(self, tokens: TokenStore):
+        self.tokens = tokens
         self._service = None
         self._creds = None
         self._local = None
 
-    def authorize(self, interactive: bool = True) -> bool:
-        """Ensure we have a valid token, running the consent flow if needed.
+    def authorize(self, interactive: bool = False) -> bool:
+        """Load the stored grant, refreshing it if it has expired.
 
-        Returns True if authorized. The consent flow opens Google's own page in
-        a browser - the user signs in there, and this app only ever receives the
-        resulting scoped token.
+        `interactive` is accepted and ignored: there is nothing interactive a
+        server can do. It stays in the signature because several call sites
+        pass `interactive=False` to say "do not pop anything", and that
+        request is now simply always honoured.
         """
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
 
-        creds = None
-        if self.token_path.exists():
-            creds = Credentials.from_authorized_user_file(str(self.token_path), SCOPES)
+        raw = self.tokens.load()
+        if not raw:
+            return False
+        try:
+            creds = Credentials.from_authorized_user_info(json.loads(raw), SCOPES)
+        except (TypeError, ValueError) as exc:
+            log.warning("stored Gmail token is unreadable: %s", exc)
+            return False
 
-        if creds and creds.valid:
+        if creds.valid:
             self._build(creds)
             return True
 
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+        if creds.expired and creds.refresh_token:
+            # Refreshing is a network call to Google and fails in two very
+            # different ways, which used to be one unhandled exception and a
+            # 500 from whatever endpoint happened to ask.
+            #
+            # This is not an edge case. An OAuth app published "External" with
+            # a status of Testing is issued refresh tokens that expire after
+            # SEVEN DAYS, so for that deployment every user's grant dies
+            # weekly and this path runs constantly.
+            from google.auth.exceptions import RefreshError
+            try:
+                creds.refresh(Request())
+            except RefreshError as exc:
+                if _grant_is_dead(exc):
+                    # Google will never honour this token again. Forget it, so
+                    # the import screen reports "not connected" and offers to
+                    # reconnect rather than showing a live grant whose every
+                    # use fails.
+                    log.info("Gmail grant is no longer valid; forgetting it")
+                    try:
+                        self.tokens.forget()
+                    except Exception:      # never let cleanup mask the cause
+                        log.exception("could not discard the dead Gmail grant")
+                else:
+                    # Transient - Google unreachable, a 5xx, a timeout. The
+                    # grant is probably fine, so it is emphatically NOT
+                    # discarded: throwing away a good token because the
+                    # network blipped would make the user re-consent for
+                    # nothing.
+                    log.warning("could not refresh the Gmail grant: %s", exc)
+                return False
             self._save(creds)
             self._build(creds)
             return True
 
-        if not interactive:
-            return False
-        if not self.credentials_path.exists():
-            raise FileNotFoundError(
-                f"No OAuth client at {self.credentials_path}. Create a Desktop "
-                f"OAuth client in Google Cloud Console and save it there."
-            )
-
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        flow = InstalledAppFlow.from_client_secrets_file(
-            str(self.credentials_path), SCOPES
-        )
-        creds = flow.run_local_server(port=0)
-        self._save(creds)
-        self._build(creds)
-        return True
+        # Expired with nothing to refresh from. The user has to grant again;
+        # saying so beats a confusing 401 from the first API call.
+        return False
 
     def _build(self, creds) -> None:
         from googleapiclient.discovery import build
@@ -403,17 +505,10 @@ class GoogleGmailClient:
         return service
 
     def _save(self, creds) -> None:
-        self.token_path.parent.mkdir(parents=True, exist_ok=True)
-        self.token_path.write_text(creds.to_json())
-        # Token is a credential: keep it readable only by this user where the OS
-        # supports it. Best-effort; harmless where it doesn't.
-        try:
-            self.token_path.chmod(0o600)
-        except OSError:
-            pass
+        self.tokens.save(creds.to_json())
 
     def is_authorized(self) -> bool:
-        return self.token_path.exists()
+        return bool(self.tokens.load())
 
     #: Gmail's hard per-page ceiling. Asking for more silently returns 500.
     LIST_PAGE_SIZE = 500
@@ -679,7 +774,13 @@ def _pdf_attachments(message: dict[str, Any]) -> list[tuple[str, str, int]]:
 #: Message metadata fetches are IO-bound round trips to Google, so they
 #: parallelise almost linearly. Kept modest to stay well inside Gmail's
 #: per-user rate limits - going wider trades a little speed for 429s.
-FETCH_WORKERS = 8
+#:
+#: Configurable because the same pool width also decides how many statements
+#: are held in memory at once, and that is the wrong number on a small host.
+#: On a 1 GB box - Oracle's Always Free E2.1.Micro, say - eight concurrent
+#: parses cost memory and buy nothing: with a fraction of one core there is no
+#: parallelism to extract, only footprint. Set FA_PARSE_WORKERS=2 there.
+FETCH_WORKERS = config.PARSE_WORKERS
 
 
 def find_statements(
