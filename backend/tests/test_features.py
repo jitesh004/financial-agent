@@ -2757,3 +2757,87 @@ def test_correcting_a_source_does_not_disturb_the_selection(tmp_db):
     entry = next(e for e in staging.all_entries(tmp_db) if e["id"] == entry_id)
     assert entry["selected"] is False
     assert entry["scan_intent"] == "investment"
+
+
+def test_processing_records_every_document_in_the_file_registry(tmp_db, tmp_path):
+    """The Data tab's "Files & passwords" screen reads `source_files`.
+
+    The staged path - which is now how everything arrives - never wrote to it,
+    only the old import path did. So a ledger built entirely through the
+    wizard left that screen empty: no files, and therefore no password box,
+    because the box is rendered per file row. The ledger beside it was fully
+    populated, which is what made it look like a display bug rather than a
+    missing write.
+    """
+    from app.api import staging_routes
+    from app.db import repository as repo
+    from app.db import staging
+    from app.ingestion.router import file_hash
+    from app.pipeline import staging_pipeline
+
+    path = _csv_statement(tmp_path)
+    entry_id = staging.add(tmp_db, file_hash(path), filename=path.name,
+                           path=str(path), origin="upload")
+    entry = next(e for e in staging.all_entries(tmp_db) if e["id"] == entry_id)
+    staging_pipeline.parse_entry(tmp_db, entry)
+
+    assert repo.list_source_files(tmp_db) == [], \
+        "parsing alone must not touch the registry"
+
+    staging_routes._register_documents(tmp_db)
+
+    files = repo.list_source_files(tmp_db)
+    assert len(files) == 1
+    assert files[0].filename == path.name
+    assert files[0].source == "upload"
+    # "empty" means read and understood with nothing in it that counts. It is
+    # a success, and calling it a failure sends someone hunting a bug that is
+    # not there.
+    assert files[0].parse_status in ("parsed", "unreconciled")
+
+
+def test_a_locked_document_reaches_the_screen_that_can_unlock_it(tmp_db):
+    """`source_files` is the ONLY table that remembers a document which could
+    not be read - statements and transactions hold successes exclusively. A
+    password-protected PDF that never parsed has no other way to reach the one
+    screen with a password box on it."""
+    from app.api import staging_routes
+    from app.db import repository as repo
+    from app.db import staging
+    from app.pipeline import staging_pipeline
+
+    entry_id = staging.add(tmp_db, "locked-hash", filename="hdfc_card.pdf",
+                           path="/nowhere/hdfc_card.pdf", origin="gmail")
+    staging.record_parse(tmp_db, entry_id,
+                         status=staging_pipeline.STATUS_LOCKED,
+                         message="Protected, and no password derived from "
+                                 "your profile opened it.")
+
+    staging_routes._register_documents(tmp_db)
+
+    files = repo.list_source_files(tmp_db)
+    assert len(files) == 1
+    assert files[0].parse_status == "needs_password"
+    assert files[0].password_status == "locked"
+    # No statement row was ever written for it, so the registry must not point
+    # at one - that is a dangling foreign key, and the drill-down would 500.
+    assert files[0].statement_id is None
+
+
+def test_a_superseded_document_is_not_listed_twice(tmp_db):
+    """A statement that arrived twice supersedes its worse copy. Listing both
+    puts the same month on screen twice with no way to tell which counted."""
+    from app.api import staging_routes
+    from app.db import repository as repo
+    from app.db import staging
+
+    keep = staging.add(tmp_db, "hash-good", filename="axis_august.pdf")
+    drop = staging.add(tmp_db, "hash-worse", filename="axis_august_older.pdf")
+    with tmp_db.connection() as conn:
+        conn.execute("UPDATE staged_files SET superseded_by = ? WHERE id = ?",
+                     (keep, drop))
+
+    staging_routes._register_documents(tmp_db)
+
+    listed = [f.filename for f in repo.list_source_files(tmp_db)]
+    assert listed == ["axis_august.pdf"]
