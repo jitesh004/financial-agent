@@ -41,6 +41,8 @@ from typing import Any, Protocol
 
 from ..rules import institutions
 
+from ..config import config
+
 log = logging.getLogger(__name__)
 
 # Read-only. This is a hard ceiling: even a compromised token cannot send or
@@ -772,7 +774,13 @@ def _pdf_attachments(message: dict[str, Any]) -> list[tuple[str, str, int]]:
 #: Message metadata fetches are IO-bound round trips to Google, so they
 #: parallelise almost linearly. Kept modest to stay well inside Gmail's
 #: per-user rate limits - going wider trades a little speed for 429s.
-FETCH_WORKERS = 8
+#:
+#: Configurable because the same pool width also decides how many statements
+#: are held in memory at once, and that is the wrong number on a small host.
+#: On a 1 GB box - Oracle's Always Free E2.1.Micro, say - eight concurrent
+#: parses cost memory and buy nothing: with a fraction of one core there is no
+#: parallelism to extract, only footprint. Set FA_PARSE_WORKERS=2 there.
+FETCH_WORKERS = config.PARSE_WORKERS
 
 
 def find_statements(

@@ -57,6 +57,12 @@ class Config:
     )
     DB_POOL_SIZE = int(_env('FA_DB_POOL_SIZE', default='10') or 10)
 
+    #: How many statements are fetched and parsed at once. Also the number
+    #: held in memory simultaneously, which is what makes it worth turning
+    #: down on a small host: parsing is CPU-bound, so on a fraction of one
+    #: core a wide pool multiplies footprint without adding throughput.
+    PARSE_WORKERS = max(1, int(_env('FA_PARSE_WORKERS', default='8') or 8))
+
     #: Last resort for a genuinely single-user deployment where nobody wants
     #: to create a second database role. Logs a warning on every boot rather
     #: than being quietly settable and forgotten.
