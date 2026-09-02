@@ -80,8 +80,13 @@ The fastest path — PostgreSQL, the API and the UI together:
 
 ```bash
 cp .env.example .env          # then fill in the two Google values
-docker compose up
+docker compose up --build
 ```
+
+`--build` matters on the first run and after every `git pull`: `docker compose
+up` on its own reuses whatever image it already has, so a backend image built
+before the PostgreSQL migration starts and then dies on `import psycopg` -
+a dependency that is sitting right there in `requirements.txt`.
 
 Open <http://localhost:5173>, sign in, and the setup wizard takes it from
 there.

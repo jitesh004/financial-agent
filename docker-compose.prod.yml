@@ -41,6 +41,7 @@ services:
       # The session cookie must be Secure once the app is behind TLS, which in
       # production it always is.
       - FA_SESSION_COOKIE_SECURE=true
+    entrypoint: ["sh", "/app/docker-entrypoint.sh"]
     restart: unless-stopped
 
   frontend:
