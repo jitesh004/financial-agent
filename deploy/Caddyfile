@@ -1,0 +1,46 @@
+# TLS in front of everything.
+#
+# Google will not accept an http:// redirect URI for anything but localhost,
+# and the session cookie is issued Secure in production - so a deployment
+# without TLS cannot sign anyone in. Caddy is here rather than certbot because
+# it obtains and renews the Let's Encrypt certificate on its own, with no cron
+# job to forget and no renewal that silently stops working.
+#
+# Set FA_DOMAIN and FA_TLS_EMAIL in the .env beside docker-compose.prod.yml.
+# The domain must already resolve to this host's public IP - Let's Encrypt
+# proves ownership by fetching a file over port 80, so DNS has to be right
+# BEFORE the first start or the certificate request fails.
+
+{
+	email {$FA_TLS_EMAIL}
+	# Nothing here should be reachable over plain http except the ACME
+	# challenge, which Caddy handles before this block applies.
+}
+
+{$FA_DOMAIN} {
+	encode zstd gzip
+
+	# The frontend container serves the built React bundle and already
+	# proxies /api/ to the backend over the compose network, which is what
+	# keeps the browser same-origin: the session cookie is host-only, so a
+	# split origin would need CORS with credentials and a cookie the browser
+	# is entitled to refuse.
+	reverse_proxy frontend:80
+
+	# HSTS. This app holds a complete financial history; a downgrade to http
+	# on a hostile network should not be something a browser will even try.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}

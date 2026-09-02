@@ -25,8 +25,11 @@ services:
         condition: service_healthy
     volumes:
       - ./data:/data
-    ports:
-      - "8078:8078"
+    # Deliberately NOT published to the host. The frontend container reaches
+    # it over the compose network; publishing 8078 would expose the API
+    # directly, bypassing the TLS Caddy terminates in front of it.
+    expose:
+      - "8078"
     environment:
       - PYTHONUNBUFFERED=1
       - FA_DATABASE_URL=postgresql://financial_agent:${FA_DB_PASSWORD:?set FA_DB_PASSWORD}@db:5432/financial_agent
@@ -44,11 +47,37 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    ports:
-      - "80:80"
+    # Also unpublished: Caddy is the only thing that should answer from the
+    # public internet, so the certificate covers every request.
+    expose:
+      - "80"
     depends_on:
       - backend
     restart: unless-stopped
 
+  # TLS terminator and the only container with published ports. Obtains and
+  # renews a Let's Encrypt certificate by itself - see deploy/Caddyfile.
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - frontend
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - FA_DOMAIN=${FA_DOMAIN:?set FA_DOMAIN, e.g. finance.example.com}
+      - FA_TLS_EMAIL=${FA_TLS_EMAIL:?set FA_TLS_EMAIL for Let's Encrypt}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Named volumes, because losing these means re-requesting certificates
+      # on every restart and running into Let's Encrypt's rate limit.
+      - caddy_data:/data
+      - caddy_config:/config
+      - caddy_logs:/var/log/caddy
+    restart: unless-stopped
+
 volumes:
   pgdata:
+  caddy_data:
+  caddy_config:
+  caddy_logs:
