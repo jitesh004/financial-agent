@@ -36,7 +36,7 @@ from .api import (auth_routes, files_routes, gmail_routes, job_routes,
                   wealth_routes)
 from .auth.session import AuthContextMiddleware
 from .api import serializers as ser
-from .db.database import get_db
+from .db.database import CLEAR_SCOPES, get_db
 from .db import repository as repo
 from .graph.build import build_graph
 from .ingestion.router import SUPPORTED_EXTENSIONS, file_hash
@@ -1098,22 +1098,94 @@ def data_inventory() -> dict[str, Any]:
 
 
 
+#: What is worth showing about each table when a clearing action is about to
+#: delete it. Only these columns are ever selected, so a preview cannot
+#: accidentally start echoing a column added later - `source_files.password`
+#: is the one that matters there, and it is deliberately absent.
+#:
+#: `user_profile` shows the name and the date it changed but NOT the PAN: a
+#: preview exists to say what you are about to lose, and "your identity
+#: details, last edited on..." says it without putting a PAN in a table
+#: somebody might screenshot.
+PREVIEW_COLUMNS: dict[str, str] = {
+    # Authored by a human - the rows a preview matters most for.
+    "user_overrides": "fingerprint, category, flow_role, note, excluded, updated_at",
+    "claims": "counterparty, direction, amount, settled_amount, status, opened_on",
+    "claim_settlements": "claim_id, method, amount, settled_on",
+    "transaction_splits": "parent_fingerprint, amount, category, note",
+    "split_rules": "label, match_text, mine_pct, counterparty, active",
+    "settlement_groups": "kind, total_amount, residual, confirmed, created_at",
+    "settlement_group_legs": "group_id, fingerprint, side",
+    "custom_categories": "name, color, icon, created_at",
+    "recurring_series_overrides": "series_id, label, category, is_active, deleted",
+    "dashboards": "name, description, is_default, position, updated_at",
+    "dashboard_widgets": "dashboard_id, title, type, position",
+    "app_settings": "key, value, updated_at",
+    "user_profile": "full_name, date_of_birth, updated_at",
+    # Bought with real money.
+    "merchant_categories": "merchant_key, category, hit_count, updated_at",
+    "ai_inferences": "cache_key, kind, provider, model, created_at, hit_count",
+    # Downloaded, and irreplaceable if the mail is gone.
+    "source_files": "filename, size_bytes, parse_status, transaction_count",
+    "staged_files": ("filename, kind, account_label, parse_status, row_count,"
+                     " period_start, period_end, added_at"),
+    # Reproducible from the files, at the cost of CPU.
+    "accounts": "product_name, account_number_masked, account_type, institution",
+    "statements": "source_filename, period_start, period_end, recon_status",
+    "transactions": "id, txn_date, amount, merchant, category, flow_role",
+    "bureau_reports": "bureau, score, pulled_on, holder_name, source_filename",
+    "bureau_accounts": ("lender, account_type, number_suffix, status,"
+                        " current_balance, match_status"),
+    "portfolio_statements": "provider, as_of, declared_value, recon_status, source_filename",
+    "holdings": "instrument, isin, folio, units, nav, value, as_of",
+    # Derived, and cheap to rebuild.
+    "transfer_pairs": "amount, kind, day_gap, confidence",
+    "recurring_series": "label, category, direction, median_amount, cadence_days, next_expected",
+    "analysis_runs": "id, created_at, status, file_count",
+    "jobs": "id, kind, status, phase, message, updated_at",
+    "job_items": "job_id, seq, name, status, detail",
+}
+
+#: Rows per table. Keep in step with PREVIEW_CAP in DataManager.jsx, which
+#: uses it to decide whether to render the count as "200+".
+PREVIEW_ROW_LIMIT = 200
+
+
 @app.get("/api/data/preview/{scope}")
 def preview_data(scope: str) -> dict[str, Any]:
-    db = get_db()
-    preview = {}
-    with db.connection() as conn:
-        if scope == "ai_inferences":
-            preview["merchant_categories"] = [dict(row) for row in conn.execute("SELECT merchant_key, category, hit_count, updated_at FROM merchant_categories LIMIT 500").fetchall()]
-            preview["ai_inferences"] = [dict(row) for row in conn.execute("SELECT cache_key, kind, provider, model, created_at, hit_count FROM ai_inferences LIMIT 500").fetchall()]
-        elif scope == "decisions":
-            preview["user_overrides"] = [dict(row) for row in conn.execute("SELECT fingerprint, category, flow_role, note, excluded, updated_at FROM user_overrides LIMIT 500").fetchall()]
-        elif scope == "parsed_data":
-            preview["transactions"] = [dict(row) for row in conn.execute("SELECT id, txn_date, amount, merchant, category, flow_role FROM transactions LIMIT 500").fetchall()]
-            preview["accounts"] = [dict(row) for row in conn.execute("SELECT product_name, account_number_masked, account_type, institution FROM accounts LIMIT 500").fetchall()]
-        elif scope == "files":
-            preview["source_files"] = [dict(row) for row in conn.execute("SELECT filename, size_bytes, parse_status, transaction_count FROM source_files LIMIT 500").fetchall()]
+    """A sample of what clearing `scope` would delete, table by table.
+
+    Driven by CLEAR_SCOPES rather than a branch per scope, which is how three
+    of the seven scopes came to have no preview at all: the buttons were added
+    to the UI and the endpoint was never extended, so "Preview data" on the
+    staged imports - the statements downloaded from Gmail - returned an empty
+    object and rendered as an empty box. Reading the tier straight from the
+    same constant the clearing itself uses means a scope cannot be previewed
+    incompletely again.
+
+    Tables are returned in PREVIEW_COLUMNS order, which runs from
+    irreplaceable to cheaply rebuilt - so the widest scope, the factory reset,
+    leads with the rows nothing can bring back. Empty tables are omitted
+    rather than listed: a factory reset spans twenty-nine of them, and a wall
+    of "Table is empty" buries the four that actually hold something.
+    """
+    tables = CLEAR_SCOPES.get(scope)
+    if tables is None:
+        raise HTTPException(
+            400, f"Unknown scope '{scope}'. Valid: {', '.join(CLEAR_SCOPES)}")
+
+    preview: dict[str, Any] = {}
+    with get_db().connection() as conn:
+        for table in PREVIEW_COLUMNS:
+            if table not in tables:
+                continue
+            rows = conn.execute(
+                f"SELECT {PREVIEW_COLUMNS[table]} FROM {table}"
+                f" LIMIT {PREVIEW_ROW_LIMIT}").fetchall()
+            if rows:
+                preview[table] = [dict(row) for row in rows]
     return preview
+
 
 @app.post("/api/data/clear/{scope}")
 def clear_data(scope: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:

@@ -21,7 +21,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
 from tests.support import fresh_ledger  # noqa: E402
-from app.db.database import CLEAR_SCOPES, MAX_SNAPSHOTS, Database  # noqa: E402
+from app.db.database import (CLEAR_SCOPES, MAX_SNAPSHOTS,  # noqa: E402
+                             Database, get_db)
 from app.models.schemas import (Account, AccountType, Category,  # noqa: E402
                                 Direction, Transaction)
 
@@ -605,3 +606,109 @@ def test_the_inventory_names_what_each_action_preserves():
     assert by_scope["everything"]["confirm_phrase"] == "DELETE EVERYTHING"
     for action in by_scope.values():
         assert action["description"], "an action with no explanation is a trap"
+
+
+# ---------------------------------------------------------------------------
+# Previewing what a clearing action would destroy
+#
+# Three of the seven scopes had no preview at all: the endpoint carried a
+# branch per scope and the UI a hardcoded list of four, and neither was
+# extended when scopes were added. "Preview data" on the staged imports - the
+# statements downloaded from Gmail - answered `{}`, which the browser rendered
+# as an empty box. Both ends are now driven by CLEAR_SCOPES; these tests are
+# what stop them drifting apart again.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def api_client():
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    return TestClient(app)
+
+
+def test_every_clearing_scope_can_be_previewed():
+    from app.main import PREVIEW_COLUMNS
+
+    for scope, tables in CLEAR_SCOPES.items():
+        previewable = [t for t in tables if t in PREVIEW_COLUMNS]
+        assert previewable, (
+            f"scope {scope!r} would delete {tables} and none of them has "
+            f"preview columns, so the user cannot see what they are losing")
+
+
+def test_every_table_a_scope_deletes_has_preview_columns():
+    """The drift guard, in the direction that actually bit.
+
+    A table added to a tier without an entry here is silently invisible in
+    every preview that covers it.
+    """
+    from app.main import PREVIEW_COLUMNS
+
+    deletable = {t for tables in CLEAR_SCOPES.values() for t in tables}
+    missing = sorted(deletable - set(PREVIEW_COLUMNS))
+    assert not missing, f"no preview columns for: {', '.join(missing)}"
+
+
+def test_preview_columns_name_only_tables_something_clears():
+    from app.main import PREVIEW_COLUMNS
+
+    deletable = {t for tables in CLEAR_SCOPES.values() for t in tables}
+    stray = sorted(set(PREVIEW_COLUMNS) - deletable)
+    assert not stray, f"preview columns for tables no scope clears: {stray}"
+
+
+def test_the_staged_imports_preview_shows_the_downloaded_files(api_client):
+    """The reported bug: Gmail-downloaded statements had no preview."""
+    from app.db import staging
+
+    db = get_db()
+    staging.add(db, "hash-downloaded", filename="icici_card.pdf",
+                origin="gmail", kind="statement", account_label="ICICI Card",
+                row_count=42, parse_status="ok")
+
+    body = api_client.get("/api/data/preview/staged_imports").json()
+    assert "staged_files" in body, body
+    assert body["staged_files"][0]["filename"] == "icici_card.pdf"
+
+
+def test_a_preview_never_echoes_a_stored_file_password(api_client):
+    """source_files.password is plaintext by design, and stays out of here.
+
+    The columns are an allowlist rather than `SELECT *` precisely so that a
+    preview cannot start leaking a column added later.
+    """
+    from app.db import repository as repo
+
+    repo.upsert_source_file(get_db(), repo.SourceFileRecord(
+        id="sf-secret", filename="locked.pdf", file_hash="h-secret",
+        password="jite0602", parse_status="parsed"))
+
+    for scope in ("files", "everything"):
+        assert "jite0602" not in api_client.get(
+            f"/api/data/preview/{scope}").text
+
+
+def test_the_factory_reset_preview_leads_with_the_irreplaceable(api_client):
+    """Ordered by what it costs to get the data back, not by table name.
+
+    Someone reading this preview is about to lose everything; the rows nothing
+    can regenerate are the ones worth seeing first.
+    """
+    from app.db import repository as repo
+
+    db = get_db()
+    repo.add_custom_category(db, "Sabbatical")
+    repo.save_merchant_categories(db, {"swiggy": (Category.DINING, 0.9, "llm")})
+    repo.upsert_source_file(db, repo.SourceFileRecord(
+        id="sf-1", filename="a.pdf", file_hash="h1", parse_status="parsed"))
+
+    tables = list(api_client.get("/api/data/preview/everything").json())
+    assert tables.index("custom_categories") < tables.index("merchant_categories")
+    assert tables.index("merchant_categories") < tables.index("source_files")
+
+
+def test_an_unknown_preview_scope_is_refused(api_client):
+    response = api_client.get("/api/data/preview/nonsense")
+    assert response.status_code == 400
+    assert "Unknown scope" in response.text
