@@ -50,7 +50,7 @@ tar -czf "$BACKUP_DIR/files.$STAMP.tar.gz" -C . data
 # --- verify ----------------------------------------------------------------
 # A backup nobody has read is a hope, not a backup. pg_restore --list fails
 # loudly on a truncated or corrupt dump, which is most of what goes wrong.
-$COMPOSE exec -T db pg_restore --list /dev/stdin \
+$COMPOSE exec -T db pg_restore --list \
   < "$BACKUP_DIR/ledger.$STAMP.dump" > /dev/null
 tar -tzf "$BACKUP_DIR/files.$STAMP.tar.gz" > /dev/null
 
