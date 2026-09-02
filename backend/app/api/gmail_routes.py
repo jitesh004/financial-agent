@@ -62,6 +62,9 @@ class _DatabaseTokenStore:
     def save(self, token_json: str) -> None:
         auth_store.save_google_token(get_db(), self.user_id, token_json)
 
+    def forget(self) -> None:
+        auth_store.delete_google_token(get_db(), self.user_id)
+
 
 def _client() -> GoogleGmailClient | None:
     """A Gmail client for whoever is signed in, or None if nobody is."""

@@ -9,6 +9,8 @@ replayed.
 
 from __future__ import annotations
 
+import json
+
 import sys
 from datetime import date
 from decimal import Decimal
@@ -450,6 +452,86 @@ def test_an_unreadable_stored_grant_does_not_crash_the_import():
 
     store.save_google_token(get_db(), TENANT.get(), "not json at all", "")
     assert _client().authorize() is False
+
+
+def _expired_token(refresh_token: str = "rt") -> str:
+    """A stored grant whose access token has already expired."""
+    return json.dumps({
+        "token": "at", "refresh_token": refresh_token,
+        "client_id": "cid", "client_secret": "sec",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "scopes": list(google.GMAIL_SCOPES),
+        "expiry": "2020-01-01T00:00:00Z",
+    })
+
+
+def test_a_revoked_grant_is_forgotten_rather_than_raising(monkeypatch):
+    """The weekly event on an External + Testing OAuth app.
+
+    Such a project is issued refresh tokens that expire after seven days, so
+    every user's grant dies on a schedule. That used to surface as an
+    unhandled RefreshError - a 500 from whichever endpoint happened to ask -
+    and the import screen went on reporting "connected" against a token
+    Google would never honour again.
+    """
+    from google.auth.exceptions import RefreshError
+    from app.api.gmail_routes import _client
+
+    db = get_db()
+    store.save_google_token(db, TENANT.get(), _expired_token(),
+                            " ".join(google.GMAIL_SCOPES))
+
+    def _dead(self, request):
+        raise RefreshError("('invalid_grant: Token has been expired or revoked.')")
+
+    monkeypatch.setattr("google.oauth2.credentials.Credentials.refresh", _dead)
+
+    assert _client().authorize() is False
+    # Forgotten, so the screen offers to reconnect instead of lying.
+    assert store.get_google_token(db, TENANT.get()) is None
+    assert _client().is_authorized() is False
+
+
+def test_a_transient_refresh_failure_keeps_the_grant(monkeypatch):
+    """Google being briefly unreachable must not cost the user a re-consent.
+
+    Both outcomes arrive as the same exception type, so the difference is read
+    from the payload - and anything unrecognised is treated as transient,
+    because discarding a working grant is the more expensive mistake.
+    """
+    from google.auth.exceptions import RefreshError
+    from app.api.gmail_routes import _client
+
+    db = get_db()
+    store.save_google_token(db, TENANT.get(), _expired_token(),
+                            " ".join(google.GMAIL_SCOPES))
+
+    def _blip(self, request):
+        raise RefreshError("HTTPSConnectionPool: Read timed out.")
+
+    monkeypatch.setattr("google.oauth2.credentials.Credentials.refresh", _blip)
+
+    assert _client().authorize() is False
+    assert store.get_google_token(db, TENANT.get()) is not None
+
+
+def test_a_grant_that_still_refreshes_is_kept_and_rewritten(monkeypatch):
+    from app.api.gmail_routes import _client
+
+    db = get_db()
+    store.save_google_token(db, TENANT.get(), _expired_token(),
+                            " ".join(google.GMAIL_SCOPES))
+
+    def _renew(self, request):
+        self.token = "fresh-access-token"
+        self.expiry = None          # google-auth reads None as "not expired"
+
+    monkeypatch.setattr("google.oauth2.credentials.Credentials.refresh", _renew)
+    monkeypatch.setattr("app.ingestion.gmail_source.GoogleGmailClient._build",
+                        lambda self, creds: None)
+
+    assert _client().authorize() is True
+    assert "fresh-access-token" in (store.get_google_token(db, TENANT.get()) or "")
 
 
 def test_disconnecting_gmail_forgets_the_grant(client, monkeypatch):

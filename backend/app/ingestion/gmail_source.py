@@ -338,6 +338,14 @@ class TokenStore(Protocol):
     def save(self, token_json: str) -> None:
         """Persist a refreshed grant."""
 
+    def forget(self) -> None:
+        """Discard a grant Google has told us is dead.
+
+        Separate from the user asking to disconnect: this is the app noticing
+        that a stored token can no longer be refreshed, so that the import
+        screen stops claiming to be connected.
+        """
+
 
 class FileTokenStore:
     """A grant in a JSON file.
@@ -361,6 +369,28 @@ class FileTokenStore:
             self.path.chmod(0o600)
         except OSError:
             pass
+
+    def forget(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+
+#: What Google says when a refresh token is expired, revoked, or was issued
+#: to a grant the user has since withdrawn. Anything else - a timeout, a 503,
+#: DNS - means try again later rather than make the user re-consent.
+_DEAD_GRANT_MARKERS = ("invalid_grant", "invalid_request", "unauthorized_client")
+
+
+def _grant_is_dead(exc: Exception) -> bool:
+    """Whether a RefreshError means the grant is gone for good.
+
+    google-auth reports both permanent and transient failures as the same
+    exception type, so the distinction has to come from the payload. Read
+    conservatively: an error this cannot classify is treated as transient,
+    because discarding a working grant costs the user a re-consent while
+    keeping a dead one costs only one more failed refresh.
+    """
+    text = " ".join(str(arg) for arg in exc.args).lower()
+    return any(marker in text for marker in _DEAD_GRANT_MARKERS)
 
 
 class GoogleGmailClient:
@@ -406,7 +436,36 @@ class GoogleGmailClient:
             return True
 
         if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            # Refreshing is a network call to Google and fails in two very
+            # different ways, which used to be one unhandled exception and a
+            # 500 from whatever endpoint happened to ask.
+            #
+            # This is not an edge case. An OAuth app published "External" with
+            # a status of Testing is issued refresh tokens that expire after
+            # SEVEN DAYS, so for that deployment every user's grant dies
+            # weekly and this path runs constantly.
+            from google.auth.exceptions import RefreshError
+            try:
+                creds.refresh(Request())
+            except RefreshError as exc:
+                if _grant_is_dead(exc):
+                    # Google will never honour this token again. Forget it, so
+                    # the import screen reports "not connected" and offers to
+                    # reconnect rather than showing a live grant whose every
+                    # use fails.
+                    log.info("Gmail grant is no longer valid; forgetting it")
+                    try:
+                        self.tokens.forget()
+                    except Exception:      # never let cleanup mask the cause
+                        log.exception("could not discard the dead Gmail grant")
+                else:
+                    # Transient - Google unreachable, a 5xx, a timeout. The
+                    # grant is probably fine, so it is emphatically NOT
+                    # discarded: throwing away a good token because the
+                    # network blipped would make the user re-consent for
+                    # nothing.
+                    log.warning("could not refresh the Gmail grant: %s", exc)
+                return False
             self._save(creds)
             self._build(creds)
             return True
