@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 
 from app.analytics import periods
 from app.analytics.budget import analyse_budget
-from app.analytics.recurring import detect_recurring
+from app.analytics.recurring import detect_recurring, to_monthly
 from app.main import app
 from app.models.schemas import (Account, AccountType, Category, Direction,
                                 FlowRole, Transaction)
@@ -117,8 +117,94 @@ def test_a_recurring_charge_becomes_a_commitment():
     assert any("RENT" in label for label in labels)
     rent = next(c for c in result.commitments if "RENT" in c.label)
     assert rent.kind == "spending"
-    assert rent.monthly == Decimal("42616.00"), "42,000 every 30 days"
+    assert rent.monthly == Decimal("42000.00"), \
+        "rent of 42,000 a month costs 42,000 a month"
     assert rent.months_seen == 12
+
+
+def test_a_monthly_commitment_costs_what_it_charges():
+    """Twelve times a year, not 365.25/30 times a year.
+
+    The conversion used to divide 30.44 days by a nominal 30-day cadence,
+    which published every monthly commitment 1.5% above what the statement
+    said - and a Budget tab that adds fourteen of them up compounded it into
+    a figure nobody could reconcile against their own bank.
+    """
+    assert to_monthly(Decimal("41500"), "monthly", 30) == Decimal("41500.00")
+    # The cadences that really are counted in days keep the day rate.
+    assert to_monthly(Decimal("700"), "weekly", 7) == Decimal("3043.83")
+    assert to_monthly(Decimal("1400"), "fortnightly", 14) == Decimal("3043.83")
+    # And the longer ones divide by how many months they cover.
+    assert to_monthly(Decimal("3000"), "quarterly", 91) == Decimal("1000.00")
+    assert to_monthly(Decimal("6000"), "half-yearly", 182) == Decimal("1000.00")
+    assert to_monthly(Decimal("12000"), "yearly", 365) == Decimal("1000.00")
+    # A shape the table does not name falls back to the day rate.
+    assert to_monthly(Decimal("1000"), "every-so-often", 10) == Decimal("3043.75")
+    assert to_monthly(Decimal("1000"), "unknown", 0) == Decimal("0")
+
+
+def test_an_irregular_habit_is_not_called_a_commitment():
+    """A shop visited now and then is a habit, not something fixed.
+
+    The recurring detector is deliberately loose - "you seem to buy fuel
+    about monthly" is worth showing on the Recurring tab. Under a heading
+    that reads "fixed every month" it is a lie, and one entry like it makes
+    the whole list unreliable. The rows are not discarded: they land on the
+    variable side, which is where irregular spending belongs.
+    """
+    scattered = [
+        # Same shop, five visits over a year, at no particular interval.
+        (date(2025, 9, 8), "3400", Category.SHOPPING, "NORTHGATE RETAIL"),
+        (date(2025, 11, 27), "1200", Category.SHOPPING, "NORTHGATE RETAIL"),
+        (date(2026, 1, 3), "5100", Category.SHOPPING, "NORTHGATE RETAIL"),
+        (date(2026, 4, 19), "2600", Category.SHOPPING, "NORTHGATE RETAIL"),
+        (date(2026, 7, 30), "3900", Category.SHOPPING, "NORTHGATE RETAIL"),
+    ]
+    rows = _twelve_months(
+        charges=[(Category.RENT, "42000", "RENT PAYMENT NEFT", 4)],
+        one_offs=scattered)
+    result = _budget(rows)
+
+    assert not any("NORTHGATE" in c.label for c in result.commitments), \
+        [c.label for c in result.commitments]
+    assert any("RENT" in c.label for c in result.commitments), \
+        "the real commitment must survive the same filter"
+    shopping = next(v for v in result.variable
+                    if v.category == Category.SHOPPING)
+    assert shopping.transaction_count == 5, "the rows went to the variable side"
+
+
+def test_typical_variable_is_the_middle_month_not_a_sum_of_medians():
+    """Categories peak in different months, so adding each one's middle month
+    describes a month that never happened.
+
+    A different shop and a different diner every time, so neither forms a
+    series - this is about the variable side's arithmetic, not the detector's.
+    Different NAMES, not just different numbers: the series signature strips
+    digits out of a description on purpose, so "SHOP 202509" and "SHOP 202511"
+    are one payee as far as the detector is concerned.
+    """
+    shops = ["NORTHGATE RETAIL", "LANTERN HOME STORE", "MERIDIAN BOOKSHOP",
+             "HARBOUR OUTFITTERS", "PEAK SPORTS", "OLD TOWN MARKET"]
+    diners = ["SPICE ROUTE KITCHEN", "CAFE ORBIT", "TANDOOR HOUSE",
+              "NOODLE BAR", "RIVERSIDE GRILL", "THE BREAKFAST ROOM"]
+    odd = [(y, m) for i, (y, m) in enumerate(FIXTURE_MONTHS) if i % 2 == 0]
+    even = [(y, m) for i, (y, m) in enumerate(FIXTURE_MONTHS) if i % 2 == 1]
+    rows = _twelve_months(one_offs=[
+        *[(date(y, m, 5), "4000", Category.SHOPPING, name)
+          for (y, m), name in zip(odd, shops)],
+        *[(date(y, m, 18), "4000", Category.DINING, name)
+          for (y, m), name in zip(even, diners)],
+    ])
+    result = _budget(rows)
+    assert not result.commitments, [c.label for c in result.commitments]
+
+    per_category = sum((v.typical_monthly for v in result.variable),
+                       Decimal("0"))
+    assert result.variable_typical == Decimal("4000.00"), \
+        "every month held one of the two, never both"
+    assert per_category == Decimal("8000.00"), \
+        "while each category's own middle month is 4,000"
 
 
 def test_a_sip_is_committed_but_is_not_a_cost():

@@ -206,11 +206,11 @@ Card-before-account is load-bearing. HDFC's Marriott statement prints both, one
 line apart:
 
 ```
-Credit Card No.            00361147XXXX6885
-Alternate Account Number   0001015980001716889
+Credit Card No.            00360000XXXX4321
+Alternate Account Number   0001010000001234567
 ```
 
-With the generic label first the card was filed as `XXXX6889` — a number that
+With the generic label first the card was filed as `XXXX4567` — a number that
 identifies something else — and all fifteen of its transaction alerts were
 refused for belonging to an account that did not exist.
 
@@ -423,9 +423,20 @@ what is chosen, and it is the one part of the app that answers a question about
 the *future* from nothing but the past.
 
 **A commitment** is a recurring series (§ the recurring detector) that is a
-debit, active, and on a cadence between 20 and 400 days — a weekly charge is a
-habit, not a commitment, and a yearly premium is one and gets normalised.
-Each is classified into one of three kinds, and the distinction is the point:
+debit, active, on a cadence between 20 and 400 days — a weekly charge is a
+habit, not a commitment, and a yearly premium is one and gets normalised — and
+whose *timing* the detector is at least `MIN_COMMITMENT_CONFIDENCE` (0.6) sure
+of. That last filter is this tab's alone: the detector's own floor is
+deliberately low, because "you seem to buy fuel about monthly" is worth
+showing on the Recurring tab, but under a heading that reads *fixed every
+month* it is a lie, and one entry like it makes the whole list untrustworthy.
+The gap is wide: rent, an EMI, a SIP and a subscription score 0.93–1.00, a
+shop visited five times in fourteen months scores 0.33–0.46. Demoted rows are
+not discarded — they fall to the variable side, which is where an irregular
+charge was always going to be counted.
+
+Each commitment is classified into one of three kinds, and the distinction is
+the point:
 
 | Kind | What it is | Counted in "a month costs"? |
 |---|---|---|
@@ -443,12 +454,31 @@ the match when the amounts differ by more than a quarter — one account can
 carry two loans, and the wrong payoff date is worse than none. Everything else
 says *until you stop it*, which is the truthful answer for a subscription.
 
+**What a charge costs per month** is `recurring.to_monthly`, and it converts by
+how often the charge actually happens — twelve times a year for a monthly one,
+four for a quarterly — not by dividing 30.44 days by the cadence in days. A
+monthly bill is paid once per calendar month whether the gap between charges
+reads 28, 30 or 31 days, so its monthly cost is the charge itself. The day-rate
+form published every monthly commitment 1.5% high (rent of a flat ₹41,500 as
+"₹42,109 a month") and the error compounded across a tab that adds fourteen of
+them up. It is one function, used by both this module and
+`RecurringSeries.monthly_equivalent`, because the two copies it replaced
+carried the same bug.
+
 **The variable side** is every expense-role row that no commitment accounts
-for, grouped by category. Its monthly figure is the **median** of the per-month
-totals, never the mean: one holiday would otherwise set the expectation for
-every month after it. A category present in *every* month of the window is
-flagged `every_month` — groceries recur even though no single merchant does,
-and that is a different kind of thing from one big trip.
+for, grouped by category. A category's own figure is the **median** of the
+months it appeared in — "what it costs when it happens", read next to the
+months-seen count beside it — never the mean: one holiday would otherwise set
+the expectation for every month after it. A category present in *every* month
+of the window is flagged `every_month`; groceries recur even though no single
+merchant does, and that is a different kind of thing from one big trip.
+
+The **total** variable figure is not those medians added up. The sum of medians
+is not the median of sums — categories peak in different months, so adding each
+one's middle month describes a month that never happened (on the demo ledger
+the two differ by a third). `variable_typical` is the median of the per-month
+variable *totals*, and the UI states both figures rather than leaving them
+looking like an arithmetic error.
 
 Membership comes from the series' own `transaction_ids` and from each row's
 `recurring_series_id`, because either source alone has a gap. It matters: a row
@@ -476,7 +506,7 @@ EMI PRIN FOR TATA AIG GENERAL (020/036)
 schedule, as opposed to a merchant whose name starts with "Principal".
 
 Indian payroll narrations run tokens together, so `\bSALARY\b` never matches
-`PRIVATELIMI-JITESHSALNOV25//CMS3`. `SAL` anchored on a following month
+`PRIVATELIMI-PANKAJSALNOV25//CMS3`. `SAL` anchored on a following month
 abbreviation and year is specific enough not to catch "SALE".
 
 ### Transfers, settlements and thresholds
@@ -518,7 +548,7 @@ your credit report" would be noise dressed as a finding.
 | **Pipeline order** | The ten stages in sequence. Order is a rule: duplicates go before transfer matching (a duplicate paired with its own original hides both), and your saved decisions are applied **last** so a decision always beats a rule. |
 | **Format detection** | The three magic-byte signatures and the supported extensions. Bytes decide, not the extension. |
 | **Classification order** | Bureau → holdings → statement, with the test each applies. The statement reader is last because it is the only one with a reconciliation gate. |
-| **Jobs** | The four terminal states. Progress is written through as it happens, so work survives a restart. |
+| **Jobs** | The four terminal states. Progress is written through as it happens, so work survives a restart. **Cancel** is checked between units of work — before each attachment while downloading, before each file while parsing — so a cancelled download keeps the attachments already fetched, and a cancelled parse keeps the statements already read and does not chain on to a parse that was never asked for. The one place it is *not* honoured is a ledger rebuild mid-flight: half a rebuilt ledger is worse than a finished one. |
 | **Forecast** | Committed vs discretionary, the ≥15% minimum band width, and the three confidence levels with what each requires. |
 | **Loans** | Closed-form, never a model. Where a statement omits the rate it is recovered from the interest actually charged. |
 | **The model** | Whether it is on, what it is used for, what it is **never** used for, the exact system prompt, and the six things stripped from a narration first. |
@@ -603,7 +633,10 @@ the money readers, and it is now explicit.
 | add a card-bill wording | `rules/formats.py` — the core if all three readers need it, the named extra if only one does |
 | change the scan look-back options | `gmail_source.PERIOD_OPTIONS` — the UI reads it from `/api/gmail/periods` | |
 | add a reporting period preset | one entry in `analytics/periods.PERIOD_PRESETS`, plus its case in `resolve_period` | nothing — `/api/periods`, the Explore schema and the picker all read that list |
-| change what counts as a commitment | `analytics/budget.py` — `DEBT_CATEGORIES` for what is debt service, `MIN_CADENCE_DAYS`/`MAX_CADENCE_DAYS` for what is monthly enough to budget | |
+| change what counts as a commitment | `analytics/budget.py` — `DEBT_CATEGORIES` for what is debt service, `MIN_CADENCE_DAYS`/`MAX_CADENCE_DAYS` for what is monthly enough to budget, `MIN_COMMITMENT_CONFIDENCE` for how predictable its timing must be | |
+| change how a cadence becomes a monthly figure | `recurring.PER_YEAR` — how many times a year each cadence happens | nothing — `to_monthly` is the only place that arithmetic lives |
+| add an operator to the admin view | nothing in the code: `FA_ADMIN_EMAILS` in the environment, comma-separated, whole addresses only | the tab appears for that address on next sign-in |
+| change what the demo ledger contains | `demo.py` — `_FIXED` for what should be found fixed, `_OCCASIONAL` for the tail that should not | rebuild it from Settings → Demo |
 
 `backend/tests/test_rules.py` guards the registries. It asserts the derived
 lists still cover what the hand-written ones did, that every institution can

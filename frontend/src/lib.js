@@ -136,6 +136,13 @@ export const api = {
      arithmetic between them. Computed from stored rows - see
      backend/app/analytics/budget.py. */
   budget: (params = {}) => request(`/api/budget?${query(params)}`),
+
+  /* The operator's view: who is on this deployment and how much they use it.
+     404s for everyone whose address is not in FA_ADMIN_EMAILS - see
+     backend/app/api/admin_routes.py, which also explains why it reports
+     volumes and never amounts. */
+  adminOverview: (detail = true) =>
+    request(`/api/admin/overview?detail=${detail ? 'true' : 'false'}`),
   run: (id) => request(`/api/runs/${id}`),
   accounts: () => request('/api/accounts'),
   categories: () => request('/api/categories'),
@@ -221,6 +228,30 @@ api.clearData = (scope, confirm) =>
   jsonPost(`/api/data/clear/${scope}`, confirm ? { confirm } : {});
 api.restoreSnapshot = (name) => jsonPost('/api/data/restore', { name });
 api.deleteSnapshot = (name) => request(`/api/data/snapshots/${name}`, { method: 'DELETE' });
+
+/* ---------- Demo mode ----------
+
+   Points the app at a generated workspace instead of the real ledger, so it
+   can be demonstrated without showing anybody a real financial history. The
+   switch decides which account's rows are read; it never moves a row. */
+api.demo = () => request('/api/settings/demo');
+api.setDemo = (enabled) => jsonPost('/api/settings/demo', { enabled });
+api.rebuildDemo = () => jsonPost('/api/settings/demo/rebuild');
+
+/* Flip the switch and start the app again from scratch.
+ *
+ * The reload is the point. Turning demo mode on or off changes which account
+ * EVERY panel reads, and no single place owns all of that state - the
+ * dashboard, the period list, Recurring, Budget, the Admin view and each open
+ * drill-down each hold their own copy. Re-reading the session is not enough:
+ * doing only that left the Overview summary reporting the real ledger's
+ * twelve months over the demo workspace's figures. A screen that mixes the
+ * two ledgers is the one outcome this switch must never produce, and a reload
+ * is the only way to rule it out rather than chase it panel by panel. */
+export async function switchDemo(enabled) {
+  await api.setDemo(enabled);
+  window.location.reload();
+}
 
 api.profile = () => request('/api/profile');
 api.saveProfile = (profile) => request('/api/profile', {

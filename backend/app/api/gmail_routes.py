@@ -675,7 +675,19 @@ def _run_download(job_id: str, selected: list[dict[str, Any]],
             )
 
         saved = download_to_cache(client, attachments, gmail_cache(),
-                                  progress=on_item)
+                                  progress=on_item,
+                                  should_stop=progress.stop_requested)
+
+        # Stopped by hand. The files already fetched stay in the cache - they
+        # are paid for and a later run will find them - but nothing is chained
+        # after this, because "download then read everything" is not what was
+        # asked for any more.
+        if progress.cancelled:
+            progress.cancel(
+                f"Stopped after {len(saved)} of {len(attachments)} documents. "
+                f"What was downloaded is cached, so picking up again does not "
+                f"re-fetch it.")
+            return
 
         fresh = sum(1 for a in saved if not a.from_cache)
         by_name = {(a.get("message_id"), a.get("filename")): a.get("intent")
@@ -798,7 +810,8 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
 
         for entry in files:
             if progress.cancelled:
-                progress.fail("Cancelled by user.")
+                progress.cancel("Stopped at your request. Anything already "
+                                "read is kept.")
                 return
 
             path = Path(entry["path"])
@@ -1086,7 +1099,7 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
                                     e["statement"].period_end)
                 for e in parsed_entries if e.get("statement")
                 and e["statement"].id},
-            # The holder's own name turns "UPI/Jitesh Muk/..." from spending
+            # The holder's own name turns "UPI/Pankaj Kum/..." from spending
             # into a transfer between the user's own accounts.
             holder_names=[n for n in (profile.full_name,) if n],
             progress=progress.phase,

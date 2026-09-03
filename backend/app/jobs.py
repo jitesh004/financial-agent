@@ -557,6 +557,30 @@ class JobProgress:
             self.job.dirty = True
         self._persist_now()
 
+    def cancel(self, message: str = "") -> None:
+        """Stop, because somebody asked - which is not a failure.
+
+        Workers used to report this through `fail`, so a run the user stopped
+        by hand came back as "That run failed" with a red error against it.
+        The distinction is worth a status: `cancelled` is already terminal and
+        the UI already words it differently, it simply was never set.
+        """
+        with self.job.lock:
+            self.job.status = "cancelled"
+            self.job.finished_at = time.time()
+            self.job.phase = "Cancelled"
+            self.job.message = message or "Stopped at your request."
+            self.job.dirty = True
+        self._persist_now()
+
+    def stop_requested(self) -> bool:
+        """`cancelled` as a callable, for a loop that lives in another module.
+
+        `download_to_cache` reports progress through a plain callback and has
+        no business importing the job system to ask whether to keep going.
+        """
+        return self.job.cancel_requested
+
     def _persist_now(self) -> None:
         """Flush synchronously at the end of a job.
 

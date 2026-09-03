@@ -84,6 +84,23 @@ def _cookie_value(scope: Scope) -> str:
     return ""
 
 
+def _demo_tenant(user) -> str | None:
+    """The demo workspace to bind for `user`, building it on first use.
+
+    Failing to find or build one is not a reason to refuse the request: it
+    falls back to the real ledger, which is the state Demo was turned on
+    from. A demo that cannot be prepared should look like Demo being off,
+    not like the app being broken.
+    """
+    from .. import demo
+
+    try:
+        return demo.ensure_workspace(get_db(), user.id, user.display_name)
+    except Exception:
+        log.exception("could not prepare the demo workspace for %s", user.id)
+        return None
+
+
 class AuthContextMiddleware:
     """Resolves the session, binds the tenant, and closes the API by default."""
 
@@ -115,7 +132,19 @@ class AuthContextMiddleware:
         state = scope.setdefault("state", {})
         state["user"] = user
 
-        reset = TENANT.set(user.id if user else None)
+        # Which account's rows this request may touch.
+        #
+        # Normally the signed-in user's own. With Demo on it is their demo
+        # workspace instead - a separate account holding generated statements
+        # (see app/demo.py) - so every screen shows that data and nothing
+        # done during a demo can reach the real ledger. The IDENTITY stays
+        # the real person throughout: `state["user"]` is who they are, and
+        # the tenant is only whose ledger they are looking at.
+        tenant = user.id if user else None
+        if user is not None and user.demo_mode:
+            tenant = await run_in_threadpool(_demo_tenant, user) or tenant
+
+        reset = TENANT.set(tenant)
         try:
             await self.app(scope, receive, send)
         finally:

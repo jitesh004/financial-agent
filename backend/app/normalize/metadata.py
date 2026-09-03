@@ -176,14 +176,14 @@ def _find_labeled(text: str, labels: list[str]) -> str | None:
                 # "Alternate Account Number" is not the account number. HDFC's
                 # Marriott card statement prints both, one line apart:
                 #
-                #     Credit Card No. 00361147XXXX6885
-                #     Alternate Account Number 0001015980001716889
+                #     Credit Card No. 00360000XXXX4321
+                #     Alternate Account Number 0001010000001234567
                 #
                 # and this function tries its LABELS in order, not the text in
                 # order - so the generic "account number" pattern matched the
                 # alternate one before "card number" was ever tried. The card
-                # was filed as XXXX6889, its fifteen transaction alerts said
-                # 6885, and every one of them was refused for belonging to an
+                # was filed as XXXX4567, its fifteen transaction alerts said
+                # 4321, and every one of them was refused for belonging to an
                 # account that did not exist.
                 continue
             value = m.group(1).strip()
@@ -199,10 +199,10 @@ def _find_labeled(text: str, labels: list[str]) -> str | None:
 #: issuer. A great many Indian addresses are written this way, and a statement
 #: prints the cardholder's address above the issuer's own name:
 #:
-#:     M3 KALSAGAR SHRI RAM COLONY
-#:     ALANDI ROAD BHOSARI
+#:     12 MAPLE COURT SAMPLE COLONY
+#:     GREEN AVENUE WESTPARK
 #:     OPP STATE BANK OF INDIA        <- not who issued this card
-#:     MAHARASHTRA, PUNE 411039
+#:     MAHARASHTRA, PUNE 400001
 #:
 #: That address is the whole of the letterhead slice institution detection
 #: reads, so an ICICI card statement was filed under State Bank of India, and
@@ -237,8 +237,8 @@ def detect_institution(text: str) -> str | None:
         # because the cardholder's address is printed above the issuer's own
         # name and reads:
         #
-        #     M3 KALSAGAR SHRI RAM COLONY
-        #     ALANDI ROAD BHOSARI
+        #     12 MAPLE COURT SAMPLE COLONY
+        #     GREEN AVENUE WESTPARK
         #     OPP STATE BANK OF INDIA
         #
         # Naming a nearby branch as a landmark is how a great many Indian
@@ -284,12 +284,12 @@ def detect_account_type(text: str, filename: str = "") -> AccountType | None:
 #: Card first, always. HDFC's Marriott card statement prints both, one line
 #: apart:
 #:
-#:     Credit Card No.            00361147XXXX6885
-#:     Alternate Account Number   0001015980001716889
+#:     Credit Card No.            00360000XXXX4321
+#:     Alternate Account Number   0001010000001234567
 #:
-#: With the generic label first the card was filed as XXXX6889 - a number that
+#: With the generic label first the card was filed as XXXX4567 - a number that
 #: identifies something else entirely. Its fifteen transaction alerts all said
-#: 6885 and every one of them was refused, for belonging to an account that
+#: 4321 and every one of them was refused, for belonging to an account that
 #: did not exist.
 ACCOUNT_NUMBER_LABELS: list[tuple[str, str]] = [
     (r"card\s*(?:number|no\.?|#)",
@@ -348,12 +348,12 @@ def detect_account_number(text: str, labeled_only: bool = False) -> str | None:
     #
     # HDFC's Marriott card statement prints both, one line apart:
     #
-    #     Credit Card No. 00361147XXXX6885
-    #     Alternate Account Number 0001015980001716889
+    #     Credit Card No. 00360000XXXX4321
+    #     Alternate Account Number 0001010000001234567
     #
-    # With the generic label first, the card was filed as XXXX6889 - a number
+    # With the generic label first, the card was filed as XXXX4567 - a number
     # that identifies something else entirely. Its fifteen transaction alerts
-    # all said 6885 and every one of them was refused, for belonging to an
+    # all said 4321 and every one of them was refused, for belonging to an
     # account that did not exist.
     labeled = _find_labeled(text, [label for label, _ in ACCOUNT_NUMBER_LABELS])
     if labeled:
@@ -391,7 +391,7 @@ def detect_account_number(text: str, labeled_only: bool = False) -> str | None:
     # Unlabeled fallback: a masked card number printed on its own, in either
     # shape a real statement uses. "XXXX XXXX XXXX 1234" masks from the start;
     # several issuers (Axis, and one of HDFC's own card templates) instead
-    # print real leading digits before the masked run: "438628******2343".
+    # print real leading digits before the masked run: "411111******4321".
     # This was the difference between three of the user's own distinct Axis
     # cards correctly separating and all three silently merging into one
     # account, because the label ("Credit Card Number") sits on its own table

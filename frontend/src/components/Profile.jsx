@@ -52,7 +52,7 @@ export default function Profile({ onSaved }) {
           Used to open your own password-protected statements automatically, and
           to match statements to the right account. Banks build statement
           passwords from these details — e.g. the first four letters of your name
-          plus your date of birth, like <code>jite0602</code>.
+          plus your date of birth, like <code>pank1407</code>.
         </p>
 
         <Callout>

@@ -16,6 +16,10 @@ const AuthContext = createContext(null);
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [config, setConfig] = useState(null);
+  /* Whether this person runs the deployment. Decided on the server from
+     FA_ADMIN_EMAILS; this only decides whether a tab is offered, and every
+     admin endpoint checks for itself. */
+  const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(true);
   /* An error Google handed back through the callback redirect. Read from the
      URL once and then removed, so a refresh does not resurrect it. */
@@ -32,12 +36,14 @@ export function AuthProvider({ children }) {
          namespace rather than the previous occupant's. */
       setStorageUser(session.user?.id);
       setUser(session.user);
+      setIsAdmin(Boolean(session.is_admin));
       setConfig(cfg);
     } catch {
       /* The API being unreachable is not the same as being signed out, but
          from here they look identical and both mean "show the door". */
       setStorageUser(null);
       setUser(null);
+      setIsAdmin(false);
     } finally {
       setLoading(false);
     }
@@ -73,6 +79,7 @@ export function AuthProvider({ children }) {
   const value = {
     user,
     config,
+    isAdmin,
     loading,
     authError,
     dismissAuthError: () => setAuthError(null),

@@ -312,6 +312,11 @@ export default function Budget() {
 }
 
 function VariableTable({ title, sub, rows, months, drill }) {
+  /* The sum of each category's middle month - which is NOT the same as the
+     middle month's total, and is the larger of the two, because categories
+     peak in different months. The headline "typical variable" figure is the
+     middle month's total; this column adds up, so both are stated plainly
+     rather than left to look like an arithmetic error. */
   const total = rows.reduce((sum, r) => sum + (r.typical_monthly || 0), 0);
   return (
     <Card title={title} sub={sub}>
@@ -362,13 +367,20 @@ function VariableTable({ title, sub, rows, months, drill }) {
           </tbody>
           <tfoot>
             <tr>
-              <th>Typical, together</th>
+              <th>These, added up</th>
               <th className="right num">{money(total)}</th>
               <th colSpan={4} />
             </tr>
           </tfoot>
         </table>
       </div>
+      <p style={{ fontSize: 11.5, color: 'var(--text-3)', margin: '8px 0 0',
+        lineHeight: 1.55 }}>
+        Each figure is that category&rsquo;s middle month over the period.
+        Adding them describes a month where every category peaked at once,
+        so it comes to more than the typical month at the top of this tab —
+        which is the middle month of the whole variable spend.
+      </p>
     </Card>
   );
 }

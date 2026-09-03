@@ -35,6 +35,26 @@ CADENCES: list[tuple[str, int, int]] = [
     ("yearly", 365, 30),
 ]
 
+#: How many times a year each cadence actually happens.
+#:
+#: Deliberately not 365.25/days. A monthly bill is paid twelve times a year -
+#: once per calendar month - whether the gap between charges reads 28, 30 or
+#: 31 days, so its monthly cost is the charge itself. Scaling a nominal
+#: 30-day cadence by 30.44 days instead reported every monthly commitment
+#: 1.5% high: rent of a flat 41,500 was published as "42,109 a month", and the
+#: error compounded across a Budget tab that adds fourteen of them up. The
+#: day-rate answer is right only for cadences that really are counted in days,
+#: and for those two this table agrees with it to three decimal places.
+PER_YEAR: dict[str, Decimal] = {
+    "weekly": Decimal("52.18"),
+    "fortnightly": Decimal("26.09"),
+    "monthly": Decimal("12"),
+    "bi-monthly": Decimal("6"),
+    "quarterly": Decimal("4"),
+    "half-yearly": Decimal("2"),
+    "yearly": Decimal("1"),
+}
+
 MIN_OCCURRENCES = 3
 MIN_CONFIDENCE = 0.25
 #: How much the amount may vary and still count as "the same" recurring charge.
@@ -71,10 +91,27 @@ class RecurringSeries:
     @property
     def monthly_equivalent(self) -> Decimal:
         """Normalize any cadence to a monthly figure for budgeting."""
-        if self.cadence_days <= 0:
+        return to_monthly(self.median_amount, self.cadence_name,
+                          self.cadence_days)
+
+
+def to_monthly(amount: Decimal, cadence_name: str,
+               cadence_days: int) -> Decimal:
+    """What one charge at this cadence costs per month.
+
+    The single place this conversion happens. It used to be written out twice
+    - here and in analytics.budget - and the two copies carried the same
+    1.5% error on every monthly commitment, which is the argument for there
+    being one of it.
+    """
+    per_year = PER_YEAR.get(cadence_name)
+    if per_year is None:
+        # A cadence the table does not name: fall back to the day rate, which
+        # is the best available answer when the shape is unknown.
+        if cadence_days <= 0:
             return Decimal("0")
-        return (self.median_amount * Decimal("30.44") / Decimal(self.cadence_days)
-                ).quantize(Decimal("0.01"))
+        per_year = Decimal("365.25") / Decimal(cadence_days)
+    return (amount * per_year / Decimal("12")).quantize(Decimal("0.01"))
 
 
 def _magnitude(amount: Decimal) -> int:
@@ -96,8 +133,8 @@ def _signature(txn: Transaction) -> str:
     """
     if txn.category == Category.SALARY:
         # Payroll narrations change every month - "NEFT-CMS1812612535608-
-        # CUBYTS TECHNOLOGIES" one month, "TECHNOLOGIES PRIVATELIMI-
-        # JITESHSALJUL26CMS2" the next - so the words cannot key the series
+        # ACME TECHNOLOGIES" one month, "TECHNOLOGIES PRIVATELIMI-
+        # PANKAJSALJUL26CMS2" the next - so the words cannot key the series
         # and the category has to.
         #
         # But the category alone put every salary-labelled row in ONE group,

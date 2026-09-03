@@ -35,7 +35,7 @@ from decimal import Decimal
 from ..models.schemas import (CONTRA_EXPENSE_ROLES, Category, Direction,
                               FlowRole, Transaction)
 from . import periods
-from .recurring import RecurringSeries
+from .recurring import RecurringSeries, to_monthly
 
 ZERO = Decimal("0")
 
@@ -56,6 +56,20 @@ DEBT_CATEGORIES = {Category.EMI, Category.LOAN_INTEREST}
 #: commitment and is left to the variable side.
 MIN_CADENCE_DAYS = 20
 MAX_CADENCE_DAYS = 400
+
+#: How predictable a charge's timing has to be before this tab will call it
+#: fixed. The detector's own floor is deliberately low, because a loose series
+#: is still worth SHOWING on the Recurring tab - "you seem to buy fuel about
+#: monthly" is a true and useful observation. It is not a commitment, though,
+#: and a list headed "fixed every month" that contains one is a list nobody
+#: can trust the rest of.
+#:
+#: The gap is wide enough to make the cut obvious: on a real ledger, rent, an
+#: EMI, a SIP and a subscription all score 0.93 to 1.00, while a shop visited
+#: five times in fourteen months scores 0.33 to 0.46. Anything below this
+#: keeps its rows - they fall to the variable side, where an irregular charge
+#: was always going to be counted anyway, so no rupee is lost by demoting it.
+MIN_COMMITMENT_CONFIDENCE = 0.6
 
 
 @dataclass
@@ -208,6 +222,8 @@ def analyse_budget(
             continue
         if not (MIN_CADENCE_DAYS <= one.cadence_days <= MAX_CADENCE_DAYS):
             continue
+        if one.confidence < MIN_COMMITMENT_CONFIDENCE:
+            continue
         members = [by_id[i] for i in one.transaction_ids if i in by_id]
         if not members:
             members = stamped.get(one.id, [])
@@ -236,7 +252,7 @@ def analyse_budget(
         # Two occurrences are needed for a median to mean anything; below
         # that the series-wide figure is the better estimate, and the UI marks
         # those rows as having been seen only once here.
-        monthly = (_monthly_from(members, one.cadence_days)
+        monthly = (_monthly_from(members, one.cadence_name, one.cadence_days)
                    if len(members) >= 2 else _q(one.monthly_equivalent))
 
         commitment = Commitment(
@@ -296,44 +312,61 @@ def analyse_budget(
         counts[txn.category] += 1
 
     for category, per_month in per_category.items():
-        amounts = [per_month[m] for m in sorted(per_month)]
-        if not amounts:
+        seen = [per_month[m] for m in sorted(per_month)]
+        if not seen:
             continue
+        # The median of the months this category appeared in - "what it costs
+        # when it happens", which is what the row is read as next to the
+        # months-seen count beside it. Not the median over the whole window:
+        # that reports 0 for anything appearing in under half the months,
+        # which would put a year of school fees or one holiday at "nothing a
+        # month". The window-wide figure is the AGGREGATE's job, below.
         line = VariableLine(
             category=category,
             group=group_of.get(category, "Other"),
-            typical_monthly=_median(amounts),
-            low_monthly=_q(min(amounts)),
-            high_monthly=_q(max(amounts)),
-            total=_q(sum(amounts, ZERO)),
-            months_seen=len(amounts),
+            typical_monthly=_median(seen),
+            low_monthly=_q(min(seen)),
+            high_monthly=_q(max(seen)),
+            total=_q(sum(seen, ZERO)),
+            months_seen=len(seen),
             transaction_count=counts[category],
-            every_month=len(amounts) >= result.months > 0,
+            every_month=len(seen) >= result.months > 0,
         )
         result.variable.append(line)
 
     result.variable.sort(key=lambda v: -v.typical_monthly)
-    result.variable_typical = _q(
-        sum((v.typical_monthly for v in result.variable), ZERO))
+    # The middle month's variable spending - NOT the sum of the per-category
+    # medians, which is a different and larger number. Categories peak in
+    # different months, so adding up each one's middle month describes a month
+    # that never happened; on the demo ledger the two differ by a third.
+    variable_by_month: dict[str, Decimal] = defaultdict(lambda: ZERO)
+    for per_month in per_category.values():
+        for month, value in per_month.items():
+            variable_by_month[month] += value
+    result.variable_typical = _median(
+        [variable_by_month.get(m, ZERO) for m in months])
 
     _add_notes(result)
     return result
 
 
-def _monthly_from(members: list[Transaction], cadence_days: int) -> Decimal:
+def _monthly_from(members: list[Transaction], cadence_name: str,
+                  cadence_days: int) -> Decimal:
     """A commitment's monthly cost, from the charges in the window.
 
     The median charge, normalised by its cadence - so a quarterly premium is
     reported as a third of itself per month, which is what a monthly budget
-    needs it to be. Median rather than mean for the usual reason: one
-    part-payment or one missed month should not move the figure.
+    needs it to be, and a monthly one as itself. Median rather than mean for
+    the usual reason: one part-payment or one missed month should not move the
+    figure.
+
+    The conversion itself lives in analytics.recurring, which is the module
+    that decided what the cadence was.
     """
     if not members:
         return ZERO
     typical = _median([t.amount for t in members])
-    if cadence_days <= 0:
-        return typical
-    return _q(typical * Decimal("30.44") / Decimal(cadence_days))
+    return _q(to_monthly(typical, cadence_name, cadence_days))
 
 
 def _attach_end_date(commitment: Commitment, series: RecurringSeries,

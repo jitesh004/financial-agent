@@ -42,7 +42,7 @@ def _txn(account_id: str = "a1", amount: str = "450.00",
     )
 
 
-def _account(masked: str = "XXXX2343", product: str = "Rewards",
+def _account(masked: str = "XXXX4321", product: str = "Rewards",
              account_id: str = "a1") -> Account:
     return Account(id=account_id, institution="Axis Bank",
                    account_type=AccountType.CREDIT_CARD,
@@ -97,7 +97,7 @@ def test_a_decision_is_recovered_when_the_account_identity_changes():
     old_fingerprint = original.fingerprint
     record_decision(db, original, before, category="groceries")
 
-    after = {"a1": _account(masked="XXXX2343", product="Rewards")}
+    after = {"a1": _account(masked="XXXX4321", product="Rewards")}
     reparsed = _txn(txn_id="new-uuid")
     stamp_fingerprints([reparsed], after)
     assert reparsed.fingerprint != old_fingerprint, "identity should have moved"
@@ -682,10 +682,10 @@ def test_a_preview_never_echoes_a_stored_file_password(api_client):
 
     repo.upsert_source_file(get_db(), repo.SourceFileRecord(
         id="sf-secret", filename="locked.pdf", file_hash="h-secret",
-        password="jite0602", parse_status="parsed"))
+        password="pank1407", parse_status="parsed"))
 
     for scope in ("files", "everything"):
-        assert "jite0602" not in api_client.get(
+        assert "pank1407" not in api_client.get(
             f"/api/data/preview/{scope}").text
 
 

@@ -94,9 +94,39 @@ class Config:
         if part.strip()
     )
 
+    #: Who may see the operator's view - the accounts on this deployment, how
+    #: often each comes back, how much each has imported.
+    #:
+    #: Comma-separated addresses, and deliberately NOT domains: this is not an
+    #: access tier, it is a named person or two who run the deployment, and a
+    #: whole domain is far too easy to grant by accident.
+    #:
+    #: Empty means there is no admin. That is the right default for a grant
+    #: nobody can give themselves - an address hardcoded in the source would
+    #: be the operator's own address published in every clone of this
+    #: repository, and a UI toggle would let anyone signed in award it to
+    #: themselves.
+    ADMIN_EMAILS = tuple(
+        part.strip().lower()
+        for part in (_env('FA_ADMIN_EMAILS', default='') or '').split(',')
+        if part.strip() and '@' in part and not part.strip().startswith('@')
+    )
+
     @property
     def google_configured(self) -> bool:
         return bool(self.GOOGLE_CLIENT_ID and self.GOOGLE_CLIENT_SECRET)
+
+    def is_admin(self, email: str | None) -> bool:
+        """Whether this address runs the deployment.
+
+        Compared case-insensitively on the whole address. No domain matching
+        and no prefix matching: "@example.com" in the list would hand the
+        operator's view to every colleague, and a substring check would hand
+        it to anyone who could register a lookalike address.
+        """
+        if not email or not self.ADMIN_EMAILS:
+            return False
+        return email.strip().lower() in self.ADMIN_EMAILS
 
     @property
     def oauth_redirect_uri(self) -> str:

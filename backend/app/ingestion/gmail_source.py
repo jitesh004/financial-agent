@@ -911,6 +911,7 @@ def download_to_cache(
     attachments: list[FoundAttachment],
     cache_dir: Path,
     progress: Any = None,
+    should_stop: Any = None,
 ) -> list[FoundAttachment]:
     """Download into a persistent cache, skipping anything already there.
 
@@ -921,12 +922,21 @@ def download_to_cache(
 
     Returns every requested attachment with `saved_path` set, whether it was
     downloaded now or already cached.
+
+    `should_stop` is checked before each attachment, so pressing Cancel stops
+    this within one file instead of at the end of the batch. What was already
+    fetched is returned rather than discarded: those files are on disk and
+    paid for, and throwing them away would mean downloading them again.
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     out: list[FoundAttachment] = []
 
     for i, att in enumerate(attachments, start=1):
+        if should_stop is not None and should_stop():
+            log.info("download stopped at %d of %d on request",
+                     i - 1, len(attachments))
+            break
         target = cache_dir / att.cache_key()
 
         # Glob rather than an exact-name check, so files cached under an earlier

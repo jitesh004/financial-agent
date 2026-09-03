@@ -73,11 +73,28 @@ CREATE TABLE IF NOT EXISTS users (
     onboarding_step TEXT NOT NULL DEFAULT 'identity',
     onboarded_at    TEXT,
     created_at      TEXT NOT NULL DEFAULT fa_now(),
-    last_seen_at    TEXT NOT NULL DEFAULT fa_now()
+    last_seen_at    TEXT NOT NULL DEFAULT fa_now(),
+    -- A demo workspace: an ordinary account holding generated statements,
+    -- owned by whoever is demonstrating the app. Set on the DEMO row and
+    -- points at the real one. A separate account rather than a flag on the
+    -- rows, because every screen, query and security policy already works
+    -- per account - so pointing the tenant at another one needs no special
+    -- case anywhere, and nothing done during a demo can reach the real
+    -- ledger. See app/demo.py.
+    demo_of         UUID REFERENCES users(id) ON DELETE CASCADE,
+    -- Set on the REAL row: show me my demo workspace rather than my ledger.
+    demo_mode       BOOLEAN NOT NULL DEFAULT FALSE
 );
 
--- Case-insensitive, because nobody thinks of Jite@example.com and
--- jite@example.com as two accounts.
+-- The index on `demo_of` is created by migrations/0001_visits_and_demo.sql,
+-- not here. This file's CREATE TABLE is IF NOT EXISTS, so on a database that
+-- already has `users` the column above is not added and an index over it here
+-- would fail the whole script before the migration that adds the column has
+-- had a chance to run. Migrations replay on a new database too, so both
+-- paths end up with it.
+
+-- Case-insensitive, because nobody thinks of Pank@example.com and
+-- pank@example.com as two accounts.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users (lower(email));
 
 -- Server-side sessions rather than a self-contained JWT. This app holds a
@@ -94,7 +111,12 @@ CREATE TABLE IF NOT EXISTS user_sessions (
     last_used_at TEXT NOT NULL DEFAULT fa_now(),
     revoked_at   TEXT,
     user_agent   TEXT NOT NULL DEFAULT '',
-    ip           TEXT NOT NULL DEFAULT ''
+    ip           TEXT NOT NULL DEFAULT '',
+    -- Requests served on this session. Incremented by the same UPDATE that
+    -- resolves the cookie, so "how often does this person actually come
+    -- back" costs no extra query - and session ROWS would answer a different
+    -- question, since one 72-hour cookie covers a week of visits.
+    uses         INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON user_sessions (user_id);

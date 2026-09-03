@@ -232,7 +232,7 @@ function IdentityStep({ profile, onSaved, onNext }) {
       <p className="onboarding-lead">
         Indian banks build statement passwords out of your own details — the
         classic format is the first four letters of your name plus your date of
-        birth, like <code>jite0602</code>. With these filled in, protected PDFs
+        birth, like <code>pank1407</code>. With these filled in, protected PDFs
         open by themselves instead of stopping the import.
       </p>
 

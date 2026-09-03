@@ -135,7 +135,7 @@ def simulate():
 
         # ---- Salary -----------------------------------------------------
         pay_day = month_start.replace(day=1) + timedelta(days=0)
-        savings.add(pay_day, f"NEFT-CR-HDFC0000521-CUBYTS TECHNOLOGIES PVT LTD-SALARY {month_start:%b%y}",
+        savings.add(pay_day, f"NEFT-CR-HDFC0000521-ACME TECHNOLOGIES PVT LTD-SALARY {month_start:%b%y}",
                     credit=SALARY_NET, ref=ref(m))
 
         # ---- Home loan EMI (amortizing) --------------------------------
@@ -234,7 +234,7 @@ def simulate():
                         "NEFT-CR-FREELANCE CONSULTING INVOICE", credit=Decimal("85000"), ref=ref(m))
         if m == 9:
             savings.add(month_start.replace(day=15),
-                        "NEFT-CR-CUBYTS TECHNOLOGIES-PERFORMANCE BONUS",
+                        "NEFT-CR-ACME TECHNOLOGIES-PERFORMANCE BONUS",
                         credit=Decimal("340000"), ref=ref(m))
 
         # Card fees, then roll the statement

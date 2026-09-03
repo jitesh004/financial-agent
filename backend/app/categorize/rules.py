@@ -45,7 +45,7 @@ def _r(pattern: str, category: Category, confidence: float = 0.95,
 RULES: list[Rule] = [
     # ---- Income --------------------------------------------------------
     # Indian payroll narrations run the tokens together, so \bSALARY\b never
-    # matches "PRIVATELIMI-JITESHSALNOV25//CMS3". Anchoring SAL on a following
+    # matches "PRIVATELIMI-PANKAJSALNOV25//CMS3". Anchoring SAL on a following
     # month abbreviation and year is specific enough not to catch "SALE".
     _r(r"\bSALARY\b|\bSAL\s+CREDIT\b|\bPAYROLL\b|\bWAGES\b|\bSALARY\s+CREDIT\b"
        r"|SAL(?=(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{2})"
@@ -358,8 +358,8 @@ _HONORIFIC = re.compile(r"\b(?:MR|MRS|MS|SHRI|SMT|DR)\b\.?\s+[A-Z]", re.IGNORECA
 _PERSON_NAME = re.compile(r"^[A-Z][A-Za-z]{1,14}(?:\s+[A-Z][A-Za-z]{1,14}){1,3}$")
 
 
-#: Honorifics and titles, dropped before comparing names so "MR JITESH ..."
-#: still lines up with "Jitesh ...".
+#: Honorifics and titles, dropped before comparing names so "MR PANKAJ ..."
+#: still lines up with "Pankaj ...".
 _NAME_NOISE = frozenset({"MR", "MRS", "MS", "SHRI", "SMT", "SRI", "DR", "KUMARI"})
 
 
@@ -410,7 +410,7 @@ def is_self_payment(txn: Transaction, holder_names: Sequence[str] | None) -> boo
 
     Paying your own name is a transfer between your own accounts, not
     spending. Matched on surname-plus-given-name tokens rather than the whole
-    string, because statements truncate ("UPI/Jitesh Muk/...") and reorder.
+    string, because statements truncate ("UPI/Pankaj Kum/...") and reorder.
     """
     if not holder_names:
         return False
@@ -427,7 +427,7 @@ def is_self_payment(txn: Transaction, holder_names: Sequence[str] | None) -> boo
             # own - plenty of other people share it.
             continue
         # Every part of the holder's name appears in the payee. This is what
-        # bridges the profile's "Jitesh Agarwal" to the "MR JITESH MUKESH
+        # bridges the profile's "Pankaj Sharma" to the "MR PANKAJ KUMAR
         # AGARWAL" the bank prints: the middle name is extra, not a mismatch.
         if all(any(p.startswith(h) or h.startswith(p) for p in payee_tokens)
                for h in held):

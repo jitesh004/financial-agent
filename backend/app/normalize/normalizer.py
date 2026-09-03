@@ -870,9 +870,9 @@ def _amount_came_from_the_filename(amount: Decimal, filename: str) -> bool:
 
     Broker and depository files name themselves after account identifiers:
 
-        transaction-with-holding-statement_UC9050-1208160028236891.pdf
+        transaction-with-holding-statement_UC9050-1200000000001234.pdf
 
-    Read as a bank statement, that yielded a 60,028,236,891 debit - the
+    Read as a bank statement, that yielded a 200,000,000,001,234 debit - the
     client ID with a digit of the DP ID in front of it. The reader had no way
     to know, because as a number it is perfectly well formed.
 
@@ -1070,7 +1070,7 @@ _CREDIT_WORDS = re.compile(
     r"|\bneft[-\s]*cr\b|\bimps[-\s]*cr\b|\bby\s+transfer\b|\bdeposit\b"
     r"|\bthank\s*you\b|\brepayment\b|\bmat(urity)?\s+proceeds\b"
     # Indian payroll narrations run the tokens together, so \bsal\b never
-    # matches: "PRIVATELIMI-JITESHSALNOV25//CMS3". Anchoring on SAL followed by
+    # matches: "PRIVATELIMI-PANKAJSALNOV25//CMS3". Anchoring on SAL followed by
     # a month abbreviation and a year is specific enough not to catch "SALE".
     r"|SAL(?=(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{2})"
     r"|\bSAL[-/]|[-/]SAL\b|\bSALARY\b",
@@ -1253,7 +1253,7 @@ def _drop_rows_after_period(statement: Statement, period_end: date | None) -> No
     HSBC heads every statement with its payment due date and total amount due:
 
         08 DEC 2025 6,831.64
-        MR JITESH MUKESH AGARWAL
+        MR PANKAJ KUMAR SHARMA
 
     The extractor reads line one as a dated row with a trailing amount and,
     finding no description, borrows the cardholder's name from the line below -
@@ -1306,7 +1306,7 @@ def _drop_rows_after_period(statement: Statement, period_end: date | None) -> No
 
 
 #: An 8-digit DDMMYYYY run, delimited so it cannot start mid-number. The
-#: account number in "20000002170971_22082026_115345421.pdf" is 14 digits and
+#: account number in "20000000001234_22082026_115345421.pdf" is 14 digits and
 #: would otherwise offer several plausible-looking dates.
 _DDMMYYYY = re.compile(r"(?<!\d)(\d{2})(\d{2})(20\d{2})(?!\d)")
 
@@ -1323,7 +1323,7 @@ def _anchor_from_filename(filename: str | None) -> date | None:
     """The month this file is named for, as a date, or None.
 
     Reuses the coverage grid's own filename reader so the two never disagree
-    about what "20000002170971_22082026_115345421.pdf" is a statement for.
+    about what "20000000001234_22082026_115345421.pdf" is a statement for.
     """
     if not filename:
         return None
@@ -1335,7 +1335,7 @@ def _anchor_from_filename(filename: str | None) -> date | None:
     if not hint:
         # The coverage grid only knows YYYYMM-style names. IDFC names its
         # files with the statement date the other way round -
-        # "20000002170971_22082026_115345421.pdf" is 22 Aug 2026 - and that
+        # "20000000001234_22082026_115345421.pdf" is 22 Aug 2026 - and that
         # was the one file whose junk row had no other anchor to catch it.
         hint = _ddmmyyyy_in(filename)
     if not hint:

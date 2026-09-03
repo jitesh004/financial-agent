@@ -170,7 +170,7 @@ def ingest_file(state: FileTask) -> dict:
     # 60,028,236,891 - not money, but a slice of its own filename, which
     # encodes Zerodha's DP ID and client ID:
     #
-    #     transaction-with-holding-statement_UC9050-1208160028236891.pdf
+    #     transaction-with-holding-statement_UC9050-1200000000001234.pdf
     #                                               ^DP ID^ ^client ID^
     #
     # Money out for the year read 120 BILLION against an actual 75 lakh.

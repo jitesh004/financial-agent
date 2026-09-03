@@ -64,14 +64,16 @@ def _dob_fragments(dob: date | None) -> list[str]:
         return []
     dd, mm = f"{dob.day:02d}", f"{dob.month:02d}"
     yy, yyyy = f"{dob.year % 100:02d}", f"{dob.year}"
-    mon = dob.strftime("%b").upper()  # e.g. FEB
+    mon = dob.strftime("%b").upper()  # e.g. JUL
+    # Illustrated throughout with 14 July 1988, which is also the date the
+    # tests use - one example date, so a reader can follow it down the list.
     return list(dict.fromkeys([
-        f"{dd}{mm}",          # 0602   <- the "jite0602" case
-        f"{dd}{mm}{yy}",      # 060290
-        f"{dd}{mm}{yyyy}",    # 06021990
+        f"{dd}{mm}",          # 1407   <- the "pank1407" case
+        f"{dd}{mm}{yy}",      # 140788
+        f"{dd}{mm}{yyyy}",    # 14071988
         f"{dd}{mm}{yy}",      # duplicate-safe
-        f"{yyyy}",            # 1990
-        f"{dd}{mon}{yy}",     # 06FEB90
+        f"{yyyy}",            # 1988
+        f"{dd}{mon}{yy}",     # 14JUL88
         f"{mm}{dd}{yyyy}",    # US-style, some card issuers use it
         f"{dd}{mm}{yyyy}",
     ]))
@@ -144,7 +146,7 @@ def derive_passwords(
     # 1. Anything the user told us outright wins.
     candidates += [p for p in (profile.custom_passwords or []) if p]
 
-    # 2. name + DOB, the single most common bank format (the "jite0602" case).
+    # 2. name + DOB, the single most common bank format (the "pank1407" case).
     for name in names:
         for dob in dobs:
             candidates.append(f"{name}{dob}")

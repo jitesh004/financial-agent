@@ -94,7 +94,14 @@ def read_session(user: User | None = Depends(optional_user)) -> dict[str, Any]:
     Public on purpose: this is the question the app asks on load, and it has
     to be answerable before there is an answer.
     """
-    return {"user": user.public_json() if user else None}
+    return {
+        "user": user.public_json() if user else None,
+        # Whether this person runs the deployment, so the app knows whether to
+        # offer the operator's view at all. Decided from FA_ADMIN_EMAILS on
+        # the server; the flag here only hides a tab, it does not grant
+        # anything - every admin endpoint checks for itself.
+        "is_admin": bool(user and config.is_admin(user.email)),
+    }
 
 
 @router.get("/sessions")

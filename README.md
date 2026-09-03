@@ -205,6 +205,48 @@ correctness property rather than an assumption. It is enforced in one place:
 
 `backend/app/db/engine.py` is the file to read first.
 
+### Running a demo without showing anybody your ledger
+
+**Settings → Demo** points every screen at a generated workspace: fourteen
+months of statements in a **separate account**, with a salary that crosses
+month ends, a card bill matched against the bank debit that paid it, an EMI
+against a real loan schedule, genuine irregular spending alongside the fixed
+charges, and one row that needs review. It is not a mock — those are real rows
+going through the real analytics, which is what makes it worth demonstrating.
+
+Because it is a separate account, nothing done during a demo can reach the real
+ledger: the switch decides which account the app *reads*, and it never moves a
+row. Turning it off leaves the workspace as it was, so the next demo picks up
+where the last one finished; **Rebuild** throws it away and generates it again.
+A banner sits above every screen while it is on, because the risk is not
+confusing the two during a demo — it is coming back on Monday, forgetting the
+switch, and concluding something about your own money from generated numbers.
+
+### The operator's view
+
+If `FA_ADMIN_EMAILS` names your address, an **Admin** tab appears: who has
+signed up, how often they come back, how many documents they have parsed, how
+many transactions are stored, which import routes and institutions are in use.
+
+Three things about it are deliberate:
+
+- The grant comes from the environment and nowhere else. Nothing in the
+  database or the UI can award it, it is matched on the whole address rather
+  than a domain, and the default is **no admin at all**.
+- It answers **404** to everyone else, not 403 — whether a deployment has an
+  operator's view is not a useful thing to confirm to somebody probing for it.
+- It reports **counts, never amounts**. There is no bypass of row-level
+  security anywhere in this app, so each account's figures are counted with
+  that account bound as the tenant, through the same policy every request goes
+  through. It can count rows it cannot read, and a test asserts no amount,
+  description, merchant or category ever reaches the payload.
+
+Set it in `.env`, comma-separated for more than one address:
+
+```
+FA_ADMIN_EMAILS=you@example.com
+```
+
 ### Coming from the SQLite version
 
 Your ledger is not lost. Sign in once to create your account, then:
@@ -234,6 +276,8 @@ untouched, and is safe to run twice.
 - **Transactions** — full ledger; recategorizing one teaches the merchant
   permanently
 - **Files & quality** — per-file reconciliation status and every matched transfer
+- **Admin** — only for an address in `FA_ADMIN_EMAILS`: signups, visits and
+  volumes across the deployment, counts only
 
 Every one of those that is *about a period* reads one, shared, from a control
 above it — see below. And **every figure opens the rows behind it**: click a
@@ -313,14 +357,14 @@ exists to prevent.
 during setup, or later from the account menu → **Your details** (name, date of
 birth, PAN, mobile). Indian banks build statement
 passwords from these — the classic format is the first four letters of your name
-plus your date of birth, e.g. `jite0602`. The app generates a small, bounded set
+plus your date of birth, e.g. `pank1407`. The app generates a small, bounded set
 of candidates *from those templates* and tries them against your own protected
 files. This is not password cracking: it only ever runs on files you uploaded,
 uses only your own details, generates dozens of format-based candidates (never a
 brute-force space), and a wrong guess simply moves on. Your PII is stored
 against your own account, is used only to open your own files, and never
 reaches any model or network call. A working password is logged only in
-redacted form (`j*******`).
+redacted form (`p*******`).
 
 **Deduplication is content-based, at three layers.** The same file added twice —
 *even renamed* — is caught by its content hash and counted once. Statements that
