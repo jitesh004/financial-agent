@@ -2234,14 +2234,25 @@ def get_holdings(db: Database, latest_only: bool = True) -> list[dict[str, Any]]
     """
     with db.connection() as conn:
         if latest_only:
+            # IS NOT DISTINCT FROM, not IS. SQLite spells null-safe equality
+            # `a IS b`; PostgreSQL has no such operator and rejects the whole
+            # statement as a syntax error, which is how the Portfolio tab came
+            # to 500 after the migration. The null-safety is load-bearing:
+            # account_id is nullable for a portfolio never matched to a ledger
+            # account, and a plain `=` silently drops exactly those holdings.
+            #
+            # NULLIF guards the cast: `value` is nullable TEXT, and where
+            # SQLite reads '' as 0.0, PostgreSQL raises. NULLS LAST restores
+            # SQLite's ordering, which sorts NULL below every number on DESC
+            # where PostgreSQL would put it on top.
             rows = conn.execute(
                 "SELECT h.* FROM holdings h"
                 " JOIN (SELECT account_id, isin, folio, MAX(as_of) AS latest"
                 "       FROM holdings GROUP BY account_id, isin, folio) newest"
-                "   ON h.account_id IS newest.account_id"
+                "   ON h.account_id IS NOT DISTINCT FROM newest.account_id"
                 "  AND h.isin = newest.isin AND h.folio = newest.folio"
-                "  AND h.as_of IS newest.latest"
-                " ORDER BY CAST(h.value AS REAL) DESC"
+                "  AND h.as_of IS NOT DISTINCT FROM newest.latest"
+                " ORDER BY CAST(NULLIF(h.value, '') AS REAL) DESC NULLS LAST"
             ).fetchall()
         else:
             rows = conn.execute(

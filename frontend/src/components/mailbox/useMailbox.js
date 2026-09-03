@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../../lib';
+import { readScoped, writeScoped } from '../../userStorage';
 
 /* The mailbox import, as a state machine driven by the server.
  *
@@ -34,18 +35,14 @@ const INTERVAL_BACKGROUND = 3000;
    rather than one. */
 const INTERVAL_IDLE = 60000;
 
+/* Namespaced per account - see userStorage.js. Two people on one machine
+   otherwise inherit each other's ticked statements and scan window. */
 function readStored() {
-  try {
-    return JSON.parse(localStorage.getItem(KEY)) || {};
-  } catch {
-    return {};
-  }
+  return readScoped(KEY, {});
 }
 
 function store(patch) {
-  try {
-    localStorage.setItem(KEY, JSON.stringify({ ...readStored(), ...patch }));
-  } catch { /* private mode, quota - the server state is the important half */ }
+  writeScoped(KEY, { ...readStored(), ...patch });
 }
 
 export const rowKey = (r) => `${r.message_id}:${r.filename}:${r.size}`;

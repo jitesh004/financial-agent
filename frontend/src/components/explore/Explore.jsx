@@ -4,6 +4,7 @@ import { Callout, Empty } from '../ui';
 import { FilterRow } from './FieldControls';
 import WidgetEditor from './WidgetEditor';
 import WidgetView from './WidgetView';
+import { scopedKey } from '../../userStorage';
 
 /* Explore: dashboards the user builds.
  *
@@ -17,6 +18,8 @@ import WidgetView from './WidgetView';
  * without rewriting any of them. */
 
 const ROW_UNIT = 120;
+/* Scoped per account - this holds a dashboard id, and one from
+   somebody else's account matches nothing here. */
 const LAST_BOARD_KEY = 'fa-explore-board';
 
 /* Discrete widths rather than a free drag: twelve columns only divide cleanly
@@ -73,7 +76,7 @@ export default function Explore() {
         setSchema(loadedSchema);
         setBoards(loadedBoards);
         setTemplates(loadedTemplates);
-        const remembered = localStorage.getItem(LAST_BOARD_KEY);
+        const remembered = localStorage.getItem(scopedKey(LAST_BOARD_KEY));
         const pick = loadedBoards.find((b) => b.id === remembered)
           || loadedBoards.find((b) => b.is_default)
           || loadedBoards[0];
@@ -102,7 +105,7 @@ export default function Explore() {
   }, []);
 
   useEffect(() => {
-    if (activeId) localStorage.setItem(LAST_BOARD_KEY, activeId);
+    if (activeId) localStorage.setItem(scopedKey(LAST_BOARD_KEY), activeId);
     loadBoard(activeId);
   }, [activeId, loadBoard]);
 

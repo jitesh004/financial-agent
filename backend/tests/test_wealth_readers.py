@@ -569,3 +569,50 @@ def test_a_repeated_header_does_not_double_a_holding():
 def test_a_bank_statement_is_not_mistaken_for_a_portfolio():
     assert not portfolio.looks_like_portfolio(
         "Opening balance closing balance UPI transfer")
+
+
+def test_holdings_survive_a_null_account_and_a_blank_value():
+    """The Portfolio tab 500'd after the PostgreSQL migration.
+
+    `get_holdings` joined on `h.account_id IS newest.account_id` - SQLite's
+    null-safe equality, which PostgreSQL does not have and rejects as a syntax
+    error, so the endpoint failed outright rather than degrading.
+
+    Both halves of the null-safety are load-bearing, so both are asserted:
+    account_id is NULL for a portfolio never matched to a ledger account, and
+    a plain `=` would silently drop exactly those rows; and `value` is
+    nullable TEXT, where SQLite read '' as 0.0 and PostgreSQL raises on the
+    cast used to order by it.
+    """
+    from tests.support import fresh_ledger
+    from app.db import repository as repo
+
+    db = fresh_ledger()
+    with db.connection() as conn:
+        for holding_id, isin, folio, value in (
+            ("h-unmatched", "INE001", "F1", "5000"),
+            ("h-blank", "INE002", "F2", ""),
+            ("h-null", "INE003", "F3", None),
+        ):
+            conn.execute(
+                "INSERT INTO holdings (id, statement_id, account_id, isin,"
+                " folio, instrument, value, as_of)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (holding_id, None, None, isin, folio,
+                 f"Fund {isin}", value, "2025-01-31"))
+
+    rows = repo.get_holdings(db, latest_only=True)
+    assert len(rows) == 3, "a holding with no matched account was dropped"
+    # Ordered by value descending, with the unsortable ones last rather than
+    # first - which is where PostgreSQL puts NULL on DESC by default.
+    assert rows[0]["instrument"] == "Fund INE001"
+
+
+def test_the_portfolio_endpoint_answers_for_an_account_with_no_holdings():
+    from fastapi.testclient import TestClient
+    from tests.support import fresh_ledger
+    from app.main import app
+
+    fresh_ledger()
+    response = TestClient(app).get("/api/portfolio")
+    assert response.status_code == 200, response.text

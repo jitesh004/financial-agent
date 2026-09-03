@@ -1,5 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { api } from './lib';
+import { setStorageUser } from './userStorage';
 
 /* Who is signed in, for the whole app.
  *
@@ -26,11 +27,16 @@ export function AuthProvider({ children }) {
   const refresh = useCallback(async () => {
     try {
       const [session, cfg] = await Promise.all([api.session(), api.authConfig()]);
+      /* Before setUser, so anything that reads browser-local state while
+         rendering the signed-in shell is already looking in this account's
+         namespace rather than the previous occupant's. */
+      setStorageUser(session.user?.id);
       setUser(session.user);
       setConfig(cfg);
     } catch {
       /* The API being unreachable is not the same as being signed out, but
          from here they look identical and both mean "show the door". */
+      setStorageUser(null);
       setUser(null);
     } finally {
       setLoading(false);

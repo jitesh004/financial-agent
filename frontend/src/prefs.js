@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { readScoped, writeScoped } from './userStorage';
 
 /* Per-browser display preferences.
  *
@@ -61,7 +62,7 @@ const DEFAULTS = Object.fromEntries(PREFS.map((p) => [p.key, p.fallback]));
 
 export function readPrefs() {
   try {
-    return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(KEY) || '{}') };
+    return { ...DEFAULTS, ...readScoped(KEY, {}) };
   } catch {
     // A private window, cleared site data, or storage disabled entirely.
     return { ...DEFAULTS };
@@ -75,7 +76,7 @@ export function usePrefs() {
     setPrefs((prev) => {
       const next = { ...prev, [key]: value };
       try {
-        localStorage.setItem(KEY, JSON.stringify(next));
+        writeScoped(KEY, next);
       } catch { /* not worth failing the interaction over */ }
       // So other mounted components pick the change up without a reload.
       window.dispatchEvent(new CustomEvent('fa-prefs-changed', { detail: next }));
