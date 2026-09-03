@@ -137,7 +137,7 @@ export default function MonthView({ data }) {
 
   const net = totals.inflow - (totals.outflow - totals.offsets);
   const singleMonth = resolved?.months === 1;
-  const truncated = total > (rows?.length || 0);
+  const truncated = rows !== null && total > rows.length;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>

@@ -2,6 +2,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useS
 import { api, count as fmtCount, dateLabel, money, titleCase } from './lib';
 import { usePeriod } from './period';
 import { downloadCsv, toCsv } from './prefs';
+import { PromptButton } from './components/ui';
 
 /* "Show me the rows behind that number."
  *
@@ -71,7 +72,7 @@ function DrillPanel({ request, onClose }) {
   const query = useMemo(() => ({
     ...(request.ignorePeriod ? {} : periodParams),
     ...request.params,
-    limit: PAGE,
+    limit: 5000,
     sort_by: request.sortBy || 'amount',
     sort_dir: request.sortDir || 'desc',
   }), [request, periodParams]);
@@ -100,6 +101,43 @@ function DrillPanel({ request, onClose }) {
       .catch((e) => !cancelled && setError(e.message));
     return () => { cancelled = true; };
   }, [JSON.stringify(query)]);
+
+  const [categories, setCategories] = useState([]);
+  const [saving, setSaving] = useState(null);
+
+  useEffect(() => {
+    api.categories().then(setCategories).catch(() => {});
+  }, []);
+
+  async function patch(txn, fields) {
+    setSaving(txn.id);
+    try {
+      const res = await api.updateTransaction(txn.id, fields);
+      const updated = res.transaction || { ...txn, ...fields };
+      setRows((prev) => prev.map((r) => (r.id === txn.id ? updated : r)));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSaving(null);
+    }
+  }
+
+  async function addNote(txn, note) {
+    await patch(txn, { note });
+  }
+
+  async function recategorize(txn, cat) {
+    if (cat === txn.category) return;
+    setSaving(txn.id);
+    try {
+      const res = await api.recategorize(txn.id, cat);
+      setRows((prev) => prev.map((r) => (r.id === txn.id ? res.transaction : r)));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSaving(null);
+    }
+  }
 
   const sums = useMemo(() => {
     const out = { inflow: 0, outflow: 0, uncounted: 0, uncountedRows: 0 };
@@ -204,6 +242,7 @@ function DrillPanel({ request, onClose }) {
                   <th>Description</th>
                   <th>Category</th>
                   <th className="right">Amount</th>
+                  <th className="right">Edit</th>
                 </tr>
               </thead>
               <tbody>
@@ -221,13 +260,52 @@ function DrillPanel({ request, onClose }) {
                     </td>
                     <td>
                       <div className="drill-desc">{r.description}</div>
+                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 4 }}>
+                        {r.excluded && <span className="chip warn">excluded</span>}
+                        {r.needs_review && <span className="chip warn">needs review</span>}
+                      </div>
                       {r.note && <div className="drill-counts-in">{r.note}</div>}
                     </td>
-                    <td className="nowrap">{titleCase(r.category)}</td>
+                    <td>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <select
+                          value={r.category}
+                          disabled={saving === r.id}
+                          onChange={(e) => recategorize(r, e.target.value)}
+                          style={{ fontSize: 12, padding: '3px 6px', maxWidth: 150 }}
+                        >
+                          {categories.map((c) => (
+                            <option key={c} value={c}>{titleCase(c)}</option>
+                          ))}
+                        </select>
+                      </div>
+                    </td>
                     <td className="right num nowrap" style={{
                       color: r.direction === 'credit' ? 'var(--positive)' : 'inherit',
                     }}>
                       {r.direction === 'credit' ? '+' : '−'}{money(Math.abs(r.amount))}
+                    </td>
+                    <td className="right nowrap">
+                      <PromptButton
+                        className="btn icon"
+                        title={r.note ? 'Edit note' : 'Add a note'}
+                        disabled={saving === r.id}
+                        initial={r.note || ''}
+                        placeholder="Note for this transaction"
+                        onSubmit={(note) => addNote(r, note)}
+                      >
+                        {r.note ? '✎' : '+'}
+                      </PromptButton>
+                      <button
+                        className="btn icon"
+                        title={r.excluded
+                          ? 'Put this back in your totals'
+                          : 'Leave this out of every total'}
+                        disabled={saving === r.id}
+                        onClick={() => patch(r, { excluded: !r.excluded })}
+                      >
+                        {r.excluded ? '↺' : '⊘'}
+                      </button>
                     </td>
                   </tr>
                 ))}

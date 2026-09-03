@@ -835,7 +835,7 @@ def list_periods() -> dict[str, Any]:
     months = repo.covered_months(db)
     today = date.today()
     resolved = []
-    for preset in periods.PERIOD_PRESETS:
+    for preset in periods.get_period_presets(today):
         key = preset["value"]
         if key in {"custom", "custom_months"}:
             # Nothing to resolve until the user draws the window, but the

@@ -267,7 +267,7 @@ OPS_FOR_TYPE: dict[str, tuple[str, ...]] = {
 #: "last 3 months". `inherit` is Explore's own: a widget that takes whatever
 #: window the board is set to.
 DATE_PRESETS: list[tuple[str, str]] = [
-    (p["value"], p["label"]) for p in periods.PERIOD_PRESETS]
+    (p["value"], p["label"]) for p in periods.get_period_presets()]
 
 MAX_ROWS = 5000
 

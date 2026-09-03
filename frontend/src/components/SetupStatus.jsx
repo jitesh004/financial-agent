@@ -69,7 +69,6 @@ export function SetupButton({ status, open, onToggle }) {
         : 'Setup is complete — nothing waiting on you'}
     >
       <span aria-hidden>{waiting ? '◍' : '✓'}</span>
-      <span className="setup-btn-label">Setup</span>
       {waiting > 0 && <span className="chip warn nav-count">{waiting}</span>}
     </button>
   );

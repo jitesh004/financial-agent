@@ -32,7 +32,7 @@ export default function MailboxButton({ mailbox, onOpen }) {
       {busy ? <span className="spinner" style={{ width: 12, height: 12 }} />
         : interrupted ? <span aria-hidden>!</span>
           : <span aria-hidden>✉</span>}
-      <span>{busy ? LABEL[job?.kind] || 'Working' : 'Mailbox'}</span>
+      <span>{busy ? LABEL[job?.kind] || 'Working' : 'Imports'}</span>
       {showCount && (
         <span className="chip accent" style={{ padding: '0 6px' }}>
           {job.current}/{job.total}

@@ -440,11 +440,7 @@ function Dashboard({ openImport = false, onImportOpened }) {
         </div>
 
         <MailboxButton mailbox={mailbox} onOpen={() => setMailboxOpen(true)} />
-        <ThemeToggle theme={theme} onToggle={toggleTheme} />
-        {/* Profile moved inside the account menu: it is one of several things
-            that belong to "you" rather than to the ledger, and a header with a
-            button for each of them stops fitting on a laptop. */}
-        <AccountMenu onProfile={() => setShowProfile(true)} />
+        <AccountMenu onProfile={() => setShowProfile(true)} theme={theme} onToggleTheme={toggleTheme} />
 
       </header>
 

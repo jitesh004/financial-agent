@@ -11,7 +11,7 @@ import { api } from '../lib';
  * a shared machine they forgot to sign out of - and a control you need in a
  * hurry should not take three clicks to find.
  */
-export default function AccountMenu({ onProfile }) {
+export default function AccountMenu({ onProfile, theme, onToggleTheme }) {
   const { user, signOut, refresh } = useAuth();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -66,6 +66,15 @@ export default function AccountMenu({ onProfile }) {
           <button role="menuitem" onClick={runSetupAgain} disabled={busy}>
             Run setup again
           </button>
+          
+          <div className="account-rule" />
+
+          <div role="menuitem" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'default' }}>
+            <span>Theme</span>
+            <button className="btn icon" onClick={onToggleTheme} aria-label="Toggle theme">
+              {theme === 'dark' ? '☼' : '☾'}
+            </button>
+          </div>
 
           <div className="account-rule" />
 

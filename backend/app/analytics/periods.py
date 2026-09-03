@@ -51,35 +51,8 @@ FY_START_MONTH = 4
 #: `months` is how many accounting months the window spans when that is
 #: fixed; None means "computed" (year-to-date) or "not a window" (all time,
 #: custom).
-PERIOD_PRESETS: list[dict[str, Any]] = [
-    {"value": "all", "label": "All time", "short": "All", "months": None},
-    {"value": "this_month", "label": "This month", "short": "This month",
-     "months": 1},
-    {"value": "last_month", "label": "Last month", "short": "Last month",
-     "months": 1},
-    {"value": "last_3m", "label": "Last 3 months", "short": "3M", "months": 3},
-    {"value": "last_6m", "label": "Last 6 months", "short": "6M", "months": 6},
-    {"value": "last_12m", "label": "Last 12 months", "short": "12M",
-     "months": 12},
-    {"value": "ytd", "label": "This year so far", "short": "YTD",
-     "months": None},
-    {"value": "last_year", "label": "Last calendar year", "short": None,
-     "months": 12},
-    {"value": "this_fy", "label": "This financial year (Apr–Mar)",
-     "short": "FY", "months": None},
-    {"value": "last_fy", "label": "Last financial year", "short": None,
-     "months": 12},
-    {"value": "custom_months", "label": "Custom months…", "short": None,
-     "months": None},
-    {"value": "custom", "label": "Custom dates…", "short": None,
-     "months": None},
-]
-
-PRESET_LABELS: dict[str, str] = {p["value"]: p["label"] for p in PERIOD_PRESETS}
-
-#: Presets that resolve to whole accounting months. Everything except the two
-#: custom shapes and all-time.
 MONTH_PRESETS = {"this_month", "last_month", "last_3m", "last_6m", "last_12m",
+                 "recent_2", "recent_3", "recent_4",
                  "ytd", "last_year", "this_fy", "last_fy"}
 
 _MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -138,6 +111,38 @@ def month_label(key: str) -> str:
     except PeriodError:
         return str(key)
     return f"{_MONTH_NAMES[month - 1]} {year}"
+
+def get_period_presets(today: date | None = None) -> list[dict[str, Any]]:
+    today = today or date.today()
+    this_month_key = f"{today.year:04d}-{today.month:02d}"
+
+    out = [
+        {"value": "all", "label": "All time", "short": "All", "months": None},
+        {"value": "this_month", "label": "This month", "short": "This", "months": 1},
+        {"value": "last_month", "label": "Last month", "short": "Last", "months": 1},
+    ]
+    
+    for i in range(2, 5):
+        month_str = shift_month_key(this_month_key, -i)
+        lbl = month_label(month_str)
+        out.append({
+            "value": f"recent_{i}", 
+            "label": lbl,
+            "short": lbl[:3],
+            "months": 1
+        })
+
+    out.extend([
+        {"value": "last_3m", "label": "Last 3 months", "short": "3M", "months": 3},
+        {"value": "last_6m", "label": "Last 6 months", "short": "6M", "months": 6},
+        {"value": "last_12m", "label": "Last 12 months", "short": "12M", "months": 12},
+        {"value": "custom_months", "label": "Custom months…", "short": None, "months": None},
+        {"value": "custom", "label": "Custom dates…", "short": None, "months": None},
+    ])
+    return out
+
+def get_preset_labels() -> dict[str, str]:
+    return {p["value"]: p["label"] for p in get_period_presets()}
 
 
 def months_between(start_month: str, end_month: str) -> list[str]:
@@ -300,6 +305,10 @@ def resolve_period(spec: dict[str, Any] | None, today: date | None = None) -> Pe
     if preset == "last_month":
         previous = shift_month_key(this_month, -1)
         return Period(preset, previous, previous)
+    if preset.startswith("recent_"):
+        i = int(preset.split("_")[1])
+        recent_month = shift_month_key(this_month, -i)
+        return Period(preset, recent_month, recent_month)
     if preset in {"last_3m", "last_6m", "last_12m"}:
         span = int(preset.split("_")[1].rstrip("m"))
         return Period(preset, shift_month_key(this_month, -(span - 1)), this_month)

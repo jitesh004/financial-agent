@@ -198,12 +198,14 @@ const SORT_FIELDS = [
  * control for it entirely rather than showing a redundant, disabled picker.
  */
 export default function TransactionsTable({
-  accounts,
+  accounts = [],
   title = 'Transactions',
   showRailToggle = false,
   fixedRail = null,
   fixedCategory = null,
   emptyHint = 'Try clearing the filters.',
+  overrideQuery = null,
+  hideHeader = false,
 }) {
   const allIds = useMemo(() => accounts.map((a) => a.id), [accounts]);
   const [selected, setSelected] = useState(() => new Set(allIds));
@@ -274,14 +276,20 @@ export default function TransactionsTable({
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    api.transactions({
+
+    const queryPayload = overrideQuery || {
       account_id: accountParam || undefined,
       category: fixedCategory || category || undefined,
       rail: fixedRail || rail || undefined,
+      sort_by: sortBy,
+      sort_dir: sortDir,
+      offset: page * pageSize,
+      limit: pageSize,
+      search: search || undefined,
       ...periodParams,
-      sort_by: sortBy, sort_dir: sortDir,
-      limit: pageSize, offset: page * pageSize,
-    })
+    };
+
+    api.transactions(queryPayload)
       .then((res) => {
         if (cancelled) return;
         setRows(res.transactions);
@@ -425,47 +433,53 @@ export default function TransactionsTable({
 
   return (
     <>
-      <div className="section-title">
-        {title} {total > 0 && `· ${count(total)} total`}
-        {scoped && (
-          <span className="section-note" title={resolved?.basis === 'accounting'
-            ? 'Whole accounting months' : 'Exact transaction dates'}>
-            {periodLabel}
-          </span>
-        )}
-      </div>
+      {!hideHeader && (
+        <>
+          <div className="section-title">
+            {title} {total > 0 && `· ${count(total)} total`}
+            {scoped && (
+              <span className="section-note" title={resolved?.basis === 'accounting'
+                ? 'Whole accounting months' : 'Exact transaction dates'}>
+                {periodLabel}
+              </span>
+            )}
+          </div>
 
-      {accounts.length > 1 && (
-        <Card style={{ marginBottom: 12 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-            <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-2)' }}>
-              Accounts
-            </span>
-            <button
-              className="btn"
-              style={{ padding: '2px 8px', fontSize: 11 }}
-              onClick={() => setSelected(allSelected ? new Set() : new Set(allIds))}
-            >
-              {allSelected ? 'Clear all' : 'Select all'}
-            </button>
-          </div>
-          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-            {accounts.map((a) => (
-              <button
-                key={a.id}
-                className={`chip-toggle ${selected.has(a.id) ? 'selected' : ''}`}
-                onClick={() => toggleAccount(a.id)}
-                title={a.display_name}
-              >
-                {a.display_name}
-              </button>
-            ))}
-          </div>
-        </Card>
+          {accounts.length > 1 && (
+            <Card style={{ marginBottom: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-2)' }}>
+                  Accounts
+                </span>
+                <button
+                  className="btn"
+                  style={{ padding: '2px 8px', fontSize: 11 }}
+                  onClick={() => setSelected(allSelected ? new Set() : new Set(allIds))}
+                >
+                  {allSelected ? 'Clear all' : 'Select all'}
+                </button>
+              </div>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                {accounts.map((a) => (
+                  <button
+                    key={a.id}
+                    className={`chip-toggle ${selected.has(a.id) ? 'selected' : ''}`}
+                    onClick={() => toggleAccount(a.id)}
+                    title={a.display_name}
+                  >
+                    {a.display_name}
+                  </button>
+                ))}
+              </div>
+            </Card>
+          )}
+        </>
       )}
 
-      <Card>
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12, alignItems: 'center' }}>
+      <Card style={hideHeader ? { padding: 0, border: 'none', boxShadow: 'none' } : {}}>
+        {!hideHeader && (
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12, alignItems: 'center' }}>
+
           {!fixedCategory && (
             <select value={category} onChange={(e) => setCategory(e.target.value)}>
               <option value="">All categories</option>
@@ -533,6 +547,7 @@ export default function TransactionsTable({
             </button>
           )}
         </div>
+        )}
 
         {error && <Callout tone="neg">{error}</Callout>}
 
@@ -602,8 +617,8 @@ export default function TransactionsTable({
             </div>
           )}
 
-          <div className="table-wrap">
-            <table>
+        <div className="table-wrap">
+          <table>
               <thead>
                 <tr>
                   <th style={{ width: 28 }}>
