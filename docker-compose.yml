@@ -48,6 +48,16 @@ services:
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
       - FA_ALLOWED_SIGNINS=${FA_ALLOWED_SIGNINS:-}
+      - FA_ADMIN_EMAILS=${FA_ADMIN_EMAILS:-}
+      - FA_PARSE_WORKERS=${FA_PARSE_WORKERS:-8}
+      - FA_SESSION_TTL_HOURS=${FA_SESSION_TTL_HOURS:-72}
+      - FA_SESSION_COOKIE_SECURE=${FA_SESSION_COOKIE_SECURE:-false}
+      - LLM_PROVIDER=${LLM_PROVIDER:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL_FAST=${GEMINI_MODEL_FAST:-}
+      - GEMINI_MODEL_STRONG=${GEMINI_MODEL_STRONG:-}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT:-}
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY:-}
     # The entrypoint refuses with an actionable message if the image is older
     # than the code - see backend/docker-entrypoint.sh for why that is worth
     # a guard rather than a bare ModuleNotFoundError.
