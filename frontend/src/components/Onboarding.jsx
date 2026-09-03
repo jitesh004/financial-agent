@@ -248,7 +248,7 @@ function IdentityStep({ profile, onSaved, onNext }) {
         <label className="field">
           <span>Full name, as printed on your statements</span>
           <input type="text" value={form.full_name} onChange={set('full_name')}
-            placeholder="e.g. Jitesh Sharma" ref={firstField} />
+            placeholder="e.g. John Adams" ref={firstField} />
         </label>
         <div className="grid cols-2" style={{ gap: 12 }}>
           <label className="field">

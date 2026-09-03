@@ -64,7 +64,7 @@ export default function Profile({ onSaved }) {
         <div className="grid" style={{ gap: 12, marginTop: 14 }}>
           <Field label="Full name (as printed on statements)">
             <input type="text" value={form.full_name} onChange={set('full_name')}
-              placeholder="e.g. Jitesh Sharma" />
+              placeholder="e.g. John Adams" />
           </Field>
 
           <div className="grid cols-2" style={{ gap: 12 }}>

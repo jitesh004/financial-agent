@@ -28,7 +28,7 @@ from app.models.profile import UserProfile  # noqa: E402
 SAMPLES = ROOT / "data" / "samples"
 ENCRYPTED = ROOT / "data" / "samples_encrypted" / "icici_credit_card_locked.pdf"
 
-PROFILE = UserProfile(full_name="JITESH SHARMA", date_of_birth=date(1990, 2, 6),
+PROFILE = UserProfile(full_name="PANKAJ SHARMA", date_of_birth=date(1990, 2, 6),
                       pan="ABCDE1234F", mobile="9876543210")
 
 

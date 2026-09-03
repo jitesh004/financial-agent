@@ -409,7 +409,7 @@ def main() -> int:
 
     # 1. Savings account -> XLSX (the most common real-world export)
     render_xlsx(savings, OUT / "hdfc_savings_2025_2026.xlsx", {
-        "Account Holder": "JITESH SHARMA",
+        "Account Holder": "PANKAJ SHARMA",
         "Account Number": "50100247718842",
         "Account Type": "SAVINGS ACCOUNT - REGULAR",
         "Bank": "HDFC BANK LTD",
@@ -432,7 +432,7 @@ def main() -> int:
     # 3. Credit card -> PDF
     render_pdf(card, OUT / "icici_credit_card_2025_2026.pdf",
                "ICICI Bank Credit Card Statement", {
-                   "Card Holder": "JITESH SHARMA",
+                   "Card Holder": "PANKAJ SHARMA",
                    "Card Number": "4471 XXXX XXXX 8842",
                    "Card Type": "ICICI AMAZON PAY CREDIT CARD",
                    "Statement Period": period,
@@ -445,7 +445,7 @@ def main() -> int:
     # 4. Home loan -> DOCX
     render_docx(home, OUT / "hdfc_home_loan_2025_2026.docx",
                 "HDFC Home Loan - Statement of Account", {
-                    "Borrower Name": "JITESH SHARMA",
+                    "Borrower Name": "PANKAJ SHARMA",
                     "Loan Account Number": "HL4471929",
                     "Loan Type": "HOME LOAN",
                     "Sanctioned Amount": "48,00,000.00",
@@ -459,7 +459,7 @@ def main() -> int:
 
     # 5. Personal loan -> XLSX
     render_xlsx(personal, OUT / "bajaj_personal_loan_2025_2026.xlsx", {
-        "Borrower Name": "JITESH SHARMA",
+        "Borrower Name": "PANKAJ SHARMA",
         "Loan Account Number": "PL8823641",
         "Loan Type": "PERSONAL LOAN",
         "Lender": "BAJAJ FINSERV",
@@ -473,7 +473,7 @@ def main() -> int:
     # 6. Mutual fund -> PDF
     render_pdf(mf, OUT / "mf_portfolio_statement_2025_2026.pdf",
                "Mutual Fund Consolidated Account Statement", {
-                   "Investor Name": "JITESH SHARMA",
+                   "Investor Name": "PANKAJ SHARMA",
                    "PAN": "ABCDE1234F",
                    "Folio Number": "91827364/55",
                    "Statement Period": period,
