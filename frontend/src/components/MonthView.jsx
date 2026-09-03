@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Callout, Card, Chip, Empty, Stat } from './ui';
-import { api, dateLabel, money, monthLabel, titleCase } from '../lib';
+import { PeriodEmpty } from './PeriodPicker';
+import { api, dateLabel, money, monthLabel, monthLabelLong, titleCase } from '../lib';
+import { usePeriod } from '../period';
 
-/* One month, every account, in one list.
+/* The period, every account, in one list.
  *
  * Two things this has to get right that a naive version does not:
  *
@@ -14,7 +16,13 @@ import { api, dateLabel, money, monthLabel, titleCase } from '../lib';
  * 2. The month is the ACCOUNTING month, not the calendar month of the date. A
  *    salary paid on the last working day lands on the 31st one month and the
  *    1st two months later; bucketing by raw date puts two salaries in one
- *    month and none in the next. */
+ *    month and none in the next.
+ *
+ * The second rule used to live only here, behind this tab's own month picker.
+ * It is now the rule the whole app's period control follows, so this tab reads
+ * that period instead of keeping a second one - and the month strip below sets
+ * it, rather than a private copy that could disagree with the Overview.
+ */
 
 const INFLOW_ROLES = new Set(['income']);
 const OUTFLOW_ROLES = new Set(['expense', 'investment']);
@@ -33,29 +41,35 @@ const ROLE_TONE = {
   card_settlement: '', transfer_out: '', transfer_in: '', excluded: 'warn',
 };
 
-function recentMonths(count = 18) {
-  const now = new Date();
-  return Array.from({ length: count }, (_, i) => {
-    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-  });
-}
+//: The ledger can be long. One page of rows is what a screen can show, and
+//: the per-month summary above it is the answer for a window this big.
+const ROW_LIMIT = 1000;
 
 export default function MonthView({ data }) {
-  const months = useMemo(recentMonths, []);
-  const [month, setMonth] = useState(months[0]);
+  const {
+    params, label, scoped, window: resolved, months, setPeriod,
+  } = usePeriod();
   const [rows, setRows] = useState(null);
+  const [total, setTotal] = useState(0);
   const [error, setError] = useState(null);
   const [groupBy, setGroupBy] = useState('date');
 
+  const periodKey = JSON.stringify(params);
+
   const load = useCallback(() => {
     setRows(null);
-    // Filtered server-side on accounting_month, so this never pulls the whole
-    // ledger down to throw most of it away.
-    api.transactions({ accounting_month: month, limit: 1000, sort_by: 'date' })
-      .then((res) => { setRows(res.transactions || []); setError(null); })
+    // Filtered server-side on the accounting month, so this never pulls the
+    // whole ledger down to throw most of it away.
+    api.transactions({ ...params, limit: ROW_LIMIT, sort_by: 'date',
+                       sort_dir: 'desc' })
+      .then((res) => {
+        setRows(res.transactions || []);
+        setTotal(res.total ?? (res.transactions || []).length);
+        setError(null);
+      })
       .catch((e) => { setError(e.message); setRows([]); });
-  }, [month]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [periodKey]);
 
   useEffect(load, [load]);
 
@@ -73,21 +87,41 @@ export default function MonthView({ data }) {
     return t;
   }, [rows]);
 
-  // Months with no statement loaded look like a genuine dip in spending,
-  // which is the most misleading thing a chart can do. The coverage grid
-  // knows which months are incomplete; surface that here rather than
-  // presenting a partial month as a real one.
-  const incomplete = useMemo(() => {
-    const monthly = data?.analysis?.monthly || [];
-    return monthly.length > 0 && !monthly.some((m) => m.month === month);
-  }, [data, month]);
+  /* Months in the window with nothing in them.
+   *
+   * A month with no statement loaded looks like a genuine dip in spending,
+   * which is the most misleading thing a chart can do. The analysis reports a
+   * row per month it found figures for, so a month in the window absent from
+   * that list is a hole - and naming the holes beats presenting a partial
+   * period as a whole one.
+   *
+   * The span is enumerated here only to name those months. Which months a
+   * period COVERS is the server's answer (see period.jsx); this is a label. */
+  const monthly = data?.analysis?.monthly || [];
+  const missing = useMemo(() => {
+    const first = resolved?.startMonth;
+    const last = resolved?.endMonth;
+    if (!first || !last || !monthly.length) return [];
+    const have = new Set(monthly.map((m) => m.month));
+    const gaps = [];
+    for (let [year, month] = first.split('-').map(Number);
+      `${year}-${String(month).padStart(2, '0')}` <= last;) {
+      const key = `${year}-${String(month).padStart(2, '0')}`;
+      if (!have.has(key)) gaps.push(key);
+      month += 1;
+      if (month > 12) { month = 1; year += 1; }
+    }
+    return gaps;
+  }, [monthly, resolved]);
 
   const grouped = useMemo(() => {
     if (!rows) return [];
     if (groupBy === 'date') return [['', rows]];
     const key = groupBy === 'category'
       ? (r) => titleCase(r.category)
-      : (r) => ROLE_LABEL[r.flow_role] || 'Unclassified';
+      : groupBy === 'month'
+        ? (r) => monthLabelLong(r.accounting_month || r.date?.slice(0, 7))
+        : (r) => ROLE_LABEL[r.flow_role] || 'Unclassified';
     const out = new Map();
     for (const r of rows) {
       const k = key(r);
@@ -100,6 +134,8 @@ export default function MonthView({ data }) {
   }, [rows, groupBy]);
 
   const net = totals.inflow - (totals.outflow - totals.offsets);
+  const singleMonth = resolved?.months === 1;
+  const truncated = total > (rows?.length || 0);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -110,39 +146,57 @@ export default function MonthView({ data }) {
       >
         <div>
           <h2 className="section-title" style={{ marginBottom: 4 }}>
-            {monthLabel(month)}
+            {scoped ? label : 'Every month'}
           </h2>
           <p style={{ color: 'var(--text-2)', margin: 0 }}>
-            Cards and bank accounts together, counted once each.
+            Cards and bank accounts together, counted once each — in the month
+            each row is counted in, not the month printed on it.
           </p>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <select value={month} onChange={(e) => setMonth(e.target.value)}>
-            {months.map((m) => (
-              <option key={m} value={m}>{monthLabel(m)}</option>
+        <div className="seg">
+          {[['date', 'By date'], ['category', 'By category'],
+            ['role', 'By type'], ...(singleMonth ? [] : [['month', 'By month']])]
+            .map(([v, name]) => (
+              <button
+                key={v}
+                className={`seg-btn ${groupBy === v ? 'active' : ''}`}
+                onClick={() => setGroupBy(v)}
+              >
+                {name}
+              </button>
             ))}
-          </select>
-          <div className="seg">
-            {[['date', 'By date'], ['category', 'By category'], ['role', 'By type']]
-              .map(([v, label]) => (
-                <button
-                  key={v}
-                  className={`seg-btn ${groupBy === v ? 'active' : ''}`}
-                  onClick={() => setGroupBy(v)}
-                >
-                  {label}
-                </button>
-              ))}
-          </div>
         </div>
       </div>
 
+      {/* Every month there is data for, as one click each. The tab is called
+          Months because this is how it is usually read - one month at a time -
+          and this sets the app's period rather than a second one of its own. */}
+      {months.length > 1 && (
+        <div className="month-strip" role="group" aria-label="Jump to a month">
+          {[...months].reverse().map((m) => {
+            const inWindow = resolved?.startMonth
+              && m.month >= resolved.startMonth && m.month <= resolved.endMonth;
+            return (
+              <button
+                key={m.month}
+                className={`chip-toggle ${inWindow ? 'selected' : ''}`}
+                title={`${m.count} transaction${m.count === 1 ? '' : 's'}`}
+                onClick={() => setPeriod({ preset: 'custom_months',
+                  start_month: m.month, end_month: m.month })}
+              >
+                {monthLabel(m.month)}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       {error && <Callout tone="neg">{error}</Callout>}
-      {incomplete && (
+      {missing.length > 0 && (
         <Callout tone="warn">
-          No statement covering this month has been parsed yet, so these
-          figures are incomplete. Check the Coverage grid under Files &amp;
-          Passwords.
+          No statement covering {missing.map(monthLabelLong).join(', ')} has been
+          parsed yet, so this period is incomplete. The Coverage grid under Data
+          shows which months are missing per account.
         </Callout>
       )}
 
@@ -160,13 +214,65 @@ export default function MonthView({ data }) {
         <Stat label="Net" value={net} tone={net >= 0 ? 'pos' : 'neg'} />
       </div>
 
+      {/* A window of several months reads as a table of months first, and the
+          rows behind them second. */}
+      {!singleMonth && monthly.length > 1 && (
+        <Card title="Month by month"
+          sub={`${monthly.length} months in this period`}>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Month</th>
+                  <th className="right">Money in</th>
+                  <th className="right">Money out</th>
+                  <th className="right">Invested</th>
+                  <th className="right">Net</th>
+                  <th className="right">Rows</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...monthly].reverse().map((m) => (
+                  <tr key={m.month}>
+                    <td className="nowrap">
+                      <button className="btn link"
+                        title={`Show only ${monthLabelLong(m.month)}`}
+                        onClick={() => setPeriod({ preset: 'custom_months',
+                          start_month: m.month, end_month: m.month })}>
+                        {monthLabelLong(m.month)}
+                      </button>
+                    </td>
+                    <td className="right num nowrap">{money(m.income)}</td>
+                    <td className="right num nowrap">{money(m.spend)}</td>
+                    <td className="right num nowrap">{money(m.invested)}</td>
+                    <td className={`right num nowrap ${m.net < 0 ? 'stat-value neg' : ''}`}
+                      style={{ fontSize: 13 }}>
+                      {money(m.net)}
+                    </td>
+                    <td className="right num">{m.transaction_count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
       {rows === null && <div className="spinner" style={{ margin: 40 }} />}
-      {rows && !rows.length && (
-        <Empty title={`Nothing recorded for ${monthLabel(month)}`}>
-          Either no statement covering this month has been parsed, or the
-          ledger has not been re-analysed since accounting periods were
-          introduced. Re-parse from the Data tab to populate them.
-        </Empty>
+      {rows && !rows.length && (scoped
+        ? <PeriodEmpty available={data?.available} />
+        : (
+          <Empty title="Nothing recorded yet">
+            Import a statement, or scan your mailbox, to see your months here.
+          </Empty>
+        ))}
+
+      {truncated && (
+        <Callout tone="warn">
+          Showing the {rows.length} most recent of {total} transactions in this
+          period. Narrow the period, or use the Ledger tab, to page through the
+          rest.
+        </Callout>
       )}
 
       {rows && rows.length > 0 && grouped.map(([groupName, groupRows]) => (
@@ -189,7 +295,19 @@ export default function MonthView({ data }) {
               <tbody>
                 {groupRows.map((r) => (
                   <tr key={r.id}>
-                    <td className="nowrap">{dateLabel(r.date)}</td>
+                    <td className="nowrap">
+                      {dateLabel(r.date)}
+                      {/* The month it is counted in, shown only when that is
+                          not the month it is dated in - which is exactly the
+                          case this whole model exists for. */}
+                      {r.accounting_month
+                        && r.accounting_month !== String(r.date).slice(0, 7) && (
+                        <div style={{ color: 'var(--text-3)', fontSize: 11 }}
+                          title="Counted in this month, not the month of the date">
+                          counts in {monthLabel(r.accounting_month)}
+                        </div>
+                      )}
+                    </td>
                     <td>
                       <div style={{ wordBreak: 'break-word', whiteSpace: 'normal', lineHeight: '1.4' }}>
                         {r.description}

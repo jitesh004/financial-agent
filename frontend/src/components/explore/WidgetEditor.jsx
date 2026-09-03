@@ -286,6 +286,24 @@ export default function WidgetEditor({ schema, widget, board, onSave, onCancel, 
                           })} />
                       </div>
                     )}
+                    {draft.query.date_range?.preset === 'custom_months' && (
+                      <div className="xp-row">
+                        <input className="xp-input slim" type="month"
+                          aria-label="First month"
+                          value={draft.query.date_range.start_month || ''}
+                          onChange={(e) => setQuery({
+                            date_range: { ...draft.query.date_range,
+                              start_month: e.target.value },
+                          })} />
+                        <input className="xp-input slim" type="month"
+                          aria-label="Last month"
+                          value={draft.query.date_range.end_month || ''}
+                          onChange={(e) => setQuery({
+                            date_range: { ...draft.query.date_range,
+                              end_month: e.target.value },
+                          })} />
+                      </div>
+                    )}
                     {draft.query.date_range?.preset !== 'inherit' && (
                       <label className="xp-check">
                         <input type="checkbox" checked={Boolean(draft.query.pin_date)}

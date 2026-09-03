@@ -267,13 +267,83 @@ def test_the_sql_comes_back_with_the_answer(db):
 # --------------------------------------------------------------------------
 
 def test_date_presets_resolve_against_a_fixed_today():
+    """A preset is a run of whole months, not a window ending today.
+
+    It used to end on today's date, which made "this month" a partial month
+    that no other screen agreed with - and, more importantly, could not
+    include a row the ledger counts in this month but dates in the next one.
+    A preset now names months and the rows are selected by the month they are
+    counted in; see analytics.periods.
+    """
     today = date(2026, 3, 15)
     assert q.resolve_range({"preset": "all"}, today) == (None, None)
-    assert q.resolve_range({"preset": "this_month"}, today) == ("2026-03-01", "2026-03-15")
+    assert q.resolve_range({"preset": "this_month"}, today) == ("2026-03-01", "2026-03-31")
     assert q.resolve_range({"preset": "last_month"}, today) == ("2026-02-01", "2026-02-28")
-    assert q.resolve_range({"preset": "last_3m"}, today) == ("2026-01-01", "2026-03-15")
-    assert q.resolve_range({"preset": "ytd"}, today) == ("2026-01-01", "2026-03-15")
+    assert q.resolve_range({"preset": "last_3m"}, today) == ("2026-01-01", "2026-03-31")
+    assert q.resolve_range({"preset": "ytd"}, today) == ("2026-01-01", "2026-03-31")
     assert q.resolve_range({"preset": "last_year"}, today) == ("2025-01-01", "2025-12-31")
+    # The financial year the app is for runs April to March.
+    assert q.resolve_range({"preset": "this_fy"}, today) == ("2025-04-01", "2026-03-31")
+    assert q.resolve_range({"preset": "last_fy"}, today) == ("2024-04-01", "2025-03-31")
+
+
+def test_a_preset_selects_by_accounting_month_not_by_date(db):
+    """The whole point: a row counted in February counts in February.
+
+    The seeded ledger holds one row dated 3 March and accounted to February -
+    a salary paid on the last working day, arriving after the month turned.
+    Asking for February has to include it, and asking for March must not.
+    """
+    with db.connection() as conn:
+        conn.execute(
+            "INSERT INTO transactions (id, account_id, txn_date,"
+            " raw_description, normalized_description, merchant, amount,"
+            " direction, category, flow_role, accounting_month,"
+            " is_mirror_leg, excluded, needs_review, category_source,"
+            " category_confidence)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), "a-bank", "2026-03-03", "SALARY FEB", "salary",
+             "Salary", "185000.00", "credit", "salary", "income", "2026-02",
+             0, 0, 0, "rule", 0.9))
+
+    def inflow(spec):
+        result = q.run_query(db, {
+            "measures": [{"field": "inflow", "agg": "sum"}],
+            "date_range": spec,
+        })
+        return result["rows"][0]["m0"] or 0
+
+    # February by accounting month: the salary dated 3 March belongs to it.
+    assert inflow({"preset": "custom_months", "start_month": "2026-02",
+                   "end_month": "2026-02"}) == 185000.0
+    # March has the row's date but not the row.
+    assert inflow({"preset": "custom_months", "start_month": "2026-03",
+                   "end_month": "2026-03"}) == 0
+    # ...and the literal day range is the other reading, on purpose.
+    assert inflow({"preset": "custom", "start": "2026-03-01",
+                   "end": "2026-03-31"}) == 185000.0
+
+
+def test_a_month_window_reports_which_basis_it_used(db):
+    """A screen has to be able to say how its rows were selected."""
+    months = q.run_query(db, {"date_range": {"preset": "last_month"}})["range"]
+    assert months["mode"] == "months" and months["basis"] == "accounting"
+    dates = q.run_query(db, {"date_range": {
+        "preset": "custom", "start": "2026-01-01", "end": "2026-01-31"}})["range"]
+    assert dates["mode"] == "dates" and dates["basis"] == "date"
+
+
+def test_a_widget_inheriting_the_board_window_is_not_an_error(db):
+    """`inherit` is what an unpinned widget carries before a board sets a range.
+
+    It used to reach the resolver as an unknown preset and 400 the whole
+    widget - so adding a tile to a board whose range had never been touched
+    failed with "Unknown date preset 'inherit'".
+    """
+    result = q.run_query(db, {"dimensions": ["category"],
+                              "date_range": {"preset": "inherit"}})
+    assert result["range"]["mode"] == "all"
+    assert result["row_count"] > 0
 
 
 def test_last_month_handles_the_january_boundary():
@@ -285,6 +355,21 @@ def test_comparison_window_is_the_same_length_immediately_before():
     assert q.shift_range("2026-03-01", "2026-03-31") == ("2026-01-29", "2026-02-28")
     # An open-ended range has no "period before", and saying so beats inventing one.
     assert q.shift_range(None, None) == (None, None)
+
+
+def test_a_month_window_compares_against_whole_months(db):
+    """Three months compare against the three before, not against 90 days.
+
+    A day-counted shift would put a partial month beside a whole one, which
+    reads as a collapse in spending rather than as an artefact of the window.
+    """
+    result = q.run_query(db, {
+        "dimensions": ["category"],
+        "date_range": {"preset": "custom_months",
+                       "start_month": "2026-02", "end_month": "2026-02"},
+        "compare": True,
+    })
+    assert result["compared_to"] == {"start": "2026-01-01", "end": "2026-01-31"}
 
 
 def test_compare_attaches_previous_and_delta(db):

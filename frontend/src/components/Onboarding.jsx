@@ -1,6 +1,7 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib';
-import { Callout } from './ui';
+import { useTheme } from '../theme';
+import { Callout, ThemeToggle } from './ui';
 
 /* First run.
  *
@@ -14,24 +15,48 @@ import { Callout } from './ui';
  * component: someone who closes the tab half-way through and signs in from a
  * different machine should land where they left off, and the step only ever
  * moves forward so revisiting a screen to fix a typo does not un-onboard them.
+ *
+ * Two things this screen is careful about, both of which used to be wrong:
+ *
+ *   - It is drawn in ONE pass. The details step used to render from the
+ *     onboarding payload and then fetch the profile separately, so the fields
+ *     visibly filled themselves in a beat after the form appeared.
+ *   - It is themed. Every colour here is a token, but the attribute that
+ *     selects the dark set was written by the app shell - which renders only
+ *     after this screen is done with. A dark-themed app therefore opened on a
+ *     white wizard. The theme is applied at boot now (see theme.js), and it is
+ *     settable from here rather than only from behind.
  */
 
 const STEPS = [
-  ['identity', 'Your details'],
-  ['mailbox', 'Your mailbox'],
-  ['import', 'First import'],
+  ['identity', 'Your details', 'Opens password-protected statements'],
+  ['mailbox', 'Your mailbox', 'Finds statements instead of downloading them'],
+  ['import', 'First import', 'Reads them, and checks the arithmetic'],
 ];
 
 export default function Onboarding({ onFinished, onImport }) {
   const [state, setState] = useState(null);
+  const [profile, setProfile] = useState(null);
   const [step, setStep] = useState('identity');
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [theme, toggleTheme] = useTheme();
+  /* Carried from the details step to the next screen rather than shown on the
+     one being left: the save advances immediately, so a confirmation rendered
+     there would flash for a frame and be gone. */
+  const [savedNote, setSavedNote] = useState(null);
 
+  /* Both requests before the first render of the form, so nothing on screen
+     changes underneath the person filling it in. A failed profile read is not
+     fatal - an empty form is a correct starting point. */
   const load = useCallback(async () => {
     try {
-      const body = await api.onboarding();
+      const [body, saved] = await Promise.all([
+        api.onboarding(),
+        api.profile().catch(() => ({})),
+      ]);
       setState(body);
+      setProfile(saved || {});
       setStep(body.step === 'done' ? 'import' : body.step);
     } catch (e) {
       setError(e.message);
@@ -59,6 +84,17 @@ export default function Onboarding({ onFinished, onImport }) {
     }
   }, [onFinished, onImport]);
 
+  const index = STEPS.findIndex(([key]) => key === step);
+
+  /* What is actually done, read from the world rather than from how far the
+     person has clicked - the server reports each one (see _onboarding_state),
+     so a Gmail grant revoked at Google's end stops showing as connected. */
+  const done = useMemo(() => ({
+    identity: Boolean(state?.identity?.ready),
+    mailbox: Boolean(state?.mailbox?.connected),
+    import: (state?.import?.transactions || 0) > 0,
+  }), [state]);
+
   if (!state) {
     return (
       <div className="onboarding">
@@ -72,16 +108,18 @@ export default function Onboarding({ onFinished, onImport }) {
     );
   }
 
-  const index = STEPS.findIndex(([key]) => key === step);
-
   return (
     <div className="onboarding">
+      <div className="auth-theme">
+        <ThemeToggle theme={theme} onToggle={toggleTheme} />
+      </div>
+
       <div className="onboarding-panel">
         <header className="onboarding-head">
           <div>
             <h1>Welcome{state.user?.name ? `, ${state.user.name.split(' ')[0]}` : ''}</h1>
-            <p>Three short steps. You can skip any of them and come back later
-              from Settings.</p>
+            <p>Three short steps — and any of them can wait. Nothing here is
+              required to use the app.</p>
           </div>
           <button className="btn onboarding-skip" onClick={() => finish(false)}
             disabled={busy}>
@@ -89,12 +127,27 @@ export default function Onboarding({ onFinished, onImport }) {
           </button>
         </header>
 
+        {/* Where you are, in a line. The step list below says what each step
+            is; this says how much is left, which is the question a wizard
+            most often refuses to answer. */}
+        <div className="onboarding-progress" role="presentation">
+          <div className="onboarding-progress-fill"
+            style={{ width: `${((index + 1) / STEPS.length) * 100}%` }} />
+        </div>
+
         <ol className="onboarding-steps">
-          {STEPS.map(([key, label], i) => (
+          {STEPS.map(([key, label, why], i) => (
             <li key={key}
-              className={i === index ? 'current' : i < index ? 'done' : ''}>
-              <button onClick={() => goTo(key)}>
-                <span className="onboarding-dot">{i < index ? '✓' : i + 1}</span>
+              className={[
+                i === index ? 'current' : '',
+                done[key] ? 'done' : '',
+                i < index && !done[key] ? 'skipped' : '',
+              ].filter(Boolean).join(' ')}>
+              <button onClick={() => goTo(key)} title={why}
+                aria-current={i === index ? 'step' : undefined}>
+                <span className="onboarding-dot">
+                  {done[key] ? '✓' : i + 1}
+                </span>
                 {label}
               </button>
             </li>
@@ -103,17 +156,26 @@ export default function Onboarding({ onFinished, onImport }) {
 
         {error && <Callout tone="warn">{error}</Callout>}
 
-        {step === 'identity' && (
-          <IdentityStep state={state} onSaved={load}
-            onNext={() => goTo('mailbox')} />
-        )}
-        {step === 'mailbox' && (
-          <MailboxStep state={state} onNext={() => goTo('import')} />
-        )}
-        {step === 'import' && (
-          <ImportStep state={state} busy={busy}
-            onImport={() => finish(true)} onLater={() => finish(false)} />
-        )}
+        {/* Keyed by step so each screen mounts fresh - which is what gives it
+            the entry transition, and what stops a form field from carrying a
+            value across to the step after it. */}
+        <div className="onboarding-body" key={step}>
+          {step === 'identity' && (
+            <IdentityStep
+              profile={profile}
+              onSaved={async (result) => { setSavedNote(result); await load(); }}
+              onNext={() => goTo('mailbox')}
+            />
+          )}
+          {step === 'mailbox' && (
+            <MailboxStep state={state} savedNote={savedNote}
+              onNext={() => goTo('import')} />
+          )}
+          {step === 'import' && (
+            <ImportStep state={state} busy={busy}
+              onImport={() => finish(true)} onLater={() => finish(false)} />
+          )}
+        </div>
       </div>
     </div>
   );
@@ -121,35 +183,42 @@ export default function Onboarding({ onFinished, onImport }) {
 
 /* ---------- 1. Details ---------- */
 
+//: A PAN is five letters, four digits, a letter. Checked to HINT, never to
+//: block: a malformed one is stored as typed (see models/profile.py) and
+//: simply produces no password candidates, and refusing to save it would
+//: strand anyone whose card reads differently from what this expects.
+const PAN_SHAPE = /^[A-Za-z]{5}[0-9]{4}[A-Za-z]$/;
+
 /* The same fields as the Profile screen, asked here because they are what
    unlocks password-protected statements - and being asked for a PAN out of
    nowhere, later, with no explanation, is alarming in a way that being asked
    during setup with the reason attached is not. */
-function IdentityStep({ state, onSaved, onNext }) {
-  const [form, setForm] = useState({
-    full_name: state.identity.full_name || '',
-    date_of_birth: '', pan: '', mobile: '',
-  });
+function IdentityStep({ profile, onSaved, onNext }) {
+  const [form, setForm] = useState(() => ({
+    full_name: profile?.full_name || '',
+    date_of_birth: profile?.date_of_birth || '',
+    pan: profile?.pan || '',
+    mobile: profile?.mobile || '',
+  }));
   const [status, setStatus] = useState(null);
   const [problem, setProblem] = useState(null);
+  const firstField = useRef(null);
 
-  useEffect(() => {
-    api.profile().then((p) => setForm({
-      full_name: p.full_name || '',
-      date_of_birth: p.date_of_birth || '',
-      pan: p.pan || '',
-      mobile: p.mobile || '',
-    })).catch(() => {});
-  }, []);
+  useEffect(() => { firstField.current?.focus(); }, []);
 
   const set = (key) => (e) => setForm((f) => ({ ...f, [key]: e.target.value }));
+
+  const anything = Object.values(form).some((v) => String(v).trim());
+  const panOdd = form.pan.trim() && !PAN_SHAPE.test(form.pan.trim());
+  const mobileOdd = form.mobile.trim()
+    && form.mobile.replace(/\D/g, '').length !== 10;
 
   async function saveAndContinue() {
     setStatus('saving');
     setProblem(null);
     try {
-      await api.saveProfile(form);
-      await onSaved();
+      const result = await api.saveProfile(form);
+      await onSaved(result);
       onNext();
     } catch (e) {
       setProblem(e.message);
@@ -172,11 +241,14 @@ function IdentityStep({ state, onSaved, onNext }) {
         sent to any AI model, and never to anyone else.
       </Callout>
 
-      <div className="grid" style={{ gap: 12, marginTop: 14 }}>
+      {/* Enter moves on, from any field. A three-field form that makes you
+          reach for the mouse to submit is a form that feels slow. */}
+      <form className="grid" style={{ gap: 12, marginTop: 14 }}
+        onSubmit={(e) => { e.preventDefault(); saveAndContinue(); }}>
         <label className="field">
           <span>Full name, as printed on your statements</span>
           <input type="text" value={form.full_name} onChange={set('full_name')}
-            placeholder="e.g. Jitesh Sharma" autoFocus />
+            placeholder="e.g. Jitesh Sharma" ref={firstField} />
         </label>
         <div className="grid cols-2" style={{ gap: 12 }}>
           <label className="field">
@@ -188,38 +260,62 @@ function IdentityStep({ state, onSaved, onNext }) {
             <span>Mobile number</span>
             <input type="text" inputMode="numeric" value={form.mobile}
               onChange={set('mobile')} placeholder="10 digits" />
+            {mobileOdd && (
+              <span className="field-hint">
+                That is {form.mobile.replace(/\D/g, '').length} digits — most
+                Indian statement passwords use all ten.
+              </span>
+            )}
           </label>
         </div>
         <label className="field">
           <span>PAN — for mutual fund and demat statements</span>
           <input type="text" value={form.pan} onChange={set('pan')}
             placeholder="ABCDE1234F" style={{ textTransform: 'uppercase' }} />
+          {panOdd && (
+            <span className="field-hint">
+              A PAN reads as five letters, four digits and a letter. Saved
+              either way — it just will not unlock anything.
+            </span>
+          )}
         </label>
-      </div>
 
-      {problem && <Callout tone="warn" style={{ marginTop: 12 }}>{problem}</Callout>}
+        {problem && <Callout tone="warn" style={{ marginTop: 12 }}>{problem}</Callout>}
 
-      <footer className="onboarding-actions">
-        <button className="btn primary" onClick={saveAndContinue}
-          disabled={status === 'saving'}>
-          {status === 'saving' ? 'Saving…' : 'Save and continue'}
-        </button>
-        <button className="btn" onClick={onNext}>
-          I’ll add these later
-        </button>
-      </footer>
+        <footer className="onboarding-actions">
+          <button className="btn primary" type="submit"
+            disabled={status === 'saving'}>
+            {status === 'saving' ? 'Saving…' : 'Save and continue'}
+          </button>
+          <button className="btn" type="button" onClick={onNext}>
+            {anything ? 'Continue without saving' : 'I’ll add these later'}
+          </button>
+        </footer>
+      </form>
     </section>
   );
 }
 
 /* ---------- 2. Mailbox ---------- */
 
-function MailboxStep({ state, onNext }) {
+function MailboxStep({ state, savedNote, onNext }) {
   const connected = state.mailbox.connected;
   const available = state.mailbox.available;
 
   return (
     <section className="onboarding-step">
+      {/* Confirmation of the step just finished, in a form that says what it
+          bought: a candidate count is the one honest measure of whether those
+          details will actually open anything. */}
+      {savedNote?.password_candidates > 0 && (
+        <Callout tone="pos">
+          <strong>Your details are saved.</strong> Protected PDFs will be tried
+          against {savedNote.password_candidates} password
+          {savedNote.password_candidates === 1 ? '' : 's'} built from them —
+          none of which leaves your account.
+        </Callout>
+      )}
+
       <h2>Read statements from your mailbox</h2>
       <p className="onboarding-lead">
         Rather than downloading every statement yourself, Prism can find the
@@ -251,6 +347,9 @@ function MailboxStep({ state, onNext }) {
               Not now — I’ll upload files myself
             </button>
           </footer>
+          <p className="onboarding-aside">
+            Google will ask on its own page, and bring you back here.
+          </p>
         </>
       ) : (
         <Callout tone="warn">

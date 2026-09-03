@@ -7,6 +7,7 @@ import { colorFor, compact, count, dateLabel, money, monthLabel, pct, titleCase 
 import { BarList, Callout, Card, ChartTooltip, Chip, Stat, axisProps, moneyAxis } from './ui';
 import Claims from './Claims';
 import Forecast from './Forecast';
+import { usePeriod } from '../period';
 
 const SEVERITY_TONE = { urgent: 'neg', watch: 'warn', info: 'accent' };
 
@@ -14,6 +15,9 @@ export default function Overview({ data }) {
   const { analysis, narrative, forecast, transfers, data_quality: quality } = data;
   const totals = analysis.totals || {};
   const period = analysis.period || {};
+  /* Which window these figures are for. The numbers themselves were computed
+     server-side for it (see /api/analysis); this is how the page says so. */
+  const { label: periodLabel, scoped, window: resolved } = usePeriod();
 
   const monthly = (analysis.monthly || []).map((m) => ({
     ...m, label: monthLabel(m.month),
@@ -27,24 +31,47 @@ export default function Overview({ data }) {
 
   return (
     <>
-      {/* ---- Narrative ---- */}
+      {/* ---- Narrative ----
+
+          Written about the WHOLE ledger, once, when the statements were
+          parsed. Every figure below can be recomputed for a period; prose
+          cannot, and re-titling last quarter's summary as if it described
+          this month would be exactly the kind of plausible-and-wrong output
+          this app exists to avoid. So it is labelled rather than hidden: the
+          summary is still true, just not about this window. */}
       {narrative?.headline && (
         <Card className="grid" style={{ gap: 12 }}>
           <div>
             <h2 className="headline">{narrative.headline}</h2>
             <div className="prose"><p>{narrative.summary}</p></div>
-            {narrative.generated_by === 'computed' && (
-              <Chip tone="warn">Computed summary — no model narration</Chip>
-            )}
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {scoped && (
+                <Chip tone="warn" title="Prose is written once, per import">
+                  Describes your whole ledger, not {periodLabel}
+                </Chip>
+              )}
+              {narrative.generated_by === 'computed' && (
+                <Chip tone="warn">Computed summary — no model narration</Chip>
+              )}
+            </div>
           </div>
         </Card>
       )}
 
       {/* ---- Headline numbers ---- */}
       <div className="section-title">
-        {period.start && period.end
-          ? `${dateLabel(period.start)} → ${dateLabel(period.end)} · ${period.months_covered} months`
-          : 'Summary'}
+        {scoped ? periodLabel : 'Summary'}
+        {period.start && period.end && (
+          <span className="section-note">
+            {/* The real first and last dates of the rows that counted, which
+                for an accounting month is not the month boundary: August's
+                rows can run from 27 July to 1 September. */}
+            {dateLabel(period.start)} → {dateLabel(period.end)}
+            {' · '}
+            {period.months_covered} month{period.months_covered === 1 ? '' : 's'}
+            {scoped && resolved?.basis === 'accounting' && ' · by accounting month'}
+          </span>
+        )}
       </div>
       <div className="grid cols-4">
         <Stat
@@ -100,7 +127,10 @@ export default function Overview({ data }) {
       {/* ---- Narrative findings ---- */}
       {narrative?.key_findings?.length > 0 && (
         <>
-          <div className="section-title">What stands out</div>
+          <div className="section-title">
+            What stands out
+            {scoped && <span className="section-note">whole ledger</span>}
+          </div>
           <Card>
             {narrative.key_findings.map((f, i) => (
               <div className="finding" key={i}>
@@ -119,14 +149,20 @@ export default function Overview({ data }) {
 
       {narrative?.where_money_went && (
         <>
-          <div className="section-title">Following the salary</div>
+          <div className="section-title">
+            Following the salary
+            {scoped && <span className="section-note">whole ledger</span>}
+          </div>
           <Card><div className="prose"><p>{narrative.where_money_went}</p></div></Card>
         </>
       )}
 
       {narrative?.observations?.length > 0 && (
         <>
-          <div className="section-title">Options worth knowing about</div>
+          <div className="section-title">
+            Options worth knowing about
+            {scoped && <span className="section-note">whole ledger</span>}
+          </div>
           <Card>
             {narrative.observations.map((o, i) => (
               <div className="finding" key={i}>
@@ -147,8 +183,19 @@ export default function Overview({ data }) {
         </>
       )}
 
-      {/* ---- Position ---- */}
-      <div className="section-title">Position</div>
+      {/* ---- Position ----
+
+          Balances are as-of the latest statement for each account, so this
+          block does not move with the period. Said out loud rather than left
+          to be inferred from a number that refuses to change. */}
+      <div className="section-title">
+        Position
+        {scoped && (
+          <span className="section-note">
+            latest known balances — not {periodLabel}
+          </span>
+        )}
+      </div>
       <div className="grid cols-3">
         <Stat
           label="Assets tracked"
@@ -188,10 +235,16 @@ export default function Overview({ data }) {
           the position this page already describes - what happens next, and what
           is coming back - so they read better as the end of that story than as
           two more places to go looking. */}
-      <div className="section-title">What happens next</div>
+      <div className="section-title">
+        What happens next
+        {scoped && <span className="section-note">from today, whatever the period</span>}
+      </div>
       <Forecast data={data} />
 
-      <div className="section-title">Money owed to you</div>
+      <div className="section-title">
+        Money owed to you
+        {scoped && <span className="section-note">everything outstanding</span>}
+      </div>
       <Claims />
     </>
   );

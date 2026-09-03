@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Callout, Card, Chip, Empty } from './ui';
 import { api, dateLabel, money, titleCase } from '../lib';
+import { usePeriod } from '../period';
 
 /* Everything the pipeline could not settle on its own.
  *
@@ -35,14 +36,19 @@ export default function ReviewQueue() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(null);
+  /* Scoped to the app's period like every other list of rows. Working
+     through a backlog one month at a time is how anyone actually clears one. */
+  const { params: periodParams, label: periodLabel, scoped } = usePeriod();
+  const periodKey = JSON.stringify(periodParams);
 
   const load = useCallback(() => {
     setLoading(true);
-    api.reviewQueue()
+    api.reviewQueue(periodParams)
       .then((res) => { setItems(res.transactions || []); setError(null); })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [periodKey]);
 
   useEffect(load, [load]);
 
@@ -96,11 +102,15 @@ export default function ReviewQueue() {
       {error && <Callout tone="neg">{error}</Callout>}
 
       {!items.length && (
-        <Empty title="Nothing to review">
-          Every transaction was classified confidently. New items appear here
-          when a card payment has no matching bank debit, when several
-          payments look like one settlement, or when money arrives that could
-          be either income or a repayment.
+        <Empty title={scoped ? `Nothing to review in ${periodLabel}`
+          : 'Nothing to review'}>
+          {scoped
+            ? 'Every transaction counted in this period was classified '
+              + 'confidently. Widen the period to check the rest of the ledger.'
+            : 'Every transaction was classified confidently. New items appear '
+              + 'here when a card payment has no matching bank debit, when '
+              + 'several payments look like one settlement, or when money '
+              + 'arrives that could be either income or a repayment.'}
         </Empty>
       )}
 

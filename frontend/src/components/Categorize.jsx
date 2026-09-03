@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Callout, Card, Chip, Empty, Stat } from './ui';
 import { api, dateLabel, money, titleCase } from '../lib';
+import { usePeriod } from '../period';
 
 /* Bulk triage, grouped by merchant.
  *
@@ -27,9 +28,14 @@ export default function Categorize() {
   const [expanded, setExpanded] = useState(null);
   const [done, setDone] = useState(0);
 
+  // Triage follows the app's period too: clearing a backlog is work anyone
+  // does a month at a time.
+  const { params: periodParams, label: periodLabel, scoped } = usePeriod();
+  const periodKey = JSON.stringify(periodParams);
+
   const load = useCallback(() => {
     setRows(null);
-    const params = { limit: 1000 };
+    const params = { limit: 1000, ...periodParams };
     if (scope === 'uncategorized') params.category = 'uncategorized';
     if (scope === 'review') params.needs_review = true;
     Promise.all([api.transactions(params), api.categories()])
@@ -39,7 +45,8 @@ export default function Categorize() {
         setError(null);
       })
       .catch((e) => { setError(e.message); setRows([]); });
-  }, [scope]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope, periodKey]);
 
   useEffect(load, [load]);
 
@@ -140,9 +147,10 @@ export default function Categorize() {
       {rows === null && <div className="spinner" style={{ margin: 40 }} />}
 
       {rows && !groups.length && (
-        <Empty title="Nothing left to categorize">
+        <Empty title={scoped ? `Nothing left to categorize in ${periodLabel}`
+          : 'Nothing left to categorize'}>
           Every transaction in this view has a category. Switch the filter
-          above to review other groups.
+          above{scoped && ', or widen the period,'} to review other groups.
         </Empty>
       )}
 

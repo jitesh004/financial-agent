@@ -40,12 +40,25 @@ export function pct(value, digits = 1) {
   return `${value.toFixed(digits)}%`;
 }
 
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/* "2026-08" -> "Aug 26". Short because it is mostly an axis tick, where
+   every character is competing for width. */
 export function monthLabel(key) {
   if (!key) return '';
-  const [y, m] = key.split('-');
-  const names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  return `${names[Number(m) - 1] || m} ${String(y).slice(2)}`;
+  const [y, m] = String(key).split('-');
+  return `${MONTH_NAMES[Number(m) - 1] || m} ${String(y).slice(2)}`;
+}
+
+/* "2026-08" -> "Aug 2026". For prose and for the period control, whose
+   labels have to read the same as the server's - see the period labels in
+   backend/app/analytics/periods.py. A window announced as "Aug 26 – Nov 26"
+   in one place and "Aug 2026 – Nov 2026" in another looks like two windows. */
+export function monthLabelLong(key) {
+  if (!key) return '';
+  const [y, m] = String(key).split('-');
+  return `${MONTH_NAMES[Number(m) - 1] || m} ${y}`;
 }
 
 export function dateLabel(iso) {
@@ -69,6 +82,15 @@ export function colorFor(index) {
 }
 
 /* ---------- API ---------- */
+
+/* Query string, minus anything unset - so an absent filter is absent rather
+   than sent as the string "undefined". Written once; it was spelled out
+   separately at every call site that needed it. */
+function query(params = {}) {
+  return new URLSearchParams(
+    Object.entries(params).filter(([, v]) => v !== '' && v != null),
+  ).toString();
+}
 
 /* Called when the server says the session is gone. Set by the auth provider
    so a 401 anywhere in the app lands on the sign-in screen instead of
@@ -97,17 +119,24 @@ async function request(path, options = {}) {
 export const api = {
   health: () => request('/api/health'),
   dashboard: () => request('/api/dashboard'),
+
+  /* Every period the app offers, already resolved to months by the server,
+     plus which accounting months the ledger actually holds rows in. Resolved
+     there rather than here so "last 3 months" has one definition - see
+     backend/app/analytics/periods.py. */
+  periods: () => request('/api/periods'),
+
+  /* The dashboard's figures for ONE period, recomputed from stored rows.
+     Separate from `dashboard()` because that one carries the narrative and
+     the transfer report, neither of which is re-derivable per period without
+     re-running the model. */
+  analysis: (params = {}) => request(`/api/analysis?${query(params)}`),
   run: (id) => request(`/api/runs/${id}`),
   accounts: () => request('/api/accounts'),
   categories: () => request('/api/categories'),
   statements: () => request('/api/statements'),
 
-  transactions: (params = {}) => {
-    const query = new URLSearchParams(
-      Object.entries(params).filter(([, v]) => v !== '' && v != null),
-    );
-    return request(`/api/transactions?${query}`);
-  },
+  transactions: (params = {}) => request(`/api/transactions?${query(params)}`),
 
   upload: (files, { useLlm = true, horizonMonths = 6 } = {}) => {
     const form = new FormData();
@@ -379,12 +408,7 @@ api.exportBoard = (id, name = 'dashboard') =>
    lets progress survive closing the tab - the UI rejoins work in flight
    instead of assuming anything it was not watching had stopped. */
 
-api.jobs = (params = {}) => {
-  const query = new URLSearchParams(
-    Object.entries(params).filter(([, v]) => v !== '' && v != null),
-  );
-  return request(`/api/jobs?${query}`);
-};
+api.jobs = (params = {}) => request(`/api/jobs?${query(params)}`);
 api.activeJobs = () => api.jobs({ active: true });
 api.job = (id) => request(`/api/jobs/${id}`);
 api.cancelJob = (id) => jsonPost(`/api/jobs/${id}/cancel`);

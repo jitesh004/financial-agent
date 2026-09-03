@@ -1,6 +1,7 @@
 import React from 'react';
 import { useAuth } from '../auth';
-import { Callout } from './ui';
+import { useTheme } from '../theme';
+import { Callout, ThemeToggle } from './ui';
 
 /* The door.
  *
@@ -15,10 +16,19 @@ import { Callout } from './ui';
  */
 export default function SignIn() {
   const { config, signIn, authError, dismissAuthError } = useAuth();
+  const [theme, toggleTheme] = useTheme();
   const configured = config?.configured !== false;
 
   return (
     <div className="signin">
+      {/* The theme is settable from the door. It used to be reachable only
+          from the app's own header, which is behind this screen - so someone
+          on a dark desktop met a white page and had no way to say otherwise
+          until they were already signed in. */}
+      <div className="auth-theme">
+        <ThemeToggle theme={theme} onToggle={toggleTheme} />
+      </div>
+
       <div className="signin-panel">
         <div className="signin-brand">
           <img src="/favicon.svg" alt="" width="26" height="26" />
