@@ -131,6 +131,11 @@ export const api = {
      the transfer report, neither of which is re-derivable per period without
      re-running the model. */
   analysis: (params = {}) => request(`/api/analysis?${query(params)}`),
+
+  /* What a month costs and what it leaves: commitments, what varies, and the
+     arithmetic between them. Computed from stored rows - see
+     backend/app/analytics/budget.py. */
+  budget: (params = {}) => request(`/api/budget?${query(params)}`),
   run: (id) => request(`/api/runs/${id}`),
   accounts: () => request('/api/accounts'),
   categories: () => request('/api/categories'),

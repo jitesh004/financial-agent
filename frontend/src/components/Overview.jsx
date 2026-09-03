@@ -8,6 +8,7 @@ import { BarList, Callout, Card, ChartTooltip, Chip, Stat, axisProps, moneyAxis 
 import Claims from './Claims';
 import Forecast from './Forecast';
 import { usePeriod } from '../period';
+import { useDrill } from '../drill';
 
 const SEVERITY_TONE = { urgent: 'neg', watch: 'warn', info: 'accent' };
 
@@ -18,6 +19,13 @@ export default function Overview({ data }) {
   /* Which window these figures are for. The numbers themselves were computed
      server-side for it (see /api/analysis); this is how the page says so. */
   const { label: periodLabel, scoped, window: resolved } = usePeriod();
+  const { drill } = useDrill();
+
+  /* Which categories belong to a group, read off the breakdown the server
+     sent rather than duplicating CATEGORY_GROUPS here - the payload already
+     names each category's group, so this cannot drift from it. */
+  const categoriesInGroup = (group) => (analysis.by_category || [])
+    .filter((c) => c.group === group).map((c) => c.category);
 
   const monthly = (analysis.monthly || []).map((m) => ({
     ...m, label: monthLabel(m.month),
@@ -28,6 +36,7 @@ export default function Overview({ data }) {
   }));
 
   const netWorth = analysis.net_worth || {};
+  const position = analysis.position || {};
 
   return (
     <>
@@ -78,11 +87,27 @@ export default function Overview({ data }) {
           label="Money in"
           value={totals.income}
           note={`${compact(totals.average_monthly_income)} average per month`}
+          onDrill={() => drill({
+            title: 'Money in',
+            subtitle: 'Everything counted as income in this period — pay, '
+              + 'interest and anything else that genuinely came in. Refunds '
+              + 'and repayments are counted against spending instead, so they '
+              + 'are not here.',
+            params: { flow_role: 'income' },
+          })}
         />
         <Stat
           label="Money out"
           value={totals.spend}
           note={`${compact(totals.average_monthly_spend)} average per month`}
+          onDrill={() => drill({
+            title: 'Money out',
+            subtitle: 'Spending, net of anything that came back against it. '
+              + 'EMIs and SIPs are money leaving too, but they are commitments '
+              + 'and investments rather than spending — they have their own '
+              + 'tiles.',
+            params: { flow_role: 'expense,refund,claim_settlement' },
+          })}
         />
         <Stat
           label="Net saved"
@@ -94,6 +119,12 @@ export default function Overview({ data }) {
           label="Invested"
           value={totals.invested}
           note={`${count(totals.transaction_count)} transactions analyzed`}
+          onDrill={() => drill({
+            title: 'Invested',
+            subtitle: 'Money moved into investments. Still yours, so it counts '
+              + 'as saved rather than spent.',
+            params: { flow_role: 'investment' },
+          })}
         />
       </div>
 
@@ -112,6 +143,29 @@ export default function Overview({ data }) {
               <Line dataKey="net" name="Net" stroke="var(--c1)" strokeWidth={2} dot={false} />
             </ComposedChart>
           </ResponsiveContainer>
+          {/* The chart's own months, as one row of buttons. Recharts can
+              report a click on a bar, but a bar is a small target and a
+              stacked one is ambiguous about which series was hit - a strip
+              under the axis is unambiguous and reachable by keyboard. */}
+          {monthly.length > 1 && (
+            <div className="month-strip" style={{ marginTop: 10 }}>
+              {[...monthly].reverse().map((m) => (
+                <button key={m.month} className="chip-toggle"
+                  title={`Every transaction counted in ${m.label}`}
+                  onClick={() => drill({
+                    title: m.label,
+                    subtitle: `${money(m.income)} in, ${money(m.spend)} out, `
+                      + `${money(m.net)} net — everything counted in this month.`,
+                    ignorePeriod: true,
+                    periodLabel: m.label,
+                    sortBy: 'date',
+                    params: { start_month: m.month, end_month: m.month },
+                  })}>
+                  {m.label}
+                </button>
+              ))}
+            </div>
+          )}
           <div className="legend">
             <span className="legend-item"><i className="dot" style={{ background: 'var(--c2)' }} />Income</span>
             <span className="legend-item"><i className="dot" style={{ background: 'var(--c7)' }} />Outflow</span>
@@ -119,8 +173,19 @@ export default function Overview({ data }) {
           </div>
         </Card>
 
-        <Card title="Where the money went" sub={`${categories.length} categories`}>
-          <BarList items={categories} total={totals.spend} max={11} />
+        <Card title="Where the money went"
+          sub={`${categories.length} categories — click one for the rows`}>
+          <BarList
+            items={categories} total={totals.spend} max={11}
+            onPick={(item) => drill({
+              title: titleCase(item.label),
+              subtitle: `${money(item.total)} across ${item.count} `
+                + `transaction${item.count === 1 ? '' : 's'}`
+                + (item.monthly_average
+                  ? `, averaging ${money(item.monthly_average)} a month.` : '.'),
+              params: { category: item.category },
+            })}
+          />
         </Card>
       </div>
 
@@ -185,22 +250,30 @@ export default function Overview({ data }) {
 
       {/* ---- Position ----
 
-          Balances are as-of the latest statement for each account, so this
-          block does not move with the period. Said out loud rather than left
-          to be inferred from a number that refuses to change. */}
+          As at the END of the window, read from the balance each statement
+          printed after its last row up to that date - not "latest known",
+          which was a figure that refused to move however far back you looked.
+          See engine._net_worth_as_at. */}
       <div className="section-title">
         Position
-        {scoped && (
-          <span className="section-note">
-            latest known balances — not {periodLabel}
-          </span>
-        )}
+        <span className="section-note">
+          {position.basis === 'period'
+            ? `as at ${dateLabel(position.as_of)}`
+            /* Not "as at the end of the window": nothing in it printed a
+               balance, so this is the latest figure there is, and saying
+               which it is beats a figure that looks like it followed the
+               period and did not. */
+            : position.as_of
+              ? `latest known balances, as at ${dateLabel(position.as_of)}`
+                + (scoped ? ` — not ${periodLabel}` : '')
+              : `latest known balances${scoped ? ` — not ${periodLabel}` : ''}`}
+        </span>
       </div>
       <div className="grid cols-3">
         <Stat
           label="Assets tracked"
           value={netWorth._assets}
-          note="Cash balances from uploaded statements"
+          note="Cash balances, as printed on the statements"
         />
         <Stat
           label="Liabilities"
@@ -215,14 +288,44 @@ export default function Overview({ data }) {
           note="Assets minus liabilities on tracked accounts"
         />
       </div>
+      {position.missing?.length > 0 && position.basis === 'period' && (
+        <Callout tone="warn">
+          {/* Named rather than counted: a total quietly missing an account is
+              worse than one that says which account it is missing. */}
+          No balance could be established as at {dateLabel(position.as_of)} for{' '}
+          {position.missing.join(', ')} — {position.missing.length === 1
+            ? 'it is' : 'they are'} left out of the figures above. Card
+          statements often print no running balance.
+        </Callout>
+      )}
 
-      {/* ---- Data quality ---- */}
-      <div className="section-title">Data quality</div>
+      {/* ---- Data quality ----
+
+          Two kinds of figure here, and they are labelled apart. "Uncategorised"
+          is a property of the rows in this window and follows it. Files and
+          transfer matching are properties of what has been imported, which is
+          not a period at all - a file does not belong to March. */}
+      <div className="section-title">
+        Data quality
+        {scoped && <span className="section-note">whole ledger, except where noted</span>}
+      </div>
       <Card>
         <div className="grid cols-4" style={{ gap: 10, marginBottom: 12 }}>
           <QualityTile label="Files reconciled" value={`${quality?.files_reconciled ?? 0}/${quality?.files_processed ?? 0}`} tone={quality?.files_unreconciled ? 'warn' : 'pos'} />
           <QualityTile label="Rules-categorized" value={quality?.rules_settled ?? 0} />
-          <QualityTile label="Needs review" value={quality?.uncategorized_count ?? 0} tone={quality?.uncategorized_count ? 'warn' : 'pos'} />
+          <QualityTile
+            label={scoped ? `Uncategorised in ${periodLabel}` : 'Uncategorised'}
+            value={count(analysis.uncategorized?.count ?? 0)}
+            tone={analysis.uncategorized?.count ? 'warn' : 'pos'}
+            onDrill={analysis.uncategorized?.count
+              ? () => drill({
+                title: 'Uncategorised',
+                subtitle: 'No rule matched these, so they sit outside the '
+                  + 'category breakdown.',
+                params: { category: 'uncategorized' },
+              })
+              : undefined}
+          />
           <QualityTile label="Double-count avoided" value={compact(transfers?.double_count_avoided || 0)} tone="pos" />
         </div>
 
@@ -250,7 +353,7 @@ export default function Overview({ data }) {
   );
 }
 
-function QualityTile({ label, value, tone }) {
+function QualityTile({ label, value, tone, onDrill }) {
   return (
     <div style={{
       padding: '10px 12px', borderRadius: 8,
@@ -259,7 +362,10 @@ function QualityTile({ label, value, tone }) {
       <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginBottom: 3 }}>{label}</div>
       <div className={`num ${tone === 'pos' ? 'stat-value pos' : tone === 'warn' ? 'stat-value neg' : ''}`}
         style={{ fontSize: 18, fontWeight: 620 }}>
-        {value}
+        {onDrill ? (
+          <button type="button" className="drill-link" onClick={onDrill}
+            title="Show these transactions">{value}</button>
+        ) : value}
       </div>
     </div>
   );

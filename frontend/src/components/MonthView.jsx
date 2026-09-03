@@ -3,6 +3,7 @@ import { Callout, Card, Chip, Empty, Stat } from './ui';
 import { PeriodEmpty } from './PeriodPicker';
 import { api, dateLabel, money, monthLabel, monthLabelLong, titleCase } from '../lib';
 import { usePeriod } from '../period';
+import { useDrill } from '../drill';
 
 /* The period, every account, in one list.
  *
@@ -49,6 +50,7 @@ export default function MonthView({ data }) {
   const {
     params, label, scoped, window: resolved, months, setPeriod,
   } = usePeriod();
+  const { drill } = useDrill();
   const [rows, setRows] = useState(null);
   const [total, setTotal] = useState(0);
   const [error, setError] = useState(null);
@@ -170,9 +172,18 @@ export default function MonthView({ data }) {
 
       {/* Every month there is data for, as one click each. The tab is called
           Months because this is how it is usually read - one month at a time -
-          and this sets the app's period rather than a second one of its own. */}
+          and this IS the period control on this tab: it sets the app's period
+          rather than keeping a second one of its own, which is why the bar
+          that appears above the other tabs is not repeated here. */}
       {months.length > 1 && (
-        <div className="month-strip" role="group" aria-label="Jump to a month">
+        <div className="month-strip" role="group" aria-label="Choose a month">
+          <button
+            className={`chip-toggle ${scoped ? '' : 'selected'}`}
+            title="Every month, together"
+            onClick={() => setPeriod({ preset: 'all' })}
+          >
+            All
+          </button>
           {[...months].reverse().map((m) => {
             const inWindow = resolved?.startMonth
               && m.month >= resolved.startMonth && m.month <= resolved.endMonth;
@@ -201,7 +212,12 @@ export default function MonthView({ data }) {
       )}
 
       <div className="grid cols-4">
-        <Stat label="Money in" value={totals.inflow} tone="pos" />
+        <Stat label="Money in" value={totals.inflow} tone="pos"
+          onDrill={() => drill({
+            title: 'Money in',
+            subtitle: `Everything counted as income in ${label}.`,
+            params: { flow_role: 'income' },
+          })} />
         <Stat
           label="Money out"
           value={totals.outflow - totals.offsets}
@@ -209,8 +225,18 @@ export default function MonthView({ data }) {
           note={totals.offsets
             ? `${money(totals.outflow)} less ${money(totals.offsets)} back`
             : undefined}
+          onDrill={() => drill({
+            title: 'Money out',
+            subtitle: `Spending in ${label}, net of anything that came back.`,
+            params: { flow_role: 'expense,refund,claim_settlement' },
+          })}
         />
-        <Stat label="Invested" value={totals.invested} tone="accent" />
+        <Stat label="Invested" value={totals.invested} tone="accent"
+          onDrill={() => drill({
+            title: 'Invested',
+            subtitle: `Money moved into investments in ${label}.`,
+            params: { flow_role: 'investment' },
+          })} />
         <Stat label="Net" value={net} tone={net >= 0 ? 'pos' : 'neg'} />
       </div>
 

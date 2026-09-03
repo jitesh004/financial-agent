@@ -39,7 +39,13 @@
   --radius-sm: 6px;
   --shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 1px 3px rgba(16, 24, 40, .06);
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+  /* Inter, bundled with the app (see main.jsx). Chosen for the reason a
+     ledger cares about: its figures are the same width, its 1/l/I and 0/O are
+     told apart at 12px, and it holds tight letter-spacing at display sizes
+     without the headline needing a second family. The system stack stays
+     behind it as the fallback for the frame or two before the font loads. */
+  --sans: "Inter Variable", -apple-system, BlinkMacSystemFont, "Segoe UI",
+          Inter, Roboto, sans-serif;
 }
 
 [data-theme="dark"] {
@@ -116,6 +122,15 @@ body {
 /* Tabular figures everywhere money appears: columns of numbers that don't
    align are genuinely harder to scan and read as sloppy. */
 .num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
+
+/* Inter's contextual alternates fix the shapes that matter here - a
+   straighter 1, an unambiguous 0 - and its slashed zero keeps a masked
+   account number readable. Applied to the frame rather than to money alone,
+   because an account number in a chip is the same problem as one in a cell. */
+body {
+  font-feature-settings: "cv05" 1, "cv08" 1, "ss03" 1;
+  font-optical-sizing: auto;
+}
 
 .app { display: flex; flex-direction: column; min-height: 100%; }
 
@@ -554,6 +569,10 @@ select option {
 /* ---------- Category bars ---------- */
 
 .catrow { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+/* Inside a clickable row the bar needs its own breathing room, so the hover
+   highlight reads as a row rather than as a stripe through the text. */
+.drill-row .catrow { padding: 6px 8px; }
+.stat-drill .stat-value .drill-link { display: block; }
 .catrow-label { width: 132px; flex: none; font-size: 12.5px; text-transform: capitalize; }
 .catrow-track { flex: 1; height: 8px; border-radius: 4px; background: var(--surface-2); overflow: hidden; }
 .catrow-fill { height: 100%; border-radius: 4px; }
@@ -578,6 +597,208 @@ select option {
 .tooltip-row span:last-child { font-variant-numeric: tabular-nums; }
 
 .scroll-y { max-height: 420px; overflow-y: auto; }
+
+
+/* ===================================================================
+   The budget bar
+   ===================================================================
+
+   One month, to scale: how much of it is already committed and how much is
+   actually a choice. A ratio has to be interpreted; a bar is read. */
+
+.budget-bar {
+  display: flex; height: 26px; width: 100%; overflow: hidden;
+  border-radius: var(--radius-sm); background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+.budget-seg { display: block; height: 100%; min-width: 2px; }
+.budget-seg + .budget-seg { border-left: 1px solid var(--surface); }
+.legend-item strong { font-weight: 620; color: var(--text); }
+
+
+/* ===================================================================
+   Drill-down: the rows behind a figure
+   ===================================================================
+
+   A sheet from the right rather than a page of its own. The figure you
+   clicked is the context, and navigating away from it means finding the
+   period, the tab and the scroll position again on the way back. */
+
+.drill-backdrop {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(8, 10, 14, .55);
+  display: flex; justify-content: flex-end;
+  animation: fade-in .12s ease;
+}
+
+.drill {
+  width: min(720px, 100%); height: 100%;
+  display: flex; flex-direction: column;
+  background: var(--surface); border-left: 1px solid var(--border-strong);
+  box-shadow: -16px 0 40px rgba(0, 0, 0, .3);
+  animation: slide-in .18s cubic-bezier(.4, 0, .2, 1);
+}
+
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes slide-in {
+  from { transform: translateX(16px); opacity: .6; }
+  to { transform: none; opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .drill-backdrop, .drill { animation: none; }
+}
+
+.drill-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 12px; padding: 16px 18px 12px; border-bottom: 1px solid var(--border);
+}
+.drill-title {
+  font-size: 16px; font-weight: 650; letter-spacing: -.3px;
+  overflow-wrap: anywhere;
+}
+.drill-sub { font-size: 12px; color: var(--text-3); margin-top: 3px; }
+.drill-note {
+  font-size: 12px; color: var(--text-2); margin-top: 7px; max-width: 62ch;
+  line-height: 1.5;
+}
+
+.drill-totals {
+  display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+  padding: 10px 18px; border-bottom: 1px solid var(--border);
+  background: var(--surface-2); font-size: 13px;
+}
+.drill-totals em {
+  font-style: normal; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--text-3); margin-right: 6px;
+}
+.drill-totals strong { font-weight: 620; }
+.drill-spacer { flex: 1; }
+
+.drill-caveat {
+  padding: 9px 18px; font-size: 11.5px; line-height: 1.5;
+  color: var(--warn); background: var(--warn-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+.drill-rows { flex: 1; overflow-y: auto; padding: 0 18px 18px; }
+.drill-rows th { background: var(--surface); }
+.drill-desc { overflow-wrap: anywhere; line-height: 1.4; }
+.drill-counts-in { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+
+/* A figure you can press. Underlined on hover rather than always, so a page
+   of these does not read as a page of links. */
+.drill-link {
+  appearance: none; background: none; border: none; padding: 0; margin: 0;
+  font: inherit; color: inherit; text-align: inherit; cursor: pointer;
+  border-radius: 3px;
+}
+.drill-link:hover { color: var(--accent); text-decoration: underline; }
+.drill-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Rows in a list that are entirely clickable - a category bar, a merchant. */
+.drill-row {
+  display: block; width: 100%;
+  appearance: none; background: none; border: none; padding: 0; margin: 0;
+  font: inherit; color: inherit; text-align: inherit; cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+.drill-row:hover { background: var(--surface-2); }
+
+/* A whole table row that opens its own transactions. */
+tr.row-drill { cursor: pointer; }
+tr.row-drill:hover > td { background: var(--surface-2); }
+.drill-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+@media (max-width: 560px) {
+  .drill { width: 100%; border-left: none; }
+}
+
+
+/* ===================================================================
+   Setup, behind one header button
+   ===================================================================
+
+   This was a six-tile strip above every panel. The count is the only urgent
+   part of it, so the count is what stays visible; the rest opens on demand.
+
+   Rendered inside the header, which sets backdrop-filter and is therefore a
+   containing block for position:fixed - so this is position:absolute against
+   its own slot rather than fixed against the viewport. The nav drawer learned
+   the same lesson the hard way and had to be moved out of the header
+   entirely; a popover anchored to its button does not have to be. */
+
+.setup-slot { position: relative; flex: none; }
+
+.setup-btn { display: inline-flex; align-items: center; gap: 7px; }
+.setup-btn.warn { border-color: var(--warn); color: var(--warn); }
+
+.setup-panel {
+  position: absolute; top: calc(100% + 8px); right: 0; z-index: 40;
+  width: min(420px, calc(100vw - 32px));
+  background: var(--surface); border: 1px solid var(--border-strong);
+  border-radius: var(--radius); box-shadow: 0 12px 32px rgba(0, 0, 0, .28);
+  padding: 14px 16px 12px;
+  animation: pop-in .14s cubic-bezier(.4, 0, .2, 1);
+}
+
+@keyframes pop-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .setup-panel { animation: none; }
+}
+
+.setup-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+}
+.setup-head > div { display: flex; align-items: center; gap: 8px; }
+.setup-head strong { font-size: 13.5px; }
+
+.setup-lead {
+  font-size: 12px; line-height: 1.55; color: var(--text-2); margin: 8px 0 12px;
+}
+
+.setup-stages { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.setup-stages button {
+  appearance: none; cursor: pointer; font-family: inherit; width: 100%;
+  display: flex; align-items: flex-start; gap: 10px; text-align: left;
+  padding: 8px 8px; border: none; border-radius: var(--radius-sm);
+  background: transparent; color: var(--text);
+}
+.setup-stages button:hover { background: var(--surface-2); }
+.setup-stages .done button { color: var(--text-2); }
+
+.setup-dot {
+  flex: none; width: 19px; height: 19px; border-radius: 50%; margin-top: 1px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 10.5px; font-weight: 650;
+  background: var(--surface-2); border: 1px solid var(--border-strong);
+  color: var(--text-3);
+}
+.setup-stages .done .setup-dot {
+  background: var(--positive-soft); border-color: transparent; color: var(--positive);
+}
+.setup-stages .todo .setup-dot {
+  background: var(--warn-soft); border-color: transparent; color: var(--warn);
+}
+
+.setup-stage-body { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.setup-stage-name { font-size: 12.5px; font-weight: 600; }
+.setup-stage-detail { font-size: 11.5px; line-height: 1.45; color: var(--text-3); }
+.setup-go { color: var(--text-3); font-size: 12px; opacity: 0; }
+.setup-stages button:hover .setup-go { opacity: 1; }
+
+.setup-foot {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--border);
+}
+.setup-counts { font-size: 11.5px; color: var(--text-3); }
+
+@media (max-width: 720px) {
+  /* The label goes; the icon and the count are what matter at this width. */
+  .setup-btn-label { display: none; }
+}
 
 
 /* ===================================================================

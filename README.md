@@ -223,6 +223,8 @@ untouched, and is safe to run twice.
 ## What it produces
 
 - **Overview** — income, spending, savings rate, net position, and the narrative
+- **Budget** — what a month costs before you decide anything: which charges are
+  fixed and *for how long*, which vary and by how much, and what is left
 - **Spending** — category and merchant breakdowns, per-month trends, outliers,
   and *"after the salary landed, where did it go?"* traced between paydays
 - **Debt** — amortization per loan, payoff dates, total interest remaining, and
@@ -234,7 +236,37 @@ untouched, and is safe to run twice.
 - **Files & quality** — per-file reconciliation status and every matched transfer
 
 Every one of those that is *about a period* reads one, shared, from a control
-above it — see below.
+above it — see below. And **every figure opens the rows behind it**: click a
+category, a merchant, a month, a commitment or a headline total and the
+transactions it was summed from appear, in the same period, with their own
+total. A number you cannot open is a number you have to trust.
+
+---
+
+## The questions this is built to answer
+
+Not "what does the data say" — the questions people actually ask themselves:
+
+| The question | Where it is answered |
+|---|---|
+| How much did I earn last month? | **Overview**, with the period set to *Last month* — and the month strip under the cashflow chart opens any month's rows |
+| Which of my expenses are fixed? For how long? | **Budget → Fixed every month.** Debt carries its payoff date and the number of payments left, read from the loan's own amortization; a subscription says *until you stop it*, because that is the truth |
+| What is my spending pattern? | **Spending** — categories, merchants, per-month trend, and outliers flagged against their own category |
+| How much did I save? | **Overview → Net saved**, with the savings rate |
+| How much went on extras? | **Budget** splits the month into committed and chosen. What is left after the commitments *is* the discretionary part |
+| What is my monthly budget? | **Budget → A month costs.** Commitments that leave for good, plus the median month of everything that varies. Nobody types a target in; it is what your own statements say a month costs |
+| Which expenses repeat month on month — EMI, school fees, utilities, recharges, insurance? | **Budget**, in two lists: charges that recur as a *series*, and categories that appear in *every month* even though no single merchant repeats (groceries are the usual case) |
+
+Two rules keep those answers honest:
+
+- **A SIP is not an expense.** Money moving into an investment every month is
+  as committed as an EMI and as unavailable to spend, but it is still yours.
+  Counting it as spending makes a diligent saver look reckless, so commitments
+  are reported as debt, fixed spending and committed saving — and only the
+  first two are subtracted to reach what a month costs.
+- **"Typical" is the median month, never the mean.** One holiday, one hospital
+  bill or one wedding would otherwise set the expectation for every month
+  after it.
 
 ---
 

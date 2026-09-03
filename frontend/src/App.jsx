@@ -12,17 +12,19 @@ import { Callout, Empty, ThemeToggle } from './components/ui';
 import AccountMenu from './components/AccountMenu';
 import { api } from './lib';
 
-import WorkflowNav from './components/WorkflowNav';
+import { SetupButton, SetupPanel, useSetupStatus } from './components/SetupStatus';
 import Recurring from './components/Recurring';
 import Rules from './components/Rules';
 import Settings from './components/Settings';
 import MonthView from './components/MonthView';
+import Budget from './components/Budget';
 import Explore from './components/explore/Explore';
 import MailboxButton from './components/mailbox/MailboxButton';
 import MailboxModal from './components/mailbox/MailboxModal';
 import useMailbox from './components/mailbox/useMailbox';
 import PeriodPicker, { PeriodEmpty } from './components/PeriodPicker';
 import { PeriodProvider, usePeriod } from './period';
+import { DrillProvider } from './drill';
 import { useTheme } from './theme';
 
 
@@ -53,6 +55,11 @@ import { useTheme } from './theme';
 const GROUPS = [
   ['money', 'Money', [
     ['overview', 'Overview'],
+    /* Second, deliberately. "What does a month cost me, and what does it
+       leave" is the question asked most often after "what came in", and it
+       was previously answerable only by reading three other tabs and doing
+       the arithmetic by hand. */
+    ['budget', 'Budget'],
     ['month-view', 'Months'],
     ['spending', 'Spending'],
     ['recurring', 'Recurring'],
@@ -91,9 +98,14 @@ const ALWAYS_AVAILABLE = ['settings', 'data', 'rules', 'credit', 'portfolio'];
  * moment. Showing a range picker over those would imply it changes something,
  * which is worse than not offering it - and Explore carries its own per-board
  * range, because a board is a saved question about a period of its own.
+ *
+ * Months is the interesting exclusion. It reads the same period as everything
+ * else, but it already HAS a period control - a strip of every month there is
+ * data for, which is the more direct way to say "that one" - so a second one
+ * above it would be two controls over one piece of state.
  */
-const PERIOD_TABS = ['overview', 'month-view', 'spending', 'recurring',
-  'ledger', 'review'];
+const PERIOD_TABS = ['overview', 'spending', 'recurring', 'ledger', 'review',
+  'budget'];
 
 /* Navigation for a viewport too narrow to hold it.
  *
@@ -161,7 +173,11 @@ function NavDrawer({ groups, tab, reviewCount, onPick, onClose }) {
 export default function App(props) {
   return (
     <PeriodProvider>
-      <Dashboard {...props} />
+      {/* Any panel can open the rows behind a figure, so the sheet that shows
+          them is mounted once, above all of them - see drill.jsx. */}
+      <DrillProvider>
+        <Dashboard {...props} />
+      </DrillProvider>
     </PeriodProvider>
   );
 }
@@ -175,6 +191,7 @@ function Dashboard({ openImport = false, onImportOpened }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
   const [mailboxOpen, setMailboxOpen] = useState(false);
+  const [setupOpen, setSetupOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [reviewCount, setReviewCount] = useState(0);
@@ -257,6 +274,16 @@ function Dashboard({ openImport = false, onImportOpened }) {
   // because the header button needs the same answer, and because an import
   // that finishes while the modal is closed still has to refresh the ledger.
   const mailbox = useMailbox({ open: mailboxOpen, onImported: load });
+
+  // Read once for the header badge; the panel re-reads when it opens.
+  const setup = useSetupStatus();
+  /* Stable identities. A popover that binds document listeners keyed on its
+     callbacks re-binds them on every render otherwise, and anything it does
+     on mount runs again with them. */
+  const toggleSetup = useCallback(() => setSetupOpen((v) => !v), []);
+  const closeSetup = useCallback(() => setSetupOpen(false), []);
+  const openProfile = useCallback(() => setShowProfile(true), []);
+  const openImportFlow = useCallback(() => setMailboxOpen(true), []);
 
   const hasData = Boolean(data?.analysis?.totals);
 
@@ -384,6 +411,19 @@ function Dashboard({ openImport = false, onImportOpened }) {
         </nav>
 
 
+        <div className="setup-slot">
+          <SetupButton status={setup} open={setupOpen} onToggle={toggleSetup} />
+          {setupOpen && (
+            <SetupPanel
+              status={setup}
+              onClose={closeSetup}
+              onNavigate={setTab}
+              onProfile={openProfile}
+              onImport={openImportFlow}
+            />
+          )}
+        </div>
+
         <MailboxButton mailbox={mailbox} onOpen={() => setMailboxOpen(true)} />
         <ThemeToggle theme={theme} onToggle={toggleTheme} />
         {/* Profile moved inside the account menu: it is one of several things
@@ -455,8 +495,6 @@ function Dashboard({ openImport = false, onImportOpened }) {
               </div>
             )}
 
-            {hasData && <WorkflowNav onNavigate={setTab} />}
-
             {/* A window with no rows in it must not render as a dashboard of
                 zeros: "you earned nothing and spent nothing" is a claim, and
                 the true one is "there is nothing here to report". */}
@@ -468,6 +506,7 @@ function Dashboard({ openImport = false, onImportOpened }) {
                 {tab === 'spending' && <Spending data={viewData} />}
               </>
             )}
+            {tab === 'budget' && <Budget />}
             {tab === 'month-view' && <MonthView data={viewData} />}
             {tab === 'recurring' && <Recurring />}
             {tab === 'review' && <ReviewHub />}

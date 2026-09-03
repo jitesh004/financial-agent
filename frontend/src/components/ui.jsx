@@ -15,13 +15,22 @@ export function Card({ title, sub, children, className = '', ...rest }) {
   );
 }
 
-export function Stat({ label, value, note, tone, precise = false }) {
+/* A headline figure. `onDrill` makes the figure itself open the rows behind
+   it - the question anyone asks of a number they did not expect. */
+export function Stat({ label, value, note, tone, precise = false, onDrill,
+  drillTitle }) {
   const isNumber = typeof value === 'number';
+  const shown = isNumber ? money(value, precise) : value;
   return (
-    <div className="card stat">
+    <div className={`card stat${onDrill ? ' stat-drill' : ''}`}>
       <div className="stat-label">{label}</div>
       <div className={`stat-value num ${tone || ''}`}>
-        {isNumber ? money(value, precise) : value}
+        {onDrill ? (
+          <button type="button" className="drill-link" onClick={onDrill}
+            title={drillTitle || 'Show the transactions behind this'}>
+            {shown}
+          </button>
+        ) : shown}
       </div>
       {note && <div className="stat-note">{note}</div>}
     </div>
@@ -80,32 +89,46 @@ export const moneyAxis = { ...axisProps, tickFormatter: compact, width: 58 };
 /* `format` exists because this list is no longer only used for money. An
    Explore widget can rank by transaction count, and the default currency
    formatter turned 654 transactions into "₹654". */
-export function BarList({ items, total, colorKey = 'color', max = 12, format = compact }) {
+/* `onPick` makes each bar open the transactions behind it. A breakdown whose
+   rows cannot be opened answers "how much" and refuses to answer "on what",
+   which is the next question every single time. */
+export function BarList({ items, total, colorKey = 'color', max = 12,
+  format = compact, onPick }) {
   const shown = items.slice(0, max);
   const peak = Math.max(...shown.map((i) => i.value), 1);
 
   return (
     <div>
-      {shown.map((item, i) => (
-        <div className="catrow" key={item.label}>
-          <div className="catrow-label" title={titleCase(item.label)}>
-            {titleCase(item.label)}
+      {shown.map((item) => {
+        const row = (
+          <div className="catrow">
+            <div className="catrow-label" title={titleCase(item.label)}>
+              {titleCase(item.label)}
+            </div>
+            <div className="catrow-track">
+              <div
+                className="catrow-fill"
+                style={{
+                  width: `${Math.max(2, (Math.abs(item.value) / peak) * 100)}%`,
+                  background: item[colorKey],
+                }}
+              />
+            </div>
+            <div className="catrow-value num">{format(item.value)}</div>
+            <div className="catrow-pct num">
+              {total ? `${((item.value / total) * 100).toFixed(0)}%` : ''}
+            </div>
           </div>
-          <div className="catrow-track">
-            <div
-              className="catrow-fill"
-              style={{
-                width: `${Math.max(2, (item.value / peak) * 100)}%`,
-                background: item[colorKey],
-              }}
-            />
-          </div>
-          <div className="catrow-value num">{format(item.value)}</div>
-          <div className="catrow-pct num">
-            {total ? `${((item.value / total) * 100).toFixed(0)}%` : ''}
-          </div>
-        </div>
-      ))}
+        );
+        if (!onPick) return <React.Fragment key={item.label}>{row}</React.Fragment>;
+        return (
+          <button type="button" className="drill-row" key={item.label}
+            onClick={() => onPick(item)}
+            title={`Show the ${titleCase(item.label)} transactions`}>
+            {row}
+          </button>
+        );
+      })}
     </div>
   );
 }
