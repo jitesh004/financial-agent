@@ -205,3 +205,95 @@ def test_cancelling_still_works(client, db):
     job_id = _running()
     assert client.post(f"/api/jobs/{job_id}/cancel").json() == {"status": "cancelling"}
     assert jobs.get(job_id).cancel_requested is True
+
+
+# --------------------------------------------------------------------------
+# Cancelling
+#
+# The button existed, the endpoint existed, and the flag it set was read by
+# exactly one worker. Pressing Cancel while documents were downloading or
+# being read did nothing at all, for as long as the batch took.
+# --------------------------------------------------------------------------
+
+def test_cancelling_stops_a_download_within_one_document(client, db, tmp_path):
+    """The loop asks before each attachment, not after the batch."""
+    from app.ingestion.gmail_source import FoundAttachment, download_to_cache
+
+    attachments = [
+        FoundAttachment(message_id=f"m{i}", attachment_id=f"a{i}",
+                        filename=f"statement-{i}.pdf", sender="bank@example.com",
+                        subject="Your statement", date="2026-08-01", size=1024)
+        for i in range(10)
+    ]
+    fetched: list[str] = []
+
+    class _Client:
+        def get_attachment(self, message_id, attachment_id):
+            fetched.append(message_id)
+            return b"%PDF-1.4 stub"
+
+    # Stops once two have been fetched, the way a user pressing Cancel does.
+    def should_stop():
+        return len(fetched) >= 2
+
+    saved = download_to_cache(_Client(), attachments, tmp_path / "gmail",
+                              should_stop=should_stop)
+
+    assert len(fetched) == 2, "it kept going after the stop was requested"
+    # What was already downloaded comes back rather than being thrown away:
+    # those files are on disk and a later run should find them cached.
+    assert len(saved) == 2
+    assert all(a.saved_path for a in saved)
+
+
+def test_a_cancelled_job_says_cancelled_and_not_failed(client, db):
+    """A run somebody stopped is not an error, and must not read as one."""
+    job = jobs.create("download", total=3, phase="Downloading")
+    progress = JobProgress(job)
+    progress.cancel("Stopped after 1 of 3.")
+
+    body = client.get(f"/api/jobs/{job.id}").json()
+    assert body["status"] == "cancelled"
+    assert body["active"] is False
+    assert not body["errors"], "cancelling is not an error to report"
+    assert "Stopped after 1 of 3." in body["message"]
+
+
+def test_cancelling_a_read_leaves_what_it_already_read(client, db, tmp_path):
+    """Documents read before the stop stay staged, waiting on Review."""
+    from app.api.staging_routes import _run_parse
+    from app.db import staging
+
+    for i in range(4):
+        path = tmp_path / f"doc-{i}.pdf"
+        path.write_bytes(b"%PDF-1.4 not really a statement")
+        staging.add(db, f"hash-{i}", filename=path.name, path=str(path),
+                    origin="upload", kind="statement")
+
+    job = jobs.create("stage_parse", total=4, phase="Queued")
+    # Requested before the worker starts, which is the same flag the endpoint
+    # sets - so this covers the endpoint's effect without racing a thread.
+    job.cancel_requested = True
+    _run_parse(job.id)
+
+    body = client.get(f"/api/jobs/{job.id}").json()
+    assert body["status"] == "cancelled"
+    assert staging.counts(db)["total"] == 4, "nothing staged was discarded"
+
+
+def test_cancelling_the_final_rebuild_leaves_the_ledger_alone(client, db):
+    """Half a rebuilt ledger is worse than a finished one nobody wanted."""
+    from app.api.staging_routes import _run_process
+
+    before = repo.count_transactions(db)
+    job = jobs.create("stage_process", total=1, phase="Queued")
+    job.cancel_requested = True
+    _run_process(job.id)
+
+    body = client.get(f"/api/jobs/{job.id}").json()
+    assert body["status"] == "cancelled"
+    assert repo.count_transactions(db) == before
+
+
+def test_cancelling_an_unknown_job_is_a_404(client, db):
+    assert client.post("/api/jobs/not-a-job/cancel").status_code == 404

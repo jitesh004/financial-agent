@@ -28,7 +28,7 @@ from app.models.profile import UserProfile  # noqa: E402
 SAMPLES = ROOT / "data" / "samples"
 ENCRYPTED = ROOT / "data" / "samples_encrypted" / "icici_credit_card_locked.pdf"
 
-PROFILE = UserProfile(full_name="PANKAJ SHARMA", date_of_birth=date(1990, 2, 6),
+PROFILE = UserProfile(full_name="PANKAJ SHARMA", date_of_birth=date(1988, 7, 14),
                       pan="ABCDE1234F", mobile="9876543210")
 
 
@@ -44,8 +44,8 @@ def _require(path: Path, hint: str):
 def test_derives_the_name_plus_dob_format():
     """The canonical bank format: first 4 of name + DDMM, in both casings."""
     candidates = derive_passwords(PROFILE)
-    assert "jite0602" in candidates
-    assert "JITE0602" in candidates
+    assert "pank1407" in candidates
+    assert "PANK1407" in candidates
 
 
 def test_candidate_set_is_bounded():
@@ -70,7 +70,7 @@ def test_empty_profile_yields_nothing():
 
 
 def test_redaction_hides_the_password():
-    assert redact_candidate("jite0602") == "j*******"
+    assert redact_candidate("pank1407") == "p*******"
     assert redact_candidate("") == "(empty)"
 
 
@@ -93,7 +93,7 @@ def test_encrypted_pdf_opens_with_the_right_profile():
     assert result.tables
     # The working password is reported only in redacted form.
     assert any("derived password" in w for w in result.warnings)
-    assert not any("jite0602" in w for w in result.warnings)
+    assert not any("pank1407" in w for w in result.warnings)
 
 
 def test_encrypted_pdf_stays_locked_for_the_wrong_profile():
@@ -426,7 +426,7 @@ def test_marketing_from_statement_senders_is_rejected(subject, expected):
      "tax certificate"),
     # A single NEFT credit note, not a statement.
     ("corporatenetbanking.autoreply@icici.com",
-     "PAYMENT FROM UPSTOX SECURITIES PVT LTD- DSCNB A/C TO JITESH - DOMNEFT01",
+     "PAYMENT FROM UPSTOX SECURITIES PVT LTD- DSCNB A/C TO PANKAJ - DOMNEFT01",
      "payment advice"),
     # Servicing notice about an account rather than a report of its activity.
     ("loanestatement@icici.bank.in",
@@ -766,7 +766,7 @@ def test_brought_forward_rows_are_not_transactions():
 
 @pytest.mark.parametrize("description,expected", [
     # Indian payroll narrations run tokens together - \bsal\b never matches.
-    ("PRIVATELIMI-JITESHSALNOV25//CMS3-XXXX4909", "credit"),
+    ("PRIVATELIMI-PANKAJSALNOV25//CMS3-XXXX1234", "credit"),
     ("NEFT-CR-ACME CORP SALARY", "credit"),
     ("BBPS PAYMENT RECEIVED - DP015271185122", "credit"),
     ("REFUND FROM AMAZON", "credit"),
@@ -1088,9 +1088,9 @@ def test_no_opening_balance_means_no_first_row_correction():
 def test_wrapped_narration_is_stitched_onto_the_data_row():
     """ICICI wraps a transaction across three lines, description above AND below.
 
-        NEFT-KKBKN6...-CUBYTS TECHNOLOGIES          <- narration
+        NEFT-KKBKN6...-ACME TECHNOLOGIES          <- narration
         01-09-2025  1,64,561.00  1,69,986.47        <- the data row
-        PRIVATE LIMI-JITESHSALAUG25//CMS2-...       <- narration continued
+        PRIVATE LIMI-PANKAJSALAUG25//CMS2-...       <- narration continued
 
     Dropping the surrounding lines left the salary credit with no description at
     all, so no rule matched and a 1.6 lakh salary never counted as income.
@@ -1099,14 +1099,14 @@ def test_wrapped_narration_is_stitched_onto_the_data_row():
 
     rows = _rows_from_text_lines([
         "01-09-2025 B/F 5,425.47",
-        "NEFT-KKBKN62025090126457682-CUBYTS TECHNOLOGIES",
+        "NEFT-KKBKN60000000000005678-ACME TECHNOLOGIES",
         "01-09-2025 1,64,561.00 1,69,986.47",
-        "PRIVATE LIMI-JITESHSALAUG25//CMS2-7245244909-KKBK00",
+        "PRIVATE LIMI-PANKAJSALAUG25//CMS2-9000001234-KKBK00",
         "02-09-2025 BAN/12345/ABC 30.00 1,69,956.47",
     ])
     salary = next(r for r in rows if r[2] == "1,64,561.00")
-    assert "CUBYTS TECHNOLOGIES" in salary[1]
-    assert "JITESHSALAUG25" in salary[1]
+    assert "ACME TECHNOLOGIES" in salary[1]
+    assert "PANKAJSALAUG25" in salary[1]
 
     # A row that already has its own description must not borrow a neighbour's.
     other = next(r for r in rows if r[2] == "30.00")
@@ -1141,7 +1141,7 @@ def test_slash_narration_wrapped_above_the_row_is_rejoined():
 def test_a_continuation_line_is_claimed_by_only_one_row():
     """The line below a wrapped row must not also be taken by the row after it.
 
-    "PRIVATE LIMI-JITESHSALAUG25//CMS2-..." completes the salary narration
+    "PRIVATE LIMI-PANKAJSALAUG25//CMS2-..." completes the salary narration
     above it. It contains two slashes, so without tracking what has already
     been claimed the next row would prepend it and report the salary's
     reference as part of an unrelated 30 rupee payment.
@@ -1149,13 +1149,13 @@ def test_a_continuation_line_is_claimed_by_only_one_row():
     from app.ingestion.extractors import _rows_from_text_lines
 
     rows = _rows_from_text_lines([
-        "NEFT-KKBKN62025090126457682-CUBYTS TECHNOLOGIES",
+        "NEFT-KKBKN60000000000005678-ACME TECHNOLOGIES",
         "01-09-2025 1,64,561.00 1,69,986.47",
-        "PRIVATE LIMI-JITESHSALAUG25//CMS2-7245244909-KKBK00",
+        "PRIVATE LIMI-PANKAJSALAUG25//CMS2-9000001234-KKBK00",
         "02-09-2025 BAN/12345/ABC 30.00 1,69,956.47",
     ])
     salary = next(r for r in rows if r[2] == "1,64,561.00")
-    assert "CUBYTS TECHNOLOGIES" in salary[1] and "JITESHSALAUG25" in salary[1]
+    assert "ACME TECHNOLOGIES" in salary[1] and "PANKAJSALAUG25" in salary[1]
     other = next(r for r in rows if r[2] == "30.00")
     assert other[1] == "BAN/12345/ABC"
 
@@ -1163,9 +1163,9 @@ def test_a_continuation_line_is_claimed_by_only_one_row():
 def test_midword_fragment_rejoins_both_neighbours():
     """One ICICI month splits the salary as prefix / row / suffix.
 
-        NEFT-KKBKN62025100170134164-CUBYTS
+        NEFT-KKBKN60000000000001234-ACME
         01-10-2025 TECHNOLOGIES PRIVATE LIMI-  1,64,561.00  1,77,043.91
-        JITESHSALSEP25//CMS2-7245244909-KKBK00
+        PANKAJSALSEP25//CMS2-9000001234-KKBK00
 
     The row keeps a description, so the empty-row stitch never fired, and
     "TECHNOLOGIES PRIVATE LIMI-" carries no credit wording - so a 1.64 lakh
@@ -1175,20 +1175,20 @@ def test_midword_fragment_rejoins_both_neighbours():
 
     rows = _rows_from_text_lines([
         "01-10-2025 B/F 12,482.91",
-        "NEFT-KKBKN62025100170134164-CUBYTS",
+        "NEFT-KKBKN60000000000001234-ACME",
         "01-10-2025 TECHNOLOGIES PRIVATE LIMI- 1,64,561.00 1,77,043.91",
-        "JITESHSALSEP25//CMS2-7245244909-KKBK00",
+        "PANKAJSALSEP25//CMS2-9000001234-KKBK00",
     ])
     salary = next(r for r in rows if r[2] == "1,64,561.00")
-    assert "CUBYTS" in salary[1]
-    assert "JITESHSALSEP25" in salary[1]
+    assert "ACME" in salary[1]
+    assert "PANKAJSALSEP25" in salary[1]
 
 
 def test_summary_rows_dated_after_the_period_are_dropped():
     """HSBC heads every statement with its payment due date and amount due.
 
         08 DEC 2025 6,831.64
-        MR JITESH MUKESH AGARWAL
+        MR PANKAJ KUMAR SHARMA
         XXXXXXXXXXX 24 OCT 2025 To 23 NOV 2025 99,181.11
 
     The first line reads as a dated row ending in an amount, so the extractor
@@ -1215,7 +1215,7 @@ def test_summary_rows_dated_after_the_period_are_dropped():
     stmt.transactions = [
         _txn(date(2025, 11, 4), "EUREKA FORBES"),      # inside the period
         _txn(date(2025, 10, 20), "EARLY POSTING"),     # before it - still real
-        _txn(date(2025, 12, 8), "MR JITESH MUKESH AGARWAL"),  # the due date
+        _txn(date(2025, 12, 8), "MR PANKAJ KUMAR SHARMA"),  # the due date
     ]
     _drop_rows_after_period(stmt, date(2025, 11, 23))
     kept = [t.raw_description for t in stmt.transactions]
@@ -1227,7 +1227,7 @@ def test_continuation_lines_are_not_stolen_from_real_rows():
     """A line with its own date, or its own amount, is never a continuation."""
     from app.ingestion.extractors import _is_continuation
 
-    assert _is_continuation("NEFT-KKBKN6-CUBYTS TECHNOLOGIES")
+    assert _is_continuation("NEFT-KKBKN6-ACME TECHNOLOGIES")
     assert not _is_continuation("01-09-2025 SOMETHING 100.00")   # own data row
     assert not _is_continuation("SOME MERCHANT 250.00")          # own amount
     assert not _is_continuation("3c")                            # too short
@@ -1235,7 +1235,7 @@ def test_continuation_lines_are_not_stolen_from_real_rows():
 
 
 def test_compound_salary_narration_categorises_as_salary():
-    """\bSALARY\b never matches "PRIVATELIMI-JITESHSALNOV25"."""
+    """\bSALARY\b never matches "PRIVATELIMI-PANKAJSALNOV25"."""
     from app.categorize.rules import apply_rules
     from app.models.schemas import Direction, Transaction
 
@@ -1245,7 +1245,7 @@ def test_compound_salary_narration_categorises_as_salary():
         match = apply_rules(txn)
         return match[0] if match else None
 
-    assert category_of("PRIVATELIMI-JITESHSALNOV25//CMS3-XXXX4909") == "salary"
+    assert category_of("PRIVATELIMI-PANKAJSALNOV25//CMS3-XXXX1234") == "salary"
     assert category_of("NEFT-CR-ACME CORP SALARY") == "salary"
     # "SALE" must not be read as salary.
     assert category_of("BIG SALE AT STORE") != "salary"
@@ -1387,12 +1387,12 @@ def test_build_coverage_prefers_parsed_over_a_prior_failed_attempt():
 
 def test_detect_account_number_handles_leading_real_digits():
     """Axis (and one of HDFC's own templates) print real digits before the
-    masked run instead of masking from the start: "438628******2343". The
+    masked run instead of masking from the start: "411111******4321". The
     original pattern only matched from-the-start masking and silently
     collapsed three of the user's own distinct Axis cards into one account."""
     from app.normalize.metadata import detect_account_number
 
-    assert detect_account_number("Card No: 438628******2343 Name JITESH") == "XXXX2343"
+    assert detect_account_number("Card No: 411111******4321 Name PANKAJ") == "XXXX4321"
     assert detect_account_number("653047******5207 360,000.00") == "XXXX5207"
     # The original from-the-start shape must still work.
     assert detect_account_number("Card ending XXXX XXXX XXXX 1234") == "XXXX1234"
@@ -1472,9 +1472,9 @@ def test_card_variant_ignores_generic_words_deep_in_the_statement():
 
     text = (
         "State Bank of India\n"
-        "MR JITESH AGARWAL\n"
-        "M3 KALSAGAR SHRI RAM COLONY\n"
-        "ALANDI ROAD BHOSARI\n"
+        "MR PANKAJ SHARMA\n"
+        "12 MAPLE COURT SAMPLE COLONY\n"
+        "GREEN AVENUE WESTPARK\n"
         "PAYMENT DUE DATE\n"
         "September 29, 2025\n"
         "STATEMENT SUMMARY\n"
@@ -1513,8 +1513,8 @@ def test_sender_domain_overrides_a_misleading_address_line():
 
     text = (
         "Neo Rupay Credit Card Statement\n"
-        "JITESH AGARWAL\n"
-        "A-1004, Utsav Homes Pune nashik road Bhosari,\n"
+        "PANKAJ SHARMA\n"
+        "A-1004, Sample Residency Springfield road Westpark,\n"
         "Pune City HDFC Bank,\n"
         "PUNE 411039\n"
     )
@@ -1562,7 +1562,7 @@ def test_undo_bold_letter_doubling_leaves_ordinary_text_alone():
     wrongly collapse. Amounts and dates must also survive untouched."""
     from app.normalize.metadata import _undo_bold_letter_doubling
 
-    text = "Mr Jitesh Agarwal\nbookkeeper fee `47,249.00 on 13/11/2025\nSS Titanic"
+    text = "Mr Pankaj Sharma\nbookkeeper fee `47,249.00 on 13/11/2025\nSS Titanic"
     assert _undo_bold_letter_doubling(text) == text
 
 
@@ -1573,7 +1573,7 @@ def test_letterhead_is_not_truncated_by_a_statement_period_range():
     card statement both open with exactly this shape."""
     from app.normalize.metadata import letterhead
 
-    axis_style = "01/11/2025 to 30/11/2025\nJITESH AGARWAL\nSavings INR 12,422.42\n"
+    axis_style = "01/11/2025 to 30/11/2025\nPANKAJ SHARMA\nSavings INR 12,422.42\n"
     assert "Savings" in letterhead(axis_style)
 
     idfc_style = "23/Sep/2025 - 22/Oct/2025\nCredit Card Statement\n(FIRST Millennia XX7597)\n"
@@ -1626,7 +1626,7 @@ def test_icici_credit_card_gets_its_variant_from_filename_when_letterhead_has_no
     from app.models.schemas import AccountType
     from app.normalize.metadata import extract_metadata
 
-    text = "Mr Jitesh Agarwal\nSTATEMENT DATE\nDecember 1, 2025\nPAYMENT DUE DATE\n" \
+    text = "Mr Pankaj Sharma\nSTATEMENT DATE\nDecember 1, 2025\nPAYMENT DUE DATE\n" \
            "STATEMENT SUMMARY\nTotal Amount due\n"
     meta = extract_metadata(
         text, "6528XXXXXXXX5004_812562_Retail_Coral_NOR.pdf",
@@ -1695,7 +1695,7 @@ def test_closing_balance_is_not_read_from_the_mitc_illustration():
     from app.normalize.metadata import extract_metadata
 
     text = (
-        "MR JITESH AGARWAL\nSTATEMENT DATE\nDecember 11, 2025\nPAYMENT DUE DATE\n"
+        "MR PANKAJ SHARMA\nSTATEMENT DATE\nDecember 11, 2025\nPAYMENT DUE DATE\n"
         "STATEMENT SUMMARY\nTotal Amount due\n`0.00 = + + -\n"
         "Minimum Amount due CREDIT SUMMARY\n`0.00\n"
         "13/11/2025 12329046524 SOME MERCHANT 500.00\n"
@@ -1856,7 +1856,7 @@ def test_ddmmyyyy_filenames_anchor_the_outlier_guard():
     from datetime import date
     from app.normalize.normalizer import _anchor_from_filename
 
-    assert _anchor_from_filename("20000002170971_22082026_115345421.pdf") \
+    assert _anchor_from_filename("20000000001234_22082026_115345421.pdf") \
         == date(2026, 8, 1)
 
 
@@ -2203,9 +2203,9 @@ def test_a_bank_named_as_a_landmark_is_not_the_issuer():
     """
     from app.normalize.metadata import detect_institution
 
-    address = ("MR JITESH AGARWAL\nM3 KALSAGAR SHRI RAM COLONY\n"
-               "ALANDI ROAD BHOSARI\nOPP STATE BANK OF INDIA\n"
-               "MAHARASHTRA, PUNE 411039")
+    address = ("MR PANKAJ SHARMA\n12 MAPLE COURT SAMPLE COLONY\n"
+               "GREEN AVENUE WESTPARK\nOPP STATE BANK OF INDIA\n"
+               "MAHARASHTRA, PUNE 400001")
     assert detect_institution(address) is None
 
     for preposition in ("Near", "Behind", "Beside", "Opposite", "Adj."):
@@ -2316,20 +2316,20 @@ def test_a_timestamp_is_not_a_description():
 def test_the_card_number_always_beats_an_account_number():
     """HDFC's Marriott statement prints both, one line apart.
 
-        Credit Card No. 00361147XXXX6885
-        Alternate Account Number 0001015980001716889
+        Credit Card No. 00360000XXXX4321
+        Alternate Account Number 0001010000001234567
 
-    The generic label was tried first, so the card was filed as XXXX6889 - a
+    The generic label was tried first, so the card was filed as XXXX4567 - a
     number that identifies something else. All fifteen of its transaction
-    alerts said 6885 and every one was refused for naming an account that did
+    alerts said 4321 and every one was refused for naming an account that did
     not exist.
     """
     from app.normalize.metadata import detect_account_number
 
     assert detect_account_number(
-        "JITESH MUKESH AGARWAL Credit Card No. 00361147XXXX6885\n"
-        "A-1004 UTSAV HOMES Alternate Account Number 0001015980001716889"
-    ) == "XXXX6885"
+        "PANKAJ KUMAR SHARMA Credit Card No. 00360000XXXX4321\n"
+        "A-1004 SAMPLE RESIDENCY Alternate Account Number 0001010000001234567"
+    ) == "XXXX4321"
 
     # In either order, and whatever the account number is called.
     assert detect_account_number(
@@ -2338,7 +2338,7 @@ def test_the_card_number_always_beats_an_account_number():
         "Card No 4315XXXXXXXX1111 ... A/c No 12345678") == "XXXX1111"
 
     # A statement with no card still reads its account number.
-    assert detect_account_number("Account Number 001015980001716889") == "XXXX6889"
+    assert detect_account_number("Account Number 001010000001234567") == "XXXX4567"
 
 
 def test_a_customer_id_is_not_an_account_number():
@@ -2369,7 +2369,7 @@ def test_a_mask_whose_runs_were_collapsed_is_still_read():
     assert detect_account_number("State: 27 51xx xx xx 1751") == "XXXX1751"
     assert detect_account_number("51xx xxxx xxxx 1751") == "XXXX1751"
     assert detect_account_number("XXXX XXXX XXXX 1234") == "XXXX1234"
-    assert detect_account_number("438628******2343") == "XXXX2343"
+    assert detect_account_number("411111******4321") == "XXXX4321"
 
 
 def test_a_masked_account_number_is_not_an_isin():
@@ -2412,8 +2412,8 @@ def test_alerts_are_rebuilt_after_the_statements_they_attach_to(tmp_db):
     """An alert can only join an account some statement described.
 
     Entries arrive sorted by account label, and an alert's label is shorter
-    than its statement's - "HDFC Bank (…6885)" sorts before "HDFC Bank
-    Marriott Bonvoy Credit Card (XXXX6885)". So every alert was looked up
+    than its statement's - "HDFC Bank (…4321)" sorts before "HDFC Bank
+    Marriott Bonvoy Credit Card (XXXX4321)". So every alert was looked up
     against an account that did not exist yet, and all of them were dropped
     from the rebuild without a word.
     """
@@ -2429,8 +2429,8 @@ def test_alerts_are_rebuilt_after_the_statements_they_attach_to(tmp_db):
                                 kind="statement")
         staging.record_parse(
             tmp_db, statement, status="ok", kind="statement",
-            account_key="HDFC Bank|XXXX6885",
-            account_label="HDFC Bank Marriott Bonvoy Credit Card (XXXX6885)",
+            account_key="HDFC Bank|XXXX4321",
+            account_label="HDFC Bank Marriott Bonvoy Credit Card (XXXX4321)",
             period_start="2026-07-01", period_end="2026-07-31",
             payload={"kind": "statement",
                      "statement": {"id": "s1", "account_id": "a1",
@@ -2438,19 +2438,19 @@ def test_alerts_are_rebuilt_after_the_statements_they_attach_to(tmp_db):
                                    "transactions": []},
                      "account": {"institution": "HDFC Bank",
                                  "account_type": "credit_card",
-                                 "account_number_masked": "XXXX6885"},
+                                 "account_number_masked": "XXXX4321"},
                      "reconciliation": {"status": "passed", "message": ""}})
 
         alert = staging.add(tmp_db, "h-alert", filename="BIRD", kind="alert")
         staging.record_parse(
             tmp_db, alert, status="ok", kind="alert",
-            account_key="HDFC Bank|XXXX6885",
-            account_label="HDFC Bank (…6885)",
+            account_key="HDFC Bank|XXXX4321",
+            account_label="HDFC Bank (…4321)",
             period_start="2026-08-04", period_end="2026-08-04",
             payload={"kind": "alert",
                      "alert": {"amount": "2899.00", "direction": "debit",
                                "date_iso": "2026-08-04", "merchant": "BIRD",
-                               "account_suffix": "6885"}})
+                               "account_suffix": "4321"}})
 
         built = staging_pipeline.materialise(tmp_db)
         rows = built.pop("_transactions", [])
@@ -2498,7 +2498,7 @@ def test_money_and_dates_survive_a_round_trip_through_storage():
 
     account = BureauAccount(
         lender="HDFC", account_type="credit_card",
-        account_number_masked="XXXX6885", ownership="individual",
+        account_number_masked="XXXX4321", ownership="individual",
         opened_on=date(2020, 1, 1), closed_on=None, status="open",
         sanctioned=Decimal("1000"), current_balance=Decimal("5"),
         overdue=None, credit_limit=None, emi_amount=None, dpd_history=[])

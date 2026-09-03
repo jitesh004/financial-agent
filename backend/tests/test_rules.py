@@ -352,7 +352,7 @@ def test_holdings_keep_their_sign_and_statements_do_not():
 
 @pytest.mark.parametrize("raw, expected", [
     ("XXXX4345", "4345"), ("xx1751", "1751"), ("**5001", "5001"),
-    ("XXXXXX1234", "1234"), ("0001015980001716889", "6889"),
+    ("XXXXXX1234", "1234"), ("0001010000001234567", "4567"),
     ("12", ""), ("", ""), (None, ""),
 ])
 def test_one_masked_account_reader(raw, expected):
@@ -1083,8 +1083,8 @@ def test_card_number_still_beats_a_neighbouring_account_number():
     from app.normalize.metadata import detect_account_number
 
     assert detect_account_number(
-        "Credit Card No. 00361147XXXX6885\n"
-        "Alternate Account Number 0001015980001716889") == "XXXX6885"
+        "Credit Card No. 00360000XXXX4321\n"
+        "Alternate Account Number 0001010000001234567") == "XXXX4321"
     # A customer ID alone identifies the person, so nothing is returned.
     assert detect_account_number("Cust ID: 341562729") is None
 
@@ -1181,17 +1181,17 @@ def test_a_record_of_trades_never_routes_to_the_statement_reader():
 def test_an_amount_that_is_a_slice_of_the_filename_is_not_money():
     """A Zerodha holdings statement names itself after its DP and client ids:
 
-        transaction-with-holding-statement_UC9050-1208160028236891.pdf
+        transaction-with-holding-statement_UC9050-1200000000001234.pdf
 
-    Read as a bank statement that produced two debits of 60,028,236,891 -
-    120 billion of money out against an actual 75 lakh."""
+    Read as a bank statement that produced two debits of 200,000,000,001,234 -
+    two hundred trillion of money out against an actual 75 lakh."""
     from app.normalize.normalizer import _amount_came_from_the_filename
 
-    name = "transaction-with-holding-statement_UC9050-1208160028236891.pdf"
-    assert _amount_came_from_the_filename(Decimal("60028236891"), name)
+    name = "transaction-with-holding-statement_UC9050-1200000000001234.pdf"
+    assert _amount_came_from_the_filename(Decimal("200000000001234"), name)
     # A real amount that happens to share a few digits is untouched, and a
     # short run is never evidence.
-    assert not _amount_came_from_the_filename(Decimal("1208"), name)
+    assert not _amount_came_from_the_filename(Decimal("1200"), name)
     assert not _amount_came_from_the_filename(Decimal("167489.00"), name)
     assert not _amount_came_from_the_filename(Decimal("60028236891"), "")
 
@@ -1235,7 +1235,7 @@ def test_a_labelled_alert_is_read_as_well_as_a_sentence():
     the email looks parseable and the body is not."""
     from app.ingestion import txn_email
 
-    body = ("01-09-2026 Dear Jitesh Agarwal, Here's the summary of your Axis "
+    body = ("01-09-2026 Dear Pankaj Sharma, Here's the summary of your Axis "
             "Bank Credit Card Transaction: Transaction Amount: INR 207.46 "
             "Merchant Name: BOOKMYSHOW Axis Bank Credit Card No. XX5207 "
             "Date & Time: 01-09-2026, 14:13:19 IST Available Limit*: "

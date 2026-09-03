@@ -184,6 +184,17 @@ def _run_parse(job_id: str, intent: str | None = None) -> None:
 
         counts: dict[str, int] = defaultdict(int)
         for entry in pending:
+            # Between documents, not inside one: a half-read PDF is not a
+            # useful place to stop, and reading one takes seconds at most.
+            # Anything already read stays staged - it is on the Review step
+            # waiting, which is exactly where it would have been anyway.
+            if progress.cancelled:
+                staging.apply_supersession(db)
+                progress.cancel(
+                    f"Stopped after reading {sum(counts.values())} of "
+                    f"{len(pending)}. What was read is on the Review step; "
+                    f"the rest is still waiting to be read.")
+                return
             status = pipeline.parse_entry(db, entry, candidates)
             counts[status] += 1
             fresh = staging.all_entries(db)
@@ -451,6 +462,16 @@ def _run_process(job_id: str) -> None:
         db = get_db()
         selected = staging.all_entries(db, selected_only=True)
         progress.start(len(selected), "Rebuilding your ledger")
+
+        # The only safe place to stop this one is before it starts. Unlike
+        # the download and the read, which are per-document loops, this is a
+        # single rebuild of the whole ledger followed by one analysis - and
+        # half a rebuilt ledger is a worse outcome than a finished one
+        # nobody wanted. So Cancel is honoured here and nowhere below.
+        if progress.cancelled:
+            progress.cancel("Stopped before anything was rebuilt. Your ledger "
+                            "is untouched and the selection is still staged.")
+            return
 
         built = pipeline.materialise(db, progress=progress.phase)
         # Registered here rather than after the analysis: when nothing parses

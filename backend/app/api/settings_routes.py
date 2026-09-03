@@ -16,8 +16,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from pydantic import BaseModel
 
+from ..auth.deps import current_user
+from ..auth.store import User
 from ..db.database import get_db
 from ..db import repository as repo
 from ..jobs import JobProgress, jobs
@@ -214,3 +217,87 @@ def _run_categorize(job_id: str) -> None:
     except Exception as exc:
         log.exception("categorisation run failed")
         progress.fail(f"{type(exc).__name__}: {exc}")
+
+
+# --------------------------------------------------------------------------
+# Demo mode
+# --------------------------------------------------------------------------
+
+
+class DemoRequest(BaseModel):
+    enabled: bool
+
+
+@router.get("/demo")
+def read_demo(user: User = Depends(current_user)) -> dict[str, Any]:
+    """Whether this account is looking at its demo workspace, and what is in it."""
+    from .. import demo
+
+    db = get_db()
+    workspace = demo.workspace_for(db, user.id)
+    figures: dict[str, Any] = {}
+    if workspace:
+        from ..db.engine import tenant_scope
+
+        with tenant_scope(workspace):
+            months = repo.covered_months(db)
+            figures = {
+                "transactions": repo.count_transactions(db),
+                "accounts": len(repo.get_accounts(db)),
+                "months": len(months),
+                "first_month": months[0][0] if months else None,
+                "last_month": months[-1][0] if months else None,
+            }
+    return {
+        "enabled": bool(user.demo_mode),
+        "prepared": bool(workspace),
+        "workspace": figures,
+    }
+
+
+@router.post("/demo")
+def set_demo(payload: DemoRequest,
+             user: User = Depends(current_user)) -> dict[str, Any]:
+    """Point this account at its demo workspace, or back at its own ledger.
+
+    Turning it ON builds the workspace if it does not exist yet, so the first
+    demo does not open on an empty dashboard. Turning it OFF leaves the
+    workspace and everything in it alone: the next demo starts where the last
+    one left off, and rebuilding it is a separate, explicit action.
+
+    Nothing about the real ledger changes either way. The switch decides which
+    account's rows the app reads; it does not move, copy or delete a row.
+    """
+    from .. import demo
+
+    db = get_db()
+    if payload.enabled:
+        demo.ensure_workspace(db, user.id, user.display_name)
+
+    with db.identity_connection() as conn:
+        conn.execute("UPDATE users SET demo_mode = ? WHERE id = ?",
+                     (bool(payload.enabled), user.id))
+    log.info("demo mode %s for %s", "on" if payload.enabled else "off", user.id)
+    return read_demo(user=_reread(db, user.id) or user)
+
+
+@router.post("/demo/rebuild")
+def rebuild_demo(user: User = Depends(current_user)) -> dict[str, Any]:
+    """Throw the demo data away and generate it again.
+
+    For a workspace a demo has been walked all over - categories changed, rows
+    excluded, a ledger cleared - so the next one starts clean. Only ever
+    touches the demo workspace; the real ledger is not reachable from here.
+    """
+    from .. import demo
+
+    db = get_db()
+    workspace = demo.ensure_workspace(db, user.id, user.display_name)
+    result = demo.reset(db, workspace)
+    return {"status": "rebuilt", **result}
+
+
+def _reread(db, user_id: str) -> User | None:
+    from ..auth import store
+
+    return store.get_user(db, user_id)

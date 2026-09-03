@@ -537,8 +537,8 @@ def _is_same_row(a: Transaction, b: Transaction) -> bool:
     #
     # Found 32 of these in a real ledger, worth 4.14 lakh of phantom money -
     # including one salary counted twice because the monthly statement wrote
-    # "NEFT-CMS1812612535608-CUBYTS TECHNOLOGIES..." and the quarterly one
-    # wrote "TECHNOLOGIES PRIVATELIMI- JITESHSALJUN26CMS1-".
+    # "NEFT-CMS1812612535608-ACME TECHNOLOGIES..." and the quarterly one
+    # wrote "TECHNOLOGIES PRIVATELIMI- PANKAJSALJUN26CMS1-".
     both_balances = a.balance_after is not None and b.balance_after is not None
     if both_balances:
         return _longest_shared_run(da, db) >= _SHARED_RUN_FLOOR

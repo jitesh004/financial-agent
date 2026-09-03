@@ -362,8 +362,8 @@ def materialise(db: Database, progress: Callable[[str], None] | None = None
     # Alerts last, always. An alert carries four digits and an issuer name and
     # nothing else, so it can only be attached to an account some statement
     # has already described - and `entries` arrives sorted by account label,
-    # under which "HDFC Bank (…6885)" (an alert) sorts before "HDFC Bank
-    # Marriott Bonvoy Credit Card (XXXX6885)" (its statement). Every alert was
+    # under which "HDFC Bank (…4321)" (an alert) sorts before "HDFC Bank
+    # Marriott Bonvoy Credit Card (XXXX4321)" (its statement). Every alert was
     # therefore looked up against an account that did not exist yet, and all
     # 211 of them were silently dropped from the rebuild.
     entries.sort(key=lambda e: e.get("kind") == "alert")

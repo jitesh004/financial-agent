@@ -254,7 +254,7 @@ def enrich_ledger(
         # A credit carrying a spending category nets against that spending -
         # a returned purchase, a reversed fee. That is unambiguous when the
         # counterparty is a merchant ("AMAZON PAY ... -549" against an Amazon
-        # charge), but not when it is a person: "UPI/POOJA ROHA/.../school
+        # charge), but not when it is a person: "UPI/MEERA NAIR/.../school
         # fee/" could be someone reimbursing a fee the user paid, or simply
         # money given to them. Netting is the more likely reading and is what
         # gets applied, but it is never applied silently.

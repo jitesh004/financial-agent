@@ -30,6 +30,29 @@ def current_user(user: User | None = Depends(optional_user)) -> User:
     return user
 
 
+def admin_user(user: User = Depends(current_user)) -> User:
+    """A user who runs this deployment.
+
+    The grant lives in the environment (FA_ADMIN_EMAILS) and nowhere else.
+    Not in the database, because then it would be editable by whatever can
+    write to the database; not in the source, because that would publish the
+    operator's own address in every clone of this repository; and not behind
+    a UI toggle, because a toggle is a grant anyone signed in can give
+    themselves.
+
+    With nothing configured there is no admin, and this refuses everyone -
+    which is the right default for a view over other people's accounts.
+    """
+    from ..config import config
+
+    if not config.is_admin(user.email):
+        # 404, not 403: whether this deployment has an operator's view at all
+        # is not a useful thing to confirm to somebody who is not its
+        # operator.
+        raise HTTPException(404, "Not found.")
+    return user
+
+
 def onboarded_user(user: User = Depends(current_user)) -> User:
     """A user who has finished the wizard.
 

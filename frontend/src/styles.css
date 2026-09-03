@@ -600,6 +600,54 @@ select option {
 
 
 /* ===================================================================
+   Demo mode, and the operator's view
+   ===================================================================
+
+   The banner is loud on purpose, and it sits above every panel including the
+   empty-ledger screen. The risk it exists for is not mistaking a demo for
+   real data during a demo - it is coming back days later, forgetting the
+   switch is on, and drawing a conclusion about your own money from generated
+   numbers. */
+
+.demo-banner {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 10px 14px; margin-bottom: 14px;
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  color: var(--text);
+}
+
+.demo-badge {
+  flex: none; font-size: 11px; font-weight: 700; letter-spacing: .09em;
+  text-transform: uppercase; padding: 3px 9px; border-radius: 999px;
+  background: var(--accent); color: #fff;
+}
+.demo-text { flex: 1; min-width: 220px; font-size: 12.5px; line-height: 1.5; }
+.demo-error { color: var(--negative); }
+
+/* Sign-ups per month. A tiny column chart, drawn in CSS: twelve bars do not
+   justify a charting library, and this one has to be legible at 90px tall. */
+.admin-bars {
+  display: flex; align-items: flex-end; gap: 6px; height: 132px;
+  padding-top: 8px; overflow-x: auto;
+}
+.admin-bar {
+  flex: 1 0 26px; height: 100%; display: flex; flex-direction: column;
+  align-items: center; justify-content: flex-end; gap: 5px;
+}
+.admin-bar-fill {
+  width: 100%; min-height: 3px; border-radius: 3px 3px 0 0;
+  background: var(--accent);
+}
+.admin-bar-label {
+  font-size: 10px; color: var(--text-3); white-space: nowrap;
+  transform: rotate(-45deg); transform-origin: center;
+  height: 22px; line-height: 22px;
+}
+
+
+/* ===================================================================
    The budget bar
    ===================================================================
 

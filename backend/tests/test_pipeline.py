@@ -637,14 +637,14 @@ def test_working_password_is_never_erased_by_a_later_failed_attempt(tmp_path):
     db = fresh_ledger()
     fid = repo.upsert_source_file(db, repo.SourceFileRecord(
         id="f1", filename="card.pdf", file_hash="h1",
-        password="jite0602", password_status="open", parse_status="parsed",
+        password="pank1407", password_status="open", parse_status="parsed",
     ))
     repo.upsert_source_file(db, repo.SourceFileRecord(
         id="f1", filename="card.pdf", file_hash="h1",
         password=None, password_status="locked", parse_status="failed",
     ))
     record = repo.get_source_file(db, fid)
-    assert record.password == "jite0602"
+    assert record.password == "pank1407"
     assert record.parse_status == "failed"  # status itself does update
 
 

@@ -18,6 +18,8 @@ import Rules from './components/Rules';
 import Settings from './components/Settings';
 import MonthView from './components/MonthView';
 import Budget from './components/Budget';
+import Admin from './components/Admin';
+import DemoBanner from './components/DemoBanner';
 import Explore from './components/explore/Explore';
 import MailboxButton from './components/mailbox/MailboxButton';
 import MailboxModal from './components/mailbox/MailboxModal';
@@ -25,6 +27,7 @@ import useMailbox from './components/mailbox/useMailbox';
 import PeriodPicker, { PeriodEmpty } from './components/PeriodPicker';
 import { PeriodProvider, usePeriod } from './period';
 import { DrillProvider } from './drill';
+import { useAuth } from './auth';
 import { useTheme } from './theme';
 
 
@@ -78,8 +81,15 @@ const GROUPS = [
     ['data', 'Data'],
     ['rules', 'Rules'],
     ['settings', 'Settings'],
+    /* Only for an address listed in FA_ADMIN_EMAILS on the server - see
+       ADMIN_ONLY below. The endpoint behind it answers 404 to everyone else
+       regardless, so hiding the tab is convenience, not the control. */
+    ['admin', 'Admin'],
   ]],
 ];
+
+//: Tabs that exist only for whoever runs the deployment.
+const ADMIN_ONLY = ['admin'];
 
 //: tab key -> the group holding it, so the active group follows the tab
 //: rather than being tracked separately and drifting out of step with it.
@@ -89,7 +99,8 @@ const GROUP_OF = Object.fromEntries(
 //: Tabs that work without a parsed ledger behind them. Rules is one of
 //: them by nature - it describes what the app WOULD do, so it is at its
 //: most useful before anything has been imported.
-const ALWAYS_AVAILABLE = ['settings', 'data', 'rules', 'credit', 'portfolio'];
+const ALWAYS_AVAILABLE = ['settings', 'data', 'rules', 'credit', 'portfolio',
+  'admin'];
 
 /* Tabs the period control applies to, and therefore appears on.
  *
@@ -202,6 +213,9 @@ function Dashboard({ openImport = false, onImportOpened }) {
   const [theme, toggleTheme] = useTheme();
 
   const { params: periodParams, scoped, reportWindow } = usePeriod();
+  /* Whether the operator's view is on offer, and whether the app is currently
+     pointed at generated data rather than a real ledger. */
+  const { isAdmin, user } = useAuth();
   /* The figures for the selected window, recomputed server-side. Held apart
      from `data` because the whole-ledger payload carries things a period
      cannot re-derive - the narrative and the transfer report - so a window
@@ -317,7 +331,8 @@ function Dashboard({ openImport = false, onImportOpened }) {
   const visibleGroups = GROUPS
     .map(([group, label, members]) => [
       group, label,
-      members.filter(([key]) => hasData || ALWAYS_AVAILABLE.includes(key)),
+      members.filter(([key]) => (hasData || ALWAYS_AVAILABLE.includes(key))
+        && (!ADMIN_ONLY.includes(key) || isAdmin)),
     ])
     .filter(([, , members]) => members.length > 0);
 
@@ -434,6 +449,9 @@ function Dashboard({ openImport = false, onImportOpened }) {
       </header>
 
       <main className="main">
+        {user?.demo_mode && (
+          <DemoBanner />
+        )}
         {showProfile ? (
           <Profile onSaved={() => setShowProfile(false)} />
         ) : loading ? (
@@ -520,6 +538,7 @@ function Dashboard({ openImport = false, onImportOpened }) {
               onImport={() => setMailboxOpen(true)} />}
             {tab === 'rules' && <Rules />}
             {tab === 'settings' && <Settings onLedgerChanged={load} />}
+            {tab === 'admin' && isAdmin && <Admin />}
           </>
         )}
       </main>

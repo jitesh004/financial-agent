@@ -651,7 +651,7 @@ def _is_narration_fragment(description: str) -> bool:
     """Whether a row's own text is a slice from the middle of a narration.
 
     Two signatures, both from ICICI wrapping a long remark around its dated
-    line: text cut mid-word ("...CUBYTS TECHNOLOGIES PRIVATE LIMI-") and text
+    line: text cut mid-word ("...ACME TECHNOLOGIES PRIVATE LIMI-") and text
     that opens partway through a slash narration ("Bank/001581210828/IBL...").
     """
     text = description.strip()
@@ -764,9 +764,9 @@ def _rows_from_text_lines(
             # Some layouts wrap the narration around the data row, leaving the
             # dated line as nothing but figures:
             #
-            #     NEFT-KKBKN6...-CUBYTS TECHNOLOGIES        <- description
+            #     NEFT-KKBKN6...-ACME TECHNOLOGIES        <- description
             #     01-09-2025  1,64,561.00  1,69,986.47      <- the data row
-            #     PRIVATE LIMI-JITESHSALAUG25//CMS2-...     <- description cont.
+            #     PRIVATE LIMI-PANKAJSALAUG25//CMS2-...     <- description cont.
             #
             # Dropping it loses the narration entirely, so a salary credit
             # arrives with no description, matches no rule, and never counts as

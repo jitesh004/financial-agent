@@ -361,8 +361,8 @@ def test_signing_in_is_refused_when_google_is_not_configured(client):
 
 
 def test_an_allowlist_keeps_strangers_out(monkeypatch):
-    monkeypatch.setattr(config, "ALLOWED_SIGNINS", ("jitesh@cubyts.com", "@work.example"))
-    assert google.sign_in_allowed("jitesh@cubyts.com")
+    monkeypatch.setattr(config, "ALLOWED_SIGNINS", ("pankaj@acme.com", "@work.example"))
+    assert google.sign_in_allowed("pankaj@acme.com")
     assert google.sign_in_allowed("anyone@work.example")
     assert not google.sign_in_allowed("stranger@example.com")
 
@@ -561,11 +561,11 @@ def test_the_wizard_reports_what_has_actually_been_done(client):
     from app.models.profile import UserProfile
 
     repo.save_profile(get_db(), UserProfile(
-        full_name="Jitesh K", date_of_birth=date(1990, 2, 6), pan="ABCDE1234F"))
+        full_name="Pankaj K", date_of_birth=date(1988, 7, 14), pan="ABCDE1234F"))
 
     body = client.get("/api/onboarding").json()
     assert body["identity"]["ready"] is True
-    assert body["identity"]["full_name"] == "Jitesh K"
+    assert body["identity"]["full_name"] == "Pankaj K"
     assert body["identity"]["has_dob"] is True
 
 

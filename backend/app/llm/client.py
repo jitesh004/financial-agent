@@ -40,8 +40,8 @@ _ADDRESS_PATTERNS = re.compile(
 _PINCODE = re.compile(r"\b\d{6}\b")
 
 #: An honorific or a "Name:" label followed by the name itself. The trailing
-#: period is optional because real statements print "Mr Jitesh Agarwal" as
-#: often as "Mr. Jitesh Agarwal", and requiring it let every one of them
+#: period is optional because real statements print "Mr Pankaj Sharma" as
+#: often as "Mr. Pankaj Sharma", and requiring it let every one of them
 #: through. Bounded to at most four capitalised words so it consumes a name
 #: rather than the remainder of the line.
 _HONORIFIC_NAME = re.compile(
@@ -106,8 +106,8 @@ def _looks_like_a_person_name(value: str) -> bool:
 def _name_patterns(names: list[str]) -> list[re.Pattern[str]]:
     """Match a known name, and also each of its parts.
 
-    Statements are inconsistent about which parts they print - "Jitesh
-    Agarwal" on one, "JITESH MUKESH AGARWAL" on another - so matching only
+    Statements are inconsistent about which parts they print - "Pankaj
+    Agarwal" on one, "PANKAJ KUMAR SHARMA" on another - so matching only
     the full string would miss most of them. Parts shorter than three
     characters are skipped: a two-letter initial would match inside ordinary
     words and shred the surrounding text.
@@ -117,7 +117,7 @@ def _name_patterns(names: list[str]) -> list[re.Pattern[str]]:
         parts = [p for p in re.split(r"\s+", name.strip()) if len(p) >= 3]
         if not parts:
             continue
-        # Longest first, so "JITESH AGARWAL" is replaced as one unit before
+        # Longest first, so "PANKAJ SHARMA" is replaced as one unit before
         # either half can be replaced on its own.
         joined = r"\s+".join(re.escape(p) for p in parts)
         out.append(re.compile(rf"\b{joined}\b", re.IGNORECASE))
@@ -154,7 +154,7 @@ def redact(text: str, names: list[str] | None = None) -> str:
         if _PINCODE.search(line):
             continue
         # "Name: John Doe", "Mr. John Doe", and - the shape real statements
-        # actually use - "Mr Jitesh Agarwal" with no period at all. The
+        # actually use - "Mr Pankaj Sharma" with no period at all. The
         # period was previously required, which is why every one of this
         # workspace's four statement formats sailed straight through.
         line = _HONORIFIC_NAME.sub("[NAME]", line)

@@ -521,7 +521,7 @@ def _run_fetch_all_missing_job(job_id: str, targets: list[tuple[str, str, str]])
         found = 0
         for account_id, month, label in targets:
             if progress.cancelled:
-                progress.fail("Cancelled by user.")
+                progress.cancel(f"Stopped after {found} of {len(targets)}.")
                 return
             result = _fetch_one_month(job_id, account_id, month)
             ok = result["status"] in {"ok", "unreconciled"}

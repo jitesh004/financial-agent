@@ -4,6 +4,7 @@ import { api, titleCase } from '../lib';
 import { PREFS, usePrefs } from '../prefs';
 import AccountSettings from './AccountSettings';
 import LlmSettings from './LlmSettings';
+import DemoSettings from './DemoSettings';
 
 /* Categories you invented, and how the app should look and behave.
  *
@@ -82,6 +83,10 @@ export default function Settings({ onLedgerChanged }) {
           somebody comes to Settings with, rather than the ones they browse
           to. */}
       <AccountSettings />
+
+      {/* Above the categories, because it is the one setting here that
+          changes what every other screen is showing. */}
+      <DemoSettings />
 
       {error && <Callout tone="neg">{error}</Callout>}
       {note && <Callout tone="pos">{note}</Callout>}

@@ -234,28 +234,28 @@ def test_statement_periods_loader_groups_by_account():
 # --------------------------------------------------------------------------
 
 REAL_LETTERHEADS = {
-    "ICICI Amazon Pay": "Mr Jitesh Agarwal\nA1004,,Utsav homes\n,Pune nashik "
-                        "road\nBhosari\nMAHARASHTRA, PUNE 411039",
-    "ICICI HPCL": "MR JITESH AGARWAL\nM3 KALSAGAR SHRI RAM COLONY\n"
-                  "ALANDI ROAD BHOSARI",
-    "Axis savings": "01/11/2025 to 30/11/2025\nJITESH MUKESH AGARWAL\n"
+    "ICICI Amazon Pay": "Mr Pankaj Sharma\nA1004,,Sample Residency\n,Springfield "
+                        "road\nWestpark\nMAHARASHTRA, PUNE 400001",
+    "ICICI HPCL": "MR PANKAJ SHARMA\n12 MAPLE COURT SAMPLE COLONY\n"
+                  "GREEN AVENUE WESTPARK",
+    "Axis savings": "01/11/2025 to 30/11/2025\nPANKAJ KUMAR SHARMA\n"
                     "Customer ID: XXXXX4254",
-    "IDFC card": "Credit Card Statement\nJITESH MUKESH AGARWAL\nStatement Summary",
-    "UPI narration": "UPI/Jitesh Muk/jitesh@okaxis/self transfer/HDFC",
+    "IDFC card": "Credit Card Statement\nPANKAJ KUMAR SHARMA\nStatement Summary",
+    "UPI narration": "UPI/Pankaj Kum/pankaj@okaxis/self transfer/HDFC",
 }
 
 
 def test_the_holder_name_never_survives_redaction():
     """Checked against the four letterhead formats this workspace actually
     receives, not invented ones. The previous pattern required a literal
-    period after the honorific ("Mr\\."), and real statements print "Mr Jitesh
+    period after the honorific ("Mr\\."), and real statements print "Mr Pankaj
     Agarwal" with none - so every format sailed through."""
     from app.llm.client import redact
 
-    names = ["Jitesh Mukesh Agarwal"]
+    names = ["Pankaj Kumar Sharma"]
     for label, text in REAL_LETTERHEADS.items():
         out = redact(text, names=names)
-        for fragment in ("Jitesh", "JITESH", "Agarwal", "AGARWAL", "Mukesh",
+        for fragment in ("Pankaj", "PANKAJ", "Agarwal", "AGARWAL", "Mukesh",
                          "MUKESH"):
             assert fragment not in out, f"{label}: {fragment!r} leaked"
 
@@ -265,8 +265,8 @@ def test_redaction_survives_a_bare_name_with_no_honorific():
     honorific rule can catch - hence matching against known holder names."""
     from app.llm.client import redact
 
-    out = redact("JITESH MUKESH AGARWAL", names=["Jitesh Mukesh Agarwal"])
-    assert "JITESH" not in out and "AGARWAL" not in out
+    out = redact("PANKAJ KUMAR SHARMA", names=["Pankaj Kumar Sharma"])
+    assert "PANKAJ" not in out and "AGARWAL" not in out
 
 
 def test_redaction_leaves_ordinary_statement_text_alone():
@@ -277,7 +277,7 @@ def test_redaction_leaves_ordinary_statement_text_alone():
 
     text = ("STATEMENT DATE\nMonday To Friday Between 9:30 AM\n"
             "AMAZON PAY IN E COMMERC BANGALORE\nTotal Amount due")
-    assert redact(text, names=["Jitesh Mukesh Agarwal"]) == text
+    assert redact(text, names=["Pankaj Kumar Sharma"]) == text
 
 
 def test_junk_holder_names_are_not_used_for_redaction():
@@ -285,11 +285,11 @@ def test_junk_holder_names_are_not_used_for_redaction():
 
     for junk in ("S", "S.", ". (Monday To Friday Between 9:30 A.M.)",
                  "Willnotbeheldliableforanytransaction",
-                 "Mr. Jitesh Mukesh Agarwal Account Branch Pune - Bhosari Branch",
+                 "Mr. Pankaj Kumar Sharma Account Branch Pune - Westpark Branch",
                  "Account 12345"):
         assert not _looks_like_a_person_name(junk), f"{junk!r} accepted"
 
-    for real in ("Jitesh Mukesh Agarwal", "Jitesh Agarwal", "Pooja Roha"):
+    for real in ("Pankaj Kumar Sharma", "Pankaj Sharma", "Meera Nair"):
         assert _looks_like_a_person_name(real), f"{real!r} rejected"
 
 
@@ -297,11 +297,11 @@ def test_redaction_still_strips_the_original_identifiers():
     from app.llm.client import redact
 
     text = ("Card 4315 1234 5678 5001\nPAN BJXPA1234R\n"
-            "mail jitesh@example.com\nphone 9876543210")
+            "mail pankaj@example.com\nphone 9876543210")
     out = redact(text, names=[])
     assert "4315 1234 5678 5001" not in out
     assert "BJXPA1234R" not in out
-    assert "jitesh@example.com" not in out
+    assert "pankaj@example.com" not in out
     assert "9876543210" not in out
 
 
@@ -820,7 +820,7 @@ def test_looks_right_in_the_review_queue_actually_clears_needs_review():
         account_id = repo.get_accounts(db)[0].id
         txn = Transaction(
             id="t1", account_id=account_id, txn_date=date(2026, 3, 4),
-            raw_description="UPI/POOJA ROHA/school fee", amount=Decimal("2000"),
+            raw_description="UPI/MEERA NAIR/school fee", amount=Decimal("2000"),
             direction=Direction.CREDIT, category=Category.OTHER_INCOME,
             flow_role="refund", needs_review=True,
             review_reason="Confirm or flip.")

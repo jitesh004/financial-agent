@@ -32,9 +32,9 @@ from fastapi.responses import JSONResponse
 
 from . import storage
 from .analytics import periods
-from .api import (auth_routes, files_routes, gmail_routes, job_routes,
-                  query_routes, rules_routes, settings_routes, staging_routes,
-                  wealth_routes)
+from .api import (admin_routes, auth_routes, files_routes, gmail_routes,
+                  job_routes, query_routes, rules_routes, settings_routes,
+                  staging_routes, wealth_routes)
 from .auth.session import AuthContextMiddleware
 from .api import serializers as ser
 from .db.database import CLEAR_SCOPES, get_db
@@ -130,6 +130,7 @@ app.include_router(job_routes.router)
 app.include_router(wealth_routes.router)
 app.include_router(settings_routes.router)
 app.include_router(staging_routes.router)
+app.include_router(admin_routes.router)
 app.include_router(rules_routes.router)
 
 

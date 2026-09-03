@@ -61,6 +61,12 @@ class User:
     onboarded_at: str | None
     created_at: str
     last_seen_at: str
+    #: Show this person their demo workspace instead of their own ledger.
+    demo_mode: bool = False
+    #: Set on a demo workspace row, pointing at the account that owns it.
+    #: A row with this set is not a person and can never be signed into: its
+    #: `google_sub` is minted locally and Google will never issue it.
+    demo_of: str | None = None
 
     @property
     def is_active(self) -> bool:
@@ -85,7 +91,16 @@ class User:
             "onboarded": self.onboarded,
             "onboarding_step": self.onboarding_step,
             "created_at": self.created_at,
+            "demo_mode": self.demo_mode,
         }
+
+
+def _col(row, name: str, default=None):
+    """A column that may not exist yet on an un-migrated database."""
+    try:
+        return row[name]
+    except (KeyError, IndexError):
+        return default
 
 
 def _row_to_user(row) -> User:
@@ -101,6 +116,8 @@ def _row_to_user(row) -> User:
         onboarded_at=row["onboarded_at"],
         created_at=row["created_at"],
         last_seen_at=row["last_seen_at"],
+        demo_mode=bool(_col(row, "demo_mode")),
+        demo_of=(str(_col(row, "demo_of")) if _col(row, "demo_of") else None),
     )
 
 
@@ -218,7 +235,11 @@ def resolve_session(db: Database, token: str) -> User | None:
     with db.identity_connection() as conn:
         row = conn.execute(
             """UPDATE user_sessions s
-                  SET last_used_at = fa_now()
+                  SET last_used_at = fa_now(),
+                      -- Free: this statement was already running on every
+                      -- request. Session rows count sign-ins, which over a
+                      -- 72-hour cookie is not the same as visits.
+                      uses = s.uses + 1
                  FROM users u
                 WHERE s.user_id = u.id
                   AND s.token_hash = ?
