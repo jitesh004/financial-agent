@@ -38,6 +38,7 @@ from .auth.session import AuthContextMiddleware
 from .api import serializers as ser
 from .db.database import CLEAR_SCOPES, get_db
 from .db import repository as repo
+from .db.engine import current_tenant
 from .graph.build import build_graph
 from .ingestion.router import SUPPORTED_EXTENSIONS, file_hash
 from .jobs import jobs
@@ -132,39 +133,66 @@ app.include_router(rules_routes.router)
 
 
 class RunStore:
-    """In-memory registry of analysis runs.
+    """In-memory registry of analysis runs, per signed-in user.
 
     Thread-safe because uploads run on a background thread while the API keeps
     serving reads.
+
+    Every read and write is scoped to the current tenant, and that is not a
+    refinement - it is the whole correctness of this class. It began life in a
+    single-user program, where "the latest run" could be one string. Carried
+    unchanged into a server that several people sign in to, that one string
+    meant whoever parsed last owned the dashboard for EVERYBODY: user A
+    imported, user B imported, and A's next page load returned B's payload
+    verbatim. `/api/dashboard` reads this cache before it touches the
+    database, so the row-level security that protects every table underneath
+    never got a chance to apply.
+
+    Keying by `current_tenant()` rather than by a caller-supplied id is
+    deliberate: it is the same function the database policies read, so the
+    cache and the ledger cannot disagree about who is asking.
     """
 
     def __init__(self) -> None:
-        self._runs: dict[str, dict[str, Any]] = {}
-        self._latest: str | None = None
+        #: tenant -> run_id -> run. Nested rather than flat so a run can never
+        #: be reached from the wrong account even by knowing its uuid.
+        self._runs: dict[str | None, dict[str, dict[str, Any]]] = {}
+        #: tenant -> the run its dashboard should show.
+        self._latest: dict[str | None, str] = {}
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _who() -> str | None:
+        from .db.engine import current_tenant
+        return current_tenant()
+
+    def _bucket(self) -> dict[str, dict[str, Any]]:
+        """This tenant's runs. Caller holds the lock."""
+        return self._runs.setdefault(self._who(), {})
 
     def create(self, run_id: str, file_count: int) -> None:
         with self._lock:
-            self._runs[run_id] = {
+            self._bucket()[run_id] = {
                 "run_id": run_id, "status": "queued", "progress": "Queued",
                 "file_count": file_count, "errors": [], "warnings": [],
             }
 
     def update(self, run_id: str, **fields: Any) -> None:
         with self._lock:
-            self._runs.setdefault(run_id, {"run_id": run_id}).update(fields)
+            self._bucket().setdefault(run_id, {"run_id": run_id}).update(fields)
 
     def get(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:
-            return self._runs.get(run_id)
+            return self._bucket().get(run_id)
 
     def set_latest(self, run_id: str) -> None:
         with self._lock:
-            self._latest = run_id
+            self._latest[self._who()] = run_id
 
     def latest(self) -> dict[str, Any] | None:
         with self._lock:
-            return self._runs.get(self._latest) if self._latest else None
+            run_id = self._latest.get(self._who())
+            return self._bucket().get(run_id) if run_id else None
 
     def create_from_payload(self, run_id: str, payload: dict[str, Any]) -> str:
         """Register an already-computed result as the current dashboard view.
@@ -174,28 +202,29 @@ class RunStore:
         land in the same place the dashboard reads from.
         """
         with self._lock:
-            self._runs[run_id] = {
+            self._bucket()[run_id] = {
                 "run_id": run_id, "status": "complete", "progress": "Done",
                 "file_count": len(payload.get("statements") or []),
                 "errors": [], "warnings": [], "result": payload,
             }
-            self._order_latest(run_id)
+            self._latest[self._who()] = run_id
         return run_id
 
-    def _order_latest(self, run_id: str) -> None:
-        self._latest = run_id
-
     def clear(self) -> None:
-        """Forget every cached run.
+        """Forget this user's cached runs.
 
         Called after any clearing action. The dashboard payload is a snapshot
         of figures computed from rows that may have just been deleted, and
         `/api/dashboard` returns it verbatim without revalidating - so leaving
         it in place shows the user totals for a ledger that no longer exists.
+
+        Only the caller's own runs go: one person clearing their data has no
+        business emptying everybody else's dashboard.
         """
         with self._lock:
-            self._runs.clear()
-            self._latest = None
+            who = self._who()
+            self._runs.pop(who, None)
+            self._latest.pop(who, None)
         # The stored payload is the same snapshot, and /api/dashboard prefers
         # it over recomputing - so clearing only the in-memory copy invalidated
         # nothing a reader could see.
@@ -417,8 +446,32 @@ def _run_analysis(
     use_llm: bool,
     horizon_months: int,
     incremental: bool = False,
+    owner: str | None = None,
 ) -> None:
-    """Execute the graph and persist the result. Runs off the request thread."""
+    """Execute the graph and persist the result. Runs off the request thread.
+
+    `owner` is captured in the request that asked for the work and re-bound
+    here. Starlette does copy the request's context into the worker thread, so
+    this is usually redundant - but everything this function writes, the ledger
+    rows and the cached dashboard alike, is filed under whoever is bound at the
+    time. That is not a guarantee to rest on framework behaviour: unbound, the
+    run would be written under no tenant and the user's dashboard would come
+    back empty, and worse, a future change to how this is dispatched could
+    silently file one person's statements against another.
+    """
+    from .db.engine import tenant_scope
+
+    with tenant_scope(owner or current_tenant()):
+        _run_analysis_scoped(run_id, tasks, use_llm, horizon_months, incremental)
+
+
+def _run_analysis_scoped(
+    run_id: str,
+    tasks: list[dict[str, Any]],
+    use_llm: bool,
+    horizon_months: int,
+    incremental: bool = False,
+) -> None:
     runs.update(run_id, status="running", progress="Extracting statements")
     try:
         # Derive candidate passwords from the stored profile so protected PDFs
@@ -865,7 +918,8 @@ def reanalyze(background: BackgroundTasks, horizon_months: int = 6,
     db = get_db()
     db.snapshot("pre-reanalyze")
     db.clear("parsed_data")
-    background.add_task(_run_analysis, run_id, tasks, use_llm, horizon_months)
+    background.add_task(_run_analysis, run_id, tasks, use_llm, horizon_months,
+                        owner=current_tenant())
     return {"run_id": run_id, "file_count": len(tasks), "status": "queued"}
 
 

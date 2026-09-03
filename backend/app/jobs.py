@@ -355,9 +355,23 @@ class JobStore:
         self._flusher.nudge()
         return job
 
+    def _mine(self, job: "Job | None") -> "Job | None":
+        """`job`, but only if it belongs to whoever is asking.
+
+        The registry is one dict for the whole process, so without this a job
+        id from one account resolves against another's. The stored fallback in
+        `snapshot` is already protected by the row-level security policy; this
+        is the in-memory half of the same guarantee, and it has to agree with
+        it or the memory hit silently bypasses the database's check.
+        """
+        if job is None:
+            return None
+        from .db.engine import current_tenant
+        return job if job.owner == current_tenant() else None
+
     def get(self, job_id: str) -> Job | None:
         with self._lock:
-            return self._jobs.get(job_id)
+            return self._mine(self._jobs.get(job_id))
 
     def snapshot(self, job_id: str) -> dict[str, Any] | None:
         """A job as a dict, from memory if it is there and from SQLite if not.
@@ -382,17 +396,24 @@ class JobStore:
         return _stored_to_dict(stored)
 
     def latest(self, kind: str | None = None) -> Job | None:
+        """This user's most recent job, not the process's."""
         with self._lock:
             for job_id in reversed(self._order):
-                job = self._jobs.get(job_id)
+                job = self._mine(self._jobs.get(job_id))
                 if job and (kind is None or job.kind == kind):
                     return job
         return None
 
     def active(self) -> list[Job]:
+        """This user's running jobs.
+
+        `/api/jobs` renders exactly this list, so an unscoped version handed
+        every signed-in user a live view of everybody else's imports - no id
+        to guess, just the page.
+        """
         with self._lock:
-            return [self._jobs[job_id] for job_id in self._order
-                    if job_id in self._jobs and self._jobs[job_id].is_active]
+            mine = (self._mine(self._jobs.get(job_id)) for job_id in self._order)
+            return [job for job in mine if job is not None and job.is_active]
 
 
 jobs = JobStore()
