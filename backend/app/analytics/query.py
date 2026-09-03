@@ -26,6 +26,7 @@ from decimal import Decimal
 from typing import Any, Literal
 
 from ..models.schemas import CATEGORY_GROUPS, Category
+from . import periods
 
 # --------------------------------------------------------------------------
 # Money, exactly
@@ -113,9 +114,7 @@ _UPI = "(t.raw_description LIKE 'UPI%' OR t.raw_description LIKE 'upi%')"
 
 FIELDS: dict[str, Field] = {f.key: f for f in [
     # ---- time ----
-    Field("month", "Month", "Time",
-          "CASE WHEN t.accounting_month != '' THEN t.accounting_month"
-          " ELSE substr(t.txn_date, 1, 7) END",
+    Field("month", "Month", "Time", periods.effective_month_sql("t."),
           type="month", options="months",
           hint="The accounting month, which is not always the calendar month "
                "of the date - see analytics.periods."),
@@ -263,17 +262,12 @@ OPS_FOR_TYPE: dict[str, tuple[str, ...]] = {
     "bool":   ("is_true", "is_false"),
 }
 
+#: Read from the period engine so the Explore tab offers exactly the periods
+#: every other screen does - one catalogue, one resolution, one answer to
+#: "last 3 months". `inherit` is Explore's own: a widget that takes whatever
+#: window the board is set to.
 DATE_PRESETS: list[tuple[str, str]] = [
-    ("all", "All time"),
-    ("this_month", "This month"),
-    ("last_month", "Last month"),
-    ("last_3m", "Last 3 months"),
-    ("last_6m", "Last 6 months"),
-    ("last_12m", "Last 12 months"),
-    ("ytd", "This year so far"),
-    ("last_year", "Last calendar year"),
-    ("custom", "Custom range"),
-]
+    (p["value"], p["label"]) for p in periods.PERIOD_PRESETS]
 
 MAX_ROWS = 5000
 
@@ -287,41 +281,31 @@ class QueryError(ValueError):
 # --------------------------------------------------------------------------
 
 
-def _shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
-    total = year * 12 + (month - 1) + delta
-    return total // 12, total % 12 + 1
+def resolve_period(spec: dict[str, Any] | None,
+                   today: date | None = None) -> periods.Period:
+    """A date range spec to a resolved window, in the engine's error type.
+
+    The resolution itself is analytics.periods' job - this only translates a
+    refusal, so a widget naming a preset that does not exist reports a bad
+    query rather than a server fault.
+    """
+    try:
+        return periods.resolve_period(spec, today)
+    except periods.PeriodError as exc:
+        raise QueryError(str(exc)) from exc
 
 
 def resolve_range(spec: dict[str, Any] | None,
                   today: date | None = None) -> tuple[str | None, str | None]:
-    """A date range spec to concrete ISO bounds (inclusive)."""
-    if not spec:
-        return None, None
-    today = today or date.today()
-    preset = spec.get("preset") or "all"
+    """A date range spec to concrete ISO date bounds (inclusive).
 
-    if preset == "custom":
-        return spec.get("start") or None, spec.get("end") or None
-    if preset == "all":
-        return None, None
-    if preset == "this_month":
-        return date(today.year, today.month, 1).isoformat(), today.isoformat()
-    if preset == "last_month":
-        year, month = _shift_month(today.year, today.month, -1)
-        next_year, next_month = _shift_month(year, month, 1)
-        last_day = date(next_year, next_month, 1).toordinal() - 1
-        return (date(year, month, 1).isoformat(),
-                date.fromordinal(last_day).isoformat())
-    if preset in {"last_3m", "last_6m", "last_12m"}:
-        months = int(preset.split("_")[1].rstrip("m"))
-        year, month = _shift_month(today.year, today.month, -(months - 1))
-        return date(year, month, 1).isoformat(), today.isoformat()
-    if preset == "ytd":
-        return date(today.year, 1, 1).isoformat(), today.isoformat()
-    if preset == "last_year":
-        return (date(today.year - 1, 1, 1).isoformat(),
-                date(today.year - 1, 12, 31).isoformat())
-    raise QueryError(f"Unknown date preset '{preset}'")
+    The CALENDAR reading of a period, which is what a date axis wants and
+    what the comparison window is measured in. It is not what rows are
+    filtered by: that is the accounting month - see `compile_query` and
+    analytics.periods.
+    """
+    start, end = resolve_period(spec, today).bounds()
+    return (start.isoformat() if start else None, end.isoformat() if end else None)
 
 
 def shift_range(start: str | None, end: str | None) -> tuple[str | None, str | None]:
@@ -492,15 +476,34 @@ def compile_query(spec: dict[str, Any], today: date | None = None) -> Compiled:
     clauses: list[str] = []
     params: list[Any] = []
 
-    start, end = resolve_range(spec.get("date_range"), today)
-    if spec.get("_range_override"):
-        start, end = spec["_range_override"]
-    if start:
-        clauses.append("t.txn_date >= ?")
-        params.append(start)
-    if end:
-        clauses.append("t.txn_date <= ?")
-        params.append(end)
+    # The period, and which column it applies to.
+    #
+    # A month window filters on the ACCOUNTING month, not on the date: that is
+    # the whole difference between "August" meaning the rows dated in August
+    # and "August" meaning the rows the ledger counts in August - the salary
+    # paid on 1 September among them. Every other screen in the app draws that
+    # line the same way, and a widget that drew it differently would disagree
+    # with the Overview beside it.
+    #
+    # A custom day range filters on the date, because that is what a day range
+    # is for.
+    period = spec.get("_period_override") or resolve_period(
+        spec.get("date_range"), today)
+    if period.mode == "months":
+        month = periods.effective_month_sql("t.")
+        if period.start_month:
+            clauses.append(f"{month} >= ?")
+            params.append(period.start_month)
+        if period.end_month:
+            clauses.append(f"{month} <= ?")
+            params.append(period.end_month)
+    elif period.mode == "dates":
+        if period.start:
+            clauses.append("t.txn_date >= ?")
+            params.append(period.start.isoformat())
+        if period.end:
+            clauses.append("t.txn_date <= ?")
+            params.append(period.end.isoformat())
 
     for one in (spec.get("filters") or []):
         clause, values = _filter_clause(one)
@@ -600,7 +603,7 @@ def run_query(db, spec: dict[str, Any], today: date | None = None) -> dict[str, 
         for row in raw_rows
     ]
 
-    start, end = resolve_range(spec.get("date_range"), today)
+    period = resolve_period(spec.get("date_range"), today)
     out: dict[str, Any] = {
         "columns": compiled.columns,
         "rows": rows,
@@ -608,7 +611,11 @@ def run_query(db, spec: dict[str, Any], today: date | None = None) -> dict[str, 
         "truncated": truncated,
         "sql": compiled.sql,
         "params": [str(p) for p in compiled.params],
-        "range": {"start": start, "end": end},
+        # `start`/`end` are the calendar bounds of the window; `mode` and
+        # `basis` say whether the rows were selected by accounting month or by
+        # date, which is the difference between two figures that would
+        # otherwise look like a bug.
+        "range": period.as_json(),
     }
 
     if spec.get("compare"):
@@ -618,15 +625,21 @@ def run_query(db, spec: dict[str, Any], today: date | None = None) -> dict[str, 
 
 def _compare(db, spec: dict[str, Any], compiled: Compiled, rows: list[dict[str, Any]],
              raw_rows: list[Any], today: date | None) -> dict[str, Any]:
-    """Attach the same measures over the preceding window of equal length."""
-    start, end = resolve_range(spec.get("date_range"), today)
-    prev_start, prev_end = shift_range(start, end)
-    if not prev_start:
+    """Attach the same measures over the preceding window of equal length.
+
+    Measured in whatever unit the window itself is in: three accounting
+    months compare against the three before them, and a 28-day custom range
+    against the 28 days before it. Comparing a month window against a day
+    window would put a partial month beside a whole one.
+    """
+    period = resolve_period(spec.get("date_range"), today)
+    previous_window = periods.previous_period(period)
+    if previous_window is None:
         return {"compare_note": "Comparison needs a bounded date range - there "
                                 "is no period before 'all time'."}
 
     previous = compile_query(
-        {**spec, "compare": False, "_range_override": (prev_start, prev_end)}, today)
+        {**spec, "compare": False, "_period_override": previous_window}, today)
     with db.connection() as conn:
         prev_rows = conn.execute(previous.sql, previous.params).fetchall()
 
@@ -645,7 +658,11 @@ def _compare(db, spec: dict[str, Any], compiled: Compiled, rows: list[dict[str, 
             row[f"{alias}__delta"] = (
                 None if before is None or now is None else round(now - before, 2))
 
-    return {"compared_to": {"start": prev_start, "end": prev_end}}
+    prev_start, prev_end = previous_window.bounds()
+    return {"compared_to": {
+        "start": prev_start.isoformat() if prev_start else None,
+        "end": prev_end.isoformat() if prev_end else None,
+    }}
 
 
 # --------------------------------------------------------------------------
@@ -677,8 +694,8 @@ def schema(db) -> dict[str, Any]:
         # computed - which is one level out.
         months = [r["m"] for r in conn.execute(
             "SELECT m FROM ("
-            "  SELECT DISTINCT CASE WHEN accounting_month != '' THEN accounting_month"
-            "  ELSE substr(txn_date, 1, 7) END AS m FROM transactions"
+            f"  SELECT DISTINCT {periods.effective_month_sql()} AS m"
+            "   FROM transactions"
             ") months WHERE m != '' ORDER BY m DESC"
         ).fetchall()]
         institutions = [r["institution"] for r in conn.execute(

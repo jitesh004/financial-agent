@@ -23,6 +23,7 @@ from ..models.schemas import (Account, AccountType, CATEGORY_GROUPS, Category,
                               CONTRA_EXPENSE_ROLES, Direction, FlowRole,
                               INCOME_CATEGORIES, LIABILITY_TYPES, Transaction)
 from ..rules import formats
+from . import periods
 
 #: Shared with the loan calculator and every other place a figure is rounded -
 #: see rules.formats. Kept under these names because callers import them here.
@@ -210,6 +211,7 @@ def analyze(
     *,
     start: date | None = None,
     end: date | None = None,
+    period: "periods.Period | None" = None,
 ) -> AnalysisResult:
     """Compute the full picture from a categorized, reconciled ledger.
 
@@ -217,12 +219,30 @@ def analyze(
     range are included.  The resulting `period_start` / `period_end` are set
     to the explicit bounds so the caller can distinguish "no data" from
     "data that happens to start later".
+
+    `period` is the richer form of the same idea and the one every screen
+    uses: a window of whole ACCOUNTING months (see analytics.periods), so
+    asking for August gets the salary the period engine assigned to August
+    even though it arrived on 1 September. The dates it reports back are then
+    the real first and last dates of the rows that qualified - 27 Jul to
+    31 Aug, say - rather than the nominal month boundaries, because those are
+    the dates the figures actually cover.
     """
     result = AnalysisResult()
     accounts = accounts or {}
 
     if not transactions:
-        result.notes.append("No transactions available to analyze.")
+        # Two different empties, and they read differently to whoever is
+        # looking: a ledger with nothing in it, versus a period with nothing
+        # in it. Distinguished here so a caller that filtered the rows in SQL
+        # gets the same answer as one that passes the whole ledger and a
+        # window - which is what makes that an optimisation rather than a
+        # behaviour change.
+        if period is not None and not period.is_all:
+            result.notes.append(f"No transactions counted in {period.label()}.")
+            result.period_start, result.period_end = period.bounds()
+        else:
+            result.notes.append("No transactions available to analyze.")
         return result
 
     txns = sorted(transactions, key=lambda t: t.txn_date)
@@ -255,7 +275,18 @@ def analyze(
     else:  # pragma: no cover - guarded by the empty check above
         span_start = span_end = None
 
-    if start or end:
+    if period is not None and not period.is_all:
+        # A no-op when the caller already filtered - `period` still has to be
+        # passed so the dates and the month count below describe the window.
+        txns = periods.filter_transactions(txns, period)
+        if not txns:
+            result.notes.append(
+                f"No transactions counted in {period.label()}.")
+            result.period_start, result.period_end = period.bounds()
+            return result
+        result.period_start = min(t.txn_date for t in txns)
+        result.period_end = max(t.txn_date for t in txns)
+    elif start or end:
         s = start or txns[0].txn_date
         e = end or txns[-1].txn_date
         txns = [t for t in txns if s <= t.txn_date <= e]
@@ -309,7 +340,13 @@ def analyze(
     result.net_savings = q(result.total_income - result.total_spend)
     result.savings_rate = _pct(result.net_savings, result.total_income)
 
-    result.months_covered = _count_months(result.period_start, result.period_end)
+    # Months the rows are COUNTED in, which is the divisor every per-month
+    # average below wants. Not the calendar span of the dates: one accounting
+    # month's rows can run across three calendar months - August's from 27
+    # July to 1 September - and dividing one month of figures by three puts
+    # every average on the screen out by a factor of three. It is also the
+    # count the monthly table has rows for, so the header and the table agree.
+    result.months_covered = len({_effective_month(t) for t in txns})
     if result.months_covered:
         divisor = Decimal(result.months_covered)
         result.average_monthly_income = q(result.total_income / divisor)
@@ -334,12 +371,6 @@ def analyze(
 
     _add_quality_notes(result)
     return result
-
-
-def _count_months(start: date | None, end: date | None) -> int:
-    if not start or not end:
-        return 0
-    return max(1, (end.year - start.year) * 12 + (end.month - start.month) + 1)
 
 
 def _income_val(t: Transaction) -> Decimal:

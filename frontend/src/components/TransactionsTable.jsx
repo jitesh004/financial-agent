@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, count, dateLabel, money, titleCase } from '../lib';
+import { api, count, dateLabel, money, monthLabel, titleCase } from '../lib';
+import { usePeriod } from '../period';
 import { downloadCsv, toCsv, usePrefs } from '../prefs';
 import { Callout, Card, Chip, Empty, PromptButton } from './ui';
 
@@ -240,6 +241,13 @@ export default function TransactionsTable({
   const [prefs] = usePrefs();
   const pageSize = Number(prefs.pageSize) || PAGE;
   const compact = prefs.density === 'compact';
+  /* The app's period, not one of this table's own. Sent to the server, which
+     selects on the ACCOUNTING month - so the rows here are the same rows the
+     period's figures were computed from, including a salary dated 1 September
+     that August is owed. */
+  const { params: periodParams, label: periodLabel, scoped, window: resolved }
+    = usePeriod();
+  const periodKey = JSON.stringify(periodParams);
 
   useEffect(() => { api.categories().then(setCategories).catch(() => {}); }, []);
 
@@ -255,7 +263,9 @@ export default function TransactionsTable({
     return [...selected].join(',');
   }, [selected]);
 
-  useEffect(() => { setPage(0); }, [accountParam, category, rail, sortBy, sortDir]);
+  useEffect(() => {
+    setPage(0);
+  }, [accountParam, category, rail, sortBy, sortDir, periodKey]);
 
   // A named loader, so a bulk edit can refresh without duplicating the query.
   const [reloadToken, setReloadToken] = useState(0);
@@ -268,6 +278,7 @@ export default function TransactionsTable({
       account_id: accountParam || undefined,
       category: fixedCategory || category || undefined,
       rail: fixedRail || rail || undefined,
+      ...periodParams,
       sort_by: sortBy, sort_dir: sortDir,
       limit: pageSize, offset: page * pageSize,
     })
@@ -280,8 +291,9 @@ export default function TransactionsTable({
       .catch((e) => !cancelled && setError(e.message))
       .finally(() => !cancelled && setLoading(false));
     return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountParam, category, rail, sortBy, sortDir, page, fixedCategory,
-      fixedRail, pageSize, reloadToken]);
+      fixedRail, pageSize, reloadToken, periodKey]);
 
   // Search filters the loaded page only. Pushing it server-side would be the
   // next step; for now the UI says so rather than pretending it searched all.
@@ -415,6 +427,12 @@ export default function TransactionsTable({
     <>
       <div className="section-title">
         {title} {total > 0 && `· ${count(total)} total`}
+        {scoped && (
+          <span className="section-note" title={resolved?.basis === 'accounting'
+            ? 'Whole accounting months' : 'Exact transaction dates'}>
+            {periodLabel}
+          </span>
+        )}
       </div>
 
       {accounts.length > 1 && (
@@ -523,7 +541,12 @@ export default function TransactionsTable({
             <div className="spinner" /> Loading transactions…
           </div>
         ) : visible.length === 0 ? (
-          <Empty title="No transactions match">{emptyHint}</Empty>
+          <Empty title={scoped ? `No transactions in ${periodLabel}`
+            : 'No transactions match'}>
+            {scoped
+              ? 'Widen the period, or clear it, to see the rest of the ledger.'
+              : emptyHint}
+          </Empty>
         ) : (
           // Fragment: this branch renders the bulk bar AND the table, and a
           // ternary arm takes one expression.
@@ -619,7 +642,16 @@ export default function TransactionsTable({
                         onChange={() => togglePicked(t.id)}
                       />
                     </td>
-                    <td className="nowrap">{dateLabel(t.date)}</td>
+                    <td className="nowrap">
+                      {dateLabel(t.date)}
+                      {t.accounting_month
+                        && t.accounting_month !== String(t.date).slice(0, 7) && (
+                        <div style={{ color: 'var(--text-3)', fontSize: 11 }}
+                          title="Counted in this month, not the month of the date">
+                          counts in {monthLabel(t.accounting_month)}
+                        </div>
+                      )}
+                    </td>
                     <td>
                       <div style={{ wordBreak: 'break-word', whiteSpace: 'normal', lineHeight: '1.4' }}>{t.description}</div>
                       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 4 }}>

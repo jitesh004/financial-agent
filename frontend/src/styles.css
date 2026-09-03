@@ -581,6 +581,99 @@ select option {
 
 
 /* ===================================================================
+   The period control
+   ===================================================================
+
+   One bar, above whichever panel is open, saying which period the whole app
+   is showing. It sits between the header and the content rather than inside
+   the header: the header is already at its width budget (see .nav-groups),
+   and this control has to be able to grow a second row for a custom window
+   without pushing the tabs off the edge.
+
+   The resolved window is part of the control, not a tooltip. "Last 3 months"
+   is a name; "Jan 2026 - Mar 2026, by accounting month" is the fact, and a
+   filter that will not show its own bounds is one you have to trust. */
+
+.period {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 10px 12px; margin-bottom: 14px;
+}
+
+.period-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+
+.period-legend {
+  font-size: 11px; font-weight: 650; text-transform: uppercase;
+  letter-spacing: .07em; color: var(--text-3);
+}
+
+/* Slimmer than the app default: this row carries a segmented control, a
+   select and two pickers, and the default 13px control makes it wrap on a
+   laptop. */
+.period-input {
+  font-size: 12px; padding: 5px 8px;
+}
+
+.period-seg .seg-btn { padding: 5px 10px; }
+.period-clear { font-size: 12px; padding: 4px 10px; }
+
+/* Pushed to the end of the row, and first to drop to its own line. */
+.period-resolved {
+  margin-left: auto; display: flex; align-items: baseline; gap: 8px;
+  font-size: 12.5px; color: var(--text-2); min-width: 0;
+}
+.period-resolved strong { color: var(--text); font-weight: 620; }
+.period-basis { font-size: 11.5px; color: var(--text-3); }
+
+.period-custom {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);
+}
+.period-dash { color: var(--text-3); font-size: 12px; }
+.period-note {
+  font-size: 11.5px; line-height: 1.5; color: var(--text-3);
+  flex: 1; min-width: 200px;
+}
+
+/* Recomputing is not a reason to unmount the figures: a spinner in their
+   place makes every period change flash the whole page. */
+.period-loading {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--text-3); margin: -4px 0 12px;
+}
+
+/* Every month there is data for, one click each - the Months tab's own way
+   in. Scrolls rather than wraps to four rows on a long ledger. */
+.month-strip {
+  display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px;
+}
+.month-strip .chip-toggle { flex: none; }
+
+/* A qualifier on a section heading: which window it covers, or that it does
+   not move with the window at all. Small, secondary, and never uppercase -
+   it is a sentence fragment, not a label. */
+.section-note {
+  margin-left: 10px; font-size: 11.5px; font-weight: 500;
+  letter-spacing: 0; text-transform: none; color: var(--text-3);
+}
+
+/* A button that reads as a link, for a table cell that navigates. */
+.btn.link {
+  background: transparent; border-color: transparent; color: var(--accent);
+  padding: 2px 4px; font-weight: 600;
+}
+.btn.link:hover:not(:disabled) {
+  background: var(--accent-soft); border-color: transparent;
+}
+
+@media (max-width: 720px) {
+  .period-resolved { margin-left: 0; width: 100%; }
+}
+
+
+/* ===================================================================
    Explore: user-built dashboards
    =================================================================== */
 
@@ -849,7 +942,13 @@ select option {
   min-height: 100vh; background: var(--bg); color: var(--text);
   display: flex; align-items: center; justify-content: center;
   padding: 32px 16px;
+  position: relative;
 }
+
+/* The theme control, on the two screens that sit outside the app shell.
+   Both used to be reachable only from the header behind them, which is the
+   one place someone on this screen cannot get to. */
+.auth-theme { position: absolute; top: 16px; right: 16px; }
 
 .signin-panel {
   width: min(460px, 100%); text-align: center;
@@ -912,9 +1011,21 @@ select option {
    to get straight to their data should be able to see that they can. */
 .onboarding-skip { flex: none; font-size: 12px; }
 
+/* How much is left, as a line. Three named steps say what the work IS; this
+   says how far through it you are, which is what makes a wizard feel finite. */
+.onboarding-progress {
+  height: 3px; border-radius: 999px; background: var(--surface-2);
+  border: 1px solid var(--border); overflow: hidden; margin-top: 20px;
+}
+.onboarding-progress-fill {
+  height: 100%; background: var(--accent);
+  transition: width .32s cubic-bezier(.4, 0, .2, 1);
+}
+
 .onboarding-steps {
   list-style: none; display: flex; gap: 6px; flex-wrap: wrap;
-  margin: 22px 0; padding: 0 0 18px; border-bottom: 1px solid var(--border);
+  margin: 14px 0 22px; padding: 0 0 18px;
+  border-bottom: 1px solid var(--border);
 }
 .onboarding-steps button {
   appearance: none; cursor: pointer; font-family: inherit;
@@ -941,10 +1052,45 @@ select option {
   background: var(--positive-soft); border-color: transparent;
   color: var(--positive);
 }
+/* Passed over rather than completed. Shown as itself instead of as done:
+   every step here is skippable, and a tick against one nobody filled in
+   would be the wizard lying about its own state. */
+.onboarding-steps .skipped button { color: var(--text-3); }
+.onboarding-steps .skipped .onboarding-dot {
+  border-style: dashed; background: transparent;
+}
+.onboarding-steps .current button { font-weight: 620; }
+
+/* Each step arrives rather than snapping in. Short enough not to be a delay -
+   the panel is already on screen, only its contents change. */
+.onboarding-body { animation: step-in .22s cubic-bezier(.4, 0, .2, 1); }
+
+@keyframes step-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* Someone who has asked their system for less motion gets none of it. */
+@media (prefers-reduced-motion: reduce) {
+  .onboarding-body { animation: none; }
+  .onboarding-progress-fill { transition: none; }
+}
+
+/* A note under a field: why what was typed may not do what was hoped. Never
+   an error - nothing here is rejected, and a red field for something that
+   will be stored anyway is a lie about the consequence. */
+.field-hint { font-size: 11.5px; line-height: 1.45; color: var(--warn); }
+
+.onboarding-aside {
+  font-size: 11.5px; color: var(--text-3); margin: 10px 0 0;
+}
 
 .onboarding-step h2 {
   font-size: 15px; font-weight: 640; letter-spacing: -.2px; margin: 0 0 8px;
 }
+/* The confirmation of the step just finished sits above this one's heading,
+   and two blocks of text with no air between them read as one. */
+.onboarding-step > .callout + h2 { margin-top: 16px; }
 .onboarding-lead {
   font-size: 13px; line-height: 1.6; color: var(--text-2); margin: 0 0 14px;
 }

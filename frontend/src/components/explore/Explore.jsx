@@ -298,6 +298,29 @@ export default function Explore() {
                   })} />
               </>
             )}
+            {/* Months rather than dates, which is how every preset is
+                resolved: whole ACCOUNTING months, so a salary paid on the 1st
+                counts in the month it is pay for. See analytics/periods.py. */}
+            {boardFilters.date_range?.preset === 'custom_months' && (
+              <>
+                <input className="xp-input slim" type="month"
+                  aria-label="First month"
+                  value={boardFilters.date_range.start_month || ''}
+                  onChange={(e) => setBoardFilters({
+                    ...boardFilters,
+                    date_range: { ...boardFilters.date_range,
+                      start_month: e.target.value },
+                  })} />
+                <input className="xp-input slim" type="month"
+                  aria-label="Last month"
+                  value={boardFilters.date_range.end_month || ''}
+                  onChange={(e) => setBoardFilters({
+                    ...boardFilters,
+                    date_range: { ...boardFilters.date_range,
+                      end_month: e.target.value },
+                  })} />
+              </>
+            )}
             <button className="btn" style={{ fontSize: 12 }} onClick={() => setFiltersOpen(true)}>
               Filters{activeFilterCount ? ` (${activeFilterCount})` : ''}
             </button>

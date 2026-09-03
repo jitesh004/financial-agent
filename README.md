@@ -233,6 +233,46 @@ untouched, and is safe to run twice.
   permanently
 - **Files & quality** — per-file reconciliation status and every matched transfer
 
+Every one of those that is *about a period* reads one, shared, from a control
+above it — see below.
+
+---
+
+## Periods, and why "August" is not "the rows dated in August"
+
+One control sits above the Overview, Months, Spending, Recurring, Ledger and
+Review, and every figure under it is for the period it names: **This month**,
+**Last month**, **3 / 6 / 12 months**, **year to date**, **last calendar
+year**, **this or last financial year** (April–March), or a window you draw
+yourself — in whole months, or in exact dates.
+
+The presets do not select by date. They select **whole accounting months**,
+which is the month the ledger *counts* each row in:
+
+> Pay lands on the last working day. In one month that is the 31st; two months
+> later the 31st is a Sunday and it arrives on the 1st of the next. Count by
+> date and August holds two salaries and July holds none — the savings rate for
+> both months is wrong, and so is every average computed from them.
+
+So asking for August gets the salary that arrived on **1 September** if that is
+August's pay, and excludes the one that arrived on **1 August** because that is
+July's. The Months tab has always worked this way; the period control is that
+rule, applied everywhere, from one implementation
+(`backend/app/analytics/periods.py`). Which month a row is counted in is
+decided once at import time and shown on the row itself wherever it differs
+from the date — see [§4b of the rules](docs/RULES.md#4b-which-month-a-transaction-counts-in).
+
+A **custom window** offers both readings, and says which is which: *Months*
+keeps the accounting behaviour above, *Exact dates* is the literal one — the
+day a transaction happened, whatever month it is booked in.
+
+Three things deliberately do **not** move with the period, and say so on
+screen: account balances (as-of the latest statement), the cashflow forecast
+(from today, forwards), and the written narrative — prose is generated once per
+import, and re-titling last quarter's summary as if it described this month
+would be exactly the kind of plausible-and-wrong output the rest of this app
+exists to prevent.
+
 ---
 
 ## Protected PDFs, deduplication, and Gmail import

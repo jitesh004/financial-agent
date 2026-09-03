@@ -379,6 +379,43 @@ The day thresholds are named constants (`MONTH_END_ANCHOR` and friends) because
 the Rules screen prints them; a number typed twice eventually disagrees with
 itself.
 
+### 4c. Selecting a period
+
+The same module's other half, and the reason it matters that the rules above
+are one implementation: **every period control in the app selects whole
+accounting months**, so a period's figures are the months' figures.
+
+`PERIOD_PRESETS` is the catalogue — all time, this month, last month, 3 / 6 /
+12 months, year to date, last calendar year, this and last financial year
+(April to March, `FY_START_MONTH`), and the two custom shapes. `/api/periods`
+serves it **already resolved**, and the frontend renders its picker from that
+rather than resolving anything itself: "the last three months" implemented on
+both sides is two answers that eventually differ, and the one that matters is
+the one the rows were filtered by.
+
+A resolved `Period` is one of three shapes:
+
+| `mode` | Selects on | Where it comes from |
+|---|---|---|
+| `months` | the accounting month, `start_month`..`end_month` | every preset, and a custom *month* window |
+| `dates` | `txn_date`, `start`..`end` | a custom *date* window |
+| `all` | nothing | all time |
+
+`effective_month_sql()` is that selection as SQL, and both the repository's
+transaction filters and the Explore query engine use it — including its
+fallback to the calendar month of the date, so a row imported before accounting
+months existed still lands in a month rather than in none. Filtering the bare
+column would have quietly excluded every such row from every period.
+
+Two consequences worth stating:
+
+- **A window's reported dates are the rows' real dates.** Ask for August and
+  the header reads "27 Jul → 1 Sep" if that is when August's rows fall. The
+  month boundaries are the *selection*; the dates are the *coverage*.
+- **`months_covered` counts months, not the calendar span.** August's rows can
+  run across three calendar months, and dividing one month of figures by three
+  would put every per-month average on the screen out by a factor of three.
+
 ## 5. Check
 
 ### Categorization
@@ -527,6 +564,7 @@ the money readers, and it is now explicit.
 | add a date or money shape | `normalize/parsers.py` — once, for every reader |
 | add a card-bill wording | `rules/formats.py` — the core if all three readers need it, the named extra if only one does |
 | change the scan look-back options | `gmail_source.PERIOD_OPTIONS` — the UI reads it from `/api/gmail/periods` | |
+| add a reporting period preset | one entry in `analytics/periods.PERIOD_PRESETS`, plus its case in `resolve_period` | nothing — `/api/periods`, the Explore schema and the picker all read that list |
 
 `backend/tests/test_rules.py` guards the registries. It asserts the derived
 lists still cover what the hand-written ones did, that every institution can

@@ -31,6 +31,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from . import storage
+from .analytics import periods
 from .api import (auth_routes, files_routes, gmail_routes, job_routes,
                   query_routes, rules_routes, settings_routes, staging_routes,
                   wealth_routes)
@@ -816,6 +817,118 @@ def dashboard() -> dict[str, Any]:
     return {"status": "ok", "run_id": run_id, **rebuilt["result"]}
 
 
+@app.get("/api/periods")
+def list_periods() -> dict[str, Any]:
+    """Every reporting period the app offers, already resolved.
+
+    Resolved HERE rather than in the browser so one implementation of "last
+    three months" serves the whole app. The frontend renders the picker from
+    this list and sends back a preset name; nothing about which months a
+    preset means is decided twice.
+
+    `months` is every accounting month the ledger actually has rows in, which
+    is what the custom-month pickers offer and what lets a period with no data
+    in it say so instead of looking like a month where nothing happened.
+    """
+    db = get_db()
+    months = repo.covered_months(db)
+    today = date.today()
+    resolved = []
+    for preset in periods.PERIOD_PRESETS:
+        key = preset["value"]
+        if key in {"custom", "custom_months"}:
+            # Nothing to resolve until the user draws the window, but the
+            # picker still needs to know which shape each one takes.
+            resolved.append({**preset,
+                             "mode": "months" if key == "custom_months" else "dates",
+                             "basis": "accounting" if key == "custom_months" else "date"})
+            continue
+        window = periods.resolve_period({"preset": key}, today).as_json()
+        # The catalogue's own label wins: "Last 3 months" is the name of the
+        # preset, and "Jan 2026 - Mar 2026" is what it currently resolves to.
+        resolved.append({**preset, **window, "label": preset["label"],
+                         "resolved_label": window["label"]})
+    return {
+        "today": today.isoformat(),
+        "presets": resolved,
+        "months": [{"month": m, "count": n} for m, n in months],
+        "earliest": months[0][0] if months else None,
+        "latest": months[-1][0] if months else None,
+        "fy_start_month": periods.FY_START_MONTH,
+    }
+
+
+def _period_from_query(
+    preset: str | None, start: str | None, end: str | None,
+    start_month: str | None, end_month: str | None,
+) -> "periods.Period":
+    """One query string to one resolved window, or a 400 saying why not."""
+    try:
+        return periods.resolve_period({
+            "preset": preset or ("custom_months" if (start_month or end_month)
+                                 else "custom" if (start or end) else "all"),
+            "start": start, "end": end,
+            "start_month": start_month, "end_month": end_month,
+        })
+    except periods.PeriodError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/analysis")
+def scoped_analysis(
+    preset: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    start_month: str | None = None,
+    end_month: str | None = None,
+) -> dict[str, Any]:
+    """The dashboard's figures, recomputed for one period.
+
+    Separate from /api/dashboard on purpose. That endpoint answers "what does
+    the whole ledger say", including the narrative and the transfer report -
+    neither of which is re-derivable per period without re-running the model.
+    This one answers "what do the figures say for THIS window", from rows
+    already in the database, which is pure aggregation.
+
+    The window is a run of accounting months, so the numbers here agree with
+    the Months tab by construction: a salary the period engine assigned to
+    August counts in August, whichever side of the month boundary it landed.
+    """
+    period = _period_from_query(preset, start, end, start_month, end_month)
+    db = get_db()
+
+    # What the whole ledger holds, in one aggregate. Answers "is this
+    # workspace empty?" and, for a window with nothing in it, "where is the
+    # data then?" - without reading a decade of rows to find out.
+    months = repo.covered_months(db)
+    if not months:
+        return {"status": "empty", "range": period.as_json(),
+                "message": "No statements have been analyzed yet."}
+
+    # Filtered in SQL rather than in Python: a one-month window on a ten-year
+    # ledger should read a month, not the decade. `analyze` still takes the
+    # period - it reports the window's own bounds and month count from it -
+    # and re-filtering rows that already match is a no-op.
+    accounts = {a.id: a for a in repo.get_accounts(db)}
+    transactions = repo.get_transactions(
+        db, start=period.start, end=period.end,
+        month_start=period.start_month, month_end=period.end_month)
+
+    from .analytics.engine import analyze
+
+    result = analyze(transactions, accounts, period=period)
+    return {
+        "status": "ok",
+        "range": period.as_json(),
+        "analysis": ser.analysis_json(result),
+        "available": {
+            "earliest": months[0][0],
+            "latest": months[-1][0],
+            "transaction_count": sum(count for _, count in months),
+        },
+    }
+
+
 def _rebuild_from_persisted_data(db) -> str:
     """Recompute the dashboard from what is already in the database.
 
@@ -942,22 +1055,44 @@ def list_transactions(
     offset: int = 0,
     needs_review: bool | None = None,
     accounting_month: str | None = None,
+    preset: str | None = None,
+    start_month: str | None = None,
+    end_month: str | None = None,
 ) -> dict[str, Any]:
+    """The ledger, filtered.
+
+    Two ways to ask for a period, and they mean different things:
+
+      * `preset` / `start_month` / `end_month` select whole ACCOUNTING months
+        - the reporting period each row is counted in, which for a salary
+        paid on 1 September can be August. This is what every period control
+        in the app sends, and it is why a period's total matches the Months
+        tab's.
+      * `start` / `end` select literal transaction dates. What a custom day
+        range means, and what a caller wanting "the rows dated in this week"
+        should use.
+
+    `accounting_month` is the single-month shortcut, kept because the Months
+    tab has always sent it.
+    """
     db = get_db()
     # Multiple accounts (or categories) come in as one comma-separated param -
     # "select card or account, multiple or single" needs an IN clause, not a
     # single equality check.
     account_ids = [a for a in account_id.split(",") if a] if account_id else None
     categories = [c for c in category.split(",") if c] if category else None
+    period = _period_from_query(preset, start, end, start_month, end_month)
     filters = dict(
         account_id=account_ids,
         category=categories,
-        start=date.fromisoformat(start) if start else None,
-        end=date.fromisoformat(end) if end else None,
+        start=period.start,
+        end=period.end,
         statement_id=statement_id,
         rail=rail,
         needs_review=needs_review,
         accounting_month=accounting_month,
+        month_start=period.start_month,
+        month_end=period.end_month,
     )
     txns = repo.get_transactions(
         db, **filters, sort_by=sort_by, sort_dir=sort_dir,
@@ -967,6 +1102,10 @@ def list_transactions(
         "transactions": [ser.transaction_json(t) for t in txns],
         "limit": limit,
         "offset": offset,
+        # What the server understood the period to be. A screen that shows
+        # figures for a window should be able to print the window it got
+        # rather than the one it asked for.
+        "range": period.as_json(),
         # Filtered to match what was actually returned - previously this
         # always reported the WHOLE table's row count regardless of any
         # filter, so a filtered view claimed far more pages than it had.

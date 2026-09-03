@@ -23,6 +23,7 @@ from typing import Any, Iterable, Sequence
 
 import psycopg
 
+from ..analytics import periods
 from ..models.schemas import (Account, AccountType, Category, ConfidenceSource,
                               Direction, ReconciliationResult,
                               ReconciliationStatus, SourceFormat, Statement,
@@ -452,6 +453,8 @@ def _transaction_filters(
     rail: str | None,
     needs_review: bool | None = None,
     accounting_month: str | None = None,
+    month_start: str | None = None,
+    month_end: str | None = None,
 ) -> tuple[list[str], list[Any]]:
     """Shared WHERE-clause builder, so a filtered count matches its list.
 
@@ -510,9 +513,23 @@ def _transaction_filters(
     # month of its date - see analytics.periods. Filtering on txn_date instead
     # would put a salary paid on 1-Sep in September even when the ledger
     # counts it as August's.
+    #
+    # `accounting_month` selects exactly one; `month_start`/`month_end` select
+    # a run of them, which is what every period preset in the app resolves to.
+    # Both go through the same expression as analytics.periods.effective_month
+    # so a row imported before accounting months existed still lands in the
+    # month of its date rather than in no month at all - filtering a bare
+    # column would silently drop every such row from every period.
+    month_column = periods.effective_month_sql()
     if accounting_month:
-        clauses.append("accounting_month = ?")
+        clauses.append(f"{month_column} = ?")
         params.append(accounting_month)
+    if month_start:
+        clauses.append(f"{month_column} >= ?")
+        params.append(month_start)
+    if month_end:
+        clauses.append(f"{month_column} <= ?")
+        params.append(month_end)
 
     return clauses, params
 
@@ -531,10 +548,12 @@ def get_transactions(
     offset: int = 0,
     needs_review: bool | None = None,
     accounting_month: str | None = None,
+    month_start: str | None = None,
+    month_end: str | None = None,
 ) -> list[Transaction]:
     clauses, params = _transaction_filters(
         account_id, start, end, category, statement_id, rail,
-        needs_review, accounting_month)
+        needs_review, accounting_month, month_start, month_end)
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     column = _SORTABLE_COLUMNS.get(sort_by, "txn_date")
@@ -597,14 +616,34 @@ def count_transactions(
     rail: str | None = None,
     needs_review: bool | None = None,
     accounting_month: str | None = None,
+    month_start: str | None = None,
+    month_end: str | None = None,
 ) -> int:
     clauses, params = _transaction_filters(
         account_id, start, end, category, statement_id, rail,
-        needs_review, accounting_month)
+        needs_review, accounting_month, month_start, month_end)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with db.connection() as conn:
         return conn.execute(
             f"SELECT COUNT(*) c FROM transactions {where}", params).fetchone()["c"]
+
+
+def covered_months(db: Database) -> list[tuple[str, int]]:
+    """Every accounting month the ledger has rows in, oldest first, with counts.
+
+    Read through the same expression as analytics.periods.effective_month, so
+    a month appears here exactly when filtering by it would return rows - a
+    list built off the bare column would omit every month whose rows predate
+    accounting periods and then the picker would not offer them.
+    """
+    month = periods.effective_month_sql()
+    with db.connection() as conn:
+        rows = conn.execute(
+            f"SELECT m, COUNT(*) c FROM ("
+            f"  SELECT {month} AS m FROM transactions"
+            f") months WHERE m != '' GROUP BY m ORDER BY m"
+        ).fetchall()
+    return [(r["m"], r["c"]) for r in rows]
 
 
 def _row_to_transaction(row) -> Transaction:

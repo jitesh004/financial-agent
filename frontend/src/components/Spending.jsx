@@ -4,10 +4,13 @@ import {
 } from 'recharts';
 import { colorFor, compact, dateLabel, money, monthLabel, pct, titleCase } from '../lib';
 import { BarList, Card, ChartTooltip, Chip, Empty, Stat, axisProps, moneyAxis } from './ui';
+import { usePeriod } from '../period';
 
 export default function Spending({ data }) {
   const { analysis } = data;
   const [groupBy, setGroupBy] = useState('category');
+  // Every figure on this page came from the window's rows; this names it.
+  const { label: periodLabel, scoped } = usePeriod();
 
   const categories = (analysis.by_category || []).map((c, i) => ({
     ...c, label: c.category, value: c.total, color: colorFor(i),
@@ -25,7 +28,10 @@ export default function Spending({ data }) {
 
   return (
     <>
-      <div className="section-title">Spending breakdown</div>
+      <div className="section-title">
+        Spending breakdown
+        {scoped && <span className="section-note">{periodLabel}</span>}
+      </div>
       <div className="grid cols-3">
         <Stat label="Total spent" value={analysis.totals?.spend} />
         <Stat
@@ -207,7 +213,12 @@ export default function Spending({ data }) {
         </>
       )}
 
-      {categories.length === 0 && <Empty title="No spending to show" />}
+      {categories.length === 0 && (
+        <Empty title={scoped ? `No spending counted in ${periodLabel}`
+          : 'No spending to show'}>
+          {scoped && 'Widen the period, or clear it, to see the whole ledger.'}
+        </Empty>
+      )}
     </>
   );
 }

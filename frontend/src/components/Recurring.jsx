@@ -1,6 +1,7 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Callout, Card, Chip, ConfirmButton, Empty, Stat } from './ui';
 import { api, dateLabel, money, titleCase } from '../lib';
+import { usePeriod } from '../period';
 
 /* Recurring commitments, each expandable to the transactions behind it.
  *
@@ -26,6 +27,8 @@ export default function Recurring() {
   const [editing, setEditing] = useState(null);
   const [draft, setDraft] = useState('');
 
+  const { label: periodLabel, scoped, window: resolved } = usePeriod();
+
   const load = useCallback(() => {
     setLoading(true);
     api.recurring()
@@ -35,6 +38,31 @@ export default function Recurring() {
   }, []);
 
   useEffect(load, [load]);
+
+  /* A series is a fact about a stretch of time, not about one row, so the
+     period narrows this list by OVERLAP: a commitment that was running at any
+     point in the window belongs in it. Filtering by "last seen inside the
+     window" would hide a live standing instruction whose last payment landed
+     the day before the window opened.
+
+     Done here rather than server-side because a series carries its own span -
+     first_seen to last_seen - and comparing two spans needs no query. The
+     comparison is against the window's NOMINAL calendar bounds, which for a
+     month window are its month boundaries; a series spans months by
+     definition, so the day or two an accounting month reaches past them
+     cannot change whether one overlaps. */
+  const visible = useMemo(() => {
+    if (!scoped || !resolved) return series;
+    const from = resolved.start;
+    const until = resolved.end;
+    return series.filter((s) => {
+      const first = s.first_seen || s.last_seen;
+      const last = s.last_seen || s.first_seen;
+      if (!first || !last) return true;
+      if (until && first > until) return false;
+      return !(from && last < from);
+    });
+  }, [series, scoped, resolved]);
 
   async function expand(s) {
     if (open === s.id) { setOpen(null); return; }
@@ -74,19 +102,33 @@ export default function Recurring() {
 
   if (loading) return <div className="spinner" style={{ margin: 40 }} />;
 
-  const active = series.filter((s) => s.is_active);
+  const active = visible.filter((s) => s.is_active);
+  /* A series reaches the frontend in two shapes, and this reads both.
+     /api/recurring returns the stored rows as they are - `median_amount`, as
+     a string - while the dashboard payload runs them through
+     serializers.recurring_json, which renames it to `amount` and adds a
+     `monthly_equivalent` the server has already normalised. Reading one name
+     renders every commitment as zero the moment the other shape arrives. */
+  const seriesAmount = (s) => Number(s.amount ?? s.median_amount) || 0;
   const monthlyTotal = active.reduce((sum, s) => {
-    const amount = Number(s.median_amount) || 0;
+    if (s.direction !== 'debit') return sum;
+    const normalised = Number(s.monthly_equivalent);
+    if (Number.isFinite(normalised) && normalised) return sum + normalised;
     const days = Number(s.cadence_days) || 30;
-    return sum + (s.direction === 'debit' ? (amount * 30.44) / days : 0);
+    return sum + (seriesAmount(s) * 30.44) / days;
   }, 0);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       <div>
-        <h2 className="section-title" style={{ marginBottom: 4 }}>Recurring</h2>
+        <h2 className="section-title" style={{ marginBottom: 4 }}>
+          Recurring
+          {scoped && <span className="section-note">{periodLabel}</span>}
+        </h2>
         <p style={{ color: 'var(--text-2)', margin: 0 }}>
           Click any row to see the transactions it was inferred from.
+          {scoped && ' Showing the commitments that were running at any point '
+            + 'in this period.'}
         </p>
       </div>
 
@@ -98,18 +140,24 @@ export default function Recurring() {
         <Stat label="Tracked series" value={String(active.length)} />
         <Stat label="Committed per month" value={monthlyTotal} tone="neg"
               note="normalised to a monthly figure" />
-        <Stat label="Not tracked" value={String(series.length - active.length)} />
+        <Stat label="Not tracked" value={String(visible.length - active.length)} />
       </div>
 
-      {!series.length && (
-        <Empty title="No recurring series detected">
-          A series needs at least three occurrences at a steady interval and a
-          reasonably stable amount. If your ledger has not been re-analysed
-          since periods were introduced, re-parse from the Data tab first.
+      {!visible.length && (
+        <Empty title={series.length
+          ? `No recurring series running in ${periodLabel}`
+          : 'No recurring series detected'}>
+          {series.length
+            ? `${series.length} series were detected in your ledger, none of `
+              + 'them in this period. Widen the period to see them.'
+            : 'A series needs at least three occurrences at a steady interval '
+              + 'and a reasonably stable amount. If your ledger has not been '
+              + 're-analysed since periods were introduced, re-parse from the '
+              + 'Data tab first.'}
         </Empty>
       )}
 
-      {series.map((s) => {
+      {visible.map((s) => {
         const isOpen = open === s.id;
         const rows = members[s.id];
         return (
@@ -170,7 +218,7 @@ export default function Recurring() {
                     color: s.direction === 'credit' ? 'var(--positive)' : 'var(--text)',
                   }}
                 >
-                  {money(Number(s.median_amount) || 0)}
+                  {money(seriesAmount(s))}
                 </div>
                 <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
                   <button

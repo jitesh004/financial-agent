@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import CreditReport from './components/CreditReport';
 import DataHub from './components/DataHub';
 import Debt from './components/Debt';
@@ -21,6 +21,9 @@ import Explore from './components/explore/Explore';
 import MailboxButton from './components/mailbox/MailboxButton';
 import MailboxModal from './components/mailbox/MailboxModal';
 import useMailbox from './components/mailbox/useMailbox';
+import PeriodPicker, { PeriodEmpty } from './components/PeriodPicker';
+import { PeriodProvider, usePeriod } from './period';
+import { useTheme } from './theme';
 
 
 // Ordered by how often they are used, not by when they were built. The five
@@ -80,6 +83,17 @@ const GROUP_OF = Object.fromEntries(
 //: them by nature - it describes what the app WOULD do, so it is at its
 //: most useful before anything has been imported.
 const ALWAYS_AVAILABLE = ['settings', 'data', 'rules', 'credit', 'portfolio'];
+
+/* Tabs the period control applies to, and therefore appears on.
+ *
+ * Not every tab has a period. A loan's amortization runs from today to
+ * payoff; a credit report and a holdings statement are photographs of one
+ * moment. Showing a range picker over those would imply it changes something,
+ * which is worse than not offering it - and Explore carries its own per-board
+ * range, because a board is a saved question about a period of its own.
+ */
+const PERIOD_TABS = ['overview', 'month-view', 'spending', 'recurring',
+  'ledger', 'review'];
 
 /* Navigation for a viewport too narrow to hold it.
  *
@@ -141,7 +155,18 @@ function NavDrawer({ groups, tab, reviewCount, onPick, onClose }) {
   );
 }
 
-export default function App({ openImport = false, onImportOpened }) {
+/* The period lives above the app so every tab reads the same one, and so it
+   survives switching tabs - which is the whole point of a period that belongs
+   to the app rather than to a panel. */
+export default function App(props) {
+  return (
+    <PeriodProvider>
+      <Dashboard {...props} />
+    </PeriodProvider>
+  );
+}
+
+function Dashboard({ openImport = false, onImportOpened }) {
   const [data, setData] = useState(null);
   const [tab, setTab] = useState('overview');
   // The member last used in each group. Bouncing between Ledger and Spending
@@ -153,15 +178,20 @@ export default function App({ openImport = false, onImportOpened }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [reviewCount, setReviewCount] = useState(0);
-  const [theme, setTheme] = useState(
-    () => localStorage.getItem('fa-theme')
-      || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'),
-  );
+  /* Held in theme.js, not here. This component only renders once you are
+     signed in and set up, so a theme owned by it left the sign-in screen and
+     the setup wizard with no theme at all - which is to say, light, under a
+     dark app. */
+  const [theme, toggleTheme] = useTheme();
 
-  useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme);
-    localStorage.setItem('fa-theme', theme);
-  }, [theme]);
+  const { params: periodParams, scoped, reportWindow } = usePeriod();
+  /* The figures for the selected window, recomputed server-side. Held apart
+     from `data` because the whole-ledger payload carries things a period
+     cannot re-derive - the narrative and the transfer report - so a window
+     replaces the arithmetic and keeps the rest. */
+  const [windowed, setWindowed] = useState(null);
+  const [windowError, setWindowError] = useState(null);
+  const [windowing, setWindowing] = useState(false);
 
   // True once anything has been shown. A refresh after that point must not
   // swap the whole of <main> for a spinner: doing so unmounts the tab the
@@ -190,6 +220,29 @@ export default function App({ openImport = false, onImportOpened }) {
 
   useEffect(() => { load(); }, [load]);
 
+  /* One request per window, for the whole app. Overview, Spending and the
+     Months tab all read this same answer, so switching between them does not
+     re-ask the same question three times - and cannot get three answers. */
+  const periodKey = JSON.stringify(periodParams);
+  useEffect(() => {
+    if (!scoped) { setWindowed(null); setWindowError(null); return undefined; }
+    let cancelled = false;
+    setWindowing(true);
+    api.analysis(periodParams)
+      .then((body) => {
+        if (cancelled) return;
+        setWindowed(body.status === 'ok' ? body : null);
+        setWindowError(null);
+        // The window the server actually applied, so the control describes
+        // that rather than what it guessed it had asked for.
+        reportWindow(periodKey, body.range);
+      })
+      .catch((e) => !cancelled && setWindowError(e.message))
+      .finally(() => !cancelled && setWindowing(false));
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [periodKey, scoped, data]);
+
   // The wizard's "Import statements" button finishes onboarding and asks the
   // app to open the import flow, rather than leaving someone who just said
   // "yes, bring my statements in" looking at an empty dashboard.
@@ -206,6 +259,30 @@ export default function App({ openImport = false, onImportOpened }) {
   const mailbox = useMailbox({ open: mailboxOpen, onImported: load });
 
   const hasData = Boolean(data?.analysis?.totals);
+
+  /* What the panels actually read.
+   *
+   * The window replaces `analysis` and nothing else. `accounts`, `loans` and
+   * `forecast` are not period-scoped facts - a balance is as-of, an
+   * amortization runs forward - and the narrative describes the whole ledger,
+   * so it is passed through untouched and labelled where it is shown, rather
+   * than being silently re-titled as if a model had written about this
+   * window.
+   */
+  const viewData = useMemo(() => {
+    if (!data) return data;
+    if (!scoped || !windowed?.analysis) return { ...data, range: null };
+    return {
+      ...data,
+      analysis: windowed.analysis,
+      range: windowed.range,
+      available: windowed.available,
+    };
+  }, [data, scoped, windowed]);
+
+  // A window with nothing in it, as opposed to a ledger with nothing in it.
+  const windowEmpty = scoped && windowed
+    && !windowed.analysis?.totals?.transaction_count;
 
   // A group with nothing available in it is not shown at all: before an
   // import, Money and Transactions have no members, and an empty group is a
@@ -308,7 +385,7 @@ export default function App({ openImport = false, onImportOpened }) {
 
 
         <MailboxButton mailbox={mailbox} onOpen={() => setMailboxOpen(true)} />
-        <ThemeToggle theme={theme} onToggle={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))} />
+        <ThemeToggle theme={theme} onToggle={toggleTheme} />
         {/* Profile moved inside the account menu: it is one of several things
             that belong to "you" rather than to the ledger, and a header with a
             button for each of them stops fitting on a laptop. */}
@@ -360,13 +437,41 @@ export default function App({ openImport = false, onImportOpened }) {
         ) : (
           <>
             {error && <Callout tone="warn">{error}</Callout>}
+
+            {/* One period, above whichever panel is open, so switching tabs
+                keeps the window rather than resetting it. Only on the tabs it
+                means something for - see PERIOD_TABS. */}
+            {hasData && PERIOD_TABS.includes(tab) && <PeriodPicker />}
+            {windowError && (
+              <Callout tone="warn">
+                The figures for this period could not be computed: {windowError}
+              </Callout>
+            )}
+            {/* Kept out of the way of the numbers: a spinner in place of the
+                figures would unmount the panel on every period change. */}
+            {windowing && (
+              <div className="period-loading">
+                <span className="spinner" /> Recomputing for this period…
+              </div>
+            )}
+
             {hasData && <WorkflowNav onNavigate={setTab} />}
-            {tab === 'overview' && <Overview data={data} />}
-            {tab === 'month-view' && <MonthView data={data} />}
-            {tab === 'spending' && <Spending data={data} />}
+
+            {/* A window with no rows in it must not render as a dashboard of
+                zeros: "you earned nothing and spent nothing" is a claim, and
+                the true one is "there is nothing here to report". */}
+            {windowEmpty && ['overview', 'spending'].includes(tab) ? (
+              <PeriodEmpty available={windowed?.available} />
+            ) : (
+              <>
+                {tab === 'overview' && <Overview data={viewData} />}
+                {tab === 'spending' && <Spending data={viewData} />}
+              </>
+            )}
+            {tab === 'month-view' && <MonthView data={viewData} />}
             {tab === 'recurring' && <Recurring />}
             {tab === 'review' && <ReviewHub />}
-            {tab === 'ledger' && <Ledger data={data} />}
+            {tab === 'ledger' && <Ledger data={viewData} />}
             {tab === 'debt' && <Debt data={data} />}
             {tab === 'credit' && <CreditReport accounts={data?.accounts || []}
               onImport={() => setMailboxOpen(true)} />}
