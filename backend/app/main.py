@@ -929,6 +929,76 @@ def scoped_analysis(
     }
 
 
+@app.get("/api/budget")
+def budget(
+    preset: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    start_month: str | None = None,
+    end_month: str | None = None,
+) -> dict[str, Any]:
+    """What a month costs, and what it leaves - from stored rows only.
+
+    Nothing here is a budget the user typed in. "Fixed" is a recurring series
+    the detector found, its end date is the loan's own amortization, and a
+    variable category's monthly figure is the median of what that category
+    actually cost per month. See analytics/budget.py.
+    """
+    period = _period_from_query(preset, start, end, start_month, end_month)
+    db = get_db()
+    transactions = repo.get_transactions(db)
+    if not transactions:
+        return {"status": "empty", "range": period.as_json(),
+                "message": "No statements have been analyzed yet."}
+
+    from .analytics import budget as budget_mod
+    from .analytics import loans as loans_mod
+    from .analytics.recurring import detect_recurring
+
+    accounts = {a.id: a for a in repo.get_accounts(db)}
+
+    # Detected here rather than read from `recurring_series`, for one reason
+    # that matters: the stored table keeps no membership. The budget has to
+    # know WHICH transactions each series accounts for, or the same rupee is
+    # counted once as a commitment and again as variable spending. Detection
+    # is deterministic and its ids are content hashes, so this returns the
+    # same series the Recurring tab shows - and the user's own edits to them
+    # are applied on top.
+    series = detect_recurring(transactions)
+    overrides = repo.recurring_overrides(db)
+    if overrides:
+        kept = []
+        for one in series:
+            edit = overrides.get(one.id)
+            if edit and edit.get("deleted"):
+                continue
+            if edit:
+                if edit.get("label") is not None:
+                    one.label = edit["label"]
+                if edit.get("category") is not None:
+                    one.category = edit["category"]
+                if edit.get("is_active") is not None:
+                    one.is_active = bool(edit["is_active"])
+            kept.append(one)
+        series = kept
+
+    projections = []
+    for account_id, account in accounts.items():
+        projection = loans_mod.project_loan(
+            account, [t for t in transactions if t.account_id == account_id])
+        if projection:
+            projections.append(projection)
+
+    result = budget_mod.analyse_budget(
+        transactions, series, period=period, loans=projections,
+        accounts=accounts)
+    return {
+        "status": "ok",
+        "range": period.as_json(),
+        **ser.budget_json(result),
+    }
+
+
 def _rebuild_from_persisted_data(db) -> str:
     """Recompute the dashboard from what is already in the database.
 
@@ -1058,6 +1128,8 @@ def list_transactions(
     preset: str | None = None,
     start_month: str | None = None,
     end_month: str | None = None,
+    flow_role: str | None = None,
+    merchant: str | None = None,
 ) -> dict[str, Any]:
     """The ledger, filtered.
 
@@ -1081,6 +1153,10 @@ def list_transactions(
     # single equality check.
     account_ids = [a for a in account_id.split(",") if a] if account_id else None
     categories = [c for c in category.split(",") if c] if category else None
+    # `flow_role` takes a list for the same reason: "money out" is expense and
+    # investment, and the panel that shows the rows behind a spending figure
+    # has to ask for exactly the roles that figure counted.
+    roles = [r for r in flow_role.split(",") if r] if flow_role else None
     period = _period_from_query(preset, start, end, start_month, end_month)
     filters = dict(
         account_id=account_ids,
@@ -1093,6 +1169,8 @@ def list_transactions(
         accounting_month=accounting_month,
         month_start=period.start_month,
         month_end=period.end_month,
+        flow_role=roles,
+        merchant=merchant,
     )
     txns = repo.get_transactions(
         db, **filters, sort_by=sort_by, sort_dir=sort_dir,

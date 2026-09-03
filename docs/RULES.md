@@ -416,6 +416,44 @@ Two consequences worth stating:
   run across three calendar months, and dividing one month of figures by three
   would put every per-month average on the screen out by a factor of three.
 
+### 4d. What a month costs
+
+`analytics/budget.py`. Splits the window's outflow into what is committed and
+what is chosen, and it is the one part of the app that answers a question about
+the *future* from nothing but the past.
+
+**A commitment** is a recurring series (§ the recurring detector) that is a
+debit, active, and on a cadence between 20 and 400 days — a weekly charge is a
+habit, not a commitment, and a yearly premium is one and gets normalised.
+Each is classified into one of three kinds, and the distinction is the point:
+
+| Kind | What it is | Counted in "a month costs"? |
+|---|---|---|
+| `debt` | EMI, loan interest | Yes |
+| `spending` | rent, utilities, insurance, subscriptions | Yes |
+| `saving` | SIPs and anything else in `investment` | **No** — the money is still theirs |
+
+Counting a SIP as an expense makes a diligent saver look reckless, so it is
+reported as spoken for and excluded from the cost.
+
+**How long a commitment lasts** is only knowable for debt, and only from the
+loan's own amortization: `_attach_end_date` matches the series to a
+`LoanProjection` on the account first and the EMI amount second, and refuses
+the match when the amounts differ by more than a quarter — one account can
+carry two loans, and the wrong payoff date is worse than none. Everything else
+says *until you stop it*, which is the truthful answer for a subscription.
+
+**The variable side** is every expense-role row that no commitment accounts
+for, grouped by category. Its monthly figure is the **median** of the per-month
+totals, never the mean: one holiday would otherwise set the expectation for
+every month after it. A category present in *every* month of the window is
+flagged `every_month` — groceries recur even though no single merchant does,
+and that is a different kind of thing from one big trip.
+
+Membership comes from the series' own `transaction_ids` and from each row's
+`recurring_series_id`, because either source alone has a gap. It matters: a row
+counted as both a commitment and as variable spending would be counted twice.
+
 ## 5. Check
 
 ### Categorization
@@ -565,6 +603,7 @@ the money readers, and it is now explicit.
 | add a card-bill wording | `rules/formats.py` — the core if all three readers need it, the named extra if only one does |
 | change the scan look-back options | `gmail_source.PERIOD_OPTIONS` — the UI reads it from `/api/gmail/periods` | |
 | add a reporting period preset | one entry in `analytics/periods.PERIOD_PRESETS`, plus its case in `resolve_period` | nothing — `/api/periods`, the Explore schema and the picker all read that list |
+| change what counts as a commitment | `analytics/budget.py` — `DEBT_CATEGORIES` for what is debt service, `MIN_CADENCE_DAYS`/`MAX_CADENCE_DAYS` for what is monthly enough to budget | |
 
 `backend/tests/test_rules.py` guards the registries. It asserts the derived
 lists still cover what the hand-written ones did, that every institution can

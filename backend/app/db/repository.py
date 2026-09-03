@@ -444,6 +444,14 @@ _SORTABLE_COLUMNS = {
 }
 
 
+#: How a merchant is keyed, matching how the analytics engine groups by one -
+#: see engine._merchant_spend. Written once because a "show me the rows behind
+#: this merchant" filter that keys the merchant differently from the figure it
+#: was clicked on returns a different set of rows than the figure counted.
+MERCHANT_KEY = ("COALESCE(NULLIF(merchant, ''),"
+                " NULLIF(normalized_description, ''), raw_description)")
+
+
 def _transaction_filters(
     account_id: str | Sequence[str] | None,
     start: date | None,
@@ -455,6 +463,8 @@ def _transaction_filters(
     accounting_month: str | None = None,
     month_start: str | None = None,
     month_end: str | None = None,
+    flow_role: str | Sequence[str] | None = None,
+    merchant: str | None = None,
 ) -> tuple[list[str], list[Any]]:
     """Shared WHERE-clause builder, so a filtered count matches its list.
 
@@ -481,6 +491,17 @@ def _transaction_filters(
 
     _in_or_eq("account_id", account_id)
     _in_or_eq("category", category)
+    _in_or_eq("flow_role", flow_role)
+
+    if merchant:
+        # A prefix match on the same expression the engine groups by, because
+        # its key is that expression truncated to 40 characters. `_` and `%`
+        # are escaped: a merchant called "PAY_TM" would otherwise match
+        # anything with any character in that position.
+        escaped = str(merchant).replace("\\", "\\\\")
+        escaped = escaped.replace("%", "\\%").replace("_", "\\_")
+        clauses.append(f"{MERCHANT_KEY} LIKE ? ESCAPE '\\'")
+        params.append(f"{escaped}%")
     if start:
         clauses.append("txn_date >= ?")
         params.append(start.isoformat())
@@ -550,10 +571,13 @@ def get_transactions(
     accounting_month: str | None = None,
     month_start: str | None = None,
     month_end: str | None = None,
+    flow_role: str | Sequence[str] | None = None,
+    merchant: str | None = None,
 ) -> list[Transaction]:
     clauses, params = _transaction_filters(
         account_id, start, end, category, statement_id, rail,
-        needs_review, accounting_month, month_start, month_end)
+        needs_review, accounting_month, month_start, month_end,
+        flow_role, merchant)
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     column = _SORTABLE_COLUMNS.get(sort_by, "txn_date")
@@ -618,10 +642,13 @@ def count_transactions(
     accounting_month: str | None = None,
     month_start: str | None = None,
     month_end: str | None = None,
+    flow_role: str | Sequence[str] | None = None,
+    merchant: str | None = None,
 ) -> int:
     clauses, params = _transaction_filters(
         account_id, start, end, category, statement_id, rail,
-        needs_review, accounting_month, month_start, month_end)
+        needs_review, accounting_month, month_start, month_end,
+        flow_role, merchant)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with db.connection() as conn:
         return conn.execute(
@@ -1038,6 +1065,22 @@ def get_recurring_series(db: Database) -> list[dict[str, Any]]:
             d["median_amount"] = _dec(d["median_amount"])
         out.append(d)
     return out
+
+
+def recurring_overrides(db: Database) -> dict[str, dict[str, Any]]:
+    """The user's own edits to detected series, by series id.
+
+    Separate from `get_recurring_series` because a caller that re-detects the
+    series itself - the budget does, to recover which transactions belong to
+    which series - still has to honour a rename, a mute or a delete. The ids
+    are content hashes of account + direction + merchant signature, so they
+    survive re-detection and an override keeps pointing at the same series.
+    """
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT series_id, label, category, is_active, deleted"
+            " FROM recurring_series_overrides").fetchall()
+    return {r["series_id"]: _row_dict(r) for r in rows}
 
 
 def save_recurring_series(db: Database, series: Sequence[Any]) -> int:

@@ -197,6 +197,16 @@ def analysis_json(analysis: Any) -> dict[str, Any]:
             for f in analysis.salary_flows
         ],
         "net_worth": {k: num(v) for k, v in analysis.net_worth.items()},
+        # A balance is a fact about a moment. Which moment, how it was
+        # arrived at, and which accounts could not be established for it -
+        # so the screen can say "as at 31 Aug" instead of leaving a figure
+        # that does not move with the period looking like one that should.
+        "position": {
+            "as_of": (analysis.net_worth_as_of.isoformat()
+                      if analysis.net_worth_as_of else None),
+            "basis": analysis.net_worth_basis,
+            "missing": analysis.net_worth_missing,
+        },
         "largest_expenses": [transaction_json(t) for t in analysis.largest_expenses],
         "unusual": [
             {**transaction_json(t), "reason": why} for t, why in analysis.unusual
@@ -206,6 +216,61 @@ def analysis_json(analysis: Any) -> dict[str, Any]:
             "total": num(analysis.uncategorized_total),
         },
         "notes": analysis.notes,
+    }
+
+
+def budget_json(result: Any) -> dict[str, Any]:
+    """The month, split into what is committed and what is chosen.
+
+    The derived figures - what a month costs, what it leaves, how much of the
+    income is spoken for - are computed on the dataclass and sent, rather than
+    left for the browser to add up. Same rule as everywhere else here: the
+    arithmetic happens once, in Python, over Decimals.
+    """
+    if result is None:
+        return {}
+    return {
+        "months": result.months,
+        "income": {
+            "typical_monthly": num(result.income_typical),
+            "total": num(result.income_total),
+        },
+        "commitments": [
+            {"label": c.label, "category": c.category, "kind": c.kind,
+             "monthly": num(c.monthly), "cadence": c.cadence,
+             "cadence_days": c.cadence_days, "occurrences": c.occurrences,
+             "months_seen": c.months_seen,
+             "charged_in_window": num(c.charged_in_window),
+             "last_seen": c.last_seen.isoformat() if c.last_seen else None,
+             "next_expected": (c.next_expected.isoformat()
+                               if c.next_expected else None),
+             "ends_on": c.ends_on.isoformat() if c.ends_on else None,
+             "months_left": c.months_left,
+             "account": c.account, "series_id": c.series_id,
+             "confidence": c.confidence}
+            for c in result.commitments
+        ],
+        "variable": [
+            {"category": v.category, "group": v.group,
+             "typical_monthly": num(v.typical_monthly),
+             "low_monthly": num(v.low_monthly),
+             "high_monthly": num(v.high_monthly),
+             "total": num(v.total), "months_seen": v.months_seen,
+             "count": v.transaction_count, "every_month": v.every_month}
+            for v in result.variable
+        ],
+        "totals": {
+            "committed_debt": num(result.committed_debt),
+            "committed_spending": num(result.committed_spending),
+            "committed_saving": num(result.committed_saving),
+            "committed_total": num(result.committed_total),
+            "variable_typical": num(result.variable_typical),
+            "monthly_cost": num(result.monthly_cost),
+            "headroom": num(result.headroom),
+            "committed_ratio": result.committed_ratio,
+            "income_typical": num(result.income_typical),
+        },
+        "notes": result.notes,
     }
 
 

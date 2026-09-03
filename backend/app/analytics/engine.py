@@ -152,6 +152,16 @@ class AnalysisResult:
 
     income_sources: list[tuple[str, Decimal, int]] = field(default_factory=list)
     net_worth: dict[str, Decimal] = field(default_factory=dict)
+    #: What `net_worth` is a position AS AT, and how it was arrived at. A
+    #: balance is a fact about a moment, so a figure with no moment attached
+    #: is the one number on the screen that cannot be checked.
+    net_worth_as_of: date | None = None
+    net_worth_basis: str = "latest"
+    #: Accounts whose balance could not be established for that moment - a
+    #: card statement with no running balance, an account with no rows in the
+    #: window. Named, because a total silently missing an account is worse
+    #: than a total that says which one it is missing.
+    net_worth_missing: list[str] = field(default_factory=list)
 
     largest_expenses: list[Transaction] = field(default_factory=list)
     unusual: list[tuple[Transaction, str]] = field(default_factory=list)
@@ -360,7 +370,31 @@ def analyze(
     result.income_sources = _income_sources(income_txns)
     result.salary_flows = _salary_flows(txns)
     result.p2p_balances = _p2p_balances(txns)
-    result.net_worth = _net_worth(accounts)
+
+    # The position, as at the end of the window rather than as of whenever the
+    # last statement happened to be. "Assets tracked" that does not move when
+    # you look at March is not answering a question about March.
+    as_at, missing = (None, [])
+    if period is not None and not period.is_all:
+        as_at, missing = _net_worth_as_at(accounts, txns, transactions)
+
+    if as_at is not None:
+        result.net_worth = as_at
+        result.net_worth_as_of = result.period_end
+        result.net_worth_basis = "period"
+        result.net_worth_missing = missing
+    else:
+        # Either no window, or a window in which nothing printed a balance -
+        # a ledger of card statements, which mostly do not carry one. The
+        # honest answer there is the latest figure there is, labelled as such.
+        # Reporting zero would be a claim that the accounts are empty.
+        result.net_worth = _net_worth(accounts)
+        result.net_worth_as_of = max(
+            (a.balance_as_of for a in accounts.values() if a.balance_as_of),
+            default=None)
+        result.net_worth_basis = "latest"
+        result.net_worth_missing = [
+            a.display_name() for a in accounts.values() if a.balance is None]
 
     result.largest_expenses = sorted(spend_txns, key=lambda t: -t.amount)[:15]
     result.unusual = _find_unusual(spend_txns + offset_txns, result.by_category)
@@ -620,6 +654,73 @@ def _net_worth(accounts: dict[str, Account]) -> dict[str, Decimal]:
     detail["_liabilities"] = q(liabilities)
     detail["_net"] = q(assets - liabilities)
     return detail
+
+
+def _net_worth_as_at(
+    accounts: dict[str, Account],
+    in_window: list[Transaction],
+    everything: list[Transaction],
+) -> tuple[dict[str, Decimal] | None, list[str]]:
+    """The position at the end of a window, from running balances.
+
+    A statement prints a balance after every row, so the balance at any moment
+    is the one printed on the last row up to it. That is read here rather than
+    recomputed by summing movements: the printed figure is the bank's own, it
+    has already been through the reconciliation gate, and a sum of movements
+    would silently absorb any row the parse missed.
+
+    Rows OUTSIDE the window are still consulted, deliberately. A window with
+    no activity on an account does not mean that account was empty in it - the
+    balance simply had not changed since the last row before it. Only an
+    account with no priced row at all is unknown, and those are named rather
+    than counted as zero.
+
+    Returns `None` when NOT ONE account could be established, which is the
+    normal case for a ledger of credit-card statements: no running balance is
+    printed on them at all. The caller falls back to the latest known figure
+    and says so, because a zero here would read as "you have nothing".
+    """
+    latest_in_window = max((t.txn_date for t in in_window), default=None)
+    assets, liabilities = ZERO, ZERO
+    detail: dict[str, Decimal] = {}
+    missing: list[str] = []
+
+    for account_id, account in accounts.items():
+        label = account.display_name()
+        priced = [
+            t for t in everything
+            if t.account_id == account_id and t.balance_after is not None
+            and (latest_in_window is None or t.txn_date <= latest_in_window)
+        ]
+        if priced:
+            # Last by date, then by source row - two rows can share a date and
+            # only their order on the statement says which came second.
+            last = max(priced, key=lambda t: (t.txn_date, t.source_row or 0))
+            signed = -abs(last.balance_after) if account.is_liability \
+                else last.balance_after
+        elif account.balance is not None and not any(
+                t.account_id == account_id for t in everything):
+            # Nothing was ever parsed for it - a holdings or loan account
+            # whose balance came from the statement header rather than from
+            # rows. That figure is as good here as anywhere.
+            signed = account.balance
+        else:
+            missing.append(label)
+            continue
+
+        if signed < 0:
+            liabilities += -signed
+        else:
+            assets += signed
+        detail[label] = q(signed)
+
+    if not detail:
+        return None, missing
+
+    detail["_assets"] = q(assets)
+    detail["_liabilities"] = q(liabilities)
+    detail["_net"] = q(assets - liabilities)
+    return detail, missing
 
 
 def _find_unusual(

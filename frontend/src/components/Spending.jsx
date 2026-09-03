@@ -5,12 +5,14 @@ import {
 import { colorFor, compact, dateLabel, money, monthLabel, pct, titleCase } from '../lib';
 import { BarList, Card, ChartTooltip, Chip, Empty, Stat, axisProps, moneyAxis } from './ui';
 import { usePeriod } from '../period';
+import { useDrill } from '../drill';
 
 export default function Spending({ data }) {
   const { analysis } = data;
   const [groupBy, setGroupBy] = useState('category');
   // Every figure on this page came from the window's rows; this names it.
   const { label: periodLabel, scoped } = usePeriod();
+  const { drill } = useDrill();
 
   const categories = (analysis.by_category || []).map((c, i) => ({
     ...c, label: c.category, value: c.total, color: colorFor(i),
@@ -18,6 +20,11 @@ export default function Spending({ data }) {
 
   const groups = Object.entries(analysis.by_group || {}).map(([label, value], i) => ({
     label, value, color: colorFor(i),
+    // A group is a set of categories, and the transactions endpoint takes a
+    // list - so a group drills into exactly the categories it is made of,
+    // read off the same breakdown the bars came from.
+    categories: (analysis.by_category || [])
+      .filter((c) => c.group === label).map((c) => c.category),
   }));
 
   const merchants = analysis.top_merchants || [];
@@ -33,7 +40,13 @@ export default function Spending({ data }) {
         {scoped && <span className="section-note">{periodLabel}</span>}
       </div>
       <div className="grid cols-3">
-        <Stat label="Total spent" value={analysis.totals?.spend} />
+        <Stat label="Total spent" value={analysis.totals?.spend}
+          onDrill={() => drill({
+            title: 'Total spent',
+            subtitle: 'Every row counted as spending in this period, net of '
+              + 'anything that came back against it.',
+            params: { flow_role: 'expense,refund,claim_settlement' },
+          })} />
         <Stat
           label="Biggest category"
           value={categories[0] ? titleCase(categories[0].category) : '—'}
@@ -44,6 +57,15 @@ export default function Spending({ data }) {
           value={analysis.uncategorized?.count ?? 0}
           tone={analysis.uncategorized?.count ? 'neg' : 'pos'}
           note={analysis.uncategorized?.total ? money(analysis.uncategorized.total) : 'Everything categorized'}
+          onDrill={analysis.uncategorized?.count
+            ? () => drill({
+              title: 'Uncategorised',
+              subtitle: 'No rule matched these, so they sit outside the '
+                + 'category breakdown. Setting a category here also teaches '
+                + 'the merchant for every future statement.',
+              params: { category: 'uncategorized' },
+            })
+            : undefined}
         />
       </div>
 
@@ -61,10 +83,24 @@ export default function Spending({ data }) {
             items={groupBy === 'category' ? categories : groups}
             total={analysis.totals?.spend}
             max={groupBy === 'category' ? 14 : 8}
+            onPick={(item) => drill({
+              title: titleCase(item.label),
+              subtitle: item.categories
+                ? `${money(item.value)} across ${item.categories.length} `
+                  + `categor${item.categories.length === 1 ? 'y' : 'ies'}: `
+                  + item.categories.map(titleCase).join(', ')
+                : `${money(item.value)} across ${item.count} `
+                  + `transaction${item.count === 1 ? '' : 's'}`,
+              params: {
+                category: item.categories
+                  ? item.categories.join(',') : item.category,
+              },
+            })}
           />
         </Card>
 
-        <Card title="Top merchants" sub={`${merchants.length} tracked`}>
+        <Card title="Top merchants"
+          sub={`${merchants.length} tracked — click one for its history`}>
           <div className="table-wrap scroll-y">
             <table>
               <thead>
@@ -77,7 +113,17 @@ export default function Spending({ data }) {
               </thead>
               <tbody>
                 {merchants.map((m) => (
-                  <tr key={m.merchant}>
+                  <tr key={m.merchant} className="row-drill"
+                    onClick={() => drill({
+                      title: m.merchant,
+                      subtitle: `${money(m.total)} over ${m.count} `
+                        + `transaction${m.count === 1 ? '' : 's'}, averaging `
+                        + `${money(m.average)}. First seen `
+                        + `${dateLabel(m.first_seen)}, last `
+                        + `${dateLabel(m.last_seen)}.`,
+                      params: { merchant: m.merchant },
+                    })}
+                    title={`Show every ${m.merchant} transaction`}>
                     <td>
                       <div className="truncate" style={{ maxWidth: 200 }}>{m.merchant}</div>
                       <Chip>{titleCase(m.category)}</Chip>
@@ -134,9 +180,26 @@ export default function Spending({ data }) {
               <BarList
                 items={latestFlow.allocations.map((a, i) => ({
                   label: a.category, value: a.amount, color: colorFor(i),
+                  category: a.category,
                 }))}
                 total={latestFlow.salary_amount}
                 max={10}
+                onPick={(item) => drill({
+                  title: titleCase(item.label),
+                  subtitle: `${money(item.value)} in the days between this `
+                    + 'salary and the next one.',
+                  // The window is the gap between two paydays, which is a
+                  // stretch of DAYS and not a month - so this one pins its
+                  // own dates rather than taking the page's period.
+                  ignorePeriod: true,
+                  periodLabel: `after the ${dateLabel(latestFlow.salary_date)} salary`,
+                  sortBy: 'date',
+                  params: {
+                    category: item.category,
+                    start: latestFlow.salary_date,
+                    end: nextSalaryDate(salaryFlows, latestFlow),
+                  },
+                })}
               />
               <div style={{ marginTop: 12 }}>
                 {latestFlow.left_over >= 0 ? (
@@ -198,7 +261,15 @@ export default function Spending({ data }) {
                 </thead>
                 <tbody>
                   {analysis.unusual.map((t) => (
-                    <tr key={t.id}>
+                    <tr key={t.id} className="row-drill"
+                      title={`Show every ${t.merchant || t.category} transaction`}
+                      onClick={() => drill({
+                        title: t.merchant || titleCase(t.category),
+                        subtitle: t.reason
+                          + ' Shown against everything else in this category, '
+                          + 'so you can see what typical looks like.',
+                        params: { category: t.category },
+                      })}>
                       <td className="nowrap">{dateLabel(t.date)}</td>
                       <td><div style={{ wordBreak: 'break-word', whiteSpace: 'normal', lineHeight: '1.4' }}>{t.description}</div></td>
                       <td><Chip>{titleCase(t.category)}</Chip></td>
@@ -221,6 +292,15 @@ export default function Spending({ data }) {
       )}
     </>
   );
+}
+
+/* When the next salary arrived, which is where a salary's window closes. The
+   last one has no next, so the window stays open-ended rather than being
+   closed at an invented date. */
+function nextSalaryDate(flows, current) {
+  const index = flows.findIndex((f) => f.salary_date === current.salary_date);
+  const next = index >= 0 ? flows[index + 1] : null;
+  return next?.salary_date || undefined;
 }
 
 /* Stack the six biggest categories per month and fold the rest into "other",

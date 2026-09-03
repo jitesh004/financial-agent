@@ -90,14 +90,22 @@ export default function PeriodPicker({ compact = false }) {
 
         {/* Everything else, including the two custom shapes. A select rather
             than more buttons: twelve of these on one row is a strip nobody
-            reads, which is the failure the grouped nav already fixed once. */}
+            reads, which is the failure the grouped nav already fixed once.
+
+            The placeholder is disabled. It read "More…" and was selectable,
+            so picking it did nothing at all - a menu entry that no-ops is
+            worse than no entry, because it reads as a broken feature rather
+            than as the label it actually is. */}
         <select
           className="period-input"
-          aria-label="More periods"
+          aria-label="Other periods"
           value={others.some((o) => o.value === period.preset) ? period.preset : ''}
           onChange={(e) => e.target.value && pick(e.target.value)}
         >
-          <option value="">More…</option>
+          <option value="" disabled>
+            {others.some((o) => o.value === period.preset)
+              ? 'Other periods…' : 'Or a longer period…'}
+          </option>
           {others.map((one) => (
             <option key={one.value} value={one.value}>
               {one.label}
