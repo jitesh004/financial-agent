@@ -306,10 +306,28 @@ def _ledger_rules() -> dict[str, Any]:
         "recurring": {
             "min_occurrences": recurring.MIN_OCCURRENCES,
             "amount_variance": recurring.AMOUNT_VARIANCE_TOLERANCE,
+            "min_confidence": recurring.MIN_CONFIDENCE,
+            "min_cadence_fit": recurring.MIN_CADENCE_FIT,
             "note": "Grouped by a merchant signature with numbers, month names and "
-                    "rail codes stripped, then tested for a regular cadence and a "
-                    "stable amount. Same payee, wildly different amounts is not a "
-                    "fixed charge.",
+                    "rail codes stripped, then every cadence is FITTED to the "
+                    "dates and the best-scoring one wins. The score weighs how "
+                    "close the dates sit to the rhythm they claim, how tightly "
+                    "they cluster on one day of the month, how many periods in "
+                    "the span actually hold a charge, and whether any period "
+                    "holds two - which is proof the rhythm is wrong.",
+            # Published because "the amount is stable" means something
+            # different for an EMI and for an electricity bill, and a single
+            # number could only ever be wrong in one direction or the other.
+            "amount_tolerance": [
+                {"category": category, "tolerance": tolerance}
+                for category, tolerance in sorted(
+                    recurring.AMOUNT_TOLERANCE.items())
+            ],
+            "amount_note": "A charge whose price ROSE is still one charge: a "
+                           "clean level shift keeps the series and the new "
+                           "level becomes the going-forward figure. So does a "
+                           "steady drift, which is what a loan's interest "
+                           "component does every month for twenty years.",
         },
         "pairing": [
             {

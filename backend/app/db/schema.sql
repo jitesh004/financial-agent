@@ -362,14 +362,40 @@ CREATE TABLE IF NOT EXISTS recurring_series (
     label          TEXT NOT NULL,
     category       TEXT NOT NULL DEFAULT 'uncategorized',
     direction      TEXT NOT NULL,
+    -- The going-forward figure: what the NEXT charge is expected to be, which
+    -- for a series whose price rose is the level SINCE the rise rather than
+    -- the lifetime median. `lifetime_median` below keeps the other one.
     median_amount  TEXT NOT NULL,
     cadence_days   INTEGER NOT NULL DEFAULT 30,
+    -- Stored rather than mapped back from cadence_days by whoever reads this.
+    -- The frontend carried its own copy of that table and could not name a
+    -- cadence the detector learned about later.
+    cadence_name   TEXT NOT NULL DEFAULT '',
     occurrences    INTEGER NOT NULL DEFAULT 0,
     first_seen     TEXT,
     last_seen      TEXT,
     next_expected  TEXT,
     is_active      INTEGER NOT NULL DEFAULT 1,
+    -- "active", "overdue" (a charge has been missed, but not enough of them
+    -- to call it finished) or "ended". is_active collapses the first two.
+    status         TEXT NOT NULL DEFAULT 'active',
     confidence     DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    -- How the detector reached its verdict, so a series read back from
+    -- storage can still be explained. Coverage is the share of periods
+    -- between the first and last charge that actually hold one, which is the
+    -- difference between rent and a shop visited now and then.
+    coverage        DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    missed          INTEGER NOT NULL DEFAULT 0,
+    day_of_month    INTEGER,
+    amount_variance DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    -- "flat", "rose", "fell" or "drifting", with the level it moved from and
+    -- when, so a price rise is visible rather than averaged away.
+    amount_trend    TEXT NOT NULL DEFAULT 'flat',
+    lifetime_median TEXT,
+    last_amount     TEXT,
+    changed_on      TEXT,
+    -- The sentences the detector wrote about its own reasoning, as JSON.
+    evidence        TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (user_id, id),
     FOREIGN KEY (user_id, account_id)
         REFERENCES accounts(user_id, id) ON DELETE CASCADE

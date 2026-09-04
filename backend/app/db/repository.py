@@ -1061,8 +1061,12 @@ def get_recurring_series(db: Database) -> list[dict[str, Any]]:
             d["category"] = o_category
         if o_is_active is not None:
             d["is_active"] = o_is_active
-        if "median_amount" in d:
-            d["median_amount"] = _dec(d["median_amount"])
+        for money in ("median_amount", "lifetime_median", "last_amount"):
+            if money in d:
+                d[money] = _dec(d[money])
+        # Stored as JSON so the row stays one row; handed back as a list so
+        # every reader does not have to know that.
+        d["evidence"] = _json(d.get("evidence"), [])
         out.append(d)
     return out
 
@@ -1083,6 +1087,22 @@ def recurring_overrides(db: Database) -> dict[str, dict[str, Any]]:
     return {r["series_id"]: _row_dict(r) for r in rows}
 
 
+#: The columns `save_recurring_series` writes, in order. Named once so the
+#: INSERT's placeholder count cannot drift away from the tuple being built -
+#: which it did, silently, the first time a column was added here.
+_SERIES_COLUMNS = (
+    "id", "account_id", "label", "category", "direction", "median_amount",
+    "cadence_days", "cadence_name", "occurrences", "first_seen", "last_seen",
+    "next_expected", "is_active", "status", "confidence", "coverage",
+    "missed", "day_of_month", "amount_variance", "amount_trend",
+    "lifetime_median", "last_amount", "changed_on", "evidence",
+)
+
+
+def _iso(value: Any) -> str | None:
+    return value.isoformat() if value else None
+
+
 def save_recurring_series(db: Database, series: Sequence[Any]) -> int:
     with db.connection() as conn:
         overrides = {r["series_id"]: r for r in conn.execute("SELECT * FROM recurring_series_overrides").fetchall()}
@@ -1093,9 +1113,26 @@ def save_recurring_series(db: Database, series: Sequence[Any]) -> int:
             label = o["label"] if o and o["label"] is not None else s.label
             category = o["category"] if o and o["category"] is not None else s.category
             is_active = o["is_active"] if o and o["is_active"] is not None else int(s.is_active)
-            rows.append((s.id, s.account_id, label, category, s.direction.value, _txt(s.median_amount), s.cadence_days, s.occurrences, s.first_seen.isoformat() if s.first_seen else None, s.last_seen.isoformat() if s.last_seen else None, s.next_expected.isoformat() if s.next_expected else None, is_active, s.confidence))
+            rows.append((
+                s.id, s.account_id, label, category, s.direction.value,
+                _txt(s.median_amount), s.cadence_days,
+                getattr(s, "cadence_name", ""), s.occurrences,
+                _iso(s.first_seen), _iso(s.last_seen), _iso(s.next_expected),
+                is_active, getattr(s, "status", "active"), s.confidence,
+                getattr(s, "coverage", 1.0), getattr(s, "missed", 0),
+                getattr(s, "day_of_month", None),
+                getattr(s, "amount_variance", 0.0),
+                getattr(s, "amount_trend", "flat"),
+                _txt(getattr(s, "lifetime_median", None)),
+                _txt(getattr(s, "last_amount", None)),
+                _iso(getattr(s, "changed_on", None)),
+                json.dumps(list(getattr(s, "evidence", []) or [])),
+            ))
+        placeholders = ",".join("?" * len(_SERIES_COLUMNS))
         conn.execute("DELETE FROM recurring_series")
-        conn.executemany("INSERT INTO recurring_series (id, account_id, label, category, direction, median_amount, cadence_days, occurrences, first_seen, last_seen, next_expected, is_active, confidence) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        conn.executemany(
+            f"INSERT INTO recurring_series ({', '.join(_SERIES_COLUMNS)})"
+            f" VALUES ({placeholders})", rows)
     return len(rows)
 
 

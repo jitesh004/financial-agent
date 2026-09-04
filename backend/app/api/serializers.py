@@ -345,6 +345,21 @@ def recurring_json(series: Any) -> dict[str, Any]:
         "is_active": series.is_active,
         "confidence": series.confidence,
         "transaction_ids": series.transaction_ids,
+        # How the detector reached its verdict. A series is an inference, and
+        # the tab that shows it already lets the user open the rows behind
+        # it; this is the other half - what about those rows made it a
+        # series, so a wrong one can be argued with rather than only deleted.
+        "status": series.status,
+        "coverage": series.coverage,
+        "missed": series.missed,
+        "day_of_month": series.day_of_month,
+        "amount_variance": series.amount_variance,
+        "amount_trend": series.amount_trend,
+        "lifetime_median": num(series.lifetime_median),
+        "last_amount": num(series.last_amount),
+        "changed_on": (series.changed_on.isoformat()
+                       if series.changed_on else None),
+        "evidence": list(series.evidence),
     }
 
 

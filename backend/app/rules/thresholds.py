@@ -158,9 +158,25 @@ def all_thresholds() -> list[Threshold]:
         Threshold(
             "Recurring", "Amount may vary by",
             recurring.AMOUNT_VARIANCE_TOLERANCE, "ratio",
-            "Utilities drift a lot month to month; a subscription barely "
-            "moves. Same payee, wildly different amounts is not a fixed "
-            "charge.",
+            "The default. Utilities drift a lot month to month and a "
+            "subscription barely moves, so the tolerance is set per category "
+            "- an EMI is the same to the paisa, an electricity bill triples "
+            "between March and June and is no less a fixed obligation.",
+            "analytics/recurring.py"),
+        Threshold(
+            "Recurring", "Cadence fit floor", recurring.MIN_CADENCE_FIT,
+            "ratio",
+            "Every cadence is fitted to the dates and the best one wins. "
+            "Below this, nothing fits: the charges keep no rhythm, whatever "
+            "their amounts do.",
+            "analytics/recurring.py"),
+        Threshold(
+            "Recurring", "Price change to notice", recurring.MIN_LEVEL_SHIFT,
+            "ratio",
+            "A jump smaller than this is noise. A bigger one - with both "
+            "levels tight and every charge cleanly on one side of it - is a "
+            "price rise, and the series survives it with the new level as "
+            "the going-forward figure.",
             "analytics/recurring.py"),
 
         Threshold(
