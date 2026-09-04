@@ -1917,7 +1917,11 @@ class RecurringUpdateReq(BaseModel):
 
 @app.get("/api/recurring")
 def get_recurring_series() -> list[dict[str, Any]]:
-    return repo.get_recurring_series(get_db())
+    # Normalised to the same shape a freshly detected series is served in -
+    # see serializers.stored_recurring_json for the two figures the frontend
+    # was otherwise deriving itself, one of them wrongly.
+    return [ser.stored_recurring_json(r)
+            for r in repo.get_recurring_series(get_db())]
 
 @app.patch("/api/recurring/{series_id}")
 def update_recurring(series_id: str, payload: RecurringUpdateReq) -> dict[str, Any]:

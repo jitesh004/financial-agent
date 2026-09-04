@@ -488,3 +488,61 @@ def test_the_api_ships_the_reasoning_too(tenant):
         assert key in payload, key
     assert payload["cadence"] == "monthly"
     assert payload["monthly_equivalent"] == 42000.0
+
+
+def test_the_recurring_endpoint_serves_the_monthly_figure_itself(tenant):
+    """The client used to work this out, and got it 1.5% wrong.
+
+    Its fallback divided 30.44 days by a nominal 30-day cadence, so rent of a
+    flat 41,500 was rendered as 42,109 a month - and the Recurring tab adds
+    fourteen commitments up. The conversion has one home, in
+    analytics.recurring, and this is the seam that was letting a second copy
+    exist.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.db import repository as repo
+    from app.main import app
+    from app.models.schemas import Account, AccountType
+    from tests.support import fresh_ledger
+
+    db = fresh_ledger()
+    repo.upsert_account(db, Account(id="a1", institution="HDFC",
+                                    account_type=AccountType.SAVINGS,
+                                    account_number_masked="4412"))
+    repo.save_recurring_series(db, [only(monthly(
+        4, "41500", 8, category=Category.RENT,
+        description="NEFT RENT HARBOUR VIEW"))])
+
+    rows = TestClient(app).get("/api/recurring").json()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["monthly_equivalent"] == 41500.0, \
+        "rent of a flat 41,500 costs 41,500 a month"
+    # And both names the frontend has ever read are present, so a component
+    # cannot render zero by picking the wrong one.
+    assert row["amount"] == 41500.0 and row["median_amount"] == 41500.0
+    assert row["cadence"] == "monthly" and row["cadence_name"] == "monthly"
+
+
+def test_a_quarterly_premium_is_normalised_by_its_own_cadence(tenant):
+    from fastapi.testclient import TestClient
+
+    from app.db import repository as repo
+    from app.main import app
+    from app.models.schemas import Account, AccountType
+    from tests.support import fresh_ledger
+
+    db = fresh_ledger()
+    repo.upsert_account(db, Account(id="a1", institution="HDFC",
+                                    account_type=AccountType.SAVINGS,
+                                    account_number_masked="4412"))
+    quarterly = series_of([(date(2025, m, 14), "9000") for m in (1, 4, 7, 10)],
+                          category=Category.INSURANCE,
+                          description="LIC PREMIUM TERM COVER")
+    detected = only(quarterly)
+    assert detected.cadence_name == "quarterly"
+    repo.save_recurring_series(db, [detected])
+
+    row = TestClient(app).get("/api/recurring").json()[0]
+    assert row["monthly_equivalent"] == 3000.0, "a quarter of 9,000 a month"

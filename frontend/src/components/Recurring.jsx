@@ -129,19 +129,17 @@ export default function Recurring() {
   if (loading) return <div className="spinner" style={{ margin: 40 }} />;
 
   const active = visible.filter((s) => s.is_active);
-  /* A series reaches the frontend in two shapes, and this reads both.
-     /api/recurring returns the stored rows as they are - `median_amount`, as
-     a string - while the dashboard payload runs them through
-     serializers.recurring_json, which renames it to `amount` and adds a
-     `monthly_equivalent` the server has already normalised. Reading one name
-     renders every commitment as zero the moment the other shape arrives. */
+  /* Both server shapes carry `amount` and `monthly_equivalent` now - see
+     serializers.stored_recurring_json - so this no longer has to normalise
+     one into the other, and there is no longer a second copy of the
+     cadence-to-monthly conversion living here. The old fallback divided 30.44
+     days by a nominal 30-day cadence, which published every monthly
+     commitment 1.5% above what the statement said and compounded across the
+     fourteen of them this stat adds up. */
   const seriesAmount = (s) => Number(s.amount ?? s.median_amount) || 0;
   const monthlyTotal = active.reduce((sum, s) => {
     if (s.direction !== 'debit') return sum;
-    const normalised = Number(s.monthly_equivalent);
-    if (Number.isFinite(normalised) && normalised) return sum + normalised;
-    const days = Number(s.cadence_days) || 30;
-    return sum + (seriesAmount(s) * 30.44) / days;
+    return sum + (Number(s.monthly_equivalent) || 0);
   }, 0);
 
   return (

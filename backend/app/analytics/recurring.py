@@ -881,7 +881,7 @@ def _merge_variants(
         keys = sorted(keys, key=lambda k: -len(groups[k]))
         for small in keys[1:]:
             for large in keys:
-                if large is small or large in absorbed:
+                if large == small or large in absorbed:
                     continue
                 if _joinable(groups[large], groups[small]):
                     groups[large].extend(groups[small])
