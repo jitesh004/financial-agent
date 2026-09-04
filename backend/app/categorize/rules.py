@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from ..models.schemas import Category, ConfidenceSource, Direction, Transaction
-from ..rules import formats
+from ..rules import formats, instalments
 
 
 @dataclass(frozen=True)
@@ -33,12 +33,24 @@ class Rule:
     #: statement and an expense on a loan statement - direction disambiguates.
     direction: Direction | None = None
     label: str = ""
+    #: A veto. When this matches, the rule stands down even though `pattern`
+    #: fired, and the row falls through to whatever describes it better.
+    #:
+    #: One word can belong to two worlds. "INSTALMENT" is a loan repayment,
+    #: a recurring deposit and the fee for converting a card purchase, and
+    #: the rule that wants the first of those sits above the rules that want
+    #: the other two - so without a veto it takes all three. Writing the
+    #: exclusion into `pattern` as a lookahead was the alternative and it
+    #: does not read: the point of a veto is that it is a second, separate
+    #: question, and `explain` can then say which one stood the rule down.
+    exclude: re.Pattern[str] | None = None
 
 
 def _r(pattern: str, category: Category, confidence: float = 0.95,
-       direction: Direction | None = None, label: str = "") -> Rule:
+       direction: Direction | None = None, label: str = "",
+       exclude: re.Pattern[str] | None = None) -> Rule:
     return Rule(re.compile(pattern, re.IGNORECASE), category, confidence,
-                direction, label or pattern[:40])
+                direction, label or pattern[:40], exclude)
 
 
 #: Evaluated top to bottom. Most specific first.
@@ -69,25 +81,27 @@ RULES: list[Rule] = [
     _r(r"\bPERSONAL\s+LOAN\b|\bPL\d{4,}\b|\bCONSUMER\s+LOAN\b", Category.EMI, 0.96),
     _r(r"\bAUTO\s+LOAN\b|\bCAR\s+LOAN\b|\bVEHICLE\s+LOAN\b|\bTWO\s*WHEELER\s+LOAN\b",
        Category.EMI, 0.96),
-    # Bare "EMI" is deliberately NOT matched here. HDFC prints the literal
-    # word "EMI" as a prefix on any ONE-TIME purchase the cardholder (or a
-    # merchant offer) converted to the card's own installment plan - a
-    # hospital bill, a fuel fill-up, a dinner, a wine shop run all carried it:
-    # "EMI CLOUDNINE PNEPPSPUNE 1,25,000.00" sits in the statement right next
-    # to "ZEPTO MARKETPLACE... 164.54" with no other marker distinguishing
-    # them. That is a PAYMENT METHOD, not what the money was for, and matching
-    # it here - checked before Dining/Fuel/Shopping/Healthcare/Education -
-    # pre-empted every one of those more specific, more correct rules. A real
-    # loan's principal/interest breakdown is the opposite: narrow and
-    # unmistakable ("EMI PRIN FOR TATA AIG GENERAL", "EMI INT-..."), so only
-    # that shape is matched as EMI; a bare "EMI <merchant>" now falls through
-    # to whatever rule actually describes the purchase.
-    # "(020/036)" is installment 20 of 36 - the one unambiguous marker of a
-    # genuine amortization schedule, as opposed to a merchant name that
-    # happens to start with "Principal" or "Interest".
-    _r(r"\bEMI\s+(?:PRIN(?:CIPAL)?|INT(?:EREST)?)\b.*\(\s*\d+\s*/\s*\d+\s*\)"
-       r"|\bINSTAL?MENT\b|\bLOAN\s+REPAYMENT\b|\bACH[-\s]?D\b.*\bLOAN\b",
-       Category.EMI, 0.9),
+    # Bare "EMI" is deliberately NOT matched here, and neither is a bare
+    # "instalment". Both are words this app used to read as debt and neither
+    # one means it on its own - see rules.instalments, which holds the whole
+    # argument and every shape that IS a lender collecting money.
+    #
+    # The short version: an issuer prints "EMI" against an ordinary purchase
+    # to advertise that the charge can be split into instalments if the
+    # cardholder asks. "EMI CLOUDNINE PNEPPSPUNE 1,25,000.00" sits in the
+    # statement next to "ZEPTO MARKETPLACE... 164.54" and is exactly as much
+    # a loan as the Zepto order is. Matching it here - above
+    # Dining/Fuel/Shopping/Healthcare/Education - pre-empted every one of
+    # those more specific, more correct rules AND put a hospital bill in the
+    # debt figures.
+    Rule(instalments.LOAN_INSTALMENT, Category.EMI, 0.92,
+         label="loan instalment"),
+    # A bare "instalment" with nothing to say what is being repaid. Usually a
+    # loan, but a recurring deposit, a SIP and a card's conversion FEE are
+    # written with the same word, and each of those has a better rule further
+    # down - so the veto hands the row to them instead of claiming it here.
+    Rule(instalments.BARE_INSTALMENT, Category.EMI, 0.8,
+         label="bare instalment", exclude=instalments.NOT_A_LOAN),
     _r(r"\bINTEREST\s+CHARGED\b|\bFINANCE\s+CHARGE\b|\bINTEREST\s+DEBIT\b",
        Category.LOAN_INTEREST, 0.95, Direction.DEBIT),
     # CRED is a credit-card bill payment app, and BPPY is how HDFC labels a
@@ -276,39 +290,43 @@ RULES: list[Rule] = [
 ]
 
 
-#: A leading timestamp and/or "EMI" marker, ahead of the actual merchant.
-#: Matches "22:01 EMI INFINITIRETAILLIMITEDMumbai" and "EMI Riders Choice".
-#: Anchored, so an "EMI" appearing mid-description is left alone - only a
-#: prefix is a conversion marker rather than part of the payee's name.
-_EMI_PREFIX = re.compile(r"^\s*(?:\d{1,2}:\d{2}\s*)?EMI[\s\-]+", re.IGNORECASE)
+def haystacks_for(txn: Transaction) -> list[str]:
+    """Every string a rule gets to look at for this row.
+
+    The raw and normalized descriptions both, because normalization strips
+    rail prefixes that sometimes carry the only useful signal (an "ATW"
+    prefix is the only marker that a row is an ATM withdrawal) - and a third
+    variant with the issuer's EMI offer marker taken out.
+
+    That third one is what puts the merchant back within reach. A charge the
+    bank flagged as instalment-eligible still names who was paid, and that
+    name is what decides the category; but "EMI" sits in front of it (often
+    behind a clock time), so a pattern anchored on the merchant never reached
+    it. On one real ledger that hid 41 rows worth 441,755 - Eduspark, Empire
+    Foundation, Infiniti Retail, Panchjanya Automobile - every one of them
+    obviously classifiable by name. `strip_offer_marker` leaves a genuine
+    loan instalment alone, so the EMI rule above still sees what it needs.
+    """
+    haystacks = [txn.raw_description or "", txn.normalized_description or ""]
+    for stripped in (instalments.strip_offer_marker(h) for h in list(haystacks)):
+        if stripped and stripped not in haystacks:
+            haystacks.append(stripped)
+    return haystacks
 
 
 def apply_rules(txn: Transaction) -> tuple[Category, float, str] | None:
-    """Return (category, confidence, rule_label) for the first matching rule.
-
-    Both the raw and normalized descriptions are searched, because normalization
-    strips rail prefixes that sometimes carry the only useful signal (an "ATW"
-    prefix is the only marker that a row is an ATM withdrawal).
-    """
-    haystacks = [txn.raw_description or "", txn.normalized_description or ""]
-
-    # A purchase converted to instalments still names its merchant, and that
-    # is what decides the category. HDFC prefixes any converted purchase with
-    # "EMI" (often behind a timestamp), and the EMI rule was deliberately
-    # narrowed so it would stop hijacking those rows from the merchant rules -
-    # but nothing then put the merchant back within reach, so the whole family
-    # fell through to uncategorized instead. On this ledger that was 41 rows
-    # worth 441,755: Eduspark, Empire Foundation, Infiniti Retail, Panchjanya
-    # Automobile - all obviously classifiable by name.
-    for stripped in (_EMI_PREFIX.sub("", h) for h in list(haystacks)):
-        if stripped and stripped not in haystacks:
-            haystacks.append(stripped)
+    """Return (category, confidence, rule_label) for the first matching rule."""
+    haystacks = haystacks_for(txn)
 
     for rule in RULES:
         if rule.direction is not None and rule.direction != txn.direction:
             continue
-        if any(rule.pattern.search(h) for h in haystacks):
-            return rule.category, rule.confidence, rule.label
+        if not any(rule.pattern.search(h) for h in haystacks):
+            continue
+        if rule.exclude is not None and any(
+                rule.exclude.search(h) for h in haystacks):
+            continue
+        return rule.category, rule.confidence, rule.label
     return None
 
 

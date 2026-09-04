@@ -23,6 +23,7 @@ from ..db.repository import (forget_merchant, lookup_merchants,
                              save_merchant_categories)
 from ..llm.client import LLMClient, get_client
 from ..models.schemas import Category, ConfidenceSource, Direction, Transaction
+from ..rules import instalments
 
 log = logging.getLogger(__name__)
 
@@ -41,9 +42,17 @@ Rules:
 - Descriptions are payment-rail strings, so they are abbreviated and noisy.
 - "direction" tells you whether money came in or went out; a credit is far more
   likely to be income, a refund, or a reversal.
-- DO NOT use the "emi" category just because the description contains the word "EMI". 
-  Many banks prefix one-time purchases (like a hospital bill or electronics) with "EMI" 
-  if the user converted it to an installment plan. Categorize these based on what was purchased (e.g. healthcare, shopping).
+- The "emi" category means a LENDER collecting a loan instalment, and nothing
+  else. Card issuers print the word "EMI" against ordinary purchases purely to
+  advertise that the charge could be split into instalments if the cardholder
+  asked - nothing was borrowed and the full price was paid, exactly like any
+  other purchase. Those markers have already been removed from the strings
+  below, so if you still see one treat it as noise and categorise by the
+  merchant: a hospital is healthcare, a school is education, an electronics
+  shop is shopping.
+- Never answer "emi", "loan_interest" or "cc_payment" for a string that only
+  names a merchant. Those three describe who is being repaid, and a merchant
+  name is not evidence of a debt.
 """
 
 
@@ -143,7 +152,38 @@ def _prompt(items: list[tuple[int, str, str]], allowed_names: list[str] | None =
 #: case, and telling someone to "check the API log" over a correct answer
 #: sends them hunting a bug that is not there.
 last_run: dict[str, int] = {"asked": 0, "answered": 0, "declined": 0,
-                            "invented": 0, "failed_batches": 0}
+                            "invented": 0, "unevidenced": 0,
+                            "failed_batches": 0}
+
+
+#: Categories that are a claim about a COUNTERPARTY rather than about a
+#: purchase, and so cannot be read off a merchant name.
+#:
+#: "emi" is the one that kept being wrong. A model handed "EMI CLOUDNINE"
+#: answers "emi" almost every time - the token is right there, and no amount
+#: of prompting reliably beats it - which filed a maternity hospital under
+#: debt servicing and, through the merchant cache, kept it there for every
+#: future statement. The marker is now stripped before the model ever sees
+#: the string (see `_merchant_key`), and this is the backstop for the case
+#: where it answers "emi" anyway: an unevidenced answer is refused, the same
+#: way an invented category is, and the row stays uncategorized for the user
+#: to decide. Refusing is not a loss - a wrong debt figure is worse than a
+#: missing one, and the review queue is where an unknown row belongs.
+COUNTERPARTY_CATEGORIES = frozenset({
+    Category.EMI, Category.LOAN_INTEREST, Category.CC_PAYMENT,
+})
+
+
+def _has_debt_evidence(key: str) -> bool:
+    """Whether this merchant string names a lender rather than a shop.
+
+    The looser of the two tests in rules.instalments, deliberately. The
+    merchant key is built from the NORMALIZED description, which has already
+    had the rail prefix taken off it - "ACH-D- BAJAJ FINANCE LTD" arrives
+    here as "D BAJAJ FINANCE LTD" - so insisting on the mandate marker would
+    refuse the model's correct answer about a real loan.
+    """
+    return instalments.names_a_lender(key)
 
 
 def categorize_with_llm(
@@ -153,7 +193,7 @@ def categorize_with_llm(
 ) -> tuple[int, int]:
     """Resolve uncategorized transactions. Returns (from_cache, from_model)."""
     last_run.update(asked=0, answered=0, declined=0, invented=0,
-                    failed_batches=0)
+                    unevidenced=0, failed_batches=0)
     pending = [t for t in transactions if t.category == Category.UNCATEGORIZED]
     if not pending:
         return 0, 0
@@ -178,6 +218,26 @@ def categorize_with_llm(
         # the run reports "0 categorised" over rows it never looked at.
         cached = {k: v for k, v in cached.items()
                   if v[0] != Category.UNCATEGORIZED}
+        # A model answer of "emi" over a merchant name is wrong (see
+        # COUNTERPARTY_CATEGORIES) and the cache is permanent, so a run that
+        # only stopped making the mistake would go on applying the ones it
+        # had already made forever. Forgotten here rather than migrated:
+        # this is per-user data behind row-level security, so it heals on
+        # the next run each account does instead of needing a backfill
+        # somebody has to remember to run. A category the USER set is left
+        # exactly alone - they are allowed to call a merchant whatever they
+        # need it to be.
+        poisoned = [k for k, (category, _, source) in cached.items()
+                    if source != "user" and category in COUNTERPARTY_CATEGORIES
+                    and not _has_debt_evidence(k)]
+        for key in poisoned:
+            cached.pop(key, None)
+            if db is not None:
+                forget_merchant(db, key)
+        if poisoned:
+            log.info("dropped %d cached debt categor%s with no lender in the "
+                     "merchant name", len(poisoned),
+                     "y" if len(poisoned) == 1 else "ies")
         for key, (category, confidence, source) in cached.items():
             for txn in by_key[key]:
                 txn.category = category
@@ -260,11 +320,18 @@ def categorize_with_llm(
                 log.debug("discarding invented category %r", category)
                 last_run["invented"] += 1
                 continue
+            key = batch[index]
+            # A debt category needs a lender in the string, not a merchant.
+            if (category in COUNTERPARTY_CATEGORIES
+                    and not _has_debt_evidence(key)):
+                log.debug("refusing %r for %r: nothing in it is a lender",
+                          category, key)
+                last_run["unevidenced"] += 1
+                continue
 
             answered_indices.add(index)
             last_run["answered"] += 1
             confidence = _clamp(answer.get("confidence", 0.6))
-            key = batch[index]
             learned[key] = (category, confidence, "llm")
             for txn in by_key[key]:
                 txn.category = category
@@ -280,9 +347,21 @@ def categorize_with_llm(
 
 
 def _merchant_key(txn: Transaction) -> str:
-    """Cache key. Merchant if we have one, else the normalized description."""
-    key = (txn.merchant or txn.normalized_description or "").strip().upper()
-    return key[:60]
+    """Cache key. Merchant if we have one, else the normalized description.
+
+    The issuer's EMI offer marker comes off first, and that matters twice
+    over. It is what the model SEES, so leaving it in was handing the model
+    the one token most likely to drag it to the wrong answer - the prompt
+    said to ignore it and a small model reliably did not. And it is the CACHE
+    KEY, so "EMI CLOUDNINE" and "CLOUDNINE" were two different merchants: the
+    same hospital learned twice, once correctly and once as debt, with which
+    one applied decided by whether that particular charge happened to carry
+    the marker.
+
+    A genuine loan instalment keeps its wording - see rules.instalments.
+    """
+    key = (txn.merchant or txn.normalized_description or "").strip()
+    return instalments.strip_offer_marker(key).upper()[:60]
 
 
 def _clamp(value, low: float = 0.0, high: float = 1.0) -> float:
