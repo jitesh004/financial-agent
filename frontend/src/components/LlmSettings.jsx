@@ -75,9 +75,11 @@ export default function LlmSettings({ onLedgerChanged }) {
         : 'no provider configured'}
     >
       <p style={{ color: 'var(--text-2)', fontSize: 13, margin: '0 0 12px' }}>
-        Rules and the merchant cache categorise most rows for free. What is left
-        can go to a language model, which costs money per run — so this is off
-        until you turn it on, and imports never switch it on for you.
+        Rules and the merchant cache categorise most rows without a model. What
+        is left can go to a language model, which spends a metered budget —
+        tokens on a paid provider, or a capped number of requests per day on a
+        free one — so this is off until you turn it on, and imports never
+        switch it on for you.
       </p>
 
       {error && <Callout tone="neg">{error}</Callout>}

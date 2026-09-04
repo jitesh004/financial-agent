@@ -20,7 +20,7 @@ import re
 from typing import Any
 
 from ..config import config
-from .providers import Provider, GeminiProvider, AzureOpenAIProvider
+from .providers import Provider, OpenRouterProvider, AzureOpenAIProvider
 
 log = logging.getLogger(__name__)
 
@@ -221,8 +221,8 @@ def get_client(model: str = DEFAULT_MODEL) -> LLMClient:
     
     if model not in _clients:
         provider = None
-        if config.LLM_PROVIDER == "gemini":
-            provider = GeminiProvider()
+        if config.LLM_PROVIDER == "openrouter":
+            provider = OpenRouterProvider()
         elif config.LLM_PROVIDER == "azure":
             provider = AzureOpenAIProvider()
         

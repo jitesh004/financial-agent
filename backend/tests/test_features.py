@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -1707,50 +1708,267 @@ def test_closing_balance_is_not_read_from_the_mitc_illustration():
 
 
 # --------------------------------------------------------------------------
-# Gemini replies in two parts: its thinking, then its answer.
+# OpenRouter puts the model's thinking beside its answer, not inside it.
 # --------------------------------------------------------------------------
 
-def test_gemini_reply_skips_the_models_thinking():
-    """The answer is the part NOT flagged as a thought.
+def test_openrouter_reply_reads_content_not_reasoning():
+    """A reasoning model returns both; the answer is `content`.
 
-    Gemini 2.5 returns the chain of thought as an ordinary text part with
-    `"thought": true` ahead of the real reply. Reading parts[0] meant every
-    call got the reasoning: categorisation asked for JSON, got "*   Input: A
-    numbered list of merchant strings...", parsed nothing, and reported "0
-    from the model" while the provider was answering perfectly well.
+    Reading the reasoning instead would give categorisation "The user wants
+    me to classify twenty-two merchants..." where it asked for JSON, which
+    parses as nothing and reports "0 from the model" over a provider that was
+    answering perfectly well.
     """
-    from app.llm.providers import _gemini_text
+    from app.llm.providers import _message_text
 
-    reply = {"candidates": [{"content": {"parts": [
-        {"text": "*   Input: a numbered list...", "thought": True},
-        {"text": '[{"i": 0, "category": "groceries"}]'},
-    ]}}]}
-    assert _gemini_text(reply) == '[{"i": 0, "category": "groceries"}]'
+    reply = {"choices": [{"message": {
+        "reasoning": "The user wants me to classify...",
+        "content": '[{"i": 0, "category": "groceries"}]',
+    }}]}
+    assert _message_text(reply) == '[{"i": 0, "category": "groceries"}]'
 
 
-def test_gemini_reply_without_thinking_is_unchanged():
+def test_openrouter_reply_without_reasoning_is_unchanged():
     """Models that do not think out loud must keep working."""
-    from app.llm.providers import _gemini_text
+    from app.llm.providers import _message_text
 
-    reply = {"candidates": [{"content": {"parts": [{"text": "plain answer"}]}}]}
-    assert _gemini_text(reply) == "plain answer"
+    reply = {"choices": [{"message": {"content": "plain answer"}}]}
+    assert _message_text(reply) == "plain answer"
 
 
-def test_gemini_reply_that_is_only_thinking_is_not_swallowed():
-    """Returning "" here would read downstream as a silent failure."""
-    from app.llm.providers import _gemini_text
+def test_openrouter_reply_that_is_only_reasoning_is_not_swallowed():
+    """A model that spends max_tokens thinking returns an empty `content`.
 
-    reply = {"candidates": [{"content": {"parts": [
-        {"text": "thinking and nothing else", "thought": True},
+    Returning "" here would read downstream as a silent failure. The
+    reasoning at least gives _parse_json_loose somewhere to look.
+    """
+    from app.llm.providers import _message_text
+
+    reply = {"choices": [{"message": {
+        "content": "",
+        "reasoning": "thinking and nothing else",
+    }}], "finish_reason": "length"}
+    assert _message_text(reply) == "thinking and nothing else"
+
+
+def test_openrouter_content_may_arrive_as_parts():
+    """Some upstreams return content as a list rather than a string."""
+    from app.llm.providers import _message_text
+
+    reply = {"choices": [{"message": {"content": [
+        {"type": "text", "text": '{"institution": '},
+        {"type": "text", "text": '"HDFC Bank"}'},
     ]}}]}
-    assert _gemini_text(reply) == "thinking and nothing else"
+    assert _message_text(reply) == '{"institution": "HDFC Bank"}'
 
 
-def test_gemini_malformed_reply_returns_empty_rather_than_raising():
-    from app.llm.providers import _gemini_text
+def test_openrouter_malformed_reply_returns_empty_rather_than_raising():
+    from app.llm.providers import _message_text
 
-    assert _gemini_text({"candidates": []}) == ""
-    assert _gemini_text({}) == ""
+    assert _message_text({"choices": []}) == ""
+    assert _message_text({}) == ""
+    assert _message_text({"choices": [{"message": None}]}) == ""
+
+
+# --------------------------------------------------------------------------
+# The free tier is rated per request, so a 429 is routine rather than fatal.
+# --------------------------------------------------------------------------
+
+class _Resp:
+    def __init__(self, status_code=200, json_body=None, headers=None):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._json = json_body if json_body is not None else {}
+
+    def json(self):
+        return self._json
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+def test_retry_after_header_is_honoured():
+    from app.llm.providers import _retry_after_seconds
+
+    resp = _Resp(429, headers={"Retry-After": "12"})
+    assert _retry_after_seconds(resp, attempt=0) == 12.0
+
+
+def test_rate_limit_reset_header_is_read_as_epoch_milliseconds():
+    from app.llm.providers import _retry_after_seconds
+
+    reset = (time.time() + 30) * 1000
+    resp = _Resp(429, headers={"X-RateLimit-Reset": str(reset)})
+    assert 25 <= _retry_after_seconds(resp, attempt=0) <= 31
+
+
+def test_rate_limit_wait_is_capped():
+    """A daily quota resets hours out; blocking an import until then is worse
+    than failing the batch and saying so."""
+    from app.llm.providers import MAX_RATE_LIMIT_WAIT, _retry_after_seconds
+
+    resp = _Resp(429, headers={"Retry-After": "86400"})
+    assert _retry_after_seconds(resp, attempt=0) == MAX_RATE_LIMIT_WAIT
+
+
+def test_a_stale_retry_after_never_reaches_sleep_as_a_negative():
+    """time.sleep() raises on a negative, so a stale header would turn a
+    routine 429 into a lost batch."""
+    from app.llm.providers import _retry_after_seconds
+
+    assert _retry_after_seconds(_Resp(429, headers={"Retry-After": "-9"}),
+                                attempt=0) == 0.0
+    stale = (time.time() - 600) * 1000
+    assert _retry_after_seconds(
+        _Resp(429, headers={"X-RateLimit-Reset": str(stale)}),
+        attempt=1) == 2.0
+
+
+def test_an_http_date_retry_after_falls_through_rather_than_raising():
+    """RFC 7231 allows a date there; this app only understands seconds."""
+    from app.llm.providers import _retry_after_seconds
+
+    resp = _Resp(429, headers={"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"})
+    assert _retry_after_seconds(resp, attempt=0) == 1.0
+
+
+def test_rate_limit_falls_back_to_doubling_when_no_header():
+    from app.llm.providers import _retry_after_seconds
+
+    assert _retry_after_seconds(_Resp(429), attempt=0) == 1.0
+    assert _retry_after_seconds(_Resp(429), attempt=2) == 4.0
+
+
+def test_openrouter_retries_a_429_then_succeeds(monkeypatch):
+    """One rate-limited call must not lose the batch behind it."""
+    from app.llm import providers
+
+    calls = []
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            calls.append((url, json, headers))
+            if len(calls) == 1:
+                return _Resp(429, headers={"Retry-After": "0"})
+            return _Resp(200, {"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(providers.httpx, "Client", _Client)
+    monkeypatch.setattr(providers.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(providers.config, "OPENROUTER_API_KEY", "k", raising=False)
+
+    assert providers.OpenRouterProvider().complete("hi") == "ok"
+    assert len(calls) == 2
+
+
+def test_openrouter_json_mode_is_a_constraint_not_a_request(monkeypatch):
+    """Asking for JSON in the system prompt is a request; response_format is
+    a constraint. Without it a model prefaces the array with prose, which
+    parses as nothing."""
+    from app.llm import providers
+
+    sent = {}
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            sent.update(url=url, payload=json, headers=headers)
+            return _Resp(200, {"choices": [{"message": {
+                "content": '[{"i": 0, "category": "groceries"}]'}}]})
+
+    monkeypatch.setattr(providers.httpx, "Client", _Client)
+    monkeypatch.setattr(providers.config, "OPENROUTER_API_KEY", "k", raising=False)
+    monkeypatch.setattr(providers.config, "OPENROUTER_MODEL_FAST",
+                        "google/gemma-4-26b-a4b-it:free", raising=False)
+
+    answer = providers.OpenRouterProvider().complete_json("classify these")
+
+    assert answer == [{"i": 0, "category": "groceries"}]
+    assert sent["payload"]["response_format"] == {"type": "json_object"}
+    assert sent["payload"]["model"] == "google/gemma-4-26b-a4b-it:free"
+    assert sent["url"].endswith("/chat/completions")
+    assert sent["headers"]["Authorization"] == "Bearer k"
+
+
+def test_openrouter_strong_tier_uses_the_strong_model(monkeypatch):
+    """The narrative is the one call where prose quality is the point."""
+    from app.llm import providers
+
+    sent = {}
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            sent.update(payload=json)
+            return _Resp(200, {"choices": [{"message": {"content": "x"}}]})
+
+    monkeypatch.setattr(providers.httpx, "Client", _Client)
+    monkeypatch.setattr(providers.config, "OPENROUTER_API_KEY", "k", raising=False)
+    monkeypatch.setattr(providers.config, "OPENROUTER_MODEL_STRONG",
+                        "z-ai/glm-5.2:free", raising=False)
+
+    providers.OpenRouterProvider().complete("write it", tier="strong")
+    assert sent["payload"]["model"] == "z-ai/glm-5.2:free"
+
+
+def test_openrouter_error_in_a_200_body_is_raised(monkeypatch):
+    """OpenRouter reports an upstream failure in the body of an otherwise
+    successful envelope. Unread, it surfaces as an unexplained empty answer."""
+    from app.llm import providers
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            return _Resp(200, {"error": {"code": 402,
+                                         "message": "insufficient credits"}})
+
+    monkeypatch.setattr(providers.httpx, "Client", _Client)
+    monkeypatch.setattr(providers.config, "OPENROUTER_API_KEY", "k", raising=False)
+
+    with pytest.raises(RuntimeError, match="insufficient credits"):
+        providers.OpenRouterProvider().complete("hi")
+
+
+def test_openrouter_without_a_key_is_unavailable(monkeypatch):
+    """No key must degrade the app, not break it: rules still categorise and
+    the narrative falls back to the computed figures."""
+    from app.llm import providers
+
+    monkeypatch.setattr(providers.config, "OPENROUTER_API_KEY", None, raising=False)
+    assert providers.OpenRouterProvider().available is False
 
 
 # --------------------------------------------------------------------------
