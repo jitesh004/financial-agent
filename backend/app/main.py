@@ -1708,17 +1708,23 @@ def workflow() -> dict[str, Any]:
 
 
 def _llm_status() -> tuple[str, bool]:
-    """Which provider is selected, and whether it could actually be called."""
+    """Which provider is selected, and whether it could actually be called.
+
+    Answered by building the client the run would build and asking whether
+    it is available, rather than by testing each provider's key here. The
+    same question written twice drifts: this used to check OpenRouter's key
+    and Azure's, and any other provider - `gemini`, once that existed - fell
+    through the bottom and was reported as unconfigured on the Settings
+    screen while the categoriser was calling it perfectly well.
+
+    Each provider already declares its own `available`, so there is one
+    definition of reachable and adding a provider cannot leave this behind.
+    """
     try:
         from .config import config
+        from .llm.client import get_client
 
-        provider = config.LLM_PROVIDER
-        if provider == "openrouter":
-            return provider, bool(config.OPENROUTER_API_KEY)
-        if provider == "azure":
-            return provider, bool(config.AZURE_OPENAI_ENDPOINT
-                                  and config.AZURE_OPENAI_API_KEY)
-        return provider, False
+        return config.LLM_PROVIDER, bool(get_client().available)
     except Exception:  # pragma: no cover - health must never 500
         return "unknown", False
 
