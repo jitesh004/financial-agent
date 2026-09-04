@@ -1962,6 +1962,116 @@ def test_openrouter_error_in_a_200_body_is_raised(monkeypatch):
         providers.OpenRouterProvider().complete("hi")
 
 
+# --------------------------------------------------------------------------
+# An empty reasoning effort is an instruction, not an absent setting.
+# --------------------------------------------------------------------------
+
+def test_reasoning_effort_passes_through_a_real_value(monkeypatch):
+    from app.config import _reasoning_effort
+
+    monkeypatch.setenv("OPENROUTER_REASONING_EFFORT", "HIGH")
+    assert _reasoning_effort() == "high"
+    monkeypatch.setenv("OPENROUTER_REASONING_EFFORT", " medium ")
+    assert _reasoning_effort() == "medium"
+
+
+def test_reasoning_effort_defaults_to_low_when_unset(monkeypatch):
+    """Classification against a fixed list of categories does not need the
+    thinking, and reasoning tokens come out of the answer's budget."""
+    from app.config import _reasoning_effort
+
+    monkeypatch.delenv("OPENROUTER_REASONING_EFFORT", raising=False)
+    assert _reasoning_effort() == "low"
+
+
+def test_an_explicitly_empty_reasoning_effort_means_off_not_unset(monkeypatch):
+    """The documented way to reach a non-OpenRouter endpoint.
+
+    `reasoning: {effort}` is how OpenRouter spells the thinking budget;
+    Gemini's OpenAI-compatible layer reads `reasoning_effort` and ignores it.
+    config's own `_env` treats "" as unset - correct where two spellings of a
+    setting fall through to one another, wrong here, because it answered
+    `low` and left the field on every request with the documented fix
+    quietly doing nothing.
+    """
+    from app.config import _reasoning_effort
+
+    monkeypatch.setenv("OPENROUTER_REASONING_EFFORT", "")
+    assert _reasoning_effort() == ""
+    monkeypatch.setenv("OPENROUTER_REASONING_EFFORT", "   ")
+    assert _reasoning_effort() == ""
+
+
+def test_reasoning_effort_accepts_the_spellings_people_write_for_off(monkeypatch):
+    """Empty is invisible in a .env and easy to lose to tooling that strips
+    blank values, so `none` is the spelling the docs use."""
+    from app.config import _reasoning_effort
+
+    for spelling in ("none", "NONE", "off", "no", "false", "0"):
+        monkeypatch.setenv("OPENROUTER_REASONING_EFFORT", spelling)
+        assert _reasoning_effort() == "", spelling
+
+
+def test_a_set_reasoning_effort_reaches_the_payload(monkeypatch):
+    from app.llm import providers
+
+    sent = {}
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            sent.update(payload=json)
+            return _Resp(200, {"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(providers.httpx, "Client", _Client)
+    monkeypatch.setattr(providers.config, "OPENROUTER_API_KEY", "k", raising=False)
+    monkeypatch.setattr(providers.config, "OPENROUTER_REASONING_EFFORT", "high",
+                        raising=False)
+
+    providers.OpenRouterProvider().complete("hi")
+    assert sent["payload"]["reasoning"] == {"effort": "high"}
+
+
+def test_json_mode_off_sends_no_response_format(monkeypatch):
+    """For a model that rejects response_format. The system prompt still asks
+    for JSON, and _parse_json_loose still digs it out of a fenced or
+    prose-prefixed reply - it is just no longer a constraint."""
+    from app.llm import providers
+
+    sent = {}
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            sent.update(payload=json)
+            return _Resp(200, {"choices": [{"message": {
+                "content": 'Here you go:\n```json\n{"ok": true}\n```'}}]})
+
+    monkeypatch.setattr(providers.httpx, "Client", _Client)
+    monkeypatch.setattr(providers.config, "OPENROUTER_API_KEY", "k", raising=False)
+    monkeypatch.setattr(providers.config, "OPENROUTER_JSON_MODE", False,
+                        raising=False)
+
+    assert providers.OpenRouterProvider().complete_json("go") == {"ok": True}
+    assert "response_format" not in sent["payload"]
+
+
 def test_a_base_url_override_reaches_another_openai_compatible_endpoint(monkeypatch):
     """Going back to Gemini is a base-URL change, not a code change.
 

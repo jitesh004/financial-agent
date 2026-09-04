@@ -36,6 +36,32 @@ def _flag(*names: str, default: bool = False) -> bool:
     return (raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
+#: Spellings of "send no reasoning directive at all". `none` is the one the
+#: docs use; the rest are what people write when they mean it.
+_NO_REASONING = {'', 'none', 'off', 'no', 'false', '0'}
+
+
+def _reasoning_effort() -> str:
+    """How hard the model should think, or '' for "do not ask it to".
+
+    Deliberately not `_env`, which treats an empty value as unset so that two
+    spellings of a setting can fall through to one another. That is wrong
+    here, because empty is itself an instruction: OPENROUTER_REASONING_EFFORT=
+    means "send no reasoning field", which is what a non-OpenRouter endpoint
+    needs, and `_env` would answer `low` instead - leaving the documented way
+    to reach Gemini quietly not working, with the field still on every
+    request and Google's layer ignoring it.
+
+    So the variable being PRESENT is what counts, not its being non-empty.
+    """
+    name = 'OPENROUTER_REASONING_EFFORT'
+    if name in os.environ:
+        value = os.environ[name].strip().lower()
+    else:
+        value = 'low'
+    return '' if value in _NO_REASONING else value
+
+
 class Config:
     # ---- storage ---------------------------------------------------------
 
@@ -169,12 +195,18 @@ class Config:
         'OPENROUTER_MODEL_STRONG', default='z-ai/glm-5.2:free')
 
     #: How hard the model should think before answering, for the models that
-    #: expose the control. Low by default: the fast tier is classification
-    #: against a fixed list of categories, where thinking mostly spends the
-    #: token budget that the answer needs. Set to 'medium' or 'high' if the
-    #: narrative reads thin. Empty sends no reasoning directive at all.
-    OPENROUTER_REASONING_EFFORT = (
-        _env('OPENROUTER_REASONING_EFFORT', default='low') or '').strip().lower()
+    #: expose the control - `low`, `medium` or `high`. Low by default: the
+    #: fast tier is classification against a fixed list of categories, where
+    #: thinking mostly spends the token budget the answer needs. Raise it if
+    #: the narrative reads thin.
+    #:
+    #: `none` (or an explicitly empty value) sends no reasoning field at all,
+    #: which is what any non-OpenRouter endpoint wants: `reasoning: {effort}`
+    #: is how OpenRouter spells it, and Gemini's OpenAI-compatible layer
+    #: reads `reasoning_effort` instead. An unrecognised value is passed
+    #: through rather than second-guessed - the provider's own 400 names the
+    #: efforts it accepts more accurately than a list here could.
+    OPENROUTER_REASONING_EFFORT = _reasoning_effort()
 
     #: Send `response_format: {"type": "json_object"}` on JSON calls. On by
     #: default because it is the difference between a parsed answer and a

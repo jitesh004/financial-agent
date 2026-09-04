@@ -507,11 +507,16 @@ catalogue is at
 and `OPENROUTER_JSON_MODE=false` covers a model that rejects
 `response_format`.
 
-`OPENROUTER_REASONING_EFFORT` defaults to `low`. Reasoning tokens come out of
-the same `max_tokens` budget as the answer, so a model left to think freely
-about a forty-item classification can spend the budget and return an empty
-`content` — which reads downstream as "0 from the model" on a provider that
-was working. Raise it to `medium` or `high` if the narrative reads thin.
+`OPENROUTER_REASONING_EFFORT` takes `low` (the default), `medium`, `high`, or
+`none` to send no reasoning field at all. Reasoning tokens come out of the same
+`max_tokens` budget as the answer, so a model left to think freely about a
+forty-item classification can spend the budget and return an empty `content` —
+which reads downstream as "0 from the model" on a provider that was working.
+Raise it if the narrative reads thin.
+
+An explicitly empty `OPENROUTER_REASONING_EFFORT=` also means off, but `none`
+is the spelling to prefer: empty is invisible in a `.env` and easy to lose to
+tooling that strips blank values.
 
 ### Pointing it somewhere else
 
@@ -524,10 +529,10 @@ OPENROUTER_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
 OPENROUTER_API_KEY=<your Gemini key>
 OPENROUTER_MODEL_FAST=gemini-2.5-flash
 OPENROUTER_MODEL_STRONG=gemini-2.5-pro
-OPENROUTER_REASONING_EFFORT=
+OPENROUTER_REASONING_EFFORT=none
 ```
 
-Clear `OPENROUTER_REASONING_EFFORT` on any non-OpenRouter endpoint: the
+Set `OPENROUTER_REASONING_EFFORT=none` on any non-OpenRouter endpoint: the
 thinking budget is sent as OpenRouter spells it (`reasoning: {effort}`),
 which other layers — Gemini's included, where it is `reasoning_effort` — do
 not read.
