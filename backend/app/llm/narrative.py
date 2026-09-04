@@ -199,7 +199,7 @@ def generate_narrative(
     client = client or get_client()
 
     if not client.available:
-        return _fallback(brief, "No ANTHROPIC_API_KEY configured, so this "
+        return _fallback(brief, "No language model is configured, so this "
                                 "summary was generated directly from the "
                                 "computed figures rather than written up.")
 

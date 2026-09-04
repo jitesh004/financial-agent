@@ -134,11 +134,59 @@ class Config:
 
     # ---- models ----------------------------------------------------------
 
-    LLM_PROVIDER = (_env('LLM_PROVIDER', default='gemini') or 'gemini').lower()
+    LLM_PROVIDER = (
+        _env('LLM_PROVIDER', default='openrouter') or 'openrouter').lower()
 
-    GEMINI_API_KEY = _env('GEMINI_API_KEY')
-    GEMINI_MODEL_FAST = _env('GEMINI_MODEL_FAST', default='gemini-2.5-flash')
-    GEMINI_MODEL_STRONG = _env('GEMINI_MODEL_STRONG', default='gemini-2.5-pro')
+    # ---- OpenRouter ------------------------------------------------------
+    #
+    # One key, one OpenAI-shaped endpoint, and a catalogue that includes
+    # models billed at zero. "Free" there means no charge per token; it does
+    # NOT mean unlimited. OpenRouter caps every `:free` model at 20 requests
+    # a minute and 50 a day, raised to 1000 a day once the account has ever
+    # bought $10 of credit. The scarce resource is therefore *requests*, not
+    # tokens, which is why the categoriser's forty-merchants-per-call batching
+    # matters more here than it did on a metered provider.
+
+    OPENROUTER_API_KEY = _env('OPENROUTER_API_KEY')
+    OPENROUTER_BASE_URL = (
+        _env('OPENROUTER_BASE_URL', default='https://openrouter.ai/api/v1')
+        or '').rstrip('/')
+
+    #: The high-volume tier: merchant categorisation in batches of forty, and
+    #: the one-line issuer lookup on an unrecognised letterhead. Gemma 4 26B
+    #: A4B is a mixture-of-experts that activates under 4B parameters per
+    #: token, so it answers quickly, and it accepts `response_format:
+    #: json_object` - which this app needs rather than merely prefers, see
+    #: the note in providers.OpenRouterProvider.complete.
+    OPENROUTER_MODEL_FAST = _env(
+        'OPENROUTER_MODEL_FAST', default='google/gemma-4-26b-a4b-it:free')
+
+    #: The narrative tier: one call, six thousand tokens, and the only place
+    #: the model writes prose a person reads. GLM 5.2 is a reasoning model
+    #: with native structured outputs and a context window long enough for
+    #: the whole computed brief.
+    OPENROUTER_MODEL_STRONG = _env(
+        'OPENROUTER_MODEL_STRONG', default='z-ai/glm-5.2:free')
+
+    #: How hard the model should think before answering, for the models that
+    #: expose the control. Low by default: the fast tier is classification
+    #: against a fixed list of categories, where thinking mostly spends the
+    #: token budget that the answer needs. Set to 'medium' or 'high' if the
+    #: narrative reads thin. Empty sends no reasoning directive at all.
+    OPENROUTER_REASONING_EFFORT = (
+        _env('OPENROUTER_REASONING_EFFORT', default='low') or '').strip().lower()
+
+    #: Send `response_format: {"type": "json_object"}` on JSON calls. On by
+    #: default because it is the difference between a parsed answer and a
+    #: silent zero, but not every free model accepts it - turn it off if you
+    #: point OPENROUTER_MODEL_* at one that does not.
+    OPENROUTER_JSON_MODE = _flag('OPENROUTER_JSON_MODE', default=True)
+
+    #: Optional attribution, shown on openrouter.ai's activity page so a
+    #: shared key's traffic can be told apart. Sent as HTTP-Referer/X-Title.
+    OPENROUTER_APP_URL = _env('OPENROUTER_APP_URL', default=APP_BASE_URL)
+    OPENROUTER_APP_TITLE = _env('OPENROUTER_APP_TITLE',
+                                default='Financial Agent')
 
     AZURE_OPENAI_ENDPOINT = _env('AZURE_OPENAI_ENDPOINT')
     AZURE_OPENAI_API_KEY = _env('AZURE_OPENAI_API_KEY')

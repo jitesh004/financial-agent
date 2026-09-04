@@ -91,6 +91,40 @@ a dependency that is sitting right there in `requirements.txt`.
 Open <http://localhost:5173>, sign in, and the setup wizard takes it from
 there.
 
+### Configuration is `.env`, and only `.env`
+
+Both compose files hand the whole of `.env` to the backend container with
+`env_file`, so **adding a setting is an `.env` edit and nothing else** — no
+compose line to remember, and no defaults duplicated between the two files
+waiting to drift apart. `backend/app/config.py` is the one place that says
+what a setting is called and what it falls back to.
+
+Two consequences worth knowing:
+
+- **The file is what counts, not your shell.** `env_file` reads `.env`, so a
+  variable you `export` in a terminal no longer reaches the container. Put it
+  in `.env`, or pass it for one run with `docker compose run -e VAR=…`.
+- **The whole file reaches the backend.** Including `POSTGRES_PASSWORD` and
+  `FA_DB_PASSWORD`, which the app never reads. That container already holds
+  the app role's own credentials, so it is a tidiness cost rather than a new
+  exposure — but keep unrelated secrets out of this `.env`. The `db` and
+  `caddy` containers still get only the two variables each actually needs.
+
+A handful of settings stay named in the compose files on purpose, and they
+override `.env` rather than the other way round: `FA_DATABASE_URL` and
+`FA_DATA_DIR`, which describe the container and not the deployment
+(`.env.example` points the first at `localhost`, which is correct for a
+host-run backend and unreachable from inside a container); production's
+`FA_SESSION_COOKIE_SECURE=true`, which is an invariant behind TLS rather than
+a choice; and the few production variables guarded with `:?`, which fail
+`docker compose up` naming what is missing instead of starting an app that
+cannot sign anybody in.
+
+The dev stack needs no `.env` at all — it comes up on a fresh clone, with
+every feature that lacks a key reporting itself unconfigured. Production
+refuses to start without one. (The `required: false` spelling needs Docker
+Compose 2.24 or newer.)
+
 ### Or run it without Docker
 
 You need a PostgreSQL 15 or newer server. Create the database and the
@@ -130,7 +164,10 @@ npm install --prefix frontend && npm run dev --prefix frontend
 Open <http://localhost:5173>, sign in, and drop the files from `data/samples/`
 into the import wizard.
 
-Optional — for the written narrative, add a `GEMINI_API_KEY` to `.env`.
+Optional — for the written narrative and the unknown-merchant tail, add an
+`OPENROUTER_API_KEY` to `.env`. The two models it defaults to are billed at
+zero per token; see [Language model](#language-model) for what "free" does
+and does not cover.
 
 ---
 
@@ -428,6 +465,85 @@ Format is detected from content (magic bytes), not the extension. PDFs go
 through a strategy ladder — ruled-table extraction, then whitespace-aligned,
 then raw text-line parsing — stopping at the first that yields a table that
 reconciles.
+
+---
+
+## Language model
+
+Two things use a model, and neither of them touches a number:
+
+| Tier | What it does | Volume |
+| --- | --- | --- |
+| `fast` | Categorises merchants that rules and the learned cache did not recognise, forty to a call; reads an unfamiliar statement letterhead for its issuer and account type | Many calls, one per batch, answers cached forever |
+| `strong` | Writes the narrative from the already-computed brief | One call per analysis |
+
+The default provider is **OpenRouter**, on models billed at zero per token:
+
+```env
+LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY=sk-or-...
+OPENROUTER_MODEL_FAST=google/gemma-4-26b-a4b-it:free
+OPENROUTER_MODEL_STRONG=z-ai/glm-5.2:free
+```
+
+**"Free" is not "unlimited".** OpenRouter charges nothing per token on a
+`:free` model, then rate limits it per *request*: 20 a minute, and 50 a day
+until the account has bought $10 of credit, after which 1000 a day. So the
+scarce resource is calls, not tokens — which is why the categoriser sends
+forty merchants at a time and why every answer it gets is written to the
+merchant cache. A first import of several years of statements can still walk
+into the ceiling; a `429` is waited out and retried (up to
+`LLM_RATE_LIMIT_RETRIES`, never longer than `LLM_RATE_LIMIT_MAX_WAIT` per
+wait), and merchants that outlast that are left uncategorized for the next
+run rather than guessed at.
+
+Why these two models. The fast tier wants latency and a reliable
+`response_format: json_object` — Gemma 4 26B A4B is a mixture-of-experts that
+activates under 4B parameters per token and honours it. The strong tier wants
+prose and a context window that fits the whole brief — GLM 5.2 is a reasoning
+model with native structured outputs. Both are swappable; the current free
+catalogue is at
+[openrouter.ai/models?max_price=0](https://openrouter.ai/models?max_price=0),
+and `OPENROUTER_JSON_MODE=false` covers a model that rejects
+`response_format`.
+
+`OPENROUTER_REASONING_EFFORT` defaults to `low`. Reasoning tokens come out of
+the same `max_tokens` budget as the answer, so a model left to think freely
+about a forty-item classification can spend the budget and return an empty
+`content` — which reads downstream as "0 from the model" on a provider that
+was working. Raise it to `medium` or `high` if the narrative reads thin.
+
+### Pointing it somewhere else
+
+`OPENROUTER_BASE_URL` is the whole switch. Anything that speaks the OpenAI
+`/chat/completions` shape works without a code change — including Gemini,
+which serves one:
+
+```env
+OPENROUTER_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+OPENROUTER_API_KEY=<your Gemini key>
+OPENROUTER_MODEL_FAST=gemini-2.5-flash
+OPENROUTER_MODEL_STRONG=gemini-2.5-pro
+OPENROUTER_REASONING_EFFORT=
+```
+
+Clear `OPENROUTER_REASONING_EFFORT` on any non-OpenRouter endpoint: the
+thinking budget is sent as OpenRouter spells it (`reasoning: {effort}`),
+which other layers — Gemini's included, where it is `reasoning_effort` — do
+not read.
+
+`LLM_PROVIDER` itself only accepts `openrouter` or `azure`. Anything else,
+including the `gemini` this used to take, logs a warning at the first call and
+calls no model — it is not a silent no-op.
+
+Azure OpenAI is the alternative (`LLM_PROVIDER=azure`), and **no provider at
+all is a supported configuration**: rules still categorise, analytics still
+compute, and the narrative falls back to a summary assembled from the computed
+figures.
+
+Text is redacted on the way out regardless of provider — account numbers, PAN,
+email, phone, addresses, and the holder names the app already knows. See
+`backend/app/llm/client.py`.
 
 ---
 

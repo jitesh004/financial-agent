@@ -1713,8 +1713,8 @@ def _llm_status() -> tuple[str, bool]:
         from .config import config
 
         provider = config.LLM_PROVIDER
-        if provider == "gemini":
-            return provider, bool(config.GEMINI_API_KEY)
+        if provider == "openrouter":
+            return provider, bool(config.OPENROUTER_API_KEY)
         if provider == "azure":
             return provider, bool(config.AZURE_OPENAI_ENDPOINT
                                   and config.AZURE_OPENAI_API_KEY)
