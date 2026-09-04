@@ -91,6 +91,40 @@ a dependency that is sitting right there in `requirements.txt`.
 Open <http://localhost:5173>, sign in, and the setup wizard takes it from
 there.
 
+### Configuration is `.env`, and only `.env`
+
+Both compose files hand the whole of `.env` to the backend container with
+`env_file`, so **adding a setting is an `.env` edit and nothing else** — no
+compose line to remember, and no defaults duplicated between the two files
+waiting to drift apart. `backend/app/config.py` is the one place that says
+what a setting is called and what it falls back to.
+
+Two consequences worth knowing:
+
+- **The file is what counts, not your shell.** `env_file` reads `.env`, so a
+  variable you `export` in a terminal no longer reaches the container. Put it
+  in `.env`, or pass it for one run with `docker compose run -e VAR=…`.
+- **The whole file reaches the backend.** Including `POSTGRES_PASSWORD` and
+  `FA_DB_PASSWORD`, which the app never reads. That container already holds
+  the app role's own credentials, so it is a tidiness cost rather than a new
+  exposure — but keep unrelated secrets out of this `.env`. The `db` and
+  `caddy` containers still get only the two variables each actually needs.
+
+A handful of settings stay named in the compose files on purpose, and they
+override `.env` rather than the other way round: `FA_DATABASE_URL` and
+`FA_DATA_DIR`, which describe the container and not the deployment
+(`.env.example` points the first at `localhost`, which is correct for a
+host-run backend and unreachable from inside a container); production's
+`FA_SESSION_COOKIE_SECURE=true`, which is an invariant behind TLS rather than
+a choice; and the few production variables guarded with `:?`, which fail
+`docker compose up` naming what is missing instead of starting an app that
+cannot sign anybody in.
+
+The dev stack needs no `.env` at all — it comes up on a fresh clone, with
+every feature that lacks a key reporting itself unconfigured. Production
+refuses to start without one. (The `required: false` spelling needs Docker
+Compose 2.24 or newer.)
+
 ### Or run it without Docker
 
 You need a PostgreSQL 15 or newer server. Create the database and the

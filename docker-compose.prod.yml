@@ -33,27 +33,35 @@ services:
     # directly, bypassing the TLS Caddy terminates in front of it.
     expose:
       - "8078"
+    # Every app setting reaches the container from the .env beside this file,
+    # whatever it is called, so adding one is an .env edit and nothing more.
+    # Required here rather than optional: a production stack with no .env is
+    # a misconfiguration, and failing at `up` beats starting an app that
+    # cannot reach its database.
+    env_file:
+      - .env
+    # `environment` beats `env_file`, so what follows overrides .env on
+    # purpose. Three kinds of thing belong here and nothing else does:
+    #
+    #  1. Container shape. FA_DATABASE_URL must name the `db` service, not
+    #     the localhost that .env.example carries for host-run backends, and
+    #     FA_DATA_DIR must be the mount point rather than the host path.
+    #  2. A production invariant. The session cookie is Secure because this
+    #     stack is always behind TLS - not a deployer's choice to get wrong.
+    #  3. The refusals below. `:?` fails `docker compose up` with a message
+    #     naming the missing variable, which is worth keeping for the few
+    #     that have no safe default: an app with no OAuth client cannot sign
+    #     anybody in, and one with the wrong base URL fails at Google with
+    #     "invalid_client" and no clue why. Optional settings need no line
+    #     here - that is the point of env_file above.
     environment:
       - PYTHONUNBUFFERED=1
       - FA_DATABASE_URL=postgresql://financial_agent:${FA_DB_PASSWORD:?set FA_DB_PASSWORD}@db:5432/financial_agent
       - FA_DATA_DIR=/data
+      - FA_SESSION_COOKIE_SECURE=true
       - FA_APP_BASE_URL=${FA_APP_BASE_URL:?set FA_APP_BASE_URL}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:?set GOOGLE_CLIENT_ID}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:?set GOOGLE_CLIENT_SECRET}
-      - FA_ALLOWED_SIGNINS=${FA_ALLOWED_SIGNINS:-}
-      - FA_ADMIN_EMAILS=${FA_ADMIN_EMAILS:-}
-      - FA_PARSE_WORKERS=${FA_PARSE_WORKERS:-8}
-      - LLM_PROVIDER=${LLM_PROVIDER:-}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
-      - OPENROUTER_MODEL_FAST=${OPENROUTER_MODEL_FAST:-}
-      - OPENROUTER_MODEL_STRONG=${OPENROUTER_MODEL_STRONG:-}
-      - OPENROUTER_REASONING_EFFORT=${OPENROUTER_REASONING_EFFORT:-}
-      - OPENROUTER_JSON_MODE=${OPENROUTER_JSON_MODE:-}
-      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT:-}
-      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY:-}
-      # The session cookie must be Secure once the app is behind TLS, which in
-      # production it always is.
-      - FA_SESSION_COOKIE_SECURE=true
     entrypoint: ["python", "/app/docker-entrypoint.py"]
     # Spelled out because Compose's `entrypoint` override also CLEARS the
     # image's CMD - so relying on the Dockerfile's would start the entrypoint

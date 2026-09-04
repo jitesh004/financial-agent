@@ -38,28 +38,35 @@ services:
       - ./data:/data
     ports:
       - "8078:8078"
+    # Every app setting reaches the container from .env, whatever it is
+    # called, so adding one is an .env edit and nothing more. This file used
+    # to name each variable and pass it through, which meant a new setting
+    # silently did not exist in Docker until somebody remembered to add a
+    # line here - and which duplicated defaults that backend/app/config.py
+    # already holds, free to drift from them.
+    #
+    # `required: false` because the dev stack is meant to come up on a fresh
+    # clone with no .env at all: every setting either has a default in
+    # config.py or is a feature that reports itself unconfigured.
+    env_file:
+      - path: .env
+        required: false
+    # These three come AFTER on purpose. `environment` beats `env_file`, and
+    # each of them describes the container rather than the deployment, so it
+    # has to win over whatever the same key says in .env - which for the
+    # first two is very likely the wrong answer here:
+    #
+    #   FA_DATABASE_URL  .env.example points it at localhost, correct when
+    #                    the backend runs on the host, unreachable from
+    #                    inside this container. The database is `db` here.
+    #   FA_DATA_DIR      ./data on the host is /data in the container, which
+    #                    is where the volume above is mounted.
+    #
+    # Anything not listed here is the deployment's business, not this file's.
     environment:
       - PYTHONUNBUFFERED=1
       - FA_DATABASE_URL=postgresql://financial_agent:${FA_DB_PASSWORD:-financial_agent}@db:5432/financial_agent
       - FA_DATA_DIR=/data
-      - FA_APP_BASE_URL=${FA_APP_BASE_URL:-http://localhost:5173}
-      # Sign-in is Google-only. Without these the app runs and says so on the
-      # sign-in screen rather than failing at Google with "invalid_client".
-      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
-      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
-      - FA_ALLOWED_SIGNINS=${FA_ALLOWED_SIGNINS:-}
-      - FA_ADMIN_EMAILS=${FA_ADMIN_EMAILS:-}
-      - FA_PARSE_WORKERS=${FA_PARSE_WORKERS:-8}
-      - FA_SESSION_TTL_HOURS=${FA_SESSION_TTL_HOURS:-72}
-      - FA_SESSION_COOKIE_SECURE=${FA_SESSION_COOKIE_SECURE:-false}
-      - LLM_PROVIDER=${LLM_PROVIDER:-}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
-      - OPENROUTER_MODEL_FAST=${OPENROUTER_MODEL_FAST:-}
-      - OPENROUTER_MODEL_STRONG=${OPENROUTER_MODEL_STRONG:-}
-      - OPENROUTER_REASONING_EFFORT=${OPENROUTER_REASONING_EFFORT:-}
-      - OPENROUTER_JSON_MODE=${OPENROUTER_JSON_MODE:-}
-      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT:-}
-      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY:-}
     # The entrypoint refuses with an actionable message if the image is older
     # than the code - see backend/docker-entrypoint.sh for why that is worth
     # a guard rather than a bare ModuleNotFoundError.
