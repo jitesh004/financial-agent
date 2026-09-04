@@ -2442,3 +2442,133 @@ def save_settings(db: Database, values: dict[str, Any]) -> dict[str, Any]:
                 "   updated_at = datetime('now')",
                 (key, stored))
     return get_settings(db)
+
+
+# --------------------------------------------------------------------------
+# Agent runs
+#
+# Stored rather than recomputed, for two reasons that pull the same way: a run
+# cost real money to produce, and a run is only half as useful as two runs.
+# Comparing this month's answer with last month's is the thing that makes an
+# agent worth re-running, and no amount of CPU reconstructs a previous one.
+# --------------------------------------------------------------------------
+
+def save_agent_run(db: Database, run: dict[str, Any]) -> str:
+    """Record one run. Returns its id."""
+    run_id = run.get("id") or _new_id()
+    with db.connection() as conn:
+        conn.execute(
+            "INSERT INTO agent_runs (id, agent, status, started_at,"
+            " finished_at, seconds, question, answer_json, transcript_json,"
+            " model, provider, steps, tool_calls, error)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, run["agent"], run.get("status", "ok"),
+             run.get("started_at") or "", run.get("finished_at"),
+             float(run.get("seconds") or 0), run.get("question", ""),
+             json.dumps(run.get("answer") or {}),
+             json.dumps(run.get("transcript") or []),
+             run.get("model", ""), run.get("provider", ""),
+             int(run.get("steps") or 0), int(run.get("tool_calls") or 0),
+             run.get("error", "")),
+        )
+    return run_id
+
+
+def _agent_run_json(row, *, with_transcript: bool = False) -> dict[str, Any]:
+    out = {
+        "id": row["id"], "agent": row["agent"], "status": row["status"],
+        "started_at": row["started_at"], "finished_at": row["finished_at"],
+        "seconds": row["seconds"], "question": row["question"],
+        "answer": _json(row["answer_json"], {}),
+        "model": row["model"], "provider": row["provider"],
+        "steps": row["steps"], "tool_calls": row["tool_calls"],
+        "error": row["error"],
+    }
+    if with_transcript:
+        # Only on request. A transcript carries every tool result the agent
+        # read and is easily the largest thing in the row, so a list of
+        # twenty runs would otherwise be megabytes to render a date and a
+        # headline.
+        out["transcript"] = _json(row["transcript_json"], [])
+    return out
+
+
+def get_agent_runs(db: Database, agent: str | None = None,
+                   limit: int = 20) -> list[dict[str, Any]]:
+    """Runs, newest first."""
+    where = "WHERE agent = ?" if agent else ""
+    params: list[Any] = [agent] if agent else []
+    with db.connection() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM agent_runs {where}"
+            f" ORDER BY started_at DESC, id DESC LIMIT ?",
+            [*params, max(1, min(int(limit), 100))]).fetchall()
+    return [_agent_run_json(r) for r in rows]
+
+
+def get_agent_run(db: Database, run_id: str) -> dict[str, Any] | None:
+    """One run, transcript included."""
+    with db.connection() as conn:
+        row = conn.execute("SELECT * FROM agent_runs WHERE id = ?",
+                           (run_id,)).fetchone()
+    return _agent_run_json(row, with_transcript=True) if row else None
+
+
+def latest_agent_runs(db: Database) -> dict[str, dict[str, Any]]:
+    """The most recent run of each agent, keyed by agent.
+
+    One query rather than one per agent: the screen that lists the catalogue
+    needs "when did this last run and what did it say" for every card on it.
+    """
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM agent_runs r WHERE r.started_at = ("
+            "  SELECT MAX(s.started_at) FROM agent_runs s"
+            "   WHERE s.agent = r.agent AND s.user_id = r.user_id)"
+        ).fetchall()
+    return {r["agent"]: _agent_run_json(r) for r in rows}
+
+
+def previous_agent_run(db: Database, agent: str,
+                       before_id: str) -> dict[str, Any] | None:
+    """The run of this agent immediately before the given one.
+
+    Ordered by the same key the listing uses, so "previous" here and
+    "the one above it in the list" are the same run.
+    """
+    with db.connection() as conn:
+        anchor = conn.execute(
+            "SELECT started_at FROM agent_runs WHERE id = ?",
+            (before_id,)).fetchone()
+        if anchor is None:
+            return None
+        row = conn.execute(
+            "SELECT * FROM agent_runs WHERE agent = ?"
+            " AND (started_at < ? OR (started_at = ? AND id < ?))"
+            " ORDER BY started_at DESC, id DESC LIMIT 1",
+            (agent, anchor["started_at"], anchor["started_at"],
+             before_id)).fetchone()
+    return _agent_run_json(row) if row else None
+
+
+def delete_agent_run(db: Database, run_id: str) -> bool:
+    with db.connection() as conn:
+        cursor = conn.execute("DELETE FROM agent_runs WHERE id = ?", (run_id,))
+        return bool(cursor.rowcount)
+
+
+def prune_agent_runs(db: Database, agent: str, keep: int = 25) -> int:
+    """Keep the most recent runs of one agent and drop the rest.
+
+    A history is for comparing against, and comparing against a run from two
+    years ago says nothing about a ledger that has been re-imported since.
+    """
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT id FROM agent_runs WHERE agent = ?"
+            " ORDER BY started_at DESC, id DESC OFFSET ?", (agent, keep)
+        ).fetchall()
+        stale = [r["id"] for r in rows]
+        for run_id in stale:
+            conn.execute("DELETE FROM agent_runs WHERE id = ?", (run_id,))
+    return len(stale)

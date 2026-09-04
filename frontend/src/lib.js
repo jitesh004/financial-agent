@@ -464,6 +464,27 @@ export async function watchJob(jobId, onTick, intervalMs = 700) {
 }
 
 
+/* ---------- Agents ----------
+   A run is a JOB, not a request: several model round trips with tool
+   execution between them takes tens of seconds, and an HTTP request held
+   open that long dies to a proxy timeout - taking the analysis, which is the
+   expensive part, with it. So `runAgent` hands back a job id and the screen
+   watches it with `watchJob` the same way an import is watched. */
+
+api.agents = () => request('/api/agents');
+api.runAgent = (key, question = '') =>
+  jsonPost(`/api/agents/${key}/run`, { question });
+api.agentRuns = (key, limit = 20) =>
+  request(`/api/agents/${key}/runs?limit=${limit}`);
+/* The transcript is every tool call and every result the agent read, which is
+   what makes its figures checkable - and easily the largest thing in the row,
+   so it is only fetched when somebody opens it. */
+api.agentRun = (id, { transcript = false } = {}) =>
+  request(`/api/agents/runs/${id}?transcript=${transcript ? 'true' : 'false'}`);
+api.deleteAgentRun = (id) =>
+  request(`/api/agents/runs/${id}`, { method: 'DELETE' });
+
+
 /* ---------- Settings, and the run that spends money ---------- */
 
 api.settings = () => request('/api/settings');

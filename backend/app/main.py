@@ -32,9 +32,9 @@ from fastapi.responses import JSONResponse
 
 from . import storage
 from .analytics import periods
-from .api import (admin_routes, auth_routes, files_routes, gmail_routes,
-                  job_routes, query_routes, rules_routes, settings_routes,
-                  staging_routes, wealth_routes)
+from .api import (admin_routes, agent_routes, auth_routes, files_routes,
+                  gmail_routes, job_routes, query_routes, rules_routes,
+                  settings_routes, staging_routes, wealth_routes)
 from .auth.session import AuthContextMiddleware
 from .api import serializers as ser
 from .db.database import CLEAR_SCOPES, get_db
@@ -132,6 +132,7 @@ app.include_router(settings_routes.router)
 app.include_router(staging_routes.router)
 app.include_router(admin_routes.router)
 app.include_router(rules_routes.router)
+app.include_router(agent_routes.router)
 
 
 class RunStore:
@@ -1395,6 +1396,7 @@ PREVIEW_COLUMNS: dict[str, str] = {
     "app_settings": "key, value, updated_at",
     "user_profile": "full_name, date_of_birth, updated_at",
     # Bought with real money.
+    "agent_runs": "agent, status, started_at, seconds, steps, tool_calls",
     "merchant_categories": "merchant_key, category, hit_count, updated_at",
     "ai_inferences": "cache_key, kind, provider, model, created_at, hit_count",
     # Downloaded, and irreplaceable if the mail is gone.

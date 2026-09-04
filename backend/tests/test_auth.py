@@ -62,6 +62,7 @@ def _spend(db, account_id: str, amount: str, description: str) -> None:
     "/api/dashboard", "/api/accounts", "/api/transactions", "/api/statements",
     "/api/files", "/api/recurring", "/api/data/inventory", "/api/profile",
     "/api/gmail/status", "/api/onboarding", "/api/query/schema",
+    "/api/agents",
 ])
 def test_every_data_endpoint_refuses_an_anonymous_caller(client, path):
     """Protection is a property of the middleware, not of each route.

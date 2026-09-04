@@ -21,6 +21,7 @@ import Budget from './components/Budget';
 import Admin from './components/Admin';
 import DemoBanner from './components/DemoBanner';
 import Explore from './components/explore/Explore';
+import Agents from './components/agents/Agents';
 import MailboxButton from './components/mailbox/MailboxButton';
 import MailboxModal from './components/mailbox/MailboxModal';
 import useMailbox from './components/mailbox/useMailbox';
@@ -58,6 +59,11 @@ import { useTheme } from './theme';
 const GROUPS = [
   ['money', 'Money', [
     ['overview', 'Overview'],
+    /* Second in Money, ahead of the tabs that show what happened, because
+       what an agent answers is not "what happened" - it is the question you
+       would have had to know to ask. A screen you only find by exhausting
+       the others is a screen nobody finds. */
+    ['agents', 'Agents'],
     /* Second, deliberately. "What does a month cost me, and what does it
        leave" is the question asked most often after "what came in", and it
        was previously answerable only by reading three other tabs and doing
@@ -530,6 +536,7 @@ function Dashboard({ openImport = false, onImportOpened }) {
               onImport={() => setMailboxOpen(true)} />}
             {tab === 'portfolio' && <Portfolio onImport={() => setMailboxOpen(true)} />}
             {tab === 'explore' && <Explore />}
+            {tab === 'agents' && <Agents />}
             {tab === 'data' && <DataHub data={data}
               onImport={() => setMailboxOpen(true)} />}
             {tab === 'rules' && <Rules />}

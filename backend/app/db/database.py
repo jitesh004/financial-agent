@@ -88,7 +88,10 @@ _TIER_FILES = ("source_files",)
 _TIER_STAGING = ("staged_files",)
 
 #: Bought with real money. Never cleared as a side effect of anything else.
-_TIER_AI = ("ai_inferences", "merchant_categories")
+#: `agent_runs` belongs here rather than with the derived data. Re-parsing a
+#: statement should not throw away an analysis somebody paid a model to
+#: produce - and unlike a recurring series, no amount of CPU brings it back.
+_TIER_AI = ("agent_runs", "ai_inferences", "merchant_categories")
 
 #: Authored by a human. Cannot be regenerated from any input at any price.
 #: `claims` is listed before `claim_settlements` and `transaction_splits`
@@ -160,6 +163,7 @@ TENANT_TABLES: tuple[str, ...] = (
     "settlement_group_legs",
     "dashboards",
     "dashboard_widgets",
+    "agent_runs",
     "jobs",
     "job_items",
     "staged_files",
