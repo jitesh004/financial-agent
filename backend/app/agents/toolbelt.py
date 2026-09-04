@@ -622,6 +622,60 @@ def runway(db, **_: Any) -> dict[str, Any]:
 # Outside the bank statements
 # ---------------------------------------------------------------------------
 
+def position(db, **_: Any) -> dict[str, Any]:
+    """What the user has confirmed is true, aged to today.
+
+    The most authoritative thing an agent can read, and the only source that
+    can carry a debt no statement mentions. Every figure here was reviewed by
+    the person whose money it is, on a date that travels with it, and rolled
+    forward from that date by the same amortization the Debt tab uses - so an
+    outstanding balance reviewed three months ago comes back three
+    instalments lighter rather than three months stale.
+
+    `unaccounted.bureau` is the one to read first. Those are credit accounts a
+    lender has reported and the position does not cover, which means every
+    total an agent computes is short by whatever they hold. An answer about
+    somebody's debt that ignores a loan sitting in that list is a confidently
+    wrong answer.
+    """
+    from ..analytics import position as position_mod
+
+    reports = repo.get_bureau_reports(db)
+    bureau_accounts = (repo.get_bureau_accounts(db, reports[0]["id"])
+                       if reports else [])
+    built = position_mod.build(
+        repo.get_position_items(db), repo.get_accounts(db), bureau_accounts)
+    items = built["items"]
+    return {
+        "as_of": built["as_of"],
+        "reviewed": bool(items),
+        "totals": built["totals"],
+        "items": [
+            {k: v for k, v in item.items()
+             # Trimmed to what an agent reasons about. The full row carries
+             # the attested baseline and the observed figure side by side,
+             # which is a screen's job rather than a prompt's.
+             if k in {"id", "kind", "label", "institution", "outstanding",
+                      "emi", "interest_rate", "months_remaining",
+                      "payoff_date", "total_interest_remaining",
+                      "credit_limit", "utilisation_pct", "next_due_on",
+                      "days_to_due", "min_due", "reviewed_on", "stale",
+                      "basis", "drift"}}
+            for item in items[:MAX_ROWS]
+        ],
+        "unaccounted": built["unaccounted"],
+        "needs_attention": built["needs_attention"],
+        "note": (
+            "Nothing has been reviewed yet, so there is no attested position "
+            "- fall back to accounts() and loans(), and say in your caveats "
+            "that the picture is only what the imported statements cover."
+            if not items else
+            "Reviewed figures, rolled forward from the date each was "
+            "confirmed. Where `drift` is set, the statements disagree with "
+            "the roll-forward and you should say so rather than picking one."),
+    }
+
+
 def credit_report(db, **_: Any) -> dict[str, Any]:
     """The latest bureau report, if one has been imported."""
     reports = repo.get_bureau_reports(db)
@@ -641,9 +695,24 @@ def credit_report(db, **_: Any) -> dict[str, Any]:
              "status": a.get("status"), "sanctioned": a.get("sanctioned"),
              "balance": a.get("current_balance"), "emi": a.get("emi_amount"),
              "overdue": a.get("overdue"), "credit_limit": a.get("credit_limit"),
-             "opened": a.get("opened_on"), "worst_dpd": a.get("worst_dpd")}
+             "opened": a.get("opened_on"), "worst_dpd": a.get("worst_dpd"),
+             # Whether this bureau line has been tied to a statement. An
+             # agent that cannot see this will total up the loans it can
+             # read and state the figure as if it were complete - which is
+             # exactly wrong when a fourth loan sits here unmatched.
+             "matched_account_id": a.get("account_id"),
+             "match_status": a.get("match_status")}
             for a in accounts_rows[:MAX_ROWS]
         ],
+        "unmatched_open_accounts": [
+            {"lender": a.get("lender"), "type": a.get("account_type"),
+             "balance": a.get("current_balance"), "emi": a.get("emi_amount")}
+            for a in accounts_rows
+            if not a.get("account_id") and (a.get("status") or "open") == "open"
+        ],
+        "note": "An entry under `unmatched_open_accounts` is a live credit "
+                "account no imported statement covers. Any total that leaves "
+                "it out is short, and you must say so.",
     }
 
 
@@ -774,6 +843,12 @@ TOOLS: dict[str, Tool] = {t.name: t for t in [
          "How many months the liquid balance covers with no income, at full "
          "cost and at essential cost.",
          {}, runway),
+    Tool("position",
+         "What the user has REVIEWED and confirmed is true - loans, cards, "
+         "balances, EMIs, due dates - aged to today, plus the credit "
+         "accounts nothing accounts for. The most authoritative source you "
+         "have, and the only one that can see a debt no statement mentions.",
+         {}, position),
     Tool("credit_report", "The imported bureau report: score and accounts.",
          {}, credit_report),
     Tool("holdings", "What is invested, from imported portfolio statements.",

@@ -2572,3 +2572,200 @@ def prune_agent_runs(db: Database, agent: str, keep: int = 25) -> int:
         for run_id in stale:
             conn.execute("DELETE FROM agent_runs WHERE id = ?", (run_id,))
     return len(stale)
+
+
+# --------------------------------------------------------------------------
+# The position
+#
+# The one table in this app a human writes to directly. Everything else is
+# derived from a document, which is why `reviewed_on` is not optional: an
+# asserted figure without a date is a figure nothing can age or check.
+# --------------------------------------------------------------------------
+
+#: Every field a position item carries, and therefore every field the PATCH
+#: endpoint will accept. Named once so the API surface and the table cannot
+#: drift apart - a column added without being listed here is a column no
+#: caller can ever set.
+POSITION_FIELDS = (
+    "kind", "label", "institution", "account_id", "bureau_account_id",
+    "reviewed_on", "outstanding", "original_amount", "emi", "interest_rate",
+    "months_remaining", "months_total", "credit_limit", "min_due",
+    "statement_day", "due_day", "notes", "archived", "sort_order",
+)
+
+#: The ones holding money, so a Decimal or a stray "₹1,20,000" arriving from
+#: a form is stored as the exact decimal string the money rule requires.
+_POSITION_MONEY = frozenset({
+    "outstanding", "original_amount", "emi", "interest_rate", "credit_limit",
+    "min_due",
+})
+
+_POSITION_INTS = frozenset({
+    "months_remaining", "months_total", "statement_day", "due_day",
+    "archived", "sort_order",
+})
+
+
+def _position_value(field: str, value: Any) -> Any:
+    """One incoming field, in the shape the column wants."""
+    if value is None or value == "":
+        return None
+    if field in _POSITION_MONEY:
+        return _txt(_dec(value))
+    if field in _POSITION_INTS:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    if field == "reviewed_on":
+        parsed = _d(value)
+        return parsed.isoformat() if parsed else None
+    return str(value)
+
+
+def save_position_item(db: Database, item: dict[str, Any]) -> str:
+    """Insert one item. Returns its id."""
+    item_id = item.get("id") or _new_id()
+    fields = [f for f in POSITION_FIELDS if f in item]
+    if "reviewed_on" not in fields:
+        fields.append("reviewed_on")
+    values = [_position_value(f, item.get(f)) for f in fields]
+    # A review date is what makes the row meaningful, so it is defaulted
+    # rather than left null - to today, which is the only honest default when
+    # somebody is adding a row by hand right now.
+    for index, field in enumerate(fields):
+        if field == "reviewed_on" and values[index] is None:
+            values[index] = date.today().isoformat()
+    columns = ", ".join(["id", *fields])
+    placeholders = ", ".join("?" * (len(fields) + 1))
+    with db.connection() as conn:
+        conn.execute(f"INSERT INTO position_items ({columns})"
+                     f" VALUES ({placeholders})", [item_id, *values])
+    return item_id
+
+
+def update_position_item(db: Database, item_id: str,
+                        changes: dict[str, Any]) -> bool:
+    """Change any subset of one item's fields.
+
+    Sent as a partial patch, so correcting an outstanding balance never
+    disturbs a label the user fixed earlier - and `updated_at` moves while
+    `reviewed_on` does not, because editing a figure and re-attesting the
+    whole item are different acts. Re-attesting is `review_position_item`.
+    """
+    wanted = {k: v for k, v in changes.items() if k in POSITION_FIELDS}
+    if not wanted:
+        return False
+    assignments = ", ".join(f"{k} = ?" for k in wanted)
+    values = [_position_value(k, v) for k, v in wanted.items()]
+    with db.connection() as conn:
+        cursor = conn.execute(
+            f"UPDATE position_items SET {assignments}, updated_at = fa_now()"
+            f" WHERE id = ?", [*values, item_id])
+        return bool(cursor.rowcount)
+
+
+def review_position_item(db: Database, item_id: str,
+                         reviewed_on: str | None = None) -> bool:
+    """Re-baseline one item: this is true, as of this date.
+
+    Kept separate from an ordinary edit on purpose. Moving the review date is
+    the act that says "I have looked at this and it is right", and it resets
+    the roll-forward - so it must never happen as a side effect of fixing a
+    typo in a label.
+    """
+    when = _d(reviewed_on) or date.today()
+    with db.connection() as conn:
+        cursor = conn.execute(
+            "UPDATE position_items SET reviewed_on = ?, updated_at = fa_now()"
+            " WHERE id = ?", (when.isoformat(), item_id))
+        return bool(cursor.rowcount)
+
+
+def get_position_items(db: Database, *, include_archived: bool = False
+                       ) -> list[dict[str, Any]]:
+    where = "" if include_archived else "WHERE archived = 0"
+    with db.connection() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM position_items {where}"
+            f" ORDER BY sort_order, label").fetchall()
+    return [_row_dict(r) for r in rows]
+
+
+def get_position_item(db: Database, item_id: str) -> dict[str, Any] | None:
+    with db.connection() as conn:
+        row = conn.execute("SELECT * FROM position_items WHERE id = ?",
+                           (item_id,)).fetchone()
+    return _row_dict(row) if row else None
+
+
+def delete_position_item(db: Database, item_id: str, *,
+                         archive: bool = True) -> bool:
+    """Remove an item - by default by archiving it.
+
+    Archived rather than deleted because a snapshot taken while it existed
+    still refers to it, and because "I closed this in March" is a fact the
+    position can show rather than a gap it cannot explain. `archive=False` is
+    the real delete, for a row that was a mistake.
+    """
+    with db.connection() as conn:
+        if archive:
+            cursor = conn.execute(
+                "UPDATE position_items SET archived = 1, updated_at = fa_now()"
+                " WHERE id = ?", (item_id,))
+        else:
+            cursor = conn.execute("DELETE FROM position_items WHERE id = ?",
+                                  (item_id,))
+        return bool(cursor.rowcount)
+
+
+def save_position_snapshot(db: Database, taken_on: str, note: str,
+                           items: list[dict[str, Any]],
+                           totals: dict[str, Any]) -> str:
+    snapshot_id = _new_id()
+    with db.connection() as conn:
+        conn.execute(
+            "INSERT INTO position_snapshots (id, taken_on, note, items_json,"
+            " totals_json, item_count) VALUES (?,?,?,?,?,?)",
+            (snapshot_id, taken_on, note, json.dumps(items, default=str),
+             json.dumps(totals, default=str), len(items)))
+    return snapshot_id
+
+
+def get_position_snapshots(db: Database, limit: int = 24
+                           ) -> list[dict[str, Any]]:
+    """Every review, newest first, without the frozen items.
+
+    The items are the bulk of the row and a list of reviews only needs the
+    date, the note and the totals - which are what a "what was I carrying in
+    September?" question is actually asking.
+    """
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT id, taken_on, note, totals_json, item_count, created_at"
+            " FROM position_snapshots ORDER BY taken_on DESC, created_at DESC"
+            " LIMIT ?", (max(1, min(int(limit), 100)),)).fetchall()
+    return [{"id": r["id"], "taken_on": r["taken_on"], "note": r["note"],
+             "totals": _json(r["totals_json"], {}),
+             "item_count": r["item_count"], "created_at": r["created_at"]}
+            for r in rows]
+
+
+def get_position_snapshot(db: Database, snapshot_id: str
+                          ) -> dict[str, Any] | None:
+    with db.connection() as conn:
+        row = conn.execute("SELECT * FROM position_snapshots WHERE id = ?",
+                           (snapshot_id,)).fetchone()
+    if row is None:
+        return None
+    return {"id": row["id"], "taken_on": row["taken_on"], "note": row["note"],
+            "items": _json(row["items_json"], []),
+            "totals": _json(row["totals_json"], {}),
+            "item_count": row["item_count"], "created_at": row["created_at"]}
+
+
+def delete_position_snapshot(db: Database, snapshot_id: str) -> bool:
+    with db.connection() as conn:
+        cursor = conn.execute("DELETE FROM position_snapshots WHERE id = ?",
+                              (snapshot_id,))
+        return bool(cursor.rowcount)

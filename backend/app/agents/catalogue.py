@@ -60,6 +60,16 @@ How you work:
   answer, and say plainly in `caveats` what is missing. "Nothing was spent on
   X" and "no statement covering X has been imported" are different claims and
   you must not confuse them.
+- `position` outranks everything else. It is what the user reviewed and
+  confirmed themselves, aged to today, and it is the ONLY source that can
+  carry a debt no statement mentions. Where it disagrees with the ledger,
+  report both figures and say which is which - never quietly average them or
+  pick one. Where its `unaccounted.bureau` list is not empty, a lender has
+  reported a live account nothing here covers: any total you give is short by
+  whatever that account holds, and you must say so rather than presenting the
+  figure as complete.
+- Where the position is empty, say so once in `caveats` and carry on from the
+  statements. Do not refuse to answer over it.
 - Amounts are Indian rupees. Write them plainly - 1,25,000 - with no symbol.
 
 What you must not do:
@@ -109,9 +119,10 @@ AGENTS: tuple[Agent, ...] = (
               "ranks them by what each rupee of repayment buys, and works out "
               "exactly what a lump sum or a bigger EMI would do.",
         icon="scale",
-        tools=("loans", "accounts", "simulate_prepayment", "recurring",
-               "budget", "credit_report", "ledger_query", "data_quality"),
-        opening=("loans", "accounts"),
+        tools=("position", "loans", "accounts", "simulate_prepayment",
+               "recurring", "budget", "credit_report", "ledger_query",
+               "data_quality"),
+        opening=("position", "loans"),
         max_steps=10,
         brief="""Your area is everything the user owes.
 
@@ -152,9 +163,9 @@ relevant.""",
               "to land, and charges to things you appear to have stopped "
               "using.",
         icon="drip",
-        tools=("recurring", "ledger_query", "search_transactions", "budget",
-               "accounts", "data_quality"),
-        opening=("recurring",),
+        tools=("position", "recurring", "ledger_query",
+               "search_transactions", "budget", "accounts", "data_quality"),
+        opening=("recurring", "position"),
         max_steps=9,
         brief="""Your area is money that leaves on a schedule without anybody
 deciding about it each time.
@@ -191,9 +202,9 @@ is worth it.""",
               "already known, finds the date the balance is lowest, and says "
               "which charges put it there.",
         icon="wave",
-        tools=("cashflow_forecast", "recurring", "accounts", "budget",
-               "analysis", "ledger_query", "data_quality"),
-        opening=("cashflow_forecast", "accounts"),
+        tools=("position", "cashflow_forecast", "recurring", "accounts",
+               "budget", "analysis", "ledger_query", "data_quality"),
+        opening=("position", "cashflow_forecast"),
         max_steps=9,
         brief="""Your area is the dated shape of the next three months.
 
@@ -230,9 +241,10 @@ figures, and leave the decision alone.""",
               "the home-loan sections from the ledger itself, and shows what "
               "is left of each limit with the deadline attached.",
         icon="receipt",
-        tools=("ledger_query", "recurring", "loans", "search_transactions",
-               "accounts", "analysis", "holdings", "data_quality"),
-        opening=("recurring", "loans"),
+        tools=("position", "ledger_query", "recurring", "loans",
+               "search_transactions", "accounts", "analysis", "holdings",
+               "data_quality"),
+        opening=("position", "recurring"),
         max_steps=10,
         brief="""Your area is the deductions the user has ALREADY earned
 without necessarily knowing it, under the Indian old tax regime.
@@ -283,9 +295,9 @@ March" is the fact, and it is enough.""",
               "many months the liquid balance covers, and what would have to "
               "keep being paid no matter what.",
         icon="shield",
-        tools=("runway", "budget", "accounts", "recurring", "analysis",
-               "holdings", "loans", "data_quality"),
-        opening=("runway", "accounts"),
+        tools=("position", "runway", "budget", "accounts", "recurring",
+               "analysis", "holdings", "loans", "data_quality"),
+        opening=("position", "runway"),
         max_steps=9,
         brief="""Your area is what happens if the income stops.
 

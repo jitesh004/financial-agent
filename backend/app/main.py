@@ -33,8 +33,8 @@ from fastapi.responses import JSONResponse
 from . import storage
 from .analytics import periods
 from .api import (admin_routes, agent_routes, auth_routes, files_routes,
-                  gmail_routes, job_routes, query_routes, rules_routes,
-                  settings_routes, staging_routes, wealth_routes)
+                  gmail_routes, job_routes, position_routes, query_routes,
+                  rules_routes, settings_routes, staging_routes, wealth_routes)
 from .auth.session import AuthContextMiddleware
 from .api import serializers as ser
 from .db.database import CLEAR_SCOPES, get_db
@@ -133,6 +133,7 @@ app.include_router(staging_routes.router)
 app.include_router(admin_routes.router)
 app.include_router(rules_routes.router)
 app.include_router(agent_routes.router)
+app.include_router(position_routes.router)
 
 
 class RunStore:
@@ -1391,6 +1392,9 @@ PREVIEW_COLUMNS: dict[str, str] = {
     "settlement_group_legs": "group_id, fingerprint, side",
     "custom_categories": "name, color, icon, created_at",
     "recurring_series_overrides": "series_id, label, category, is_active, deleted",
+    "position_items": ("kind, label, institution, outstanding, emi,"
+                       " reviewed_on, archived"),
+    "position_snapshots": "taken_on, note, item_count, created_at",
     "dashboards": "name, description, is_default, position, updated_at",
     "dashboard_widgets": "dashboard_id, title, type, position",
     "app_settings": "key, value, updated_at",

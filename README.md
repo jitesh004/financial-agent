@@ -332,6 +332,9 @@ untouched, and is safe to run twice.
 ## What it produces
 
 - **Overview** — income, spending, savings rate, net position, and the narrative
+- **Position** — what *you* have checked and confirmed, aged to today. The one
+  screen the documents do not produce, and the only one that can hold a loan
+  no statement mentions. See below
 - **Agents** — the questions you would have had to know to ask. Each one is
   handed the whole ledger and a job, decides for itself what to look at, and
   shows its working. See below
@@ -419,6 +422,87 @@ Two rules keep those answers honest:
 
 ---
 
+## Position
+
+Every other screen is derived from a document, and is therefore only as
+complete as the documents that have been imported. Position is the other half:
+the place where you say *this is my reality, I have been through it*. It exists
+because there are facts no statement carries — a loan serviced from an account
+nobody uploaded, a tenure agreed on the phone, a card whose PDF is lost.
+
+The obvious objection to letting anyone type "outstanding: 42,00,000" is that
+it is true for exactly one day. That is a property of the number, not a reason
+to refuse it, and two things answer it:
+
+**An attested figure ages.** Nothing here is displayed as typed. A loan is
+rolled forward from the day you confirmed it through the same closed-form
+amortization the Debt tab uses, so a balance signed off in January reads three
+instalments lighter in April — and the row shows both, with a sentence saying
+which is which:
+
+```
+Home loan          ₹41,26,891     221 left   paid off Jan 2045
+                   from ₹42,00,000 · 3 EMIs on
+                   as you reviewed it on 5 Jan 2026, rolled forward 3 instalment(s)
+```
+
+**An attested figure is checkable.** Where the row is mapped to a statement,
+the rolled-forward number is compared against what the bank actually says and
+the difference is reported — never resolved silently in either direction. A
+statement is checked and an attestation is not, so the statement is usually
+right; but the whole reason this table exists is that statements are sometimes
+absent or months behind.
+
+### A card is the deliberate exception
+
+A card balance does not amortize — it is whatever was spent minus whatever was
+paid — so projecting one would be inventing a liability, which is the single
+number on this screen that must not exist. What a card *does* have is a cycle,
+and that is arithmetic: the next statement date and the next due date are
+computed, and the balance is marked stale the moment a statement has been
+generated since you last looked.
+
+### Three of four terms are enough
+
+A loan has four numbers — balance, EMI, rate, remaining term — and any three
+determine the fourth. The rate is the one nobody remembers, so give the other
+three and it is recovered by bisection and labelled as *worked out* rather than
+confirmed. Give all four and disagree with yourself, and it says so at the
+moment you type it rather than letting a payoff date come out four years wrong.
+
+### What nothing accounts for
+
+The most important thing on the screen is the list of credit accounts your
+position does *not* cover. A bureau report names every account a lender has
+reported; anything open there and unmapped here means every total on this
+screen — and every answer an agent gives — is short by whatever it holds.
+Nothing else in this app can tell you that.
+
+### A blank is never a zero
+
+An account whose balance nobody has recorded is not an account holding nothing.
+Totals show an em dash where a figure is genuinely unknown and say how many
+rows are still blank, because "assets: ₹0" from a position with one empty field
+in it is a worse answer than no answer.
+
+### Reviews are a record, not a state
+
+*"No one can deny it, because I reviewed it myself"* only holds if the review
+is dated and kept. Signing off freezes the whole position as a snapshot, so
+*what was I carrying in September?* is answerable in December — and so a later
+roll-forward can be audited against it when the next statement finally arrives
+and disagrees.
+
+Nothing needs typing from scratch: **Draft it from what I have imported** fills
+in every figure the statements and the bureau already carry, dated to when each
+is actually true rather than to today. Your job is to correct what is wrong,
+which is a five-minute pass. Every field is editable in place, rows can be
+added and removed, each row maps to a statement and to a bureau line, and every
+column sorts — *which card is nearest its limit*, *what is due first*, *which
+loan has longest to run* are each one click.
+
+---
+
 ## Agents
 
 Every tab above answers a question somebody already knew to ask. An agent is
@@ -426,6 +510,10 @@ for the ones they cannot phrase — *am I actually going to be short in March?*,
 *which of these subscriptions is quietly the most expensive?*, *what have I
 already spent this year that counts against 80C?* — and it works by being
 handed the ledger and a job rather than an answer to narrate.
+
+Every agent opens with the [Position](#position) — it outranks the statements,
+because it is what the user confirmed themselves and it is the only source that
+can carry a debt no document mentions.
 
 | Agent | The question it answers |
 |---|---|
@@ -727,7 +815,7 @@ backend/app/
   normalize/             Date/amount parsers, column mapping, metadata, normalizer
   reconcile/             The balance gate + transfer detection
   categorize/            Rules engine, merchant cache, LLM tail
-  analytics/             Cashflow, recurring, loans, forecast
+  analytics/             Cashflow, recurring, loans, forecast, position
   agents/                Read-only toolbelt, agent catalogue, the tool loop
   graph/                 LangGraph state, nodes, assembly
   llm/                   Anthropic client (with redaction) + narrative
@@ -735,7 +823,7 @@ backend/app/
   auth/                  Google sign-in, sessions, onboarding
   api/, main.py          FastAPI
 backend/tools/           Synthetic fixture generator
-backend/tests/           911 tests, including fault injection and isolation
+backend/tests/           948 tests, including fault injection and isolation
 frontend/src/            React UI
 ```
 

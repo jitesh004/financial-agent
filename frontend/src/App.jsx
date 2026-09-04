@@ -22,6 +22,7 @@ import Admin from './components/Admin';
 import DemoBanner from './components/DemoBanner';
 import Explore from './components/explore/Explore';
 import Agents from './components/agents/Agents';
+import Position from './components/position/Position';
 import MailboxButton from './components/mailbox/MailboxButton';
 import MailboxModal from './components/mailbox/MailboxModal';
 import useMailbox from './components/mailbox/useMailbox';
@@ -74,6 +75,11 @@ const GROUPS = [
     ['recurring', 'Recurring'],
   ]],
   ['accounts', 'Accounts', [
+    /* First in Accounts, because it is the only one of these that is not
+       merely what the imports happened to cover. It is what the user has
+       checked and confirmed, including the loan no statement mentions -
+       which makes it the thing the other three should be read against. */
+    ['position', 'Position'],
     ['debt', 'Debt'],
     ['credit', 'Credit report'],
     ['portfolio', 'Portfolio'],
@@ -106,7 +112,11 @@ const GROUP_OF = Object.fromEntries(
 //: them by nature - it describes what the app WOULD do, so it is at its
 //: most useful before anything has been imported.
 const ALWAYS_AVAILABLE = ['settings', 'data', 'rules', 'credit', 'portfolio',
-  'admin'];
+  'admin',
+  /* Reachable before anything is imported, deliberately. Somebody who has
+     not connected a bank yet can still write down what they owe, and that
+     is a more useful first five minutes than an empty dashboard. */
+  'position'];
 
 /* Tabs the period control applies to, and therefore appears on.
  *
@@ -537,6 +547,7 @@ function Dashboard({ openImport = false, onImportOpened }) {
             {tab === 'portfolio' && <Portfolio onImport={() => setMailboxOpen(true)} />}
             {tab === 'explore' && <Explore />}
             {tab === 'agents' && <Agents />}
+            {tab === 'position' && <Position />}
             {tab === 'data' && <DataHub data={data}
               onImport={() => setMailboxOpen(true)} />}
             {tab === 'rules' && <Rules />}
