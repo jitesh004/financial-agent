@@ -479,6 +479,29 @@ about a forty-item classification can spend the budget and return an empty
 `content` — which reads downstream as "0 from the model" on a provider that
 was working. Raise it to `medium` or `high` if the narrative reads thin.
 
+### Pointing it somewhere else
+
+`OPENROUTER_BASE_URL` is the whole switch. Anything that speaks the OpenAI
+`/chat/completions` shape works without a code change — including Gemini,
+which serves one:
+
+```env
+OPENROUTER_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+OPENROUTER_API_KEY=<your Gemini key>
+OPENROUTER_MODEL_FAST=gemini-2.5-flash
+OPENROUTER_MODEL_STRONG=gemini-2.5-pro
+OPENROUTER_REASONING_EFFORT=
+```
+
+Clear `OPENROUTER_REASONING_EFFORT` on any non-OpenRouter endpoint: the
+thinking budget is sent as OpenRouter spells it (`reasoning: {effort}`),
+which other layers — Gemini's included, where it is `reasoning_effort` — do
+not read.
+
+`LLM_PROVIDER` itself only accepts `openrouter` or `azure`. Anything else,
+including the `gemini` this used to take, logs a warning at the first call and
+calls no model — it is not a silent no-op.
+
 Azure OpenAI is the alternative (`LLM_PROVIDER=azure`), and **no provider at
 all is a supported configuration**: rules still categorise, analytics still
 compute, and the narrative falls back to a summary assembled from the computed

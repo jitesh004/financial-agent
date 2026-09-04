@@ -1962,6 +1962,51 @@ def test_openrouter_error_in_a_200_body_is_raised(monkeypatch):
         providers.OpenRouterProvider().complete("hi")
 
 
+def test_a_base_url_override_reaches_another_openai_compatible_endpoint(monkeypatch):
+    """Going back to Gemini is a base-URL change, not a code change.
+
+    Gemini serves the same `/chat/completions` shape, so the switch has to be
+    the URL and nothing else - no path assumptions, no openrouter.ai baked in
+    anywhere.
+    """
+    from app.llm import providers
+
+    sent = {}
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            sent.update(url=url, payload=json, headers=headers)
+            return _Resp(200, {"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(providers.httpx, "Client", _Client)
+    monkeypatch.setattr(providers.config, "OPENROUTER_API_KEY", "g", raising=False)
+    monkeypatch.setattr(
+        providers.config, "OPENROUTER_BASE_URL",
+        "https://generativelanguage.googleapis.com/v1beta/openai", raising=False)
+    monkeypatch.setattr(providers.config, "OPENROUTER_MODEL_FAST",
+                        "gemini-2.5-flash", raising=False)
+    # Cleared, as the docs say to on a non-OpenRouter endpoint: the thinking
+    # budget is sent as OpenRouter spells it, which Google's layer ignores.
+    monkeypatch.setattr(providers.config, "OPENROUTER_REASONING_EFFORT", "",
+                        raising=False)
+
+    assert providers.OpenRouterProvider().complete("hi") == "ok"
+    assert sent["url"] == ("https://generativelanguage.googleapis.com"
+                           "/v1beta/openai/chat/completions")
+    assert sent["payload"]["model"] == "gemini-2.5-flash"
+    assert sent["headers"]["Authorization"] == "Bearer g"
+    assert "reasoning" not in sent["payload"]
+
+
 def test_openrouter_without_a_key_is_unavailable(monkeypatch):
     """No key must degrade the app, not break it: rules still categorise and
     the narrative falls back to the computed figures."""

@@ -225,7 +225,23 @@ def get_client(model: str = DEFAULT_MODEL) -> LLMClient:
             provider = OpenRouterProvider()
         elif config.LLM_PROVIDER == "azure":
             provider = AzureOpenAIProvider()
-        
+        elif config.LLM_PROVIDER:
+            # A name nothing implements is not the same as no name at all.
+            # Unnamed, the app is deliberately running without a model and
+            # says so on the Settings screen. Misnamed - a typo, or a
+            # provider that used to exist, like `gemini` before it moved to
+            # OpenRouter - it degrades to exactly the same silent no-model
+            # path, so a user who has set a key and a model sees no narrative
+            # and no explanation of why. Said once, at the top of the log.
+            log.warning(
+                "LLM_PROVIDER=%r is not a provider this app implements "
+                "(known: openrouter, azure), so no model will be called. "
+                "Gemini reaches this app through its OpenAI-compatible "
+                "endpoint: set LLM_PROVIDER=openrouter and point "
+                "OPENROUTER_BASE_URL at it - see .env.example.",
+                config.LLM_PROVIDER,
+            )
+
         # fallback if requested provider isn't available, but it's set in config
         _clients[model] = LLMClient(provider=provider, tier=model)
         
