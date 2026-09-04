@@ -23,8 +23,14 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
+import pypdf
+
 ROOT = Path(__file__).resolve().parents[2]
+
 OUT = ROOT / "data" / "samples"
+#: The locked fixture lives beside the plain ones rather than among them, so
+#: a test that globs data/samples does not try to parse a file it cannot open.
+LOCKED_OUT = ROOT / "data" / "samples_encrypted"
 
 random.seed(20260826)  # deterministic fixtures
 
@@ -395,6 +401,23 @@ def render_docx(ledger: Ledger, path: Path, title: str, meta: dict) -> None:
     doc.save(path)
 
 
+def render_locked_pdf(source: Path, path: Path, password: str) -> None:
+    """Copy a rendered PDF, encrypted with `password`.
+
+    Owner and user password are the same deliberately: the fixture stands in
+    for a bank statement, and those arrive needing one password to open,
+    with no separate permissions password to work around.
+    """
+    reader = pypdf.PdfReader(source)
+    writer = pypdf.PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    writer.encrypt(user_password=password, owner_password=password)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as fh:
+        writer.write(fh)
+
+
 def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
     savings, card, home, personal, mf, summary = simulate()
@@ -481,6 +504,20 @@ def main() -> int:
                    "Latest NAV": f"{summary['nav']:.4f}",
                    "Current Value": f"{summary['mf_units'] * summary['nav']:,.2f}",
                })
+
+    # 7. The same card statement, locked. The test suite looks for this
+    # under data/samples_encrypted and skips three tests without it; the
+    # hint it prints says "run generate_samples + encrypt step", so the step
+    # belongs here rather than in whatever ad-hoc command made it once.
+    #
+    # The password is the format ICICI actually uses on a credit-card PDF -
+    # first four letters of the name, then DDMM of birth - and has to stay
+    # one that passwords.derive_passwords() produces from the profile in
+    # tests/test_features.py, because what those tests check is that the
+    # derivation opens a real locked file.
+    render_locked_pdf(OUT / "icici_credit_card_2025_2026.pdf",
+                      LOCKED_OUT / "icici_credit_card_locked.pdf",
+                      password="PANK1407")
 
     print("Generated sample statements in", OUT)
     for f in sorted(OUT.iterdir()):

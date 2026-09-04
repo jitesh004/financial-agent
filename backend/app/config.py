@@ -137,6 +137,29 @@ class Config:
     LLM_PROVIDER = (
         _env('LLM_PROVIDER', default='openrouter') or 'openrouter').lower()
 
+    # ---- Gemini (Google's own API) ---------------------------------------
+    #
+    # Distinct from pointing the OpenRouter provider at Google's
+    # OpenAI-compatible endpoint, which also works. Native buys the things
+    # the compatibility shim flattens away: `responseSchema` can have an
+    # ARRAY at its root, so the categoriser's answers need no object
+    # wrapper, and `systemInstruction` is a field of its own rather than a
+    # message with a role - which for the Gemma models is the difference
+    # between an answer and an empty list.
+
+    GEMINI_API_KEY = _env('GEMINI_API_KEY')
+    GEMINI_BASE_URL = (
+        _env('GEMINI_BASE_URL',
+             default='https://generativelanguage.googleapis.com/v1beta')
+        or '').rstrip('/')
+
+    #: Categorisation and letterhead lookups.
+    GEMINI_MODEL_FAST = _env('GEMINI_MODEL_FAST',
+                             default='gemma-4-26b-a4b-it')
+    #: The written narrative.
+    GEMINI_MODEL_STRONG = _env('GEMINI_MODEL_STRONG',
+                               default='gemma-4-26b-a4b-it')
+
     # ---- OpenRouter ------------------------------------------------------
     #
     # One key, one OpenAI-shaped endpoint, and a catalogue that includes
@@ -173,8 +196,19 @@ class Config:
     #: against a fixed list of categories, where thinking mostly spends the
     #: token budget that the answer needs. Set to 'medium' or 'high' if the
     #: narrative reads thin. Empty sends no reasoning directive at all.
+    #
+    #: Read straight from the environment rather than through `_env`, which
+    #: folds an empty value into the default. Here that distinction is the
+    #: whole point: `OPENROUTER_REASONING_EFFORT=` is documented, in this
+    #: file and in .env.example, as the way to send no directive at all, and
+    #: through `_env` it came back as 'low' instead - so the one escape
+    #: hatch from the directive did nothing, silently. It exists for a model
+    #: or endpoint that rejects the field rather than ignoring it, which is
+    #: a failure of the whole request rather than of the directive.
+    _reasoning_effort = os.environ.get('OPENROUTER_REASONING_EFFORT')
     OPENROUTER_REASONING_EFFORT = (
-        _env('OPENROUTER_REASONING_EFFORT', default='low') or '').strip().lower()
+        'low' if _reasoning_effort is None
+        else _reasoning_effort.strip().lower())
 
     #: Send `response_format: {"type": "json_object"}` on JSON calls. On by
     #: default because it is the difference between a parsed answer and a

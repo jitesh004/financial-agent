@@ -20,7 +20,8 @@ import re
 from typing import Any
 
 from ..config import config
-from .providers import Provider, OpenRouterProvider, AzureOpenAIProvider
+from .providers import (Provider, OpenRouterProvider, AzureOpenAIProvider,
+                        GeminiProvider)
 
 log = logging.getLogger(__name__)
 
@@ -202,14 +203,24 @@ class LLMClient:
         system: str = "",
         max_tokens: int = 4096,
         model: str | None = None,
+        schema: dict | None = None,
     ) -> Any:
+        """Ask for JSON. Pass `schema` to say which JSON.
+
+        Without one the provider asks only for a valid object, which is
+        enough for the callers that want an object anyway - a letterhead
+        lookup, a narrative. The categoriser wants a list, and no amount of
+        asking in the prompt makes an object-shaped constraint deliver one,
+        so it passes the shape it needs.
+        """
         if not self.available:
             raise LLMUnavailable("No LLM Provider is configured or available.")
         return self._provider.complete_json(
             prompt=redact(prompt),
             system=system,
             max_tokens=max_tokens,
-            tier=model or self.tier
+            tier=model or self.tier,
+            schema=schema,
         )
 
 
@@ -223,21 +234,24 @@ def get_client(model: str = DEFAULT_MODEL) -> LLMClient:
         provider = None
         if config.LLM_PROVIDER == "openrouter":
             provider = OpenRouterProvider()
+        elif config.LLM_PROVIDER == "gemini":
+            provider = GeminiProvider()
         elif config.LLM_PROVIDER == "azure":
             provider = AzureOpenAIProvider()
         elif config.LLM_PROVIDER:
             # A name nothing implements is not the same as no name at all.
             # Unnamed, the app is deliberately running without a model and
             # says so on the Settings screen. Misnamed - a typo, or a
-            # provider that used to exist, like `gemini` before it moved to
-            # OpenRouter - it degrades to exactly the same silent no-model
-            # path, so a user who has set a key and a model sees no narrative
-            # and no explanation of why. Said once, at the top of the log.
+            # provider spelled the way another tool spells it - it degrades
+            # to exactly the same silent no-model path, so a user who has set
+            # a key and a model sees no narrative and no explanation of why.
+            # Said once, at the top of the log.
             log.warning(
                 "LLM_PROVIDER=%r is not a provider this app implements "
-                "(known: openrouter, azure), so no model will be called. "
-                "Gemini reaches this app through its OpenAI-compatible "
-                "endpoint: set LLM_PROVIDER=openrouter and point "
+                "(known: openrouter, gemini, azure), so no model will be "
+                "called. Gemini can be reached either way: natively with "
+                "LLM_PROVIDER=gemini and GEMINI_API_KEY, or through its "
+                "OpenAI-compatible endpoint by pointing "
                 "OPENROUTER_BASE_URL at it - see .env.example.",
                 config.LLM_PROVIDER,
             )

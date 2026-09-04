@@ -72,6 +72,58 @@ def allowed_categories(db: Database | None = None) -> list[str]:
     return list(dict.fromkeys(names))
 
 
+def _response_schema(allowed_names: list[str]) -> dict:
+    """The exact shape of an answer, as a constraint rather than a request.
+
+    Wrapped in an object with a single `results` key because that is the only
+    way to be handed a list: `response_format` takes a JSON *object* at the
+    root, so a schema whose root is an array is not expressible. Asked for a
+    bare array through plain JSON mode instead, a model satisfies the
+    constraint by returning the first object on its own - one merchant
+    answered, thirty-nine dropped, and the batch then discarded here as "got
+    dict".
+
+    The category enum is the other half of the point. A bucket outside the
+    allowed set was previously caught after the fact and thrown away, which
+    silently cost that merchant its answer; inside the schema it is not a
+    token the model can emit.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "i": {"type": "integer"},
+                        "category": {"type": "string",
+                                     "enum": list(allowed_names)},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": ["i", "category", "confidence"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["results"],
+        "additionalProperties": False,
+    }
+
+
+def _answers_from(reply: object) -> list | None:
+    """The list of answers, however this model chose to present it.
+
+    The schema asks for {"results": [...]}, but a provider that ignores
+    `response_format` (or an Azure API version too old for it) can still
+    return the bare array the prompt asks for, and that answer is perfectly
+    usable. Anything else is a failed batch.
+    """
+    if isinstance(reply, dict):
+        reply = reply.get("results")
+    return reply if isinstance(reply, list) else None
+
+
 def _prompt(items: list[tuple[int, str, str]], allowed_names: list[str] | None = None) -> str:
     allowed = ", ".join(allowed_names or Category.all_builtins())
     lines = [f'{i}. [{direction}] "{merchant}"' for i, merchant, direction in items]
@@ -157,20 +209,31 @@ def categorize_with_llm(
         ]
 
         try:
-            answers = client.complete_json(
-                _prompt(items, allowed_names), system=SYSTEM)
+            reply = client.complete_json(
+                _prompt(items, allowed_names), system=SYSTEM,
+                schema=_response_schema(allowed_names))
         except Exception as exc:
             # One failed batch must not lose the batches that succeeded.
             log.warning("LLM categorization batch failed: %s", exc)
             last_run["failed_batches"] += 1
             continue
 
-        if not isinstance(answers, list):
-            log.warning("expected a JSON array, got %s", type(answers).__name__)
+        answers = _answers_from(reply)
+        if answers is None:
+            log.warning("expected a JSON array or {\"results\": [...]}, got %s",
+                        type(reply).__name__)
             last_run["failed_batches"] += 1
             continue
 
         last_run["asked"] += len(batch)
+
+        # One answer per index, the first one. A model is asked for exactly
+        # one object per input and some return more - Gemma emits a repeated
+        # index readily, which is how "ATM WDL SELF 1234" ended up filed
+        # under dining: a later duplicate overwrote the answer the model had
+        # already given correctly. The count of answered rows exceeding the
+        # count asked is the visible symptom.
+        answered_indices: set[int] = set()
 
         for answer in answers:
             if not isinstance(answer, dict):
@@ -181,6 +244,8 @@ def categorize_with_llm(
             except (ValueError, TypeError):
                 continue  # a hallucinated category is discarded, not coerced
             if not 0 <= index < len(batch):
+                continue
+            if index in answered_indices:
                 continue
             if category == Category.UNCATEGORIZED:
                 # A refusal is an answer. "RBL*SULOCHANA BH" is a person's
@@ -196,6 +261,7 @@ def categorize_with_llm(
                 last_run["invented"] += 1
                 continue
 
+            answered_indices.add(index)
             last_run["answered"] += 1
             confidence = _clamp(answer.get("confidence", 0.6))
             key = batch[index]

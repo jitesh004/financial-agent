@@ -125,6 +125,30 @@ def quiet_job_flusher():
     yield
 
 
+@pytest.fixture(scope="session", autouse=True)
+def no_outbound_model_calls():
+    """Keep the suite off the network.
+
+    `config` is read from the developer's own .env, so a machine with a real
+    key configured had the identity fallback in normalize.metadata calling
+    Gemini during ordinary parse tests - once per unrecognised letterhead,
+    against a live quota, at a few seconds each. The app is built to work
+    with no model at all, which is the state worth testing by default; a
+    test that wants one asks for it by passing its own client.
+    """
+    from app.config import config
+    from app.llm import client as llm_client
+
+    # Every provider's key, not the current one's: which provider is active
+    # comes from the developer's own .env, so clearing only some of them
+    # puts the suite back on the network the moment LLM_PROVIDER changes.
+    config.OPENROUTER_API_KEY = ""
+    config.GEMINI_API_KEY = ""
+    config.AZURE_OPENAI_API_KEY = ""
+    llm_client._clients.clear()
+    yield
+
+
 @pytest.fixture(autouse=True)
 def tenant(isolated_database):
     """Give every test its own user, and bind it for the whole test.

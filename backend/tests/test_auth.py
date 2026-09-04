@@ -352,7 +352,13 @@ def test_the_callback_will_not_redirect_off_this_origin(target, expected):
     assert _safe_redirect(target) == expected
 
 
-def test_signing_in_is_refused_when_google_is_not_configured(client):
+def test_signing_in_is_refused_when_google_is_not_configured(client, monkeypatch):
+    # Cleared explicitly rather than assumed absent: `config` is loaded from
+    # the developer's own .env, so on any machine that has actually set up
+    # Google sign-in this asserted the opposite of what it reads and failed.
+    monkeypatch.setattr(config, "GOOGLE_CLIENT_ID", "")
+    monkeypatch.setattr(config, "GOOGLE_CLIENT_SECRET", "")
+
     with anonymous():
         response = client.get("/api/auth/google/start", follow_redirects=False)
     assert response.status_code == 503

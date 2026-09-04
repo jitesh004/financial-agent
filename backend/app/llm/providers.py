@@ -53,7 +53,7 @@ def _parse_json_loose(raw: str) -> Any:
 class Provider:
     def complete(self, prompt: str, system: str = "", max_tokens: int = 4096, tier: str = "fast", temperature: float = 0.0) -> str:
         raise NotImplementedError
-    def complete_json(self, prompt: str, system: str = "", max_tokens: int = 4096, tier: str = "fast") -> Any:
+    def complete_json(self, prompt: str, system: str = "", max_tokens: int = 4096, tier: str = "fast", schema: dict | None = None) -> Any:
         raise NotImplementedError
     @property
     def available(self) -> bool:
@@ -166,7 +166,7 @@ class OpenRouterProvider(Provider):
 
     def complete(self, prompt: str, system: str = "", max_tokens: int = 4096,
                  tier: str = "fast", temperature: float = 0.0,
-                 json_mode: bool = False) -> str:
+                 json_mode: bool = False, schema: dict | None = None) -> str:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -183,11 +183,37 @@ class OpenRouterProvider(Provider):
         # sentence of explanation, which parses as nothing - which is how a
         # correctly configured provider reports "0 from the model" on every
         # run with only a warning in the log to say why.
-        if json_mode and config.OPENROUTER_JSON_MODE:
+        #
+        # Which constraint matters. `json_object` only promises *an* object,
+        # and an object is precisely what the categoriser cannot use: it asks
+        # for one answer per merchant and gets back a single
+        # {"i": 0, ...} with the other thirty-nine dropped, which arrives
+        # downstream as "expected a JSON array, got dict" and loses the whole
+        # batch. A schema states the shape instead of hoping for it - and,
+        # because the category list is an enum inside it, a hallucinated
+        # bucket stops being possible rather than being caught and discarded
+        # afterwards. Callers wanting a bare object still pass json_mode.
+        if schema is not None and config.OPENROUTER_JSON_MODE:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "strict": True,
+                                "schema": schema},
+            }
+        elif json_mode and config.OPENROUTER_JSON_MODE:
             payload["response_format"] = {"type": "json_object"}
+        # `reasoning_effort`, not OpenRouter's own `reasoning: {effort}`.
+        # Both endpoints accept this spelling - it is OpenAI's, which is the
+        # shape they are each compatible with - but Google's accepts only
+        # this one, rejecting the nested form outright with a 400 `Unknown
+        # name "reasoning"` rather than ignoring a field it does not know.
+        #
+        # It is worth sending rather than omitting. Gemini 3.x flash thinks
+        # by default, and thinking is charged against `max_tokens`: the
+        # letterhead lookup asks for 100 tokens, which the model spends
+        # entirely on reasoning, returning empty content and no institution.
+        # At 'low' the same call answers in fifteen.
         if config.OPENROUTER_REASONING_EFFORT:
-            payload["reasoning"] = {
-                "effort": config.OPENROUTER_REASONING_EFFORT}
+            payload["reasoning_effort"] = config.OPENROUTER_REASONING_EFFORT
 
         headers = {"Authorization": f"Bearer {config.OPENROUTER_API_KEY}"}
         # Attribution, so a shared key's traffic is identifiable on
@@ -224,10 +250,195 @@ class OpenRouterProvider(Provider):
 
         return _message_text(data)
 
-    def complete_json(self, prompt: str, system: str = "", max_tokens: int = 4096, tier: str = "fast") -> Any:
+    def complete_json(self, prompt: str, system: str = "", max_tokens: int = 4096, tier: str = "fast", schema: dict | None = None) -> Any:
         system = system or "You return only valid JSON. No prose, no code fences."
         raw = self.complete(prompt, system=system, max_tokens=max_tokens,
-                            tier=tier, temperature=0.0, json_mode=True)
+                            tier=tier, temperature=0.0, json_mode=True,
+                            schema=schema)
+        return _parse_json_loose(raw)
+
+
+#: JSON Schema words that Google's schema dialect has no place for. It takes
+#: an OpenAPI 3.0 subset, which rejects an unknown key outright rather than
+#: ignoring it, so a schema written for the OpenAI providers has to be
+#: translated rather than forwarded.
+_SCHEMA_DROP = {"additionalProperties", "$schema", "strict", "definitions",
+                "$defs", "default", "examples", "title"}
+
+
+def _gemini_schema(schema: Any) -> Any:
+    """A JSON Schema rewritten in Google's OpenAPI dialect.
+
+    Two differences and one addition. Types are upper-case there ("OBJECT",
+    not "object"); `additionalProperties` and friends are not part of the
+    subset and are refused rather than ignored; and `propertyOrdering` is
+    added so the model emits fields in the order the schema lists them,
+    which keeps a truncated reply parseable up to the point it stops.
+
+    Callers keep writing ordinary JSON Schema, so one schema at one call
+    site serves every provider.
+    """
+    if isinstance(schema, list):
+        return [_gemini_schema(v) for v in schema]
+    if not isinstance(schema, dict):
+        return schema
+
+    out: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key in _SCHEMA_DROP:
+            continue
+        if key == "type" and isinstance(value, str):
+            out[key] = value.upper()
+        elif key == "properties" and isinstance(value, dict):
+            out[key] = {k: _gemini_schema(v) for k, v in value.items()}
+            out["propertyOrdering"] = list(value)
+        elif key in ("items", "not"):
+            out[key] = _gemini_schema(value)
+        elif key in ("anyOf", "oneOf", "allOf") and isinstance(value, list):
+            out[key] = [_gemini_schema(v) for v in value]
+        else:
+            out[key] = value
+    return out
+
+
+def _gemini_error(response: Any) -> str:
+    """What Google actually said, which is never in the status line.
+
+    A 429 here is "Too Many Requests" on the envelope and, in the body, the
+    quota's name and its limit - the difference between a burst worth
+    retrying and a daily ceiling that is not.
+    """
+    try:
+        body = response.json()
+        if isinstance(body, list):
+            body = body[0] if body else {}
+        error = body.get("error", body) if isinstance(body, dict) else body
+        if isinstance(error, dict):
+            return str(error.get("message") or error)
+        return str(error)
+    except Exception:
+        return (getattr(response, "text", "") or "")[:300]
+
+
+def _gemini_text(data: Any) -> str:
+    """The answer, with the model's thinking left out.
+
+    Gemini returns a candidate as a list of parts, and a thinking model
+    marks its chain of thought with `"thought": true` on the part carrying
+    it. Concatenating every part would prepend the reasoning to the JSON and
+    parse as nothing; taking parts[0] blindly returns the reasoning instead
+    of the answer whenever the model thought first. So: the unmarked parts,
+    joined, and the marked ones only if that leaves nothing at all.
+    """
+    try:
+        candidate = data["candidates"][0]
+    except (KeyError, IndexError, TypeError):
+        logging.error("Unexpected Gemini response: %s", data)
+        return ""
+
+    parts = (candidate.get("content") or {}).get("parts") or []
+    answer = "".join(
+        str(part.get("text", "")) for part in parts
+        if isinstance(part, dict) and not part.get("thought")
+    )
+    if answer.strip():
+        return answer
+
+    # Nothing but thinking, or nothing at all. Said plainly here rather than
+    # surfacing as unparseable JSON three frames up.
+    reason = candidate.get("finishReason")
+    if reason and reason != "STOP":
+        logging.warning(
+            "Gemini returned no answer (finishReason=%s). Raise max_tokens "
+            "if that is MAX_TOKENS; check the prompt if it is SAFETY.",
+            reason)
+    return "".join(str(p.get("text", "")) for p in parts
+                   if isinstance(p, dict))
+
+
+class GeminiProvider(Provider):
+    """Google's own API, rather than its OpenAI-compatible endpoint.
+
+    Both routes reach the same models, and the compatible one needs no code
+    at all - point OPENROUTER_BASE_URL at it. This exists for the two things
+    that route flattens away:
+
+      - `responseSchema` takes an ARRAY at its root, so a caller wanting a
+        list of answers gets one directly. Through `response_format` it
+        cannot: JSON mode there promises an object, so the same request has
+        to ask for {"results": [...]} and unwrap it.
+      - `systemInstruction` is a field rather than a message with a role.
+        The Gemma models honour the field and ignore the message; with the
+        system text folded into the prompt, the categoriser's batch comes
+        back as an empty array.
+
+    Free-tier quota is per model per day and small - 20 requests a day on
+    gemini-3.6-flash - so a 429 here is more often a daily ceiling than a
+    burst, and no amount of waiting inside one request will clear it.
+    """
+
+    @property
+    def available(self) -> bool:
+        return bool(config.GEMINI_API_KEY)
+
+    def _model(self, tier: str) -> str:
+        return (config.GEMINI_MODEL_FAST if tier == "fast"
+                else config.GEMINI_MODEL_STRONG)
+
+    def complete(self, prompt: str, system: str = "", max_tokens: int = 4096,
+                 tier: str = "fast", temperature: float = 0.0,
+                 json_mode: bool = False, schema: dict | None = None) -> str:
+        generation: dict[str, Any] = {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+        }
+        if schema is not None:
+            generation["responseMimeType"] = "application/json"
+            generation["responseSchema"] = _gemini_schema(schema)
+        elif json_mode:
+            generation["responseMimeType"] = "application/json"
+
+        body: dict[str, Any] = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": generation,
+        }
+        if system:
+            body["systemInstruction"] = {"parts": [{"text": system}]}
+
+        url = (f"{config.GEMINI_BASE_URL}/models/"
+               f"{self._model(tier)}:generateContent")
+        headers = {"x-goog-api-key": config.GEMINI_API_KEY,
+                   "Content-Type": "application/json"}
+
+        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+            for attempt in range(RATE_LIMIT_RETRIES + 1):
+                resp = client.post(url, json=body, headers=headers)
+                if resp.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
+                    break
+                delay = _retry_after_seconds(resp, attempt)
+                logging.warning(
+                    "Gemini rate limited (429); retrying in %.0fs "
+                    "(attempt %d of %d)", delay, attempt + 1,
+                    RATE_LIMIT_RETRIES)
+                time.sleep(delay)
+
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Gemini returned {resp.status_code}: "
+                                   f"{_gemini_error(resp)}")
+            data = resp.json()
+
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(f"Gemini returned an error: {data['error']}")
+
+        return _gemini_text(data)
+
+    def complete_json(self, prompt: str, system: str = "", max_tokens: int = 4096, tier: str = "fast", schema: dict | None = None) -> Any:
+        system = system or "You return only valid JSON. No prose, no code fences."
+        raw = self.complete(prompt, system=system, max_tokens=max_tokens,
+                            tier=tier, temperature=0.0, json_mode=True,
+                            schema=schema)
         return _parse_json_loose(raw)
 
 
@@ -236,7 +447,7 @@ class AzureOpenAIProvider(Provider):
     def available(self) -> bool:
         return bool(config.AZURE_OPENAI_ENDPOINT and config.AZURE_OPENAI_API_KEY)
         
-    def complete(self, prompt: str, system: str = "", max_tokens: int = 4096, tier: str = "fast", temperature: float = 0.0) -> str:
+    def complete(self, prompt: str, system: str = "", max_tokens: int = 4096, tier: str = "fast", temperature: float = 0.0, schema: dict | None = None) -> str:
         deployment = config.AZURE_OPENAI_DEPLOYMENT_FAST if tier == "fast" else config.AZURE_OPENAI_DEPLOYMENT_STRONG
         base_url = config.AZURE_OPENAI_ENDPOINT.rstrip('/')
         if config.AZURE_OPENAI_USE_CLASSIC:
@@ -258,6 +469,14 @@ class AzureOpenAIProvider(Provider):
             "temperature": temperature,
             "max_tokens": max_tokens
         }
+        # Same reasoning as the OpenRouter provider: a caller that states the
+        # shape it needs gets it enforced rather than requested.
+        if schema is not None:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "strict": True,
+                                "schema": schema},
+            }
         if not config.AZURE_OPENAI_USE_CLASSIC:
             payload["model"] = deployment
 
@@ -274,7 +493,7 @@ class AzureOpenAIProvider(Provider):
                 logging.error(f"Unexpected Azure response: {data}")
                 return ""
 
-    def complete_json(self, prompt: str, system: str = "", max_tokens: int = 4096, tier: str = "fast") -> Any:
+    def complete_json(self, prompt: str, system: str = "", max_tokens: int = 4096, tier: str = "fast", schema: dict | None = None) -> Any:
         system = system or "You return only valid JSON. No prose, no code fences."
-        raw = self.complete(prompt, system=system, max_tokens=max_tokens, tier=tier, temperature=0.0)
+        raw = self.complete(prompt, system=system, max_tokens=max_tokens, tier=tier, temperature=0.0, schema=schema)
         return _parse_json_loose(raw)

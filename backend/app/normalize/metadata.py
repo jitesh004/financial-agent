@@ -740,6 +740,45 @@ def _before_mitc_illustration(text: str) -> str:
     return text[: m.start()] if m else text
 
 
+#: Words a model uses to mean "I have no value here", which are not values.
+#:
+#: A schema can require a field but cannot require it to be meaningful, so a
+#: model with nothing to say fills it rather than omitting it. Seen from
+#: gemma-4-31b-it on a letterhead with no product line: the literal string
+#: "null". Stored unchecked, that becomes the product name shown in the UI.
+_NON_ANSWERS = {"", "null", "none", "n/a", "na", "unknown", "...",
+                "string", "not specified", "not available", "-"}
+
+
+def _answered(value: object) -> str | None:
+    """`value` if the model actually answered, else None."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if cleaned.lower() in _NON_ANSWERS:
+        return None
+    return cleaned or None
+
+
+#: The identity fields the letterhead fallback asks a model for.
+#:
+#: `account_type` is an enum of what `AccountType` actually accepts, so a
+#: label the app has no member for cannot come back at all - it used to
+#: arrive as prose ("Savings Account"), fail the AccountType() lookup, and be
+#: discarded after the request had already been spent.
+_IDENTITY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "institution": {"type": "string"},
+        "account_type": {"type": "string",
+                         "enum": [member.value for member in AccountType]},
+        "product_name": {"type": "string"},
+    },
+    "required": ["institution", "account_type"],
+    "additionalProperties": False,
+}
+
+
 def extract_metadata(text: str, filename: str = "", sender: str = "") -> StatementMetadata:
     """Pull everything we can from the statement letterhead.
 
@@ -886,17 +925,29 @@ def extract_metadata(text: str, filename: str = "", sender: str = "") -> Stateme
 
 
     # LLM Fallback for identity fields
-    if meta.institution == "Unknown" or meta.account_type == AccountType.UNKNOWN:
+    #
+    # Both halves test for absence, not for a sentinel. `StatementMetadata`
+    # declares `institution: str | None = None` and `account_type:
+    # AccountType | None = None`, and nothing anywhere assigns the string
+    # "Unknown" or AccountType.UNKNOWN to either - that enum default belongs
+    # to `Account` in models.schemas, a different class. Written against
+    # those sentinels the condition was never true once, so this fallback
+    # had never run on any statement.
+    if not meta.institution or meta.account_type in (None, AccountType.UNKNOWN):
         from ..llm.client import get_client, LLMUnavailable
         from ..db.repository import get_ai_inference, save_ai_inference
-        from ..api.dependencies import get_db
+        # `app.api.dependencies` does not exist; the handle comes from the
+        # database module, as it does everywhere else in the app. Reaching
+        # this line at all used to raise ModuleNotFoundError - and from out
+        # here, above the try, that would have failed the whole parse rather
+        # than degrading the one field it fills.
+        from ..db.database import get_db
         import hashlib
         
         # Only use the letterhead slice!
         slice_to_send = head if head else text[:1000]
         
         fingerprint = hashlib.sha256(slice_to_send.encode()).hexdigest()
-        db = get_db()
         
         def fill_gaps(answer: dict) -> None:
             """Fill only what is still missing.
@@ -907,17 +958,23 @@ def extract_metadata(text: str, filename: str = "", sender: str = "") -> Stateme
             have its issuer replaced by a guess - the deterministic reader
             beaten by the model on a question it had already answered.
             """
-            if meta.institution == "Unknown" and answer.get("institution"):
-                meta.institution = answer["institution"]
-            if meta.account_type == AccountType.UNKNOWN and answer.get("account_type"):
+            if not meta.institution:
+                meta.institution = _answered(answer.get("institution"))
+            if meta.account_type in (None, AccountType.UNKNOWN):
                 try:
-                    meta.account_type = AccountType(answer["account_type"])
+                    kind = AccountType(_answered(answer.get("account_type")))
                 except ValueError:
-                    pass  # a type the app does not have is not a type
-            if not meta.product_name and answer.get("product_name"):
-                meta.product_name = answer["product_name"]
+                    kind = None  # a type the app does not have is not a type
+                # UNKNOWN is what this block exists to replace, so accepting
+                # it back would just relabel the gap as an answer.
+                if kind is not None and kind != AccountType.UNKNOWN:
+                    meta.account_type = kind
+            if not meta.product_name:
+                meta.product_name = _answered(answer.get("product_name"))
 
+        db = None
         try:
+            db = get_db()
             cached = get_ai_inference(db, fingerprint)
         except Exception as exc:  # a broken cache must not fail the parse
             import logging
@@ -931,13 +988,36 @@ def extract_metadata(text: str, filename: str = "", sender: str = "") -> Stateme
             try:
                 client = get_client()
                 if client.available:
-                    prompt = f"""Extract bank name, account type, and product name from this statement letterhead.
-Return JSON: {{"institution": "...", "account_type": "savings|credit_card|current|...", "product_name": "..."}}
-Letterhead: {slice_to_send}"""
-                    resp = client.complete_json(prompt, system="You return JSON only.", max_tokens=100)
+                    # The shape is stated as a schema, not drawn in the
+                    # prompt. Asked in prose, the model answers in whatever
+                    # words it likes - "bank_name" instead of "institution",
+                    # "Savings Account" instead of the enum member `savings`
+                    # - and both are dropped silently here, so the call costs
+                    # a request and fills nothing. Worse, a small budget got
+                    # the template echoed back verbatim, which would have
+                    # stored "..." as the name of the bank.
+                    prompt = ("Extract the bank name, account type and "
+                              "product name from this statement "
+                              f"letterhead.\nLetterhead: {slice_to_send}")
+                    resp = client.complete_json(
+                        prompt, system="You return JSON only.",
+                        max_tokens=100, schema=_IDENTITY_SCHEMA)
                     if isinstance(resp, dict):
-                        save_ai_inference(db, fingerprint, resp)
+                        # Fill first, cache second, and never let the second
+                        # cost the first. Writing to ai_inferences needs a
+                        # signed-in user for row-level security, so a parse
+                        # running outside a request is refused there - and
+                        # with the save ahead of the fill, that refusal threw
+                        # away an identity the model had already answered.
                         fill_gaps(resp)
+                        if db is not None:
+                            try:
+                                save_ai_inference(db, fingerprint, resp)
+                            except Exception as exc:
+                                import logging
+                                logging.getLogger(__name__).warning(
+                                    "could not cache the identity answer: %s",
+                                    exc)
             except (LLMUnavailable, Exception) as e:
                 import logging
                 logging.getLogger(__name__).warning("LLM fallback failed: %s", e)
