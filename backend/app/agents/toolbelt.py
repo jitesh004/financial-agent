@@ -20,6 +20,7 @@ with the ledger has no room left to think about it.
 from __future__ import annotations
 
 import logging
+import statistics
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
@@ -32,6 +33,8 @@ from ..models.schemas import (LOAN_TYPES, AccountType, Category, Direction,
                               FlowRole, Transaction)
 
 log = logging.getLogger(__name__)
+
+ZERO = Decimal("0")
 
 #: The most rows any single tool will hand back. Past this an agent is reading
 #: the ledger rather than reasoning about it.
@@ -619,6 +622,240 @@ def runway(db, **_: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# What looks wrong
+# ---------------------------------------------------------------------------
+
+def anomalies(db, period: dict[str, Any] | None = None,
+              **_: Any) -> dict[str, Any]:
+    """Charges that are large against their OWN category, not in general.
+
+    A 12,000 flight is unremarkable; a 12,000 coffee is not, and a single
+    threshold across the ledger cannot tell them apart. The engine compares
+    each charge to the median of its own category using median absolute
+    deviation rather than a standard deviation, because spending is heavily
+    right-skewed and one big outlier inflates a standard deviation enough to
+    hide itself.
+    """
+    from ..analytics.engine import analyze
+
+    rows, accounts_by_id = _ledger(db)
+    window = periods.resolve_period(period or {"preset": "last_12m"})
+    result = analyze(periods.filter_transactions(rows, window), accounts_by_id)
+    return {
+        "period": window.as_json(),
+        "unusual": [
+            {"date": _iso(t.txn_date),
+             "description": (t.raw_description or "")[:80],
+             "merchant": t.merchant, "amount": _money(t.amount),
+             "category": t.category, "account_id": t.account_id, "why": why}
+            for t, why in result.unusual[:MAX_ROWS]
+        ],
+        "largest": [
+            {"date": _iso(t.txn_date),
+             "description": (t.raw_description or "")[:80],
+             "amount": _money(t.amount), "category": t.category}
+            for t in result.largest_expenses[:15]
+        ],
+        "note": "Unusual means large for ITS OWN category. A big flight is "
+                "not unusual; a big coffee is.",
+    }
+
+
+#: How close two charges have to be, in days, to be one charge billed twice.
+#: A genuine repeat purchase from the same merchant on the same day happens -
+#: two coffees, two fuel stops - so the amount has to match as well, and even
+#: then this is a candidate rather than a verdict.
+DUPLICATE_DAY_WINDOW = 5
+
+
+def duplicate_charges(db, period: dict[str, Any] | None = None,
+                      min_amount: float = 200, **_: Any) -> dict[str, Any]:
+    """The same merchant charging the same amount twice in a few days.
+
+    Reported as candidates, never as a verdict. Two identical charges days
+    apart are usually one bill collected twice - a retried payment that
+    actually went through the first time, a subscription renewed on two
+    cards - and occasionally two genuine purchases. Which it is depends on
+    what was bought, which no rule here can see.
+
+    Rows already cancelled against their own refund are excluded: the
+    reversal detector has settled those, and re-flagging them would send
+    somebody chasing a charge they were never billed for.
+    """
+    rows, _accounts = _ledger(db)
+    window = periods.resolve_period(period or {"preset": "last_12m"})
+    floor = Decimal(str(min_amount or 0))
+
+    candidates: dict[tuple, list[Transaction]] = {}
+    for txn in periods.filter_transactions(rows, window):
+        if (txn.direction != Direction.DEBIT or txn.excluded
+                or txn.is_mirror_leg or txn.amount < floor):
+            continue
+        key = ((txn.merchant or txn.normalized_description
+                or txn.raw_description or "")[:40].upper(), txn.amount)
+        candidates.setdefault(key, []).append(txn)
+
+    found = []
+    for (merchant, amount), group in candidates.items():
+        if len(group) < 2 or not merchant:
+            continue
+        group.sort(key=lambda t: t.txn_date)
+        for first, second in zip(group, group[1:]):
+            gap = (second.txn_date - first.txn_date).days
+            if 0 <= gap <= DUPLICATE_DAY_WINDOW:
+                found.append({
+                    "merchant": merchant, "amount": _money(amount),
+                    "first": _iso(first.txn_date),
+                    "second": _iso(second.txn_date), "days_apart": gap,
+                    "same_account": first.account_id == second.account_id,
+                })
+    found.sort(key=lambda d: -(d["amount"] or 0))
+    return {
+        "period": window.as_json(),
+        "candidates": found[:MAX_ROWS],
+        "count": len(found),
+        "total_at_risk": _money(sum(
+            (Decimal(str(d["amount"] or 0)) for d in found), Decimal("0"))),
+        "note": "Candidates, not confirmed duplicates. Two identical charges "
+                "days apart are usually one bill collected twice, and "
+                "sometimes two real purchases.",
+    }
+
+
+def income(db, **_: Any) -> dict[str, Any]:
+    """What comes in, how reliably, and from how many places.
+
+    A single source is a concentration whatever the amount, and a salary
+    whose arrival date wanders is a different planning problem from one that
+    lands on the 1st - neither of which a total can show.
+    """
+    from ..analytics.engine import analyze
+    from ..analytics.recurring import detect_recurring
+
+    rows, accounts_by_id = _ledger(db)
+    result = analyze(rows, accounts_by_id)
+    series = [s for s in detect_recurring(rows)
+              if s.direction == Direction.CREDIT]
+
+    monthly = [{"month": m.month, "income": _money(m.income)}
+               for m in result.monthly]
+    amounts = [Decimal(str(m["income"] or 0)) for m in monthly]
+    typical = (Decimal(str(statistics.median([float(a) for a in amounts])))
+               if amounts else ZERO)
+    lowest = min(amounts) if amounts else None
+    highest = max(amounts) if amounts else None
+
+    return {
+        "monthly": monthly[-18:],
+        "typical_month": _money(typical),
+        "lowest_month": _money(lowest),
+        "highest_month": _money(highest),
+        # A month at half the median is a fact worth surfacing on its own -
+        # the average hides exactly the month somebody could not pay.
+        "months_below_half_typical": sum(
+            1 for a in amounts if typical > 0 and a < typical / 2),
+        "sources": [
+            {"source": source, "total": _money(total), "count": count}
+            for source, total, count in result.income_sources[:10]
+        ],
+        "recurring_credits": [
+            {"label": s.label, "amount": _money(s.median_amount),
+             "cadence": s.cadence_name, "day_of_month": s.day_of_month,
+             "occurrences": s.occurrences, "status": s.status,
+             "trend": s.amount_trend, "confidence": s.confidence}
+            for s in series[:15]
+        ],
+        "note": "One source is a concentration whatever the amount. A "
+                "wandering pay date is a different problem from a late one.",
+    }
+
+
+def coverage_gaps(db, **_: Any) -> dict[str, Any]:
+    """Months an account should have a statement for and does not.
+
+    The difference between "you spent nothing in March" and "March was never
+    imported" - which is the difference between a fact and a hole, and no
+    total anywhere else in this app distinguishes them.
+
+    Assembled by the same code the Coverage tab uses rather than by a second
+    reading of the registry. A first attempt here rebuilt that assembly and
+    got two keys wrong, so every account came back with nothing covered and
+    nothing missing - which is exactly the confidently empty answer this tool
+    exists to prevent.
+    """
+    from ..api.files_routes import get_coverage
+
+    try:
+        rows = get_coverage().get("accounts", [])
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("coverage unavailable: %s", exc)
+        return {"available": False, "note": f"{type(exc).__name__}: {exc}"}
+
+    out = []
+    for row in rows:
+        months = row.get("months", [])
+        missing = [m["month"] for m in months if m.get("status") == "missing"]
+        failed = [m["month"] for m in months if m.get("status") == "failed"]
+        out.append({
+            "account": row.get("display_name") or row.get("account_id"),
+            "account_id": row.get("account_id"),
+            "type": row.get("account_type"),
+            "months_covered": sum(1 for m in months
+                                  if m.get("status") == "parsed"),
+            "months_missing": len(missing),
+            "months_failed": len(failed),
+            "missing": missing[:24],
+            "failed": failed[:12],
+        })
+    return {
+        "available": True,
+        "accounts": out,
+        "total_missing_months": sum(a["months_missing"] for a in out),
+        "total_failed_months": sum(a["months_failed"] for a in out),
+        "note": "A missing month is a hole, not a quiet month. Any total "
+                "covering it is short by whatever happened in it. A FAILED "
+                "month is worse: the file exists and could not be read.",
+    }
+
+
+def review_queue(db, **_: Any) -> dict[str, Any]:
+    """Rows the app itself is not sure about.
+
+    Every one of these has a figure in the totals already - the safe default
+    was applied - and every one is a place where that figure could be wrong.
+    An agent quoting a total should know how much of it is waiting on a
+    human.
+    """
+    rows, _accounts = _ledger(db)
+    pending = [t for t in rows if t.needs_review]
+    uncategorized = [t for t in rows
+                     if t.category == Category.UNCATEGORIZED]
+    reasons: dict[str, int] = {}
+    for txn in pending:
+        reasons[(txn.review_reason or "unspecified")[:70]] = reasons.get(
+            (txn.review_reason or "unspecified")[:70], 0) + 1
+
+    return {
+        "awaiting_review": len(pending),
+        "awaiting_review_total": _money(
+            sum((t.amount for t in pending), Decimal("0"))),
+        "uncategorized": len(uncategorized),
+        "uncategorized_total": _money(
+            sum((t.amount for t in uncategorized), Decimal("0"))),
+        "reasons": [{"why": why, "count": count}
+                    for why, count in sorted(reasons.items(),
+                                             key=lambda kv: -kv[1])[:10]],
+        "largest_waiting": [
+            {"date": _iso(t.txn_date),
+             "description": (t.raw_description or "")[:70],
+             "amount": _money(t.amount), "category": t.category,
+             "why": t.review_reason[:90]}
+            for t in sorted(pending, key=lambda t: -t.amount)[:15]
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Outside the bank statements
 # ---------------------------------------------------------------------------
 
@@ -849,6 +1086,28 @@ TOOLS: dict[str, Tool] = {t.name: t for t in [
          "accounts nothing accounts for. The most authoritative source you "
          "have, and the only one that can see a debt no statement mentions.",
          {}, position),
+    Tool("anomalies",
+         "Charges that are large against their OWN category - a big coffee, "
+         "not a big flight - plus the largest expenses outright.",
+         {"period": "same shape as analysis"}, anomalies),
+    Tool("duplicate_charges",
+         "The same merchant charging the same amount twice within days: one "
+         "bill collected twice, or two real purchases. Candidates only.",
+         {"period": "same shape as analysis",
+          "min_amount": "ignore anything smaller, default 200"},
+         duplicate_charges),
+    Tool("income",
+         "What comes in: per month, how far it swings, how many sources, and "
+         "which credits recur.",
+         {}, income),
+    Tool("coverage_gaps",
+         "Months an account should have a statement for and does not - the "
+         "difference between a quiet month and a missing one.",
+         {}, coverage_gaps),
+    Tool("review_queue",
+         "Rows the app itself is unsure about, and how much money is sitting "
+         "on them. A total is only as settled as its review queue.",
+         {}, review_queue),
     Tool("credit_report", "The imported bureau report: score and accounts.",
          {}, credit_report),
     Tool("holdings", "What is invested, from imported portfolio statements.",
@@ -860,8 +1119,16 @@ TOOLS: dict[str, Tool] = {t.name: t for t in [
 ]}
 
 
-def describe(names: list[str]) -> list[dict[str, Any]]:
-    """The tool catalogue as the prompt renders it."""
+def describe(names: list[str], *, examples: bool = True
+             ) -> list[dict[str, Any]]:
+    """The tool catalogue as the prompt renders it.
+
+    `examples=False` drops the worked calls for a model on a tight prompt
+    budget - except for `ledger_query`, whose argument is a nested query
+    description that no one-line summary conveys. A model that cannot see the
+    shape of that one spends its first two turns guessing at it, which costs
+    far more than the example does.
+    """
     out = []
     for name in names:
         tool = TOOLS.get(name)
@@ -870,7 +1137,7 @@ def describe(names: list[str]) -> list[dict[str, Any]]:
         entry: dict[str, Any] = {"name": tool.name, "does": tool.summary}
         if tool.args:
             entry["args"] = tool.args
-        if tool.example:
+        if tool.example and (examples or tool.name == "ledger_query"):
             entry["example"] = tool.example
         out.append(entry)
     return out

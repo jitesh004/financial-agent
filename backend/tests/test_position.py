@@ -634,12 +634,25 @@ def test_the_agent_tool_reads_the_position(seeded):
         "the agent gets the current figure, not the screen's full row"
 
 
-def test_every_agent_can_read_the_position():
-    """It outranks every other source, so no agent should be without it."""
+def test_every_agent_about_debt_or_balances_can_read_the_position():
+    """It outranks the statements for whoever asks about what is owed.
+
+    Not every agent, deliberately. The position records loans, cards,
+    balances and what nothing accounts for; an agent about dining trends has
+    no use for it, and offering it anyway would spend prompt budget on every
+    turn to no effect. The split is a named set rather than a judgement call
+    left to whoever adds the next agent - see catalogue.POSITION_SUBJECTS.
+    """
     from app.agents import catalogue
 
     for agent in catalogue.AGENTS:
-        assert "position" in agent.tools, agent.key
+        wanted = agent.key in catalogue.POSITION_SUBJECTS
+        has = "position" in agent.tools
+        assert has == wanted, (
+            f"{agent.key} {'should' if wanted else 'should not'} carry the "
+            f"position tool - update POSITION_SUBJECTS if that is wrong")
+    # And the set names only agents that exist.
+    assert catalogue.POSITION_SUBJECTS <= {a.key for a in catalogue.AGENTS}
 
 
 # --------------------------------------------------------------------------

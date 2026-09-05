@@ -20,6 +20,8 @@ import { api, dateLabel, formatDuration, watchJob } from '../../lib';
 
 const ICONS = {
   scale: '⚖️', drip: '💧', wave: '🌊', receipt: '🧾', shield: '🛡️',
+  alarm: '⏰', stairs: '📈', gauge: '🎯', magnifier: '🔍', coin: '🪙',
+  pulse: '💓', scales: '🔬',
 };
 
 function ago(iso) {
@@ -256,6 +258,16 @@ export default function Agents() {
       </div>
 
       {error && <Callout tone="neg">{error}</Callout>}
+
+      {/* Which budget is in force. Said out loud because a compact run and a
+          broken run look identical from the outside - three findings instead
+          of six - and a reader who does not know which is which will read a
+          working agent as a poor one. */}
+      {catalogue?.profile?.name === 'compact' && !blocked && (
+        <Callout>
+          <strong>Compact budget</strong> — {catalogue.profile.note}
+        </Callout>
+      )}
 
       {blocked && (
         <Callout tone="warn">

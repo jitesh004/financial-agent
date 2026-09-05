@@ -522,6 +522,13 @@ can carry a debt no document mentions.
 | **Cashflow Sentinel** | Am I going to be short, and exactly when? A dated, day-by-day projection: which date is lowest, and which charges in the days before it put it there. A month that balances can still be short on the 4th |
 | **Tax Utilisation** | What have I already spent that counts, and what is unused? Adds up qualifying spending under 80C, 80D, 24(b), 80CCD(1B), 80E and 80G *from the ledger* — including the home-loan principal and interest split, which is the deduction most often missed |
 | **Emergency Fund & Resilience** | How long could I last if the income stopped? Two burn rates, because "six months of expenses" means nothing without knowing which expenses: what a month costs today, and what still has to be paid in the month somebody loses their job |
+| **Bill Shock Forecaster** | What large bill is about to land that I have forgotten? The annual and quarterly charges that are invisible eleven months of the year — and, the part that matters, whether the month each falls in can absorb it. Two annual bills in one month is the case that hurts, because each is affordable alone |
+| **Lifestyle Creep Detector** | What am I spending more on than I used to, without noticing? Separates *more often* (the count rose — a habit changed) from *more each time* (prices did) from *one expensive month*, which is not creep at all. Checks income over the same stretch before calling anything creep |
+| **Credit Health** | What is actually holding my score back? Utilisation per card rather than overall — one maxed card among four drags a file that looks calm — plus any days-past-due, the file's age, and anything reported that should not be. Leads with the single biggest drag rather than listing four evenly |
+| **Anomaly Watch** | Is anything here not mine, or not what I think? Large *for its own category* (a big flight is ordinary, a big coffee is not), billed twice, one appearance at a large amount, or a small test charge followed by a large one — which is the only shape that actually indicates a stolen card. Never asserts fraud |
+| **Fee & Waste Auditor** | What am I paying purely for the privilege? Late fees, ATM and forex charges, annual fees, bounce charges — and interest on a revolved card balance, which is usually the largest item and the one nobody files mentally as a fee. Says what would have avoided each, with the figure |
+| **Income Stability** | How reliable is what comes in, really? The spread rather than the total: typical against lowest month, how many sources and what share the largest is, whether pay lands on a date that wanders, and whether income has ever fallen below the committed outflow |
+| **Ledger Trust** | How much of this app's numbers should I believe? Audits the data, not the money — missing months, files that failed to read, live bureau accounts nothing covers — and then says *which figures elsewhere are affected and by how much*, which is the part a list of statistics cannot give |
 
 ### How an agent works, and what it may not do
 
@@ -552,6 +559,54 @@ EMIs are 43% of take-home, which is above the 40% lenders generally treat as
 stretched"* and may lay out the mechanics of an option in full. It may not tell
 anybody what to buy or sell, what to prioritise with their money, or what a
 market will do.
+
+### Every figure is checked against a tool result
+
+The rest of this app enforces "no model ever produces a figure" by
+construction. An agent breaks that arrangement — it chooses what to compute
+and then writes prose around the results — so the guarantee is restored
+mechanically instead.
+
+Every number any tool returned this run is collected; every number in the
+finished answer is extracted, in whatever form it was written (`41,24,762`,
+`41.2 lakh`, `4124761.64` all resolve to the same figure); and any
+**money-scale** figure with no match is reported as unverified, on the screen
+and in the run's history.
+
+Three limits, each deliberate. Only money is checked — a model is entitled to
+work out "43% of take-home" from two figures it was given, and flagging that
+would flag every correct derivation there is. A match is approximate, wide
+enough for rounding to two significant figures and narrow enough that a
+genuinely different number does not pass. And **nothing is deleted**: silently
+editing the prose would leave a sentence that reads as if it had been checked.
+
+### Fitting a small model
+
+Gemini's free tier meters **input tokens per minute** — 16,000, shared across
+every call in the same minute. Measured against that, this loop's original
+settings cost **91,250 input tokens for one ten-step run**: six minutes of
+ceiling spent in a burst, which in practice is a cascade of 429s and a run
+that never finishes.
+
+So a run has a budget, chosen per model:
+
+| | steps | one result | transcript | tools offered | brief |
+|---|---|---|---|---|---|
+| **compact** | 5 | 1,800 chars | 6,000 chars | 6 | the agent's short focus |
+| **full** | 10 | 8,000 chars | 40,000 chars | 12 | the agent's full brief |
+
+A whole compact run now costs **under 7,000 input tokens** — one minute's
+budget, once, with room to spare. `FA_AGENT_PROFILE` forces either; left on
+`auto` the model's own name decides, and an unknown name gets compact because
+compact still answers on a large model while full does not answer at all on a
+small one.
+
+The short brief is **written, not truncated**. Each agent says its job twice:
+once at length, once in the fewest lines that still name what to look at and
+what not to conclude. A prompt cut off mid-sentence produces reasoning cut off
+mid-thought, which is the failure this avoids rather than a cheaper version of
+it. And the screen says which budget is in force, because a compact run and a
+broken run look identical from outside.
 
 ### Runs are kept, and compared
 
@@ -694,7 +749,7 @@ Three things use a model, and none of them touches a number:
 | --- | --- | --- |
 | `fast` | Categorises merchants that rules and the learned cache did not recognise, forty to a call; reads an unfamiliar statement letterhead for its issuer and account type | Many calls, one per batch, answers cached forever |
 | `strong` | Writes the narrative from the already-computed brief | One call per analysis |
-| `strong` | Runs an **agent**: a tool-calling loop over the ledger, up to ten turns | One call per turn, only when you press Run |
+| `strong` | Runs an **agent**: a tool-calling loop over the ledger | One call per turn (5 on the compact budget, 10 on the full one), only when you press Run |
 
 The default provider is **OpenRouter**, on models billed at zero per token:
 
@@ -816,14 +871,15 @@ backend/app/
   reconcile/             The balance gate + transfer detection
   categorize/            Rules engine, merchant cache, LLM tail
   analytics/             Cashflow, recurring, loans, forecast, position
-  agents/                Read-only toolbelt, agent catalogue, the tool loop
+  agents/                Read-only toolbelt, agent catalogue, the tool loop,
+                         and the check that every reported figure came from it
   graph/                 LangGraph state, nodes, assembly
   llm/                   Anthropic client (with redaction) + narrative
   db/                    PostgreSQL schema, engine and repository
   auth/                  Google sign-in, sessions, onboarding
   api/, main.py          FastAPI
 backend/tools/           Synthetic fixture generator
-backend/tests/           948 tests, including fault injection and isolation
+backend/tests/           1000 tests, including fault injection and isolation
 frontend/src/            React UI
 ```
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -30,23 +31,130 @@ from typing import Any, Callable
 
 from ..llm.client import LLMClient, NARRATIVE_MODEL, get_client
 from . import toolbelt
-from .catalogue import SHARED_RULES, Agent
+from . import verify
+from .catalogue import COMPACT_RULES, SHARED_RULES, Agent
 
 log = logging.getLogger(__name__)
 
 #: How many tools the model may ask for in one turn.
 MAX_CALLS_PER_STEP = 3
 
-#: How much of one tool result is carried into the next prompt. A result
-#: bigger than this is truncated with a note saying so - which is a worse
-#: answer than the whole thing and a far better one than a context window
-#: that fills up before the model has read anything.
-MAX_RESULT_CHARS = 9000
 
-#: And how much of the transcript in total. Older results are dropped from
-#: the prompt (never from the stored run) once this is exceeded, oldest
-#: first, because the recent ones are what the current reasoning is about.
-MAX_TRANSCRIPT_CHARS = 45000
+@dataclass(frozen=True)
+class Budget:
+    """What one run is allowed to spend, and how much detail it carries.
+
+    A profile rather than a set of constants because the ceiling is not the
+    same everywhere, and the difference is not small. Gemini's free tier
+    meters INPUT TOKENS PER MINUTE - 16,000, shared across every call made in
+    the same minute, which the provider layer had to learn the hard way (see
+    llm.providers._token_budget_note). Measured against that, the settings
+    this loop shipped with cost 91,250 input tokens for a single ten-step
+    run: roughly six minutes of ceiling, spent in a burst, which in practice
+    means a cascade of 429s and a run that never finishes.
+
+    The fix is not to send less of everything by a fixed fraction. It is to
+    decide, per model, how much room there is and then spend it where it
+    buys the most - which for a small model is fewer, sharper steps over
+    smaller results, and for a large one is the breadth it can actually use.
+    """
+
+    name: str
+    #: Never more steps than this, whatever an agent asks for.
+    max_steps: int
+    #: How much of ONE tool result is carried into the next prompt.
+    max_result_chars: int
+    #: And how much of the transcript in total. Older results are dropped
+    #: from the prompt (never from the stored run) once this is exceeded,
+    #: oldest first, because the recent ones are what the reasoning is about.
+    max_transcript_chars: int
+    #: How many tools to offer. A small model handed nine picks badly, and
+    #: every one it is offered costs prompt on every single turn.
+    max_tools: int
+    #: Whether to send the agent's full brief or its short focus.
+    full_brief: bool
+    #: Whether to include the worked example on tools that carry one.
+    examples: bool
+
+    def estimate(self, system_chars: int) -> int:
+        """Roughly what a whole run costs, in input tokens.
+
+        Four characters to the token, which is close enough for a budget and
+        wrong in the safe direction for JSON, where it is nearer three.
+        """
+        total = 0
+        for step in range(1, self.max_steps + 1):
+            carried = min(self.max_transcript_chars,
+                          step * self.max_result_chars)
+            total += (system_chars + carried) // 4
+        return total
+
+
+#: For a small or rate-limited model. Sized so a whole run fits inside one
+#: minute of Gemini's free-tier input-token budget, which is what makes an
+#: agent usable there at all rather than a queue of 429s.
+COMPACT = Budget(name="compact", max_steps=5, max_result_chars=1800,
+                 max_transcript_chars=6000, max_tools=6, full_brief=False,
+                 examples=False)
+
+#: For a model with room to think. Close to what this loop shipped with.
+FULL = Budget(name="full", max_steps=10, max_result_chars=8000,
+              max_transcript_chars=40000, max_tools=12, full_brief=True,
+              examples=True)
+
+#: Words in a model's name that mean "small". The naming is a zoo and the
+#: only thing the small ones reliably share is a word saying so.
+#:
+#: Matched on token boundaries, NOT as substrings, which is not a nicety:
+#: "mini" is a substring of "geMINI", so a substring match put every Gemini
+#: model - Pro included - on the compact budget. The boundary is any
+#: non-alphanumeric, because these names are delimited by hyphens, dots and
+#: nothing else.
+_SMALL_MODEL_MARKERS = (
+    "lite", "mini", "nano", "small", "tiny", "gemma", "phi", "haiku",
+    "1b", "2b", "3b", "4b", "7b", "8b", "9b",
+)
+
+_IS_SMALL = re.compile(
+    r"(?<![a-z0-9])(?:" + "|".join(_SMALL_MODEL_MARKERS) + r")(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def profile_for(model_name: str | None = None) -> Budget:
+    """Which budget this deployment gets.
+
+    `FA_AGENT_PROFILE` forces it; otherwise the model's own name decides.
+    Defaulting to compact when the name is unknown is deliberate: compact
+    still produces a sound answer on a large model - it simply looks at
+    fewer things - whereas full on a small one produces no answer at all.
+    """
+    from ..config import config
+
+    forced = (config.AGENT_PROFILE or "auto").strip().lower()
+    if forced == "compact":
+        return COMPACT
+    if forced == "full":
+        return FULL
+
+    name = (model_name or _configured_model()).lower()
+    if not name:
+        return COMPACT
+    return COMPACT if _IS_SMALL.search(name) else FULL
+
+
+def _configured_model() -> str:
+    """The model this deployment will actually call, whoever provides it."""
+    from ..config import config
+
+    provider = (config.LLM_PROVIDER or "").lower()
+    if provider == "gemini":
+        return config.GEMINI_MODEL_STRONG or ""
+    if provider == "openrouter":
+        return config.OPENROUTER_MODEL_STRONG or ""
+    if provider == "azure":
+        return getattr(config, "AZURE_OPENAI_DEPLOYMENT_STRONG", "") or ""
+    return ""
 
 
 @dataclass
@@ -71,6 +179,15 @@ class AgentRun:
     model: str = ""
     started_at: str = ""
     finished_at: str = ""
+    #: Which budget this run was given, and roughly what it cost. Recorded
+    #: because "the agent only looked at three things" is a fact about the
+    #: profile rather than about the ledger, and the reader is owed it.
+    profile: str = ""
+    prompt_chars: int = 0
+    #: Money figures in the answer that no tool result contains - see
+    #: agents.verify. Empty is the normal case and the one worth trusting.
+    unverified: list[str] = field(default_factory=list)
+    figures_checked: int = 0
 
 
 class AgentUnavailable(RuntimeError):
@@ -171,7 +288,7 @@ def _json_default(obj: Any) -> Any:
     return str(obj)
 
 
-def _dump(value: Any, limit: int = MAX_RESULT_CHARS) -> str:
+def _dump(value: Any, limit: int) -> str:
     text = json.dumps(value, default=_json_default, separators=(",", ":"))
     if len(text) <= limit:
         return text
@@ -180,13 +297,28 @@ def _dump(value: Any, limit: int = MAX_RESULT_CHARS) -> str:
               f'query or raise a filter to see the rest]')
 
 
-def _system(agent: Agent) -> str:
-    tools = toolbelt.describe(list(agent.tools))
+def _system(agent: Agent, budget: Budget = FULL) -> str:
+    """The instruction, sized to the budget.
+
+    Three things shrink together and they have to, because the system prompt
+    is re-sent on EVERY turn - so a kilobyte here is a kilobyte times the
+    step count. The rules lose their worked examples, the agent sends its
+    focus rather than its full brief, and the tool catalogue drops to the
+    ones that agent leads with.
+
+    None of that is truncation. Each agent writes both a focus and a brief,
+    and a prompt cut off mid-sentence produces reasoning cut off mid-thought
+    - which is the failure this exists to avoid, not a cheaper version of it.
+    """
+    offered = list(agent.tools)[:budget.max_tools]
+    tools = toolbelt.describe(offered, examples=budget.examples)
+    rules = SHARED_RULES if budget.full_brief else COMPACT_RULES
+    job = agent.brief if budget.full_brief else (agent.focus or agent.brief)
     return (
-        f"{SHARED_RULES}\n\n"
-        f"YOUR JOB\n{agent.brief}\n\n"
-        f"TOOLS AVAILABLE TO YOU\n"
-        f"{json.dumps(tools, indent=1, default=_json_default)}\n"
+        f"{rules}\n\n"
+        f"YOUR JOB\n{job}\n\n"
+        f"YOUR TOOLS\n"
+        f"{json.dumps(tools, separators=(',', ':'), default=_json_default)}\n"
     )
 
 
@@ -200,6 +332,7 @@ def run(
     *,
     client: LLMClient | None = None,
     question: str = "",
+    budget: Budget | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> AgentRun:
     """Run one agent to an answer, or to the end of its step budget."""
@@ -209,10 +342,14 @@ def run(
             "No language model is configured, so agents cannot run. Add a "
             "provider and key on the Settings tab.")
 
+    budget = budget or profile_for()
     started = time.monotonic()
     run_record = AgentRun(agent=agent.key, status="failed",
-                          model=NARRATIVE_MODEL,
+                          model=NARRATIVE_MODEL, profile=budget.name,
                           started_at=_now())
+    #: Everything the tools returned, as numbers, so the answer can be
+    #: checked against them at the end - see agents.verify.
+    figures: set = set()
 
     def progress(label: str) -> None:
         if on_progress:
@@ -221,7 +358,8 @@ def run(
             except Exception:  # pragma: no cover - reporting must never break
                 log.debug("progress callback failed", exc_info=True)
 
-    system = _system(agent)
+    system = _system(agent, budget)
+    steps_allowed = min(agent.max_steps, budget.max_steps)
     transcript: list[str] = []
 
     # The opening facts. Fetched before the first turn rather than left to the
@@ -234,22 +372,25 @@ def run(
             result = toolbelt.call(db, name, {})
             opening.calls.append({"tool": name, "args": {}})
             opening.results.append({"tool": name, "result": result})
+            verify.collect_figures(result, figures)
             run_record.tool_calls += 1
         run_record.steps.append(opening)
         transcript.append(
-            "These were fetched for you before you started:\n"
-            + "\n".join(f"{c['tool']} -> {_dump(r['result'])}"
-                        for c, r in zip(opening.calls, opening.results)))
+            "Fetched for you before you started:\n"
+            + "\n".join(
+                f"{c['tool']} -> {_dump(r['result'], budget.max_result_chars)}"
+                for c, r in zip(opening.calls, opening.results)))
 
     task = (question.strip() or agent.question)
 
-    for index in range(1, agent.max_steps + 1):
-        last_turn = index == agent.max_steps
-        progress(f"Thinking (step {index} of {agent.max_steps})")
+    for index in range(1, steps_allowed + 1):
+        last_turn = index == steps_allowed
+        progress(f"Thinking (step {index} of {steps_allowed})")
         step = Step(index=index)
         turn_started = time.monotonic()
 
-        prompt = _prompt(task, transcript, index, agent.max_steps, last_turn)
+        prompt = _prompt(task, transcript, index, steps_allowed, last_turn)
+        run_record.prompt_chars += len(system) + len(prompt)
         try:
             reply = client.complete_json(
                 prompt, system=system, schema=REPLY_SCHEMA, max_tokens=8000)
@@ -307,16 +448,18 @@ def run(
                     "your_tools": list(agent.tools)}
             else:
                 result = toolbelt.call(db, name, args)
+                verify.collect_figures(result, figures)
                 run_record.tool_calls += 1
             step.calls.append({"tool": name, "args": args if isinstance(args, dict) else {}})
             step.results.append({"tool": name, "result": result})
-            lines.append(f"{name}({_dump(args, 600)}) -> {_dump(result)}")
+            lines.append(f"{name}({_dump(args, 400)}) -> "
+                         f"{_dump(result, budget.max_result_chars)}")
 
         step.seconds = round(time.monotonic() - turn_started, 2)
         run_record.steps.append(step)
         transcript.append(
             f"Step {index}. You said: {step.thought}\n" + "\n".join(lines))
-        transcript = _trim(transcript)
+        transcript = _trim(transcript, budget.max_transcript_chars)
     else:
         # The loop finished without breaking, so the budget ran out.
         run_record.status = "exhausted"
@@ -324,8 +467,19 @@ def run(
     if run_record.answer is None and run_record.status != "failed":
         run_record.status = "exhausted"
         run_record.error = run_record.error or (
-            f"The agent used all {agent.max_steps} of its steps without "
+            f"The agent used all {steps_allowed} of its steps without "
             f"reaching an answer.")
+
+    # Every money figure in the answer, against everything the tools said.
+    # Mechanical, and the last thing that happens - see agents.verify for
+    # why it is money only and why nothing is deleted.
+    if run_record.answer:
+        report = verify.check(run_record.answer, figures)
+        run_record.unverified = report.unverified
+        run_record.figures_checked = report.checked
+        caveat = verify.caveat_for(report)
+        if caveat:
+            run_record.answer.setdefault("caveats", []).append(caveat)
 
     run_record.seconds = round(time.monotonic() - started, 2)
     run_record.finished_at = _now()
@@ -353,7 +507,7 @@ def _prompt(task: str, transcript: list[str], index: int, budget: int,
     return "\n\n".join(parts)
 
 
-def _trim(transcript: list[str]) -> list[str]:
+def _trim(transcript: list[str], limit: int) -> list[str]:
     """Keep the prompt inside its budget, dropping the oldest results first.
 
     Dropped from the PROMPT only - the run keeps every step, so nothing the
@@ -362,13 +516,13 @@ def _trim(transcript: list[str]) -> list[str]:
     better thing to lose than the ability to think about the last one.
     """
     total = sum(len(t) for t in transcript)
-    if total <= MAX_TRANSCRIPT_CHARS:
+    if total <= limit:
         return transcript
     kept = list(transcript)
-    while len(kept) > 1 and total > MAX_TRANSCRIPT_CHARS:
+    while len(kept) > 1 and total > limit:
         total -= len(kept.pop(0))
-    return ["[earlier steps have been summarised away to save room; do not "
-            "repeat calls you have already made]", *kept]
+    return ["[earlier steps dropped to save room; do not repeat calls you "
+            "have already made]", *kept]
 
 
 def _clean_answer(answer: dict[str, Any]) -> dict[str, Any]:
