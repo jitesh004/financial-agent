@@ -851,6 +851,30 @@ def _explain_category(txn) -> dict[str, Any]:
     source = txn.category_source.value
     matched = next((r for r in category_rules.RULES
                     if r.label == txn.category_rule), None)
+
+    # A matched transfer is not a forgotten rule.
+    #
+    # `reconcile.settlement` and `reconcile.transfers` stamp the category
+    # themselves when they pair two legs, and both set the source to "rule"
+    # because there is no other value in `ConfidenceSource` that fits. So 211
+    # of this holder's rows claimed a rule had decided them, could not name
+    # it, and the panel apologised - "the row was categorised before the app
+    # started keeping that; rebuilding the ledger captures it" - for
+    # something no rebuild will ever capture, because no rule was involved.
+    #
+    # Reported as what actually happened. The pairing itself is already in
+    # the `transfer` block beside this one, so the panel can show its kind
+    # and its far leg.
+    if source == "rule" and not txn.category_rule and txn.is_internal_transfer:
+        return {
+            "value": txn.category,
+            "source": "transfer_match",
+            "rule": None,
+            "pattern": None,
+            "confidence": txn.category_confidence,
+            "recorded": True,
+        }
+
     return {
         "value": txn.category,
         "source": source,

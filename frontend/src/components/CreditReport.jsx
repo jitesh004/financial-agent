@@ -235,14 +235,48 @@ export default function CreditReport({ accounts = [], onImport }) {
           Re-run matching
         </button>
       </div>
-      <BureauAccountTable rows={[...(recon?.linked || []),
-        ...(recon?.bureau_only || [])]} />
+      <BureauAccountTable
+        rows={[...(recon?.linked || []), ...(recon?.bureau_only || [])]}
+        ledger={recon?.ledger_only || []}
+        onChanged={load} />
     </>
   );
 }
 
-function BureauAccountTable({ rows }) {
+function BureauAccountTable({ rows, ledger = [], onChanged }) {
+  const [busy, setBusy] = React.useState('');
   if (!rows.length) return <Empty title="No accounts in this report" />;
+
+  /* The matcher has three answers, and this table used to render two.
+   *
+   * Above AUTO_LINK_CONFIDENCE a bureau line is linked outright; below
+   * SUGGEST_CONFIDENCE it is left alone. In between it is SUGGESTED, which
+   * means "this is probably that card, but two cards from the same bank match
+   * each other's lender and type exactly and guessing wrong puts one card's
+   * debt on the other's row" - so a person has to say.
+   *
+   * Nothing asked them. The column keyed off `account_id`, which only a link
+   * sets, so all nine of this holder's suggestions rendered as "no
+   * statements" alongside the genuinely unknown ones, under a heading saying
+   * their money was missing from every total. The backend has sent the
+   * candidate, the confidence and the reason on every row all along, and the
+   * endpoint to confirm or reject one has been there just as long. */
+  const nameOf = (accountId) => (ledger.find((a) => a.account_id === accountId)
+    || {}).label || 'an account here';
+
+  const decide = async (row, confirmed) => {
+    setBusy(row.bureau_account_id);
+    try {
+      await api.request(
+        `/api/bureau/accounts/${row.bureau_account_id}/match`,
+        { method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            confirmed, account_id: confirmed ? row.suggestion : null }) });
+      if (onChanged) await onChanged();
+    } catch (e) { /* the row stays as it was; nothing is silently linked */ }
+    setBusy('');
+  };
   return (
     <Card>
       <div className="table-wrap scroll-y" style={{ maxHeight: 460 }}>
@@ -276,8 +310,23 @@ function BureauAccountTable({ rows }) {
                     ? <span className="neg">{row.worst_dpd}</span> : '0'}
                 </td>
                 <td>
-                  {row.account_id
-                    ? <Chip tone="pos">matched</Chip>
+                  {row.account_id ? <Chip tone="pos">matched</Chip>
+                    : row.suggestion ? (
+                      <div style={{ display: 'flex', gap: 6, alignItems: 'center',
+                        flexWrap: 'wrap' }}>
+                        <Chip tone="accent"
+                          title={row.reason || ''}>suggested</Chip>
+                        <span style={{ fontSize: 11, color: 'var(--text-3)' }}>
+                          {nameOf(row.suggestion)}
+                        </span>
+                        <button className="btn" style={{ fontSize: 11 }}
+                          disabled={busy === row.bureau_account_id}
+                          onClick={() => decide(row, true)}>Link</button>
+                        <button className="btn" style={{ fontSize: 11 }}
+                          disabled={busy === row.bureau_account_id}
+                          onClick={() => decide(row, false)}>Not it</button>
+                      </div>
+                    )
                     : row.is_blind_spot
                       ? <Chip tone="warn">no statements</Chip>
                       : <Chip>closed</Chip>}

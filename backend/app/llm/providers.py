@@ -71,8 +71,47 @@ def _retry_after_seconds(response: Any, attempt: int) -> float:
     shorter just spends another request against the same ceiling; fall back
     to doubling waits when it gave neither. Capped so a misread header cannot
     park an import job for an hour.
+
+    Gemini sends NEITHER. It answers 429 with the delay in the response BODY
+    - a `google.rpc.RetryInfo` block carrying `retryDelay: "16s"`, and the
+    same figure in prose at the end of the message. Reading only the two
+    headers above meant every Gemini 429 fell through to the exponential
+    fallback and waited 1s, 2s, then 4s against a limit that had told us,
+    precisely, to wait 15.9 - so all three retries were spent inside the
+    window and the call failed anyway. An agent making seventeen tool calls
+    never finished one.
     """
     headers = getattr(response, "headers", {}) or {}
+
+    body = None
+    try:
+        body = response.json()
+    except Exception:  # not JSON, or no body - the headers below still apply
+        body = None
+
+    if isinstance(body, list):
+        body = body[0] if body else None
+    if isinstance(body, dict):
+        error = body.get("error") or {}
+        for detail in (error.get("details") or []):
+            if not isinstance(detail, dict):
+                continue
+            delay = detail.get("retryDelay")
+            if not delay:
+                continue
+            try:
+                return _clamp_wait(float(str(delay).rstrip("s")))
+            except (TypeError, ValueError):
+                pass
+        # The prose carries it too, and has outlived more than one change to
+        # the structured shape: "Please retry in 15.914573931s."
+        prose = re.search(r"retry in ([\d.]+)\s*s",
+                          str(error.get("message") or ""), re.IGNORECASE)
+        if prose:
+            try:
+                return _clamp_wait(float(prose.group(1)))
+            except (TypeError, ValueError):
+                pass
 
     raw = headers.get("Retry-After")
     if raw:
@@ -94,6 +133,93 @@ def _retry_after_seconds(response: Any, attempt: int) -> float:
             pass
 
     return _clamp_wait(2.0 ** attempt)
+
+
+#: A 429 that names a per-minute INPUT TOKEN ceiling rather than a request
+#: count. Worth saying out loud when the retries run out, because the number
+#: explains the failure in a way "429" does not.
+_PER_MINUTE_INPUT_LIMIT = re.compile(
+    r"limit:\s*(\d+).{0,80}?input_token_count|input_token_count.{0,80}?limit:\s*(\d+)",
+    re.IGNORECASE | re.DOTALL)
+
+
+def _token_budget_note(response: Any) -> str:
+    """Why a 429 kept happening, in the terms the provider used, or "".
+
+    Gemini's free tier meters INPUT TOKENS PER MINUTE - 16,000 on the model
+    this app defaults to. That is a budget shared across every call made in
+    the same minute, so an agent sending 12,000-token prompts can make one
+    call a minute and no more, however small each request is on its own.
+    Retrying is still the right response; what was missing was any way for
+    the person reading the failure to know that the ceiling was tokens per
+    minute rather than a dead key or a broken request.
+    """
+    try:
+        body = response.json()
+    except Exception:
+        return ""
+    if isinstance(body, list):
+        body = body[0] if body else {}
+    if not isinstance(body, dict):
+        return ""
+    message = str((body.get("error") or {}).get("message") or "")
+    match = _PER_MINUTE_INPUT_LIMIT.search(message)
+    if not match:
+        return ""
+    limit = match.group(1) or match.group(2)
+    return (
+        f" This tier meters input tokens per minute ({limit}), shared across "
+        f"every call in the same minute - not a per-request size limit. A "
+        f"run making several large calls in quick succession will keep "
+        f"hitting it."
+    )
+
+
+def _post_with_retries(client: Any, url: str, *, json: Any, headers: dict,
+                       provider: str) -> Any:
+    """POST once, retrying the two failures that are worth retrying.
+
+    A 429 is the provider saying "not yet"; a timeout or a dropped connection
+    is the network saying "ask again". Neither means the request was wrong,
+    and both were fatal here - the 429 because only its status was checked,
+    the timeout because `client.post` raised straight out of the loop.
+
+    That cost whole agent runs. One of these agents makes twenty-three tool
+    calls over ten steps; a single slow reply on call twenty-three threw away
+    the twenty-two before it and reported "ReadTimeout" as the answer to a
+    question about the holder's debt.
+
+    Raises the last error if every attempt fails, so a genuine outage still
+    surfaces rather than being swallowed.
+    """
+    last_error: Exception | None = None
+    for attempt in range(RATE_LIMIT_RETRIES + 1):
+        try:
+            resp = client.post(url, json=json, headers=headers)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_error = exc
+            if attempt == RATE_LIMIT_RETRIES:
+                raise
+            delay = _clamp_wait(2.0 ** attempt)
+            logging.warning(
+                "%s call failed (%s); retrying in %.0fs (attempt %d of %d)",
+                provider, type(exc).__name__, delay, attempt + 1,
+                RATE_LIMIT_RETRIES)
+            time.sleep(delay)
+            continue
+
+        if resp.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
+            return resp
+
+        delay = _retry_after_seconds(resp, attempt)
+        logging.warning(
+            "%s rate limited (429); retrying in %.0fs (attempt %d of %d)",
+            provider, delay, attempt + 1, RATE_LIMIT_RETRIES)
+        time.sleep(delay)
+
+    if last_error is not None:  # pragma: no cover - loop always returns first
+        raise last_error
+    return resp
 
 
 def _message_text(data: Any) -> str:
@@ -225,17 +351,8 @@ class OpenRouterProvider(Provider):
 
         url = f"{config.OPENROUTER_BASE_URL}/chat/completions"
         with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-            for attempt in range(RATE_LIMIT_RETRIES + 1):
-                resp = client.post(url, json=payload, headers=headers)
-                if resp.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
-                    break
-                delay = _retry_after_seconds(resp, attempt)
-                logging.warning(
-                    "OpenRouter rate limited (429); retrying in %.0fs "
-                    "(attempt %d of %d)",
-                    delay, attempt + 1, RATE_LIMIT_RETRIES)
-                time.sleep(delay)
-
+            resp = _post_with_retries(client, url, json=payload,
+                                      headers=headers, provider="OpenRouter")
             resp.raise_for_status()
             data = resp.json()
 
@@ -411,20 +528,13 @@ class GeminiProvider(Provider):
                    "Content-Type": "application/json"}
 
         with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-            for attempt in range(RATE_LIMIT_RETRIES + 1):
-                resp = client.post(url, json=body, headers=headers)
-                if resp.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
-                    break
-                delay = _retry_after_seconds(resp, attempt)
-                logging.warning(
-                    "Gemini rate limited (429); retrying in %.0fs "
-                    "(attempt %d of %d)", delay, attempt + 1,
-                    RATE_LIMIT_RETRIES)
-                time.sleep(delay)
-
+            resp = _post_with_retries(client, url, json=body,
+                                      headers=headers, provider="Gemini")
             if resp.status_code >= 400:
+                note = (_token_budget_note(resp)
+                        if resp.status_code == 429 else "")
                 raise RuntimeError(f"Gemini returned {resp.status_code}: "
-                                   f"{_gemini_error(resp)}")
+                                   f"{_gemini_error(resp)}{note}")
             data = resp.json()
 
         if isinstance(data, list):

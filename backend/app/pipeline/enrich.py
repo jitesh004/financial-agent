@@ -399,7 +399,24 @@ def enrich_ledger(
 
     # 11. The analysis proper.
     phase("Computing analysis")
-    result.analysis = analyze(transactions, accounts)
+    # The credit report goes in too. `analyze` adds up debt a lender reports
+    # that no tracked account covers, and it can only do that if it is handed
+    # the bureau lines - so leaving them out did not merely lose a detail, it
+    # published a smaller liabilities figure.
+    #
+    # The rebuild path has always passed them and this one never did, so the
+    # same Overview reported 69,15,027 owed after an import and 69,30,233
+    # after a refresh, with nothing changed in between but which function
+    # happened to write the payload last.
+    try:
+        from ..db import repository as _repo
+        bureau_accounts = _repo.get_latest_bureau_accounts(db)
+    except Exception:  # pragma: no cover - a credit report is not the ledger
+        log.warning("credit report unavailable for the net-worth figure")
+        bureau_accounts = None
+
+    result.analysis = analyze(transactions, accounts,
+                              bureau_accounts=bureau_accounts)
 
     for account_id, account in accounts.items():
         account_txns = [t for t in transactions if t.account_id == account_id]

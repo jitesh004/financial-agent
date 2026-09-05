@@ -25,7 +25,8 @@ import psycopg
 
 from ..analytics import periods
 from ..models.schemas import (Account, AccountType, Category, ConfidenceSource,
-                              Direction, LOAN_TYPES, ReconciliationResult,
+                              Direction, FlowRole, LOAN_TYPES,
+                              ReconciliationResult,
                               ReconciliationStatus, SourceFormat, Statement,
                               Transaction)
 from .database import Database
@@ -676,13 +677,22 @@ def covered_months(db: Database) -> list[tuple[str, int]]:
     a month appears here exactly when filtering by it would return rows - a
     list built off the bare column would omit every month whose rows predate
     accounting periods and then the picker would not offer them.
+
+    Rows belonging to a lender's own ledger do not make a month. One ICICI
+    personal loan statement carried its history back to January 2022, so the
+    picker offered fifty-six months of "Jan 2022 - 2 rows", "Feb 2022 - 2
+    rows" and so on, every one of which opens onto nothing: those rows are
+    the far side of payments the bank account already recorded and no total
+    counts them. A month worth offering is a month with something in it.
     """
     month = periods.effective_month_sql()
     with db.connection() as conn:
         rows = conn.execute(
             f"SELECT m, COUNT(*) c FROM ("
             f"  SELECT {month} AS m FROM transactions"
-            f") months WHERE m != '' GROUP BY m ORDER BY m"
+            f"   WHERE COALESCE(flow_role, '') != ?"
+            f") months WHERE m != '' GROUP BY m ORDER BY m",
+            (FlowRole.LENDER_LEDGER.value,)
         ).fetchall()
     return [(r["m"], r["c"]) for r in rows]
 
@@ -2264,6 +2274,19 @@ def apply_bureau_matches(db: Database, matches: Iterable[Any]) -> int:
     whole reason fuzzy matches are offered rather than applied is that the
     person is the authority, and re-running the matcher must not quietly
     overrule them.
+
+    A SUGGESTED match stores its candidate too, and `match_status` is what
+    says whether that candidate is a link or a proposal. It used to be
+    written as NULL - "not linked yet", which is true, but it also threw away
+    the only record of WHICH account was being suggested. Nothing could then
+    offer it: `reconcile` reads the column back to fill `suggestion`, got
+    None, and the Credit report tab rendered nine perfectly good candidates
+    as "no statements" under a heading warning that their balances were
+    missing from every total. The tier existed in the matcher, had an
+    endpoint to confirm it, and could not be reached from the app at all.
+    Every reader already gates on `match_status` before treating the column
+    as a link - see `reconcile`, `position._is_attributed` and
+    `engine._unaccounted_debt` - so storing it links nothing on its own.
     """
     updated = 0
     with db.connection() as conn:
@@ -2276,7 +2299,8 @@ def apply_bureau_matches(db: Database, matches: Iterable[Any]) -> int:
             conn.execute(
                 "UPDATE bureau_accounts SET account_id = ?, match_status = ?,"
                 " match_confidence = ?, match_reason = ? WHERE id = ?",
-                (match.account_id if match.status == "auto" else None,
+                (match.account_id if match.status in {"auto", "suggested"}
+                 else None,
                  match.status, match.confidence, match.reason,
                  match.bureau_account_id))
             updated += 1

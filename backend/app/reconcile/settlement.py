@@ -268,6 +268,18 @@ def match_settlements(
             continue
         if txn.is_internal_transfer:
             continue  # already claimed by transfer detection
+        if txn.excluded:
+            # A row taken out of every total is not a leg of anything.
+            #
+            # `detect_reversals` runs before this and excludes both halves of
+            # a charge that failed and was refunded the same day - money that
+            # never moved. Three of those were then matched into settlement
+            # groups anyway, which put 1,922 of phantom charges inside real
+            # card-bill settlements, and overwrote each row's role from
+            # "excluded" to "card settlement". `derive_flow_role` states the
+            # precedence this broke: an explicit exclusion beats everything,
+            # because it is the only signal there that somebody looked.
+            continue
         if txn.account_id in card_ids and txn.direction == Direction.CREDIT:
             card_credits.append(txn)
         elif txn.account_id in cash_ids and txn.direction == Direction.DEBIT:

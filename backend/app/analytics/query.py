@@ -200,9 +200,18 @@ MEASURES: dict[str, Measure] = {m.key: m for m in [
             hint="Credits positive, debits negative. Sums to the actual change "
                  "in the account."),
     Measure("outflow", "Money out", "Money",
-            f"CASE WHEN t.direction = 'debit' THEN {_paise('t.amount')} ELSE 0 END"),
+            f"CASE WHEN t.direction = 'debit' THEN {_paise('t.amount')} ELSE 0 END",
+            hint="Every debit, added up. GROSS: a refund is a credit, so it "
+                 "is not subtracted here. The Overview's \u201cMoney out\u201d "
+                 "nets refunds off and is the smaller figure - on this ledger "
+                 "19,46,645 here against 18,33,480 there. Filter to a flow "
+                 "role if you want one side of the books rather than every "
+                 "debit."),
     Measure("inflow", "Money in", "Money",
-            f"CASE WHEN t.direction = 'credit' THEN {_paise('t.amount')} ELSE 0 END"),
+            f"CASE WHEN t.direction = 'credit' THEN {_paise('t.amount')} ELSE 0 END",
+            hint="Every credit, added up - which includes refunds and money "
+                 "moved in from your own accounts, not just income. Filter by "
+                 "flow role for income alone."),
     Measure("gross_amount", "Amount (unsigned)", "Money", _paise("t.amount"),
             hint="Size of the transaction regardless of direction."),
     Measure("txn_count", "Transactions", "Counts", "*",

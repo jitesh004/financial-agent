@@ -30,6 +30,26 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 
+
+def _awaiting_a_category(txn) -> bool:
+    """Whether asking a model about this row would change any figure.
+
+    Uncategorised is not enough on its own. A row somebody has taken out of
+    every total - a parser artifact, a reversed charge, an explicit "leave
+    this out" - stays uncategorised for good reason, and its category is
+    never read again. Counting those made the Settings page offer to
+    categorise 301 rows against the 293 the Overview said were missing from
+    the breakdown, and the eight in between would have cost model calls to
+    label something nothing displays.
+    """
+    from ..models.schemas import NEUTRAL_ROLES
+
+    if txn.category != "uncategorized":
+        return False
+    role = getattr(txn, "flow_role", "") or ""
+    return role not in {r.value for r in NEUTRAL_ROLES}
+
+
 def _llm_status() -> dict[str, Any]:
     """Which provider is selected, and whether it could actually be called.
 
@@ -55,7 +75,7 @@ def _settings_payload() -> dict[str, Any]:
     """
     db = get_db()
     pending = sum(1 for t in repo.get_transactions(db)
-                  if t.category == "uncategorized")
+                  if _awaiting_a_category(t))
     return {**repo.get_settings(db), **_llm_status(),
             "uncategorized_count": pending}
 
@@ -99,7 +119,7 @@ def start_categorize(background: BackgroundTasks,
                  "call. Add an API key to your .env and restart the API.")
 
     pending = [t for t in repo.get_transactions(db)
-               if t.category == "uncategorized"]
+               if _awaiting_a_category(t)]
     if not pending:
         raise HTTPException(400, "Nothing is uncategorised.")
 
@@ -156,7 +176,7 @@ def _run_categorize(job_id: str) -> None:
 
         db = get_db()
         everything = repo.get_transactions(db)
-        pending = [t for t in everything if t.category == "uncategorized"]
+        pending = [t for t in everything if _awaiting_a_category(t)]
         progress.start(len(pending), "Asking the model")
 
         before = {t.id: t.category for t in pending}

@@ -92,10 +92,27 @@ export const moneyAxis = { ...axisProps, tickFormatter: compact, width: 58 };
 /* `onPick` makes each bar open the transactions behind it. A breakdown whose
    rows cannot be opened answers "how much" and refuses to answer "on what",
    which is the next question every single time. */
+/* A percentage column has to agree with the bars beside it.
+
+   `total` used to be taken from the caller and used as the denominator
+   directly, and the caller passed NET spending - money out after refunds
+   were deducted. The bars, meanwhile, are the categories money actually went
+   to, and a category that took back more than it took (an insurance premium
+   refunded, a 50,000 reversal) is negative and never rendered. So the
+   denominator was net and the numerators were gross, and in a month with
+   real refunds the visible bars read 97%, 44%, 31%, 8%... adding to 194% of
+   a total the reader could see printed above them.
+
+   The denominator is now the outgoing side of the same list: every positive
+   item, whether or not it made the top `max`. Shares then sum to 100% across
+   the whole breakdown, and to slightly less than 100% in the visible slice,
+   which is what a truncated list should look like. */
 export function BarList({ items, total, colorKey = 'color', max = 12,
   format = compact, onPick }) {
-  const shown = items.slice(0, max);
+  const outgoing = items.filter((i) => i.value > 0);
+  const shown = outgoing.slice(0, max);
   const peak = Math.max(...shown.map((i) => i.value), 1);
+  const basis = outgoing.reduce((sum, i) => sum + i.value, 0) || total;
 
   return (
     <div>
@@ -116,7 +133,7 @@ export function BarList({ items, total, colorKey = 'color', max = 12,
             </div>
             <div className="catrow-value num">{format(item.value)}</div>
             <div className="catrow-pct num">
-              {total ? `${((item.value / total) * 100).toFixed(0)}%` : ''}
+              {basis ? `${((item.value / basis) * 100).toFixed(0)}%` : ''}
             </div>
           </div>
         );
@@ -244,3 +261,6 @@ export function PromptButton({
     </span>
   );
 }
+
+
+

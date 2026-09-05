@@ -9,10 +9,12 @@ const PAGE = 100;
 /* Where a category came from. Shown so a user can tell a hard rule from a model
    guess and knows which ones are worth checking. */
 const SOURCE_TONE = {
-  rule: '', merchant_cache: '', llm: 'warn', user: 'pos', default: 'warn',
+  rule: '', merchant_cache: '', transfer_match: '', llm: 'warn',
+  user: 'pos', default: 'warn',
 };
 const SOURCE_LABEL = {
-  rule: 'rule', merchant_cache: 'learned', llm: 'AI', user: 'you', default: 'guess',
+  rule: 'rule', merchant_cache: 'learned', transfer_match: 'matched',
+  llm: 'AI', user: 'you', default: 'guess',
 };
 
 /* Why this row has the category it has, in one sentence.
@@ -27,6 +29,12 @@ const SOURCE_LABEL = {
 function whyCategorised(t) {
   if (t.category_rule) return `Matched the rule: ${t.category_rule}`;
   switch (t.category_source) {
+    case 'transfer_match':
+      // Not a forgotten rule. The transfer matcher paired this row with its
+      // far leg and set the category itself, and there is no rule to name -
+      // saying "rebuilding captures it" promised something no rebuild does.
+      return 'Set by pairing this with its other leg, not by a rule. '
+        + 'The pairing is below.';
     case 'rule':
       return 'A rule decided this, but which one was not recorded. '
         + 'Rebuilding the ledger captures it.';
@@ -99,6 +107,12 @@ function Explanation({ row, data }) {
           <div style={note}>
             Matched the rule <strong>{c.rule}</strong>
             {c.pattern && <span title={c.pattern}> — hover for the full pattern</span>}.
+          </div>
+        ) : c.source === 'transfer_match' ? (
+          <div style={note}>
+            Set by pairing this row with its other leg, not by a rule -
+            see the pairing below. Nothing was forgotten; there is no
+            rule to name.
           </div>
         ) : c.source === 'rule' ? (
           <div style={note}>

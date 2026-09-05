@@ -170,6 +170,59 @@ _SUPERSEDED_LABEL = re.compile(
 )
 
 
+#: Words that never appear in a person's name, and do appear in the sentence
+#: a statement prints near the words "card holder".
+_NOT_IN_A_NAME = frozenset("""
+    the a an and or of for to on in at by with from through their there this
+    that will shall not be been is are was were any all made make making
+    please note kindly terms term condition conditions agreement agreements
+    liable liability bank banking banks statement statements transaction
+    transactions card cards credit debit account accounts number limited ltd
+    pvt private company corp corporation branch customer service services
+    helpline contact call between monday tuesday wednesday thursday friday
+    saturday sunday am pm hours holder holders name names mobile net internet
+""".split())
+
+#: A name token: letters, with the dots and hyphens that initials and
+#: double-barrelled names carry. Nothing else.
+_NAME_TOKEN = re.compile(r"^[A-Za-z][A-Za-z.'\-]*$")
+
+
+def looks_like_a_persons_name(value: str) -> bool:
+    """Whether a captured value is plausibly somebody's name.
+
+    The old test was "no run of four digits in it", which passes almost any
+    prose. What a statement prints around the words "card holder" is prose:
+
+        Willnotbeheldliableforanytransactionmadeonthecreditcard
+        . (Monday To Friday Between 9:30 A.M. And 6:00 P.M.)
+        Agreement, Mobile Banking Terms,
+        S Through Their
+        S.
+
+    Six of this holder's seven accounts carried one of those as the name of
+    the person who owns them, on screen, in the Manage tab.
+
+    A name has a shape instead: two to six tokens, every one of them letters
+    (initials and hyphens allowed), none of them a word that belongs to a
+    terms-and-conditions sentence, and short enough overall to be a name.
+    """
+    text = (value or "").strip(" .,:;-")
+    if not text or len(text) > 60 or any(ch.isdigit() for ch in text):
+        return False
+    tokens = [t for t in re.split(r"\s+", text) if t]
+    if not 2 <= len(tokens) <= 6:
+        return False
+    for token in tokens:
+        if not _NAME_TOKEN.match(token):
+            return False
+        if token.strip(".'-").lower() in _NOT_IN_A_NAME:
+            return False
+    # A run-on with no spaces cannot be caught by the token rules above, and
+    # a single very long "word" is never a name.
+    return all(len(t) <= 20 for t in tokens)
+
+
 def _find_labeled(text: str, labels: list[str]) -> str | None:
     """Find 'Label: value' anywhere in the text, tolerant of layout noise.
 
@@ -1087,12 +1140,19 @@ def extract_metadata(text: str, filename: str = "", sender: str = "",
     if not meta.period_start:
         meta.period_start, meta.period_end = detect_period(text)
 
+    # `(s)` is part of the LABEL, not the value. ICICI prints "Customer
+    # Name(s) : Mr Jitesh ...", and without this the captured name began
+    # "S : Mr Jitesh".
     holder = _find_labeled(head or text, [
-        r"prepared\s*for", r"account\s*holder(?:\s*name)?", r"customer\s*name", r"borrower\s*name",
-        r"investor\s*name", r"card\s*holder(?:\s*name)?", r"name\s*of\s*(?:the\s*)?holder",
+        r"prepared\s*for", r"account\s*holder(?:\s*name)?(?:\s*\(s\))?",
+        r"customer\s*name(?:\s*\(s\))?", r"borrower\s*name(?:\s*\(s\))?",
+        r"investor\s*name(?:\s*\(s\))?", r"card\s*holder(?:\s*name)?",
+        r"name\s*of\s*(?:the\s*)?holder",
     ])
-    if holder and not re.search(r"\d{4,}", holder):
-        meta.holder_name = holder.title()
+    if holder:
+        holder = holder.strip(" .,:;-")
+        if looks_like_a_persons_name(holder):
+            meta.holder_name = holder.title()
 
     balances_text = _before_mitc_illustration(text)
     meta.opening_balance = _labeled_amount(balances_text, [

@@ -31,7 +31,7 @@ const REASON_HINT = {
     + 'resolves it without a decision.',
 };
 
-export default function ReviewQueue() {
+export default function ReviewQueue({ onDecided }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -67,6 +67,10 @@ export default function ReviewQueue() {
         flow_role: txn.flow_role, ...fields,
       });
       setItems((prev) => prev.filter((t) => t.id !== txn.id));
+      // Tell the shell, so the Review badge in the navigation counts
+      // down with the queue instead of holding the number it had on
+      // mount - it said 96 over a queue the server put at 94.
+      onDecided?.();
     } catch (e) {
       setError(e.message);
     } finally {

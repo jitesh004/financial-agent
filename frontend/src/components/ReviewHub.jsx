@@ -23,7 +23,7 @@ const MODES = [
 
 const STORAGE_KEY = 'fa-review-mode';
 
-export default function ReviewHub() {
+export default function ReviewHub({ onDecided }) {
   const [mode, setMode] = useState(
     () => localStorage.getItem(STORAGE_KEY) || 'queue');
 
@@ -49,7 +49,9 @@ export default function ReviewHub() {
         {active.hint}
       </div>
 
-      {mode === 'queue' ? <ReviewQueue /> : <Categorize />}
+      {mode === 'queue'
+        ? <ReviewQueue onDecided={onDecided} />
+        : <Categorize onDecided={onDecided} />}
     </>
   );
 }

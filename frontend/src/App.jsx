@@ -246,17 +246,28 @@ function Dashboard({ openImport = false, onImportOpened }) {
   // that report to the very refresh that proves the run worked.
   const shown = useRef(false);
 
+  /* The Review badge, re-counted rather than counted once.
+   *
+   * This used to live inside `load()`, which runs on mount and on a reload.
+   * Clearing an item from the Review tab does neither, so the badge went on
+   * saying 96 while the queue emptied beneath it and the server answered 94 -
+   * a number on the navigation that disagreed with the screen it pointed at.
+   *
+   * Failing to count is not worth surfacing: the tab still works, it just
+   * shows no number. */
+  const countReviews = useCallback(() => {
+    api.workflow()
+      .then((w) => setReviewCount(w?.counts?.needs_review || 0))
+      .catch(() => setReviewCount(0));
+  }, []);
+
   const load = useCallback(async () => {
     if (!shown.current) setLoading(true);
     try {
       const dashboard = await api.dashboard();
       setData(dashboard.status === 'ok' ? dashboard : null);
       setError(dashboard.status === 'stale' ? dashboard.message : null);
-      // Badge on the Review tab. Failing to count is not worth surfacing -
-      // the tab still works, it just shows no number.
-      api.workflow()
-        .then((w) => setReviewCount(w?.counts?.needs_review || 0))
-        .catch(() => setReviewCount(0));
+      countReviews();
     } catch (e) {
       setError(e.message);
     } finally {
@@ -539,7 +550,7 @@ function Dashboard({ openImport = false, onImportOpened }) {
             {tab === 'budget' && <Budget />}
             {tab === 'month-view' && <MonthView data={viewData} />}
             {tab === 'recurring' && <Recurring />}
-            {tab === 'review' && <ReviewHub />}
+            {tab === 'review' && <ReviewHub onDecided={countReviews} />}
             {tab === 'ledger' && <Ledger data={viewData} />}
             {tab === 'debt' && <Debt data={data} />}
             {tab === 'credit' && <CreditReport accounts={data?.accounts || []}

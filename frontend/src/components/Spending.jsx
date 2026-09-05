@@ -2,7 +2,8 @@ import React, { useMemo, useState } from 'react';
 import {
   Bar, BarChart, CartesianGrid, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
-import { colorFor, compact, dateLabel, money, monthLabel, pct, titleCase } from '../lib';
+import { colorFor, compact, count, dateLabel, money, monthLabel, pct,
+  SPEND_ROLES, titleCase } from '../lib';
 import { BarList, Card, ChartTooltip, Chip, Empty, Stat, axisProps, moneyAxis } from './ui';
 import { usePeriod } from '../period';
 import { useDrill } from '../drill';
@@ -52,11 +53,20 @@ export default function Spending({ data }) {
           value={categories[0] ? titleCase(categories[0].category) : '—'}
           note={categories[0] ? `${money(categories[0].total)} · ${pct(categories[0].share_pct)}` : ''}
         />
+        {/* `count()`, not a bare number: `Stat` money-formats anything
+            numeric, so the tally of uncategorised rows rendered as "₹293" -
+            a rupee figure sitting directly above the real one, 9,66,711.
+            And the label says what the figure is: `needs_review` is a
+            different field with a different count, and this has always been
+            the uncategorised tally, which is what its own drill-down says
+            when you click it. */}
         <Stat
-          label="Needs review"
-          value={analysis.uncategorized?.count ?? 0}
+          label="Uncategorised"
+          value={count(analysis.uncategorized?.count ?? 0)}
           tone={analysis.uncategorized?.count ? 'neg' : 'pos'}
-          note={analysis.uncategorized?.total ? money(analysis.uncategorized.total) : 'Everything categorized'}
+          note={analysis.uncategorized?.total
+            ? `${money(analysis.uncategorized.total)} outside the breakdown`
+            : 'Everything categorized'}
           onDrill={analysis.uncategorized?.count
             ? () => drill({
               title: 'Uncategorised',
@@ -94,6 +104,7 @@ export default function Spending({ data }) {
               params: {
                 category: item.categories
                   ? item.categories.join(',') : item.category,
+                flow_role: SPEND_ROLES,
               },
             })}
           />

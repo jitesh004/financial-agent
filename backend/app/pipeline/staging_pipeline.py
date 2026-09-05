@@ -424,9 +424,23 @@ def materialise(db: Database, progress: Callable[[str], None] | None = None
         the fourth path finally using it too.
         """
         from ..graph.nodes import _merge_account_facts
+        from ..normalize.metadata import looks_like_a_persons_name
 
         incoming = Account(**payload_account)
         incoming.id = None
+
+        # The payload was written by whatever the reader did on the day the
+        # file was parsed, and a rebuild replays it - so a reader fix does not
+        # reach data already staged. `holder_name` is the case that matters:
+        # it used to accept any capture without a long run of digits, which
+        # let a terms-and-conditions sentence through, and six of this
+        # holder's seven accounts were owned by one. Re-reading 127 PDFs to
+        # correct one string is a poor trade, and this is the boundary where a
+        # stored parse becomes an account, so the check belongs here as well
+        # as in the reader.
+        if incoming.holder_name and not looks_like_a_persons_name(
+                incoming.holder_name):
+            incoming.holder_name = None
         if key in accounts:
             account_id = accounts[key]
             known = account_objects.get(account_id)

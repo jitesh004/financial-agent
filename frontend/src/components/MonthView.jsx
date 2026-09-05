@@ -75,8 +75,32 @@ export default function MonthView({ data }) {
 
   useEffect(load, [load]);
 
+  const monthly = data?.analysis?.monthly || [];
+
+  /* The tiles total the PERIOD, not the page.
+   *
+   * They used to be summed from `rows`, which is capped at ROW_LIMIT. On a
+   * ledger with more rows than that the four figures at the top quietly
+   * described the most recent thousand and nothing said so - "Money in
+   * 17,19,649" above a month-by-month table on the same screen whose eight
+   * rows added to 21,83,336, the 4.6 lakh difference being the 193 oldest
+   * transactions that never got loaded.
+   *
+   * `analysis.monthly` is the server's own per-month figures, the same ones
+   * the table below renders and the Overview reports, so the two now agree by
+   * construction. Falling back to the row sum only when there are no monthly
+   * figures to read - a single-month window still has one. */
   const totals = useMemo(() => {
     const t = { inflow: 0, outflow: 0, offsets: 0, invested: 0, neutral: 0 };
+    if (monthly.length) {
+      for (const m of monthly) {
+        t.inflow += Number(m.income) || 0;
+        t.outflow += Number(m.gross_spend ?? m.spend) || 0;
+        t.offsets += Number(m.offsets) || 0;
+        t.invested += Number(m.invested) || 0;
+      }
+      return t;
+    }
     for (const r of rows || []) {
       const amount = Math.abs(Number(r.amount) || 0);
       const role = r.flow_role || '';
@@ -87,7 +111,7 @@ export default function MonthView({ data }) {
       else t.neutral += amount;
     }
     return t;
-  }, [rows]);
+  }, [rows, monthly]);
 
   /* Months in the window with nothing in them.
    *
@@ -99,7 +123,6 @@ export default function MonthView({ data }) {
    *
    * The span is enumerated here only to name those months. Which months a
    * period COVERS is the server's answer (see period.jsx); this is a label. */
-  const monthly = data?.analysis?.monthly || [];
   const missing = useMemo(() => {
     const first = resolved?.startMonth;
     const last = resolved?.endMonth;

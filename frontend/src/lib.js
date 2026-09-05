@@ -68,6 +68,19 @@ export function dateLabel(iso) {
   return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' });
 }
 
+/* The flow roles the spending breakdown is a sum over.
+ *
+ * `analysis.by_category` is built from `spend_txns + offset_txns` - rows whose
+ * role is EXPENSE, plus the contra roles that net against them. Clicking a
+ * bar has to ask for the same rows, or the panel contradicts the figure that
+ * opened it: an EMI bar reading 3,87,864 across 19 transactions opened a
+ * drawer headed 7,31,327 across 27, the extra being the same instalments seen
+ * again as transfer legs.
+ *
+ * Sent as a `flow_role` filter, which /api/transactions already accepts as a
+ * comma-separated list. */
+export const SPEND_ROLES = 'expense,refund,claim_settlement';
+
 export function titleCase(text) {
   if (!text) return '';
   return String(text).replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());

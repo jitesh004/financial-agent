@@ -3,7 +3,8 @@ import {
   Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Line, ComposedChart,
   ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
-import { colorFor, compact, count, dateLabel, money, monthLabel, pct, titleCase } from '../lib';
+import { colorFor, compact, count, dateLabel, money, monthLabel, pct,
+  SPEND_ROLES, titleCase } from '../lib';
 import { BarList, Callout, Card, ChartTooltip, Chip, Stat, axisProps, moneyAxis } from './ui';
 import Claims from './Claims';
 import Forecast from './Forecast';
@@ -183,9 +184,21 @@ export default function Overview({ data }) {
                 + `transaction${item.count === 1 ? '' : 's'}`
                 + (item.monthly_average
                   ? `, averaging ${money(item.monthly_average)} a month.` : '.'),
-              params: { category: item.category },
+              params: { category: item.category, flow_role: SPEND_ROLES },
             })}
           />
+          {/* The bars are what went OUT. "Money out" above is what went out
+              after money that came back is deducted, so without this line the
+              two disagree by exactly the refunds and nothing on screen says
+              why - in June that was 63,736 of a 130,241 gross, and the card
+              simply looked wrong. */}
+          {totals.offsets > 0 && (
+            <div className="section-note" style={{ marginTop: 10 }}>
+              {money(totals.gross_spend)} went out and {money(totals.offsets)}
+              {' '}came back as refunds and reimbursements, which is the
+              {' '}{money(totals.spend)} counted above. The bars show what went out.
+            </div>
+          )}
         </Card>
       </div>
 

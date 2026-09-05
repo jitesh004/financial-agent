@@ -17,7 +17,7 @@ const SORTS = [
   ['name', 'Name'],
 ];
 
-export default function Categorize() {
+export default function Categorize({ onDecided }) {
   const [rows, setRows] = useState(null);
   const [categories, setCategories] = useState([]);
   const [error, setError] = useState(null);
@@ -85,6 +85,9 @@ export default function Categorize() {
       await api.bulkUpdate(group.items.map((t) => t.id), { category });
       setRows((prev) => prev.filter(
         (t) => !group.items.some((g) => g.id === t.id)));
+      // Same reason as ReviewQueue: the navigation badge is counted
+      // by the shell and has no other way to know this happened.
+      onDecided?.();
       setDone((n) => n + group.items.length);
     } catch (e) {
       setError(e.message);
