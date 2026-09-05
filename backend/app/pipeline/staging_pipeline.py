@@ -196,7 +196,7 @@ def _stage_bureau(db: Database, entry_id: str, text: str, name: str,
     from ..ingestion import bureau as bureau_reader
 
     try:
-        report = bureau_reader.parse_report(text, name)
+        report = bureau_reader.read_extraction(extraction, name)
     except Exception as exc:
         staging.record_parse(db, entry_id, status=STATUS_FAILED,
                              message=f"{type(exc).__name__}: {exc}")
@@ -306,6 +306,61 @@ def stage_alert(db: Database, alert: dict[str, Any]) -> str | None:
 # ----------------------------------------------------------- materialising --
 
 
+def stage_loan_summary(db: Database, summary: dict[str, Any]) -> str:
+    """Stage one lender's periodic summary of a loan.
+
+    A loan repaid by standing instruction produces no statement at all. What
+    the lender sends instead is a quarterly email - balance, rate, EMI,
+    instalments left - in the body, with nothing attached. That email is the
+    only record of a 67 lakh mortgage this holder has.
+
+    It is staged rather than written straight to the accounts table, and that
+    is the whole point of this function. `materialise` clears the ledger and
+    rebuilds it from the staged selection, because the selection is what
+    defines the ledger - untick a file and its rows must go. An account
+    written outside that selection is therefore deleted by the next Process
+    and never rebuilt: the home loan was imported correctly, appeared in the
+    Debt tab, and vanished the next time the holder pressed the button, with
+    nothing anywhere saying why.
+
+    Same shape as `stage_alert` above, for the same reason: neither is a
+    file, so identity comes from the message plus what was read out of it.
+    """
+    import hashlib
+
+    fingerprint = "|".join(str(summary.get(k) or "") for k in
+                           ("institution", "account_number_masked",
+                            "account_type", "as_of", "outstanding"))
+    digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
+    lender = summary.get("institution") or "Unknown"
+    masked = summary.get("account_number_masked") or ""
+    label = f"{lender} Loan{f' ({masked})' if masked else ''}"
+
+    entry_id = staging.add(
+        db, digest,
+        filename=f"{lender} loan summary"[:120],
+        origin="gmail", kind="loan_summary", scan_intent="loan_summary",
+        message_id=summary.get("message_id", ""),
+        sender=summary.get("sender", ""), subject=summary.get("subject", ""),
+        payload={"kind": "loan_summary", "loan_summary": summary},
+        parse_status=STATUS_OK,
+    )
+    staging.record_parse(
+        db, entry_id, status=STATUS_OK,
+        message=(f"Lender reported {summary.get('outstanding')} outstanding"
+                 f"{f' as of ' + str(summary.get('as_of')) if summary.get('as_of') else ''}."),
+        payload={"kind": "loan_summary", "loan_summary": summary},
+        account_label=label,
+        account_key=f"{lender}|{masked}|{summary.get('account_type') or 'loan'}",
+        account_type=summary.get("account_type") or "personal_loan",
+        period_start=summary.get("as_of"), period_end=summary.get("as_of"),
+        row_count=0, debits="0", credits="0",
+        recon_status="not_applicable",
+    )
+    return entry_id
+
+
 def materialise(db: Database, progress: Callable[[str], None] | None = None
                 ) -> dict[str, Any]:
     """Build the whole ledger from the staged files that are ticked.
@@ -348,14 +403,43 @@ def materialise(db: Database, progress: Callable[[str], None] | None = None
     failures: list[str] = []
 
     def resolve_account(payload_account: dict[str, Any], key: str) -> str:
+        """The database id for this account, with every file's facts merged in.
+
+        The early return this used to open with - "seen this key already, hand
+        back the id" - threw away everything the second and every subsequent
+        statement for an account had to say. Balances are what that cost.
+
+        A balance is a snapshot, only true as of the statement that printed
+        it, and statements do not arrive in date order. Seven monthly ICICI
+        statements were read here; February's was resolved first, so the
+        account's balance was fixed at February's closing figure - 49,977.90 -
+        and March through September were discarded on arrival. The true
+        balance on the last statement was 7,686.34. Everything downstream
+        inherited the wrong one: the Position tab's assets, the forecast's
+        opening balance, and a cash-runway figure computed from money the
+        holder spent six months ago.
+
+        `_merge_account_facts` is the rule the other three import paths have
+        always used, and it compares dates rather than arrival order. This is
+        the fourth path finally using it too.
+        """
+        from ..graph.nodes import _merge_account_facts
+
+        incoming = Account(**payload_account)
+        incoming.id = None
         if key in accounts:
-            return accounts[key]
-        account = Account(**payload_account)
-        account.id = None
-        account_id = repo.upsert_account(db, account)
-        account.id = account_id
+            account_id = accounts[key]
+            known = account_objects.get(account_id)
+            if known is None:
+                return account_id
+            _merge_account_facts(known, incoming)
+            known.id = account_id
+            repo.upsert_account(db, known)
+            return account_id
+        account_id = repo.upsert_account(db, incoming)
+        incoming.id = account_id
         accounts[key] = account_id
-        account_objects[account_id] = account
+        account_objects[account_id] = incoming
         return account_id
 
     unread = 0
@@ -403,6 +487,29 @@ def materialise(db: Database, progress: Callable[[str], None] | None = None
                 log.exception("could not rebuild statement %s", entry["filename"])
                 failures.append(f"{entry['filename']}: {type(exc).__name__}: {exc}")
 
+        elif kind == "loan_summary":
+            try:
+                said = payload["loan_summary"]
+                resolve_account({
+                    "id": None,
+                    "institution": said.get("institution") or "Unknown",
+                    "account_type": said.get("account_type") or "personal_loan",
+                    "account_number_masked": said.get("account_number_masked") or "",
+                    "product_name": None, "holder_name": None, "currency": "INR",
+                    "current_balance": None,
+                    "balance_as_of": said.get("as_of"),
+                    "principal_outstanding": said.get("outstanding"),
+                    "interest_rate": said.get("interest_rate"),
+                    "emi_amount": said.get("emi"),
+                    "tenure_months_remaining": said.get("months_remaining"),
+                    "credit_limit": None,
+                }, entry["account_key"] or entry["id"])
+            except Exception as exc:
+                log.exception("could not rebuild loan summary %s",
+                              entry["filename"])
+                failures.append(
+                    f"{entry['filename']}: {type(exc).__name__}: {exc}")
+
         elif kind == "alert":
             try:
                 account_id = _account_for_alert(db, entry, accounts, account_objects)
@@ -429,11 +536,22 @@ def materialise(db: Database, progress: Callable[[str], None] | None = None
                 from ..ingestion.portfolio import PortfolioStatement
                 statement = _rebuild_dataclass(PortfolioStatement,
                                                payload["statement"])
+                if not statement.holdings:
+                    # A holdings statement with no holdings in it is not a
+                    # holdings statement. Recording one anyway filled the
+                    # Portfolio tab with 222 empty rows against 37 real ones
+                    # - every weekly funds statement, running-order file and
+                    # retention notice a broker sends, each filed as a
+                    # portfolio that could not be read.
+                    continue
                 provider = payload.get("provider") or "Investments"
                 holdings_account = Account(
                     institution=provider,
                     account_type=AccountType.INVESTMENT,
-                    account_number_masked="")
+                    # Which account of that provider's, where the document
+                    # names one - an NPS PRAN, say. Without it two accounts
+                    # with one provider merge and one of them disappears.
+                    account_number_masked=getattr(statement, "account_ref", ""))
                 account_id = repo.upsert_account(db, holdings_account)
                 repo.save_portfolio_statement(
                     db, statement, account_id=account_id,
@@ -443,8 +561,22 @@ def materialise(db: Database, progress: Callable[[str], None] | None = None
                 log.exception("could not rebuild portfolio %s", entry["filename"])
                 failures.append(f"{entry['filename']}: {type(exc).__name__}: {exc}")
 
-    if transactions:
-        repo.save_transactions(db, transactions)
+    # NOT saved here. These rows are raw - not deduplicated, not categorised,
+    # carrying no flow role - and the caller enriches them and saves what
+    # comes out. Writing them first looked harmless because the second write
+    # overwrites the same ids, but enrichment DROPS rows: exact duplicates,
+    # parser artifacts, reversed charges. Every dropped row had already been
+    # written, and nothing ever took it back out.
+    #
+    # On this ledger that left 87 rows behind that no analysis counted and
+    # every screen listed - the home loan EMI twice in June, the personal
+    # loan EMI twice, all of it uncategorised because the step that assigns
+    # categories ran after the save and its results went to a list these rows
+    # were no longer in. They inflated "uncategorised" on the Data Quality
+    # card and showed up in the Transactions tab as spending that never
+    # happened.
+    #
+    # One writer, after enrichment, so what is stored is what was computed.
 
     return {
         "statements": statements_written,

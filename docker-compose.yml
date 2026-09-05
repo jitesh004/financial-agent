@@ -36,6 +36,21 @@ services:
     volumes:
       - ./backend:/app
       - ./data:/data
+      # Read-only, and not for the app - `app/` never opens it. It is here
+      # for the tests in tests/test_rules.py that check the frontend agrees
+      # with the backend: that every category the API can emit has a colour
+      # in styles.css, that no screen reads a field the schema stopped
+      # sending. Those assertions are only worth anything against the
+      # frontend as it is right now, and the container mounts `backend`
+      # alone, so `parents[2]/frontend` - the repo root on the host - was
+      # `/frontend` here and did not exist. Six tests failed on a missing
+      # file rather than on anything they were written to catch.
+      #
+      # A bind mount and not a copy: a copy would go stale and those tests
+      # would keep passing against a frontend nobody has, which is worse
+      # than failing loudly. `:ro` because nothing in this container has any
+      # business writing to the frontend's source.
+      - ./frontend:/frontend:ro
     ports:
       - "8078:8078"
     # Every app setting reaches the container from .env, whatever it is

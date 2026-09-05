@@ -12,7 +12,7 @@ import { api } from '../lib';
 
 const KIND_LABEL = {
   equity: 'Equity', mutual_fund: 'Mutual funds', etf: 'ETFs',
-  bond: 'Bonds & debt', other: 'Other',
+  bond: 'Bonds & debt', nps: 'NPS', epf: 'EPF', other: 'Other',
 };
 
 export default function Portfolio({ onImport }) {

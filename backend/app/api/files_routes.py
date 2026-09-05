@@ -83,6 +83,59 @@ def file_transactions(file_id: str) -> dict[str, Any]:
     }
 
 
+def _merge_portfolio(db, record, extraction, resolved_password: str | None,
+                     password_status: str, digest: str,
+                     target_month: str | None, _fail) -> dict[str, Any]:
+    """Fold one holdings statement into the portfolio.
+
+    The same two writes the mailbox pipeline makes - an investment account to
+    hang the holdings off, and the statement itself keyed by content hash, so
+    re-parsing the same file replaces its holdings rather than adding a
+    second copy of every one of them.
+    """
+    from ..ingestion import portfolio as portfolio_reader
+    from ..models.schemas import Account, AccountType
+
+    # The WHOLE document here, not the classification text: a holdings
+    # statement prints its valuation date and often its declared total in
+    # prose above the tables, and both are what makes it checkable.
+    text = ingest_router.full_text_of(extraction)
+    statement = portfolio_reader.parse_statement(
+        text, extraction.tables, record.filename)
+    if not statement.holdings:
+        return _fail("failed",
+                     "Read as a holdings statement, but no holdings could be "
+                     + "found in it. " + " ".join(statement.warnings)[:160])
+
+    provider = statement.provider or "Investments"
+    account_id = repo.upsert_account(db, Account(
+        institution=provider, account_type=AccountType.INVESTMENT,
+        account_number_masked=statement.account_ref))
+    repo.save_portfolio_statement(db, statement, account_id=account_id,
+                                  file_hash=digest, filename=record.filename)
+
+    status, _gap, message = statement.reconcile()
+    resolved_id = repo.upsert_source_file(db, repo.SourceFileRecord(
+        id=record.id, filename=record.filename, filepath=record.filepath,
+        file_hash=digest, source=record.source, sender=record.sender,
+        message_id=record.message_id, size_bytes=record.size_bytes,
+        password=resolved_password, password_status=password_status,
+        parse_status="parsed", institution_guess=provider,
+        account_type_guess="investment", account_id=account_id,
+        error_message=f"{len(statement.holdings)} holding(s). {message}",
+        period_hint=target_month,
+    ))
+    return {
+        "status": "parsed",
+        "kind": "portfolio",
+        "provider": provider,
+        "holdings": len(statement.holdings),
+        "reconciliation": status,
+        "message": message,
+        "file": ser.source_file_json(repo.get_source_file(db, resolved_id)),
+    }
+
+
 def merge_extracted_file_into_ledger(
     db, record, extraction, resolved_password: str | None, password_status: str,
     digest: str, target_month: str | None = None,
@@ -133,6 +186,30 @@ def merge_extracted_file_into_ledger(
     if not extraction.tables:
         return _fail("failed", "No transaction table could be extracted. "
                                 + " ".join(extraction.warnings)[:200])
+
+    # What KIND of document this is, before assuming it is a bank statement.
+    #
+    # The mailbox pipeline classifies; this path did not, and went straight to
+    # `normalize`. So every holdings statement retried here - a CAS, an NPS
+    # statement, a fund house's own - was read as a ledger, found to have no
+    # transactions in it, and reported as "Table found but no rows parsed".
+    # Which is the one message guaranteed to mislead: retry is what a user
+    # presses after supplying a password, so the file they just unlocked came
+    # back looking broken.
+    kind = ingest_router.classify_document(
+        ingest_router.text_of(extraction), record.filename,
+        full_text=ingest_router.full_text_of(extraction))
+    if kind == ingest_router.DOC_PORTFOLIO:
+        return _merge_portfolio(db, record, extraction, resolved_password,
+                                password_status, digest, target_month, _fail)
+    if kind != ingest_router.DOC_STATEMENT:
+        # Bureau reports and contract notes have their own readers and their
+        # own homes; neither belongs in the ledger. Saying so is worth more
+        # than a parse error for a file that parsed perfectly well.
+        return _fail("failed",
+                     f"This is a {kind} document, not a bank statement. "
+                     f"Import it from the Mailbox tab, which routes it to "
+                     f"the right reader.")
 
     statement, account = normalize(extraction, record.filename, sender=record.sender)
     if not statement.transactions:

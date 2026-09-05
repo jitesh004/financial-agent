@@ -25,7 +25,7 @@ import psycopg
 
 from ..analytics import periods
 from ..models.schemas import (Account, AccountType, Category, ConfidenceSource,
-                              Direction, ReconciliationResult,
+                              Direction, LOAN_TYPES, ReconciliationResult,
                               ReconciliationStatus, SourceFormat, Statement,
                               Transaction)
 from .database import Database
@@ -465,6 +465,7 @@ def _transaction_filters(
     month_end: str | None = None,
     flow_role: str | Sequence[str] | None = None,
     merchant: str | None = None,
+    exclude_flow_role: Sequence[str] | None = None,
 ) -> tuple[list[str], list[Any]]:
     """Shared WHERE-clause builder, so a filtered count matches its list.
 
@@ -492,6 +493,17 @@ def _transaction_filters(
     _in_or_eq("account_id", account_id)
     _in_or_eq("category", category)
     _in_or_eq("flow_role", flow_role)
+
+    # An exclusion rather than a longer inclusion list, so a row whose role
+    # was never stamped - anything persisted before roles existed - still
+    # appears. Naming every wanted role instead would have hidden those.
+    if exclude_flow_role:
+        unwanted = [r for r in exclude_flow_role if r]
+        if unwanted:
+            clauses.append(
+                f"(flow_role IS NULL OR flow_role NOT IN "
+                f"({', '.join('?' * len(unwanted))}))")
+            params.extend(unwanted)
 
     if merchant:
         # A prefix match on the same expression the engine groups by, because
@@ -573,11 +585,12 @@ def get_transactions(
     month_end: str | None = None,
     flow_role: str | Sequence[str] | None = None,
     merchant: str | None = None,
+    exclude_flow_role: Sequence[str] | None = None,
 ) -> list[Transaction]:
     clauses, params = _transaction_filters(
         account_id, start, end, category, statement_id, rail,
         needs_review, accounting_month, month_start, month_end,
-        flow_role, merchant)
+        flow_role, merchant, exclude_flow_role)
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     column = _SORTABLE_COLUMNS.get(sort_by, "txn_date")
@@ -644,11 +657,12 @@ def count_transactions(
     month_end: str | None = None,
     flow_role: str | Sequence[str] | None = None,
     merchant: str | None = None,
+    exclude_flow_role: Sequence[str] | None = None,
 ) -> int:
     clauses, params = _transaction_filters(
         account_id, start, end, category, statement_id, rail,
         needs_review, accounting_month, month_start, month_end,
-        flow_role, merchant)
+        flow_role, merchant, exclude_flow_role)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with db.connection() as conn:
         return conn.execute(
@@ -2292,10 +2306,14 @@ def save_portfolio_statement(db: Database, statement: Any, account_id: str | Non
                              file_hash: str = "", filename: str = "") -> str:
     """Persist a holdings statement and its positions.
 
-    Positions are keyed by (account, ISIN, folio, valuation date), so importing
-    the same statement twice updates the holdings rather than doubling the
-    portfolio - the failure this would otherwise cause is a net worth that
-    grows every time you re-import.
+    Positions are keyed by (account, ISIN, folio, instrument, valuation
+    date), so importing the same statement twice updates the holdings rather
+    than doubling the portfolio - the failure this would otherwise cause is a
+    net worth that grows every time you re-import.
+
+    The instrument is part of that key, not decoration: an NPS statement
+    carries neither an ISIN nor a folio number, and without it a subscriber's
+    three schemes were one row that each overwrote in turn.
     """
     statement_id = str(uuid.uuid4())
     status, gap, message = statement.reconcile()
@@ -2328,28 +2346,87 @@ def save_portfolio_statement(db: Database, statement: Any, account_id: str | Non
                 "INSERT INTO holdings (id, statement_id, account_id, isin,"
                 " symbol, instrument, kind, folio, units, avg_cost, nav, value,"
                 " invested, as_of) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT (user_id, account_id, isin, folio, as_of) DO UPDATE SET"
+                " ON CONFLICT (user_id, account_id, isin, folio, instrument,"
+                "             as_of) DO UPDATE SET"
                 "   statement_id = excluded.statement_id,"
                 "   units = excluded.units, nav = excluded.nav,"
                 "   value = excluded.value, avg_cost = excluded.avg_cost,"
                 "   invested = excluded.invested,"
-                "   instrument = excluded.instrument, kind = excluded.kind",
+                "   kind = excluded.kind",
                 (str(uuid.uuid4()), statement_id, account_id, holding.isin,
                  holding.symbol, holding.instrument, holding.kind,
                  holding.folio, _txt(holding.units), _txt(holding.avg_cost),
                  _txt(holding.nav), _txt(holding.computed_value()),
                  _txt(holding.invested), as_of),
             )
+
+        # The account this hangs off IS the portfolio, so its balance is what
+        # the portfolio is worth.
+        #
+        # Nothing set it before, and the effect reached well past the
+        # Portfolio tab: an investment account carried a balance of NULL, so
+        # every screen that reads accounts rather than holdings valued the
+        # whole lot at nothing. The Position tab seeded six investment rows
+        # with no amount in them and reported total assets of 31 rupees
+        # against a real 15.7 lakh - then flagged ten holdings as "no amount
+        # recorded yet", which read as the user's omission rather than the
+        # app's.
+        #
+        # Guarded on the date so re-reading an older statement cannot walk
+        # the balance backwards.
+        #
+        # And never dated in the future. An EPFO passbook heads its total
+        # "Closing balance as on 31/03/2027" whatever month it is printed in,
+        # because that is the financial year it covers - the date is a label
+        # on the year, not a claim about a balance seven months from now.
+        # Taken literally it made the EPF corpus the most recent fact the app
+        # held, so the Overview announced "latest known balances, as at 31 Mar
+        # 27" - a date that has not happened - and any real balance read this
+        # week could never overtake it.
+        #
+        # What is actually known is that the figure is true no later than
+        # today, so that is what is stored.
+        dated = min(as_of, date.today().isoformat()) if as_of else as_of
+        if account_id and dated:
+            conn.execute(
+                "UPDATE accounts SET current_balance = ?, balance_as_of = ?"
+                " WHERE id = ? AND (balance_as_of IS NULL"
+                "                   OR balance_as_of <= ?)",
+                (_txt(statement.computed_value), dated, account_id, dated))
     return statement_id
 
 
 def get_holdings(db: Database, latest_only: bool = True) -> list[dict[str, Any]]:
     """Current positions.
 
-    `latest_only` keeps one row per instrument - the most recent valuation.
-    Without it a portfolio imported across several statement dates counts the
-    same holding once per date, which is a net worth that multiplies with
-    diligence.
+    `latest_only` returns the holdings of each account's most recent
+    statement. A portfolio is a SNAPSHOT: what the newest statement lists is
+    the position, and everything before it is history.
+
+    It used to keep the newest sighting of every INSTRUMENT instead, which is
+    a different thing and quietly wrong. Anything that ever appeared and then
+    stopped - sold, transferred, renamed, or merely spelt differently by the
+    issuer one month ("NPS TRUST- A/C" becoming "NPS TRUST A/C") - kept its
+    last known valuation for ever and went on being counted. Ten months of
+    statements accumulated into 106 instruments worth 32.8 lakh for a
+    portfolio of about 16, and every extra rupee of it was a position the
+    holder had already disposed of or had never held twice.
+
+    A CAS then SUPERSEDES a broker's own holdings statement, security by
+    security, the same way a bank statement supersedes an email alert. This
+    is not a preference between two sources; it is what "consolidated" means.
+    A CDSL CAS reports every demat account the holder has - this one names
+    six, Zerodha and Upstox among them - so a broker statement is a subset of
+    it that has already been counted. All twenty holdings on the Upstox
+    statement were ISINs the CAS also reported, and adding them put 3.01 lakh
+    of shares into the portfolio twice.
+
+    Freshness loses to correctness where the two conflict. The broker's July
+    figure is a month newer than the June CAS, and it cannot be substituted
+    in: the CAS's line for a share is the total across all six accounts and
+    the broker's is one account's slice of it, so mixing them understates the
+    holding rather than updating it. What the CAS does not report - an NPS
+    corpus, a fund house's own folio - is untouched by any of this.
     """
     with db.connection() as conn:
         if latest_only:
@@ -2365,13 +2442,23 @@ def get_holdings(db: Database, latest_only: bool = True) -> list[dict[str, Any]]
             # SQLite's ordering, which sorts NULL below every number on DESC
             # where PostgreSQL would put it on top.
             rows = conn.execute(
-                "SELECT h.* FROM holdings h"
-                " JOIN (SELECT account_id, isin, folio, MAX(as_of) AS latest"
-                "       FROM holdings GROUP BY account_id, isin, folio) newest"
-                "   ON h.account_id IS NOT DISTINCT FROM newest.account_id"
-                "  AND h.isin = newest.isin AND h.folio = newest.folio"
-                "  AND h.as_of IS NOT DISTINCT FROM newest.latest"
-                " ORDER BY CAST(NULLIF(h.value, '') AS REAL) DESC NULLS LAST"
+                "WITH newest AS ("
+                "  SELECT account_id, MAX(as_of) AS latest"
+                "  FROM holdings GROUP BY account_id),"
+                " live AS ("
+                "  SELECT h.*, COALESCE(s.layout, '') AS layout"
+                "  FROM holdings h"
+                "  JOIN newest n"
+                "    ON h.account_id IS NOT DISTINCT FROM n.account_id"
+                "   AND h.as_of IS NOT DISTINCT FROM n.latest"
+                "  LEFT JOIN portfolio_statements s ON s.id = h.statement_id),"
+                " consolidated AS ("
+                "  SELECT DISTINCT isin FROM live"
+                "  WHERE layout = 'cas' AND isin <> '')"
+                " SELECT * FROM live"
+                " WHERE layout = 'cas' OR isin = ''"
+                "    OR isin NOT IN (SELECT isin FROM consolidated)"
+                " ORDER BY CAST(NULLIF(value, '') AS REAL) DESC NULLS LAST"
             ).fetchall()
         else:
             rows = conn.execute(
@@ -2383,6 +2470,136 @@ def get_holdings(db: Database, latest_only: bool = True) -> list[dict[str, Any]]
         "nav": r["nav"], "value": r["value"], "invested": r["invested"],
         "as_of": r["as_of"],
     } for r in rows]
+
+
+def get_latest_bureau_accounts(db: Database) -> list[dict[str, Any]]:
+    """The newest credit report's accounts, or [] if none was imported.
+
+    A convenience with a purpose: net worth, the Position tab and the agents
+    all need the bureau's view, and each was reaching for it differently -
+    which is how the Overview came to leave a 66.7 lakh home loan out of a
+    figure the Position tab included.
+    """
+    reports = get_bureau_reports(db)
+    return get_bureau_accounts(db, reports[0]["id"]) if reports else []
+
+
+def adopt_bureau_loan_balances(db: Database) -> int:
+    """Give a loan account the balance its own statement never states.
+
+    A loan account statement is an amortisation ledger, not a balance
+    statement. ICICI's runs each instalment as a matched pair - "EMI DUE FOR
+    INST.59" against "RECEIPT CHQ NO..." for the same 42,850 - so it opens at
+    zero, closes at zero and reconciles perfectly while saying nothing about
+    what is still owed. The account was therefore real, correctly typed, and
+    invisible to the Debt tab, which needs a balance to amortise.
+
+    The lender's report to the bureau does state it. Where a loan account has
+    no outstanding of its own and its matched bureau line has one, that
+    figure is adopted - and `balance_as_of` is set to the report's pull date,
+    not today, because a bureau balance is routinely a month or two old and
+    dating it now would present a stale figure as freshly confirmed.
+
+    The EMI comes from the account's own rows rather than the bureau, which
+    frequently omits it: an instalment repeated to the rupee across dozens of
+    months is the strongest statement of it available, and it is the holder's
+    own document.
+
+    Returns how many accounts were given a balance.
+    """
+    reports = get_bureau_reports(db)
+    if not reports:
+        return 0
+    pulled = reports[0].get("pulled_on")
+    lines = {row.get("account_id"): row
+             for row in get_bureau_accounts(db, reports[0]["id"])
+             if row.get("account_id")}
+
+    adopted = 0
+    for account in get_accounts(db):
+        if account.account_type not in LOAN_TYPES:
+            continue
+        if account.principal_outstanding:
+            continue
+        line = lines.get(account.id)
+        owed = _dec(line.get("current_balance")) if line else None
+        emi = _median_instalment(db, account.id)
+        if owed is None and emi is None:
+            continue
+        with db.connection() as conn:
+            conn.execute(
+                "UPDATE accounts SET"
+                "  principal_outstanding = COALESCE(?, principal_outstanding),"
+                "  emi_amount = COALESCE(?, emi_amount),"
+                "  balance_as_of = COALESCE(?, balance_as_of)"
+                " WHERE id = ?",
+                (_txt(owed), _txt(emi), pulled if owed is not None else None,
+                 account.id))
+        adopted += 1
+    return adopted
+
+
+def _median_instalment(db: Database, account_id: str) -> Decimal | None:
+    """The repeated instalment on a loan account, or None.
+
+    Read as the most common debit amount rather than an average: a loan
+    ledger carries the odd part-payment and closing adjustment, and a mean
+    would land between two figures that both exist while the mode is the
+    instalment itself.
+    """
+    from collections import Counter
+
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT amount FROM transactions"
+            " WHERE account_id = ? AND direction = 'debit'"
+            "   AND excluded = 0", (account_id,)).fetchall()
+    amounts = Counter(str(r["amount"]) for r in rows if r["amount"])
+    if not amounts:
+        return None
+    value, seen = amounts.most_common(1)[0]
+    # One repeat is a coincidence; three is a schedule.
+    return _dec(value) if seen >= 3 else None
+
+
+def refresh_investment_balances(db: Database) -> int:
+    """Set every investment account's balance to what it actually adds.
+
+    An investment account's balance IS its holdings, and `get_holdings` is
+    the one place that decides which holdings count - it drops what a
+    consolidated statement already reports. Summing the raw rows instead
+    gives a different answer, and the two then disagree across the app:
+    the Portfolio tab read the superseded view and showed 15.70 lakh while
+    the Position tab summed account balances and showed 18.72, the
+    difference being one Upstox statement counted twice.
+
+    An account whose every security the CAS also reports settles at zero.
+    That is the honest figure for what it CONTRIBUTES - the shares are real
+    and are counted once, on the consolidated statement.
+
+    Returns how many accounts were changed.
+    """
+    live: dict[str, Decimal] = {}
+    for holding in get_holdings(db, latest_only=True):
+        account_id = holding.get("account_id")
+        if not account_id:
+            continue
+        live[account_id] = live.get(account_id, Decimal("0")) + (
+            _dec(holding.get("value")) or Decimal("0"))
+
+    changed = 0
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT id, current_balance FROM accounts"
+            " WHERE account_type = 'investment'").fetchall()
+        for row in rows:
+            total = _txt(live.get(row["id"], Decimal("0")))
+            if row["current_balance"] == total:
+                continue
+            conn.execute("UPDATE accounts SET current_balance = ?"
+                         " WHERE id = ?", (total, row["id"]))
+            changed += 1
+    return changed
 
 
 def get_portfolio_statements(db: Database) -> list[dict[str, Any]]:
@@ -2465,8 +2682,13 @@ def save_agent_run(db: Database, run: dict[str, Any]) -> str:
             (run_id, run["agent"], run.get("status", "ok"),
              run.get("started_at") or "", run.get("finished_at"),
              float(run.get("seconds") or 0), run.get("question", ""),
-             json.dumps(run.get("answer") or {}),
-             json.dumps(run.get("transcript") or []),
+             # `default=str` for the same reason `_job_json` has it: a
+             # transcript is whatever the tools returned, and a run costs
+             # real money and a minute of the user's attention to produce.
+             # Losing all of it because one tool handed back a `date` is the
+             # wrong trade - a date rendered as its ISO string is not.
+             json.dumps(run.get("answer") or {}, default=str),
+             json.dumps(run.get("transcript") or [], default=str),
              run.get("model", ""), run.get("provider", ""),
              int(run.get("steps") or 0), int(run.get("tool_calls") or 0),
              run.get("error", "")),
@@ -2605,18 +2827,31 @@ _POSITION_INTS = frozenset({
     "archived", "sort_order",
 })
 
+#: The NOT NULL columns, and what a blank means for each.
+#:
+#: A column DEFAULT only fires when the column is left out of the INSERT
+#: altogether - an explicit NULL is still a NULL, and every column here is
+#: NOT NULL. So a blank has to become the default HERE, or an account with
+#: no institution recorded, or a card someone cleared the lender box on,
+#: fails on a constraint the user can neither see nor have done anything
+#: about. A missing name is an empty name; it is not the absence of a row.
+_POSITION_BLANKS: dict[str, Any] = {
+    "kind": "other", "label": "", "institution": "", "notes": "",
+    "archived": 0, "sort_order": 0,
+}
+
 
 def _position_value(field: str, value: Any) -> Any:
     """One incoming field, in the shape the column wants."""
     if value is None or value == "":
-        return None
+        return _POSITION_BLANKS.get(field)
     if field in _POSITION_MONEY:
         return _txt(_dec(value))
     if field in _POSITION_INTS:
         try:
             return int(value)
         except (TypeError, ValueError):
-            return None
+            return _POSITION_BLANKS.get(field)
     if field == "reviewed_on":
         parsed = _d(value)
         return parsed.isoformat() if parsed else None
@@ -2653,11 +2888,17 @@ def update_position_item(db: Database, item_id: str,
     `reviewed_on` does not, because editing a figure and re-attesting the
     whole item are different acts. Re-attesting is `review_position_item`.
     """
-    wanted = {k: v for k, v in changes.items() if k in POSITION_FIELDS}
+    wanted = {k: _position_value(k, v) for k, v in changes.items()
+              if k in POSITION_FIELDS}
+    # `reviewed_on` is the one NOT NULL column with no honest default on an
+    # edit: a blank or unreadable date is a field to leave alone, not a
+    # review to erase. Moving it deliberately is `review_position_item`.
+    if wanted.get("reviewed_on") is None:
+        wanted.pop("reviewed_on", None)
     if not wanted:
         return False
     assignments = ", ".join(f"{k} = ?" for k in wanted)
-    values = [_position_value(k, v) for k, v in wanted.items()]
+    values = list(wanted.values())
     with db.connection() as conn:
         cursor = conn.execute(
             f"UPDATE position_items SET {assignments}, updated_at = fa_now()"

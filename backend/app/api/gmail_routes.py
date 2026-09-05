@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -217,15 +218,149 @@ def _run_multi_scan(job_id: str, max_messages: int, months: int | None,
     so reading the statements first means supersession is settled by the time
     the alerts land.
     """
-    file_intents = [i for i in wanted if i != "transactional"]
+    # Intents that carry their content in the BODY rather than an
+    # attachment. `_run_scan` looks for files and finds none on these, so
+    # they get their own pass - the same arrangement alerts have always had,
+    # generalised now that they are not the only one.
+    body_intents = [i for i in wanted if i in BODY_ONLY_INTENTS]
+    file_intents = [i for i in wanted if i not in BODY_ONLY_INTENTS]
     for index, one in enumerate(file_intents):
         # Each pass appends to the same job's result rather than replacing it.
         _run_scan(job_id, max_messages, months, one,
-                  finish=(index == len(file_intents) - 1
-                          and "transactional" not in wanted),
+                  finish=(index == len(file_intents) - 1 and not body_intents),
                   append=index > 0)
-    if "transactional" in wanted:
-        _run_alert_scan(job_id, max_messages, months, append=bool(file_intents))
+    for index, one in enumerate(body_intents):
+        appending = bool(file_intents) or index > 0
+        if one == "transactional":
+            _run_alert_scan(job_id, max_messages, months, append=appending)
+        else:
+            _run_loan_summary_scan(job_id, max_messages, months,
+                                   append=appending,
+                                   finish=(index == len(body_intents) - 1))
+
+
+#: Intents whose content is the email itself. A lender that collects by
+#: standing instruction sends no statement at all, so its quarterly summary
+#: - and a bank's transaction alert - are the only record there is.
+BODY_ONLY_INTENTS = frozenset({"transactional", "loan_summary"})
+
+
+def _run_loan_summary_scan(job_id: str, max_messages: int,
+                           months: int | None = None, append: bool = False,
+                           finish: bool = True) -> None:
+    """Read the periodic summaries lenders email, and record the loans.
+
+    Written to the accounts rather than held for review, unlike an alert.
+    An alert asserts a TRANSACTION that nothing has reconciled; this asserts
+    what a lender says its own loan stands at, which is the same kind of fact
+    a statement's letterhead carries and is treated the same way. Where the
+    holder disagrees, the Position tab is where they say so.
+
+    Newest wins per loan: a quarterly summary supersedes the one before it,
+    and a mailbox holds every quarter.
+    """
+    from ..ingestion import loan_email
+    from ..ingestion.gmail_source import message_body
+    from ..models.schemas import Account
+
+    job = jobs.get(job_id)
+    progress = JobProgress(job)
+    try:
+        client = _require_client()
+        db = get_db()
+        progress.start(max_messages, "Searching for loan summaries")
+
+        query = build_query(months=months, intent="loan_summary")
+        message_ids = client.list_messages(query, max_messages)
+        progress.bump_total(max(1, len(message_ids)))
+
+        newest: dict[tuple, Any] = {}
+        for seen, message_id in enumerate(message_ids, 1):
+            progress.advance(seen, f"Reading emails ({seen}/{len(message_ids)})")
+            try:
+                message = client.get_message(message_id)
+            except Exception as exc:
+                log.warning("could not read %s: %s", message_id, exc)
+                continue
+            headers = {h["name"].lower(): h["value"]
+                       for h in message.get("payload", {}).get("headers", [])}
+            summary = loan_email.parse(headers.get("subject", ""),
+                                       message_body(message),
+                                       headers.get("from", ""))
+            if summary is None:
+                continue
+            key = (summary.institution, summary.account_number_masked,
+                   summary.account_type)
+            current = newest.get(key)
+            if current is None or (summary.as_of or date.min) > \
+                    (current.as_of or date.min):
+                newest[key] = summary
+
+        progress.phase("Recording what the lenders reported")
+        recorded = []
+        from ..pipeline import staging_pipeline
+
+        for summary in newest.values():
+            repo.upsert_account(db, Account(
+                institution=summary.institution,
+                account_type=summary.account_type,
+                account_number_masked=summary.account_number_masked,
+                principal_outstanding=summary.outstanding,
+                emi_amount=summary.emi,
+                interest_rate=summary.interest_rate,
+                tenure_months_remaining=summary.months_remaining,
+                balance_as_of=summary.as_of))
+
+            # Written above AND staged here, because the two answer different
+            # questions. The upsert makes the loan visible immediately, the
+            # way this scan has always behaved. The staging row makes it
+            # survive: `staging_pipeline.materialise` clears the accounts
+            # table and rebuilds from the staged selection, so an account
+            # that exists only because a scan wrote it is deleted by the next
+            # Process. This holder's home loan was imported, shown, and then
+            # silently dropped on the following rebuild - twice.
+            try:
+                staging_pipeline.stage_loan_summary(db, {
+                    "institution": summary.institution,
+                    "account_number_masked": summary.account_number_masked,
+                    "account_type": summary.account_type.value,
+                    "outstanding": str(summary.outstanding)
+                                   if summary.outstanding is not None else None,
+                    "emi": str(summary.emi) if summary.emi is not None else None,
+                    "interest_rate": str(summary.interest_rate)
+                                     if summary.interest_rate is not None else None,
+                    "months_remaining": summary.months_remaining,
+                    "as_of": summary.as_of.isoformat() if summary.as_of else None,
+                })
+            except Exception:  # pragma: no cover - staging is not the read
+                log.exception("could not stage a loan summary")
+
+            recorded.append({
+                "lender": summary.institution,
+                "account": summary.account_number_masked,
+                "kind": summary.account_type.value,
+                "outstanding": str(summary.outstanding),
+                "emi": str(summary.emi) if summary.emi else None,
+                "as_of": summary.as_of.isoformat() if summary.as_of else None,
+            })
+
+        result = {"loan_summaries": recorded,
+                  "messages_read": len(message_ids)}
+        if append:
+            existing = (job.result or {}) if job else {}
+            merged = list(existing.get("loan_summaries") or []) + recorded
+            result = {**existing, "loan_summaries": merged,
+                      "messages_read": len(message_ids)}
+        if finish:
+            progress.complete(
+                result=result,
+                message=(f"{len(recorded)} loan summary(ies) read"
+                         if recorded else "No loan summaries found"))
+        else:
+            job.result = result
+    except Exception as exc:
+        log.exception("loan summary scan failed")
+        progress.fail(f"{type(exc).__name__}: {exc}")
 
 
 def _staged_accounts(db, already: list | None = None) -> list:
@@ -916,7 +1051,7 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
             from ..ingestion import bureau
             text = bureau._text_of(extraction)
             if bureau.looks_like_bureau_report(text, name):
-                bureau_report = bureau.parse_report(text, name)
+                bureau_report = bureau.read_extraction(extraction, name)
                 bureau_report.warnings = [*extraction.warnings, *bureau_report.warnings]
                 repo.save_bureau_report(db, bureau_report, file_hash=digest, filename=name)
                 try:

@@ -362,6 +362,24 @@ _NUMBERED_ACCOUNT = re.compile(r"^\s*(\d{1,3})\s+account\s*type\s*:",
                                re.IGNORECASE)
 
 
+#: A line that is nothing but an account number. Bureaus print them long and
+#: unpunctuated - a sixteen-digit card, a loan reference like "DMI0013530551"
+#: - and a wrapped one arrives alone on its own line. Deliberately strict: a
+#: line with a space in it is prose, and this runs over every unrecognised
+#: line in the report.
+_BARE_ACCOUNT_NUMBER = re.compile(r"^[A-Za-z]{0,4}[0-9][0-9A-Za-z\-]{5,}$")
+
+
+def _looks_like_an_account_number(line: str) -> bool:
+    """Whether this line is a bare account number and nothing else."""
+    stripped = line.strip()
+    if not _BARE_ACCOUNT_NUMBER.match(stripped):
+        return False
+    # At least half of it has to be digits, which rules out a stray word.
+    digits = sum(1 for c in stripped if c.isdigit())
+    return digits * 2 >= len(stripped)
+
+
 def parse_report(text: str, filename: str = "") -> BureauReport:
     """Read a bureau report out of its extracted text.
 
@@ -395,8 +413,16 @@ def parse_report(text: str, filename: str = "") -> BureauReport:
     # ---- pulled-on date ----
     for line in text.splitlines()[:60]:
         lowered = line.lower()
+        # "date:" does not match "Date of Request:", which is what CRIF
+        # calls it - so every CRIF report was stored with no date at all.
+        # That is not cosmetic: a bureau balance is routinely a month or two
+        # old, and the Position tab dates a seeded row FROM this. With it
+        # missing, stale figures were dated today and read as freshly
+        # confirmed.
         if any(k in lowered for k in ("date:", "report date", "generated on",
-                                      "as on", "date of report")):
+                                      "as on", "date of report",
+                                      "date of request", "date of issue",
+                                      "date of generation")):
             found = parse_date(line)
             if found:
                 report.pulled_on = found
@@ -413,6 +439,28 @@ def parse_report(text: str, filename: str = "") -> BureauReport:
     if not report.accounts:
         report.warnings.append(
             "No credit accounts could be read out of this report.")
+    # Last, because it checks the accounts that were read, and every
+    # other reader here earns its trust the same way: against a figure
+    # the document prints for itself.
+    stated = parse_summary(text)
+    if stated:
+        read_open = sum(1 for a in report.accounts if a.status == "open")
+        read_balance = sum((a.current_balance or Decimal("0"))
+                           for a in report.accounts if a.status == "open")
+        if stated["accounts"] != len(report.accounts):
+            report.warnings.append(
+                f"The report states {stated['accounts']} accounts and "
+                f"{len(report.accounts)} were read.")
+        if stated["active"] != read_open:
+            report.warnings.append(
+                f"The report states {stated['active']} active accounts and "
+                f"{read_open} were read as open.")
+        if stated["balance"] is not None and \
+                abs(read_balance - stated["balance"]) > Decimal("1"):
+            report.warnings.append(
+                f"Balances across the open accounts total {read_balance:,.0f} "
+                f"against a stated {stated['balance']:,.0f}.")
+
     return report
 
 
@@ -461,6 +509,7 @@ def _parse_accounts(text: str) -> list[BureauAccount]:
         current = None
 
     pending_grantor = False
+    pending_number = False
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -473,6 +522,13 @@ def _parse_accounts(text: str) -> list[BureauAccount]:
             current = BureauAccount()
             if not numbered:
                 continue
+
+        # Checked before the fields, because a line can state the standing
+        # and then carry on with other fields on the same line.
+        if current is not None:
+            standing = _leading_status(line)
+            if standing is not None:
+                current.status = standing
 
         found = fields_in(line)
         if not found:
@@ -496,8 +552,30 @@ def _parse_accounts(text: str) -> list[BureauAccount]:
                     current.lender = name
                     if trailing and not current.account_number_masked:
                         current.account_number_masked = trailing.group(2)
+                        pending_number = False
                     pending_grantor = False
                     continue
+
+            # The number can wrap on its own, without the name. A grantor
+            # short enough to fit still pushes a sixteen-digit card number
+            # onto the next line, where it sits alone:
+            #
+            #   3 ... Credit Grantor: BOBCARD LIMITED Account #:  Info. as of:
+            #   7934060000496083
+            #
+            # Only the wrapped NAME was recovered, so eleven of twenty-two
+            # accounts came back with no number - and the number is what the
+            # matcher joins on, which is most of why nothing ever matched.
+            if pending_number and not current.account_number_masked \
+                    and _looks_like_an_account_number(line):
+                current.account_number_masked = line.strip()
+                pending_number = False
+                continue
+            standing = _bare_status(line)
+            if standing is not None:
+                current.status = standing
+                continue
+
             if _looks_like_dpd_row(line):
                 current.dpd_history += _DPD.findall(line)
             continue
@@ -521,6 +599,7 @@ def _parse_accounts(text: str) -> list[BureauAccount]:
                 current.account_type = map_account_type(value)
             elif name == "account_number":
                 current.account_number_masked = value
+                pending_number = not value
             elif name == "opened":
                 current.opened_on = parse_date(value)
             elif name == "closed":
@@ -529,7 +608,9 @@ def _parse_accounts(text: str) -> list[BureauAccount]:
                     current.closed_on = closed
                     current.status = "closed"
             elif name == "status":
-                current.status = _normalise_status(value)
+                standing = _status_from_field(value)
+                if standing is not None:
+                    current.status = standing
             elif name == "sanctioned":
                 amount = parse_money(value)
                 if amount is not None:
@@ -562,6 +643,108 @@ def _looks_like_dpd_row(line: str) -> bool:
     hits = sum(1 for t in tokens if re.fullmatch(r"(?:000|STD|XXX|\d{1,3})",
                                                  t, re.IGNORECASE))
     return hits >= max(3, len(tokens) // 2)
+
+
+#: The report's own tally of itself: "Number of Account(s) / Active
+#: Account(s) / Overdue Account(s) / Current Balance". Every other reader in
+#: this app checks its rows against a figure the document prints, and a
+#: bureau report prints one too - it was simply never read.
+#:
+#: It is worth reading because it catches the failures that look like
+#: successes. A report that came back with 27 accounts of a stated 31, or 21
+#: open of a stated 18, parsed without error and reported nothing wrong.
+_SUMMARY_HEADER = re.compile(
+    r"number\s+of\s+account", re.IGNORECASE)
+_SUMMARY_FIGURES = re.compile(
+    r"^\s*(\d{1,4})\s+(\d{1,4})\s+(\d{1,4})\s+([\d,]+)")
+
+
+def parse_summary(text: str) -> dict[str, Any]:
+    """What the report says about itself, or {} if it says nothing."""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not _SUMMARY_HEADER.search(line):
+            continue
+        for candidate in lines[index + 1:index + 3]:
+            found = _SUMMARY_FIGURES.match(candidate)
+            if found:
+                return {
+                    "accounts": int(found.group(1)),
+                    "active": int(found.group(2)),
+                    "overdue": int(found.group(3)),
+                    "balance": parse_money(found.group(4)),
+                }
+    return {}
+
+
+#: A line that is nothing but an account's standing. CRIF prints it on its
+#: own, under the header line, and leaves "Closed Date:" empty even when the
+#: account is shut - so a reader that learns the status only from that field
+#: learns nothing.
+#:
+#: On a real report that was thirteen of thirty-one accounts: every one of
+#: them closed, every one recorded as open, and all thirteen drafted onto the
+#: Position tab as live debt the holder no longer owes.
+_BARE_STATUS = frozenset({
+    "active", "closed", "settled", "written off", "written-off",
+    "restructured", "doubtful", "sub-standard", "loss", "current",
+})
+
+
+def _bare_status(line: str) -> str | None:
+    """The status this line states outright, or None if it states none."""
+    cleaned = re.sub(r"[^a-z \-]", "", (line or "").strip().lower()).strip()
+    return _normalise_status(cleaned) if cleaned in _BARE_STATUS else None
+
+
+def _leading_status(line: str) -> str | None:
+    """The status a line OPENS with, where the rest of it is other fields.
+
+    The standing does not always get a line to itself - three of thirteen
+    closed accounts on a real report ran it straight into the next field:
+
+        CLOSED Ownership: INDIVIDUAL Disbursed Date: 31-12-2022 ...
+
+    Those lines carry recognisable fields, so the bare-status check never
+    reached them and the accounts stayed open.
+
+    Upper case is what separates a STANDING from a LABEL. CRIF prints the
+    standing in capitals and its field labels in title case, so "CLOSED
+    Ownership:" states a status while "Closed Date:" names a field - and
+    reading the second as the first would close every account on the report.
+    """
+    first = (line or "").strip().split(" ", 1)[0].strip(":,")
+    if not first or first != first.upper() or not first.isalpha():
+        return None
+    return _normalise_status(first.lower()) if first.lower() in _BARE_STATUS \
+        else None
+
+
+def _status_from_field(raw: str) -> str | None:
+    """The standing a "Status:" field states, or None if it states none.
+
+    Not every field called Status is about the account's standing. CRIF has
+    a "Status: No Suit filed" on most blocks - a note about legal action -
+    and `_normalise_status` has no way to say "this tells me nothing", so it
+    fell through to its default of "open". That default then overwrote the
+    CLOSED the block had already stated a few lines earlier, and did it on
+    exactly the accounts that had one: three of thirteen closed accounts
+    reported as live debt.
+
+    Silence is the honest answer where the text is not about standing.
+    """
+    lowered = (raw or "").strip().lower()
+    if not lowered or "suit" in lowered:
+        return None
+    if any(k in lowered for k in ("closed", "settled", "written off",
+                                  "written-off", "paid")):
+        return "closed"
+    if any(k in lowered for k in ("doubtful", "sub-standard", "loss")):
+        return "delinquent"
+    if any(k in lowered for k in ("active", "current", "open", "standard",
+                                  "live", "regular")):
+        return "open"
+    return None
 
 
 def _normalise_status(raw: str) -> str:
@@ -627,15 +810,40 @@ def read_file(path: Path, password: str | None = None,
     return report, report.warnings
 
 
+def read_extraction(result: Any, filename: str = "") -> BureauReport:
+    """Read a report out of an extraction, from the best text it offers.
+
+    The PROSE alone first. `_text_of` appends every table cell to the running
+    text so that classification sees everything, and for a report laid out in
+    prose that means the whole document arrives twice - once as sentences and
+    once as the extractor's guess at a grid. The reader parsed both and
+    believed both, so a CRIF report of 22 accounts came back with 27: five
+    ghosts with the digits re-spaced ("3730064 2903" beside the real
+    "37300642903"), two of them with no lender at all.
+
+    Tables are still read when the prose yields nothing, because some bureaus
+    genuinely lay their account blocks out as a grid - which is why the two
+    were combined in the first place.
+    """
+    prose = getattr(result, "full_text", "") or getattr(result, "text", "") or ""
+    report = parse_report(prose, filename)
+    if report.accounts:
+        return report
+    return parse_report(_text_of(result), filename)
+
+
 def _text_of(result: Any) -> str:
     """Whatever text an ExtractionResult carries, however it carries it.
 
     The PDF extractor returns tables for statements and raw text for anything
     else; a bureau report can come back either way depending on how the issuer
     laid it out, and both have to be readable here.
+
+    One implementation, in `router`, because there were two and they drifted -
+    and the drift was invisible: this one read the whole document and the
+    other only its tables, so the same file classified differently depending
+    on which path reached it.
     """
-    text = getattr(result, "full_text", "") or getattr(result, "text", "") or ""
-    for table in getattr(result, "tables", []) or []:
-        for row in getattr(table, "rows", []) or []:
-            text += "\n" + " ".join(str(cell) for cell in row if cell)
-    return text
+    from .router import full_text_of
+
+    return full_text_of(result)

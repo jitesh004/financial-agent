@@ -184,6 +184,16 @@ def analyse_budget(
     today = today or date.today()
 
     rows = periods.filter_transactions(transactions, period)
+
+    # A loan account's own statement is the lender's ledger, and it is not
+    # part of anybody's budget - see `FlowRole.LENDER_LEDGER`. Dropped here
+    # rather than merely ignored, because this function divides by the months
+    # it can see: one ICICI personal loan statement carried its full history
+    # back to January 2022, so a ledger covering eight real months reported
+    # 57, and every "typical month" figure below was that month's total
+    # divided by fifty-seven. Income came out as zero a month.
+    rows = [t for t in rows if t.role != FlowRole.LENDER_LEDGER]
+
     if not rows:
         result.notes.append("No transactions in this period to budget from.")
         return result

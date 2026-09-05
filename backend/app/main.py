@@ -43,7 +43,7 @@ from .db.engine import current_tenant
 from .graph.build import build_graph
 from .ingestion.router import SUPPORTED_EXTENSIONS, file_hash
 from .jobs import jobs
-from .models.schemas import Category
+from .models.schemas import Category, FlowRole
 
 try:
     from dotenv import load_dotenv
@@ -773,7 +773,67 @@ def _build_payload(state: dict[str, Any]) -> dict[str, Any]:
             }
             for s in statements
         ],
-        "data_quality": (state.get("report") or {}).get("brief", {}).get("data_quality", {}),
+        "data_quality": _data_quality(state, statements),
+    }
+
+
+def _data_quality(state: dict[str, Any], statements: list) -> dict[str, Any]:
+    """How much of the picture is actually there, counted from the picture.
+
+    This used to be lifted out of `report.brief.data_quality`, and a report
+    is only produced by the full pipeline - so on every other path, including
+    the rebuild that runs after any correction, the whole card rendered as
+    zeros: "Files reconciled 0/0" over 169 statements, "Rules-categorized 0"
+    over 2,741 transactions. Zeros that mean "not measured" are worse than a
+    blank, because they read as a measurement.
+
+    Counted here from the state every path has, so the card says the same
+    thing however the run was produced.
+    """
+    from .models.schemas import Category, ReconciliationStatus
+
+    # Two shapes reach here. A pipeline run carries Statement objects; a
+    # rebuild carries the registry rows the Files tab renders. Both say
+    # whether the file reconciled, so both are read rather than one being
+    # declared the real one.
+    reconciled = unreconciled = 0
+    for entry in statements:
+        status = None
+        if isinstance(entry, dict):
+            statement = entry.get("statement")
+            status = getattr(getattr(statement, "reconciliation", None),
+                             "status", None)
+            if status is None:
+                status = entry.get("recon_status") or entry.get("status")
+        if status is None:
+            continue
+        name = getattr(status, "value", status)
+        if name in {"failed", "unreconciled"}:
+            unreconciled += 1
+        elif name in {"passed", "reconciled", "ok", "parsed"}:
+            reconciled += 1
+
+    transactions = state.get("transactions") or []
+    uncategorized = sum(1 for t in transactions
+                        if t.category == Category.UNCATEGORIZED)
+    by_rule = sum(1 for t in transactions
+                  if (getattr(t, "category_source", "") or "") in
+                  {"rule", "user_rule", "merchant", "override"})
+
+    return {
+        "files_processed": len(statements),
+        "files_reconciled": reconciled,
+        "files_unreconciled": unreconciled,
+        "transactions": len(transactions),
+        "uncategorized": uncategorized,
+        # `rules_settled` is the name the Overview reads. Emitting only
+        # `rules_categorized` left the tile showing 0 against 883 rows that
+        # a rule had in fact settled - both names are kept so neither side
+        # has to change to match the other.
+        "rules_categorized": by_rule,
+        "rules_settled": by_rule,
+        "needs_review": sum(1 for t in transactions
+                            if getattr(t, "needs_review", False)),
     }
 
 
@@ -919,7 +979,8 @@ def scoped_analysis(
 
     from .analytics.engine import analyze
 
-    result = analyze(transactions, accounts, period=period)
+    result = analyze(transactions, accounts, period=period,
+                     bureau_accounts=repo.get_latest_bureau_accounts(db))
     return {
         "status": "ok",
         "range": period.as_json(),
@@ -1010,17 +1071,25 @@ def _rebuild_from_persisted_data(db) -> str:
     transaction, so this is pure in-memory aggregation - the same cost as any
     other dashboard load, not a re-import.
     """
-    from .analytics.engine import analyze
+    from .analytics.engine import analyze, mark_lender_ledgers
     from .analytics import forecast as forecast_mod
     from .analytics import loans as loans_mod
     from .analytics.recurring import detect_recurring
     from .models.schemas import AccountType
     from .api.files_routes import all_statement_rows
+    from .reconcile.transfers import detect_transfers
 
     accounts = {a.id: a for a in repo.get_accounts(db)}
     transactions = repo.get_transactions(db)
 
-    analysis = analyze(transactions, accounts)
+    # The same stamp the import applies, for the same reason. Rows persisted
+    # before this existed carry no role, and `detect_recurring` below reads
+    # the role rather than the account - so without this a rebuild resurrects
+    # every loan-statement row as though the holder had spent it.
+    mark_lender_ledgers(transactions, accounts)
+
+    analysis = analyze(transactions, accounts,
+                       bureau_accounts=repo.get_latest_bureau_accounts(db))
     recurring = detect_recurring(transactions)
     loan_projections = []
     for account_id, account in accounts.items():
@@ -1036,14 +1105,23 @@ def _rebuild_from_persisted_data(db) -> str:
         monthly=analysis.monthly, series=recurring, opening_balance=opening,
         horizon_months=6, as_of=analysis.period_end,
     )
+    # The registry rows go in BEFORE the payload is built, not after.
+    # Assigning them afterwards left `_data_quality` counting an empty list,
+    # so the card read "Files reconciled 0/0" over a hundred and sixty-nine
+    # statements - on every path except a full pipeline run.
+    rows = all_statement_rows(db)
     state = {
         "accounts": accounts, "transactions": transactions,
         "recurring": recurring, "analysis": analysis,
         "loan_projections": loan_projections, "forecast": forecast,
-        "statements": [],
+        "statements": rows,
+        # Recomputed from the ledger rather than left out. Without it the
+        # Overview reported "Double-count avoided 0" while the transfer
+        # matcher had in fact paired every card payment and EMI it found.
+        "transfer_report": detect_transfers(transactions, accounts),
     }
     payload = _build_payload(state)
-    payload["statements"] = all_statement_rows(db)
+    payload["statements"] = rows
     return remember_run(str(uuid.uuid4()), payload)
 
 
@@ -1174,6 +1252,19 @@ def list_transactions(
         month_end=period.end_month,
         flow_role=roles,
         merchant=merchant,
+        # A loan account's own statement is the lender's ledger, and it is
+        # not the holder's activity - see `FlowRole.LENDER_LEDGER`. It is
+        # kept out of every total already; this keeps it out of the LIST as
+        # well, which is what somebody means by "these should not be
+        # considered anywhere". One ICICI personal loan statement put 114
+        # rows of its own internal history into the Transactions tab - four
+        # years of instalments falling due and being received, none of them
+        # money the holder moved - and they read as ordinary spending.
+        #
+        # Only when the caller has not asked for a role explicitly. A panel
+        # that asks for `flow_role=lender_ledger` gets exactly that, so the
+        # loan's ledger is still there to look at.
+        exclude_flow_role=None if roles else [FlowRole.LENDER_LEDGER.value],
     )
     txns = repo.get_transactions(
         db, **filters, sort_by=sort_by, sort_dir=sort_dir,

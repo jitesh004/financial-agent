@@ -379,3 +379,107 @@ def test_a_nonsense_period_is_a_bad_request_not_a_server_fault():
     assert client.get("/api/analysis", params={"preset": "whenever"}).status_code == 400
     assert client.get("/api/transactions",
                       params={"start_month": "2026-99"}).status_code == 400
+
+
+# ==========================================================================
+# The rows a real import hands over have no ids yet
+# ==========================================================================
+
+def test_salary_drift_survives_rows_that_have_no_id_yet():
+    """Two salaries in one month, caught at the altitude it actually breaks.
+
+    This has been fixed more than once and kept coming back, because every
+    test of it built its own transactions - and a hand-built transaction is
+    given an id, while a freshly parsed one is not. `Transaction.id` was
+    filled in by `save_transactions`, at the very END of the import, so for
+    the whole of enrichment every real row carried `id = None`.
+
+    `assign_accounting_months` resolves a series' members by id and skips the
+    series when none resolve, so on the real path it skipped ALL of them,
+    silently. Under test it worked perfectly. On a rebuild from the database
+    it worked perfectly. Only on the one path that matters - parse, enrich,
+    save - did the salary paid on 31 August stay in August, next to the one
+    paid on 1 August, leaving September empty.
+
+    So this builds them the way the parser does: no ids. That is the whole
+    point of the test, and the reason it goes through `enrich_ledger` rather
+    than calling `assign_accounting_months` directly.
+    """
+    from app.db.database import get_db
+    from app.models.schemas import (Account, AccountType, ConfidenceSource,
+                                    Transaction)
+    from app.pipeline.enrich import enrich_ledger
+
+    fresh_ledger()
+    db = get_db()
+
+    # Paid on the 1st, pulled to the last working day when the 1st is not
+    # one. Exactly the shape of this employer's run.
+    paydays = [date(2026, 2, 1), date(2026, 3, 1), date(2026, 4, 1),
+               date(2026, 5, 1), date(2026, 5, 31), date(2026, 6, 30),
+               date(2026, 8, 1), date(2026, 8, 31)]
+
+    txns = [
+        Transaction(
+            id=None,                      # <- as the parser produces them
+            account_id="savings_1",
+            txn_date=day,
+            raw_description="ACME TECHNOLOGIES PRIVATE LIMITED SALARY",
+            normalized_description="ACME TECHNOLOGIES PRIVATE LIMITED SALARY",
+            amount=Decimal("167489"),
+            direction=Direction.CREDIT,
+            category=Category.SALARY,
+            category_source=ConfidenceSource.RULE,
+        )
+        for day in paydays
+    ]
+    accounts = {"savings_1": Account(
+        id="savings_1", institution="HDFC Bank",
+        account_type=AccountType.SAVINGS, account_number_masked="XXXX1234")}
+
+    result = enrich_ledger(db, txns, accounts, use_llm=False)
+
+    months = [t.accounting_month for t in result.transactions
+              if t.category == Category.SALARY]
+    doubled = {m for m in months if months.count(m) > 1}
+    assert not doubled, (
+        f"{sorted(doubled)} holds more than one salary. "
+        f"Months assigned: {sorted(months)}"
+    )
+
+    # And specifically: pay drawn on 31 August is September's.
+    august_31 = next(t for t in result.transactions
+                     if t.txn_date == date(2026, 8, 31))
+    assert august_31.accounting_month == "2026-09"
+
+    # Eight payments, eight consecutive months, none skipped.
+    assert sorted(months) == ["2026-02", "2026-03", "2026-04", "2026-05",
+                              "2026-06", "2026-07", "2026-08", "2026-09"]
+
+
+def test_enrichment_gives_every_row_an_id_before_anything_refers_to_one():
+    """The invariant behind the test above, stated on its own.
+
+    Recurring series, splits, transfer pairs and drift correction all refer
+    to rows by id. Any of them is a no-op on a row that has none, and a
+    no-op is indistinguishable from a correct answer.
+    """
+    from app.db.database import get_db
+    from app.models.schemas import (Account, AccountType, ConfidenceSource,
+                                    Transaction)
+    from app.pipeline.enrich import enrich_ledger
+
+    fresh_ledger()
+    txns = [Transaction(
+        id=None, account_id="savings_1", txn_date=date(2026, 3, 4),
+        raw_description="ANYTHING", normalized_description="ANYTHING",
+        amount=Decimal("100"), direction=Direction.DEBIT,
+        category=Category.SHOPPING,
+        category_source=ConfidenceSource.RULE)]
+    accounts = {"savings_1": Account(
+        id="savings_1", institution="HDFC Bank",
+        account_type=AccountType.SAVINGS, account_number_masked="XXXX1234")}
+
+    result = enrich_ledger(get_db(), txns, accounts, use_llm=False,
+                           run_analysis=False)
+    assert all(t.id for t in result.transactions)

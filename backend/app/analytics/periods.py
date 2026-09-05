@@ -545,6 +545,19 @@ def assign_accounting_months(
 
         members = [txn_by_id[tid] for tid in series.transaction_ids if tid in txn_by_id]
         if not members:
+            # Never a normal outcome. A monthly series exists because these
+            # transactions were found in this very list, so failing to
+            # resolve one of them means the rows carry no id - and this pass
+            # then does nothing at all, quietly, which is how two salaries
+            # in one month survived several rounds of being fixed.
+            #
+            # Said out loud rather than skipped in silence. `enrich_ledger`
+            # assigns ids before detection for exactly this reason.
+            logger.warning(
+                "Drift correction skipped for %r: none of its %d "
+                "transaction ids resolve against the ledger it was detected "
+                "from. Rows without ids cannot be shifted.",
+                series.label, len(series.transaction_ids))
             continue
 
         anchor = circular_median_day([m.txn_date for m in members])

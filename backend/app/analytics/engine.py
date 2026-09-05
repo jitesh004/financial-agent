@@ -21,7 +21,9 @@ from decimal import Decimal
 
 from ..models.schemas import (Account, AccountType, CATEGORY_GROUPS, Category,
                               CONTRA_EXPENSE_ROLES, Direction, FlowRole,
-                              INCOME_CATEGORIES, LIABILITY_TYPES, Transaction)
+                              NEUTRAL_ROLES,
+                              INCOME_CATEGORIES, LIABILITY_TYPES, LOAN_TYPES,
+                              Transaction)
 from ..rules import formats
 from . import periods
 
@@ -222,6 +224,7 @@ def analyze(
     start: date | None = None,
     end: date | None = None,
     period: "periods.Period | None" = None,
+    bureau_accounts: list[dict[str, Any]] | None = None,
 ) -> AnalysisResult:
     """Compute the full picture from a categorized, reconciled ledger.
 
@@ -255,7 +258,8 @@ def analyze(
             result.notes.append("No transactions available to analyze.")
         return result
 
-    txns = sorted(transactions, key=lambda t: t.txn_date)
+    txns = sorted(_without_lender_ledgers(transactions, accounts),
+                  key=lambda t: t.txn_date)
 
     # The span is measured over rows that COUNT. An excluded row is one
     # somebody looked at and rejected - a misread date, a duplicate, a figure
@@ -379,6 +383,14 @@ def analyze(
         as_at, missing = _net_worth_as_at(accounts, txns, transactions)
 
     if as_at is not None:
+        if as_at is not None:
+            owed = _unaccounted_debt(bureau_accounts, as_at)
+            if owed:
+                as_at["_liabilities"] = q(
+                    Decimal(str(as_at.get("_liabilities") or 0)) + owed)
+                as_at["_net"] = q(
+                    Decimal(str(as_at.get("_assets") or 0))
+                    - Decimal(str(as_at["_liabilities"])))
         result.net_worth = as_at
         result.net_worth_as_of = result.period_end
         result.net_worth_basis = "period"
@@ -388,7 +400,7 @@ def analyze(
         # a ledger of card statements, which mostly do not carry one. The
         # honest answer there is the latest figure there is, labelled as such.
         # Reporting zero would be a claim that the accounts are empty.
-        result.net_worth = _net_worth(accounts)
+        result.net_worth = _net_worth(accounts, bureau_accounts)
         result.net_worth_as_of = max(
             (a.balance_as_of for a in accounts.values() if a.balance_as_of),
             default=None)
@@ -437,8 +449,27 @@ def _monthly_flows(txns: list[Transaction]) -> list[MonthlyFlow]:
         elif role == FlowRole.INVESTMENT:
             b["invested"] = b["invested"] + _spend_val(t)
 
+        # Every debit that is really the holder's money leaving, once.
+        #
+        # `NEUTRAL_ROLES` is the list of roles that are not a flow of their
+        # own money in either direction, and naming it here rather than
+        # spelling out two or three of its members is what keeps this in step
+        # with the rest of the app. Two roles it adds that this used to miss:
+        #
+        #   LENDER_LEDGER  an EMI on the LOAN's own statement, the far side
+        #                  of the payment the bank account already recorded.
+        #   TRANSFER_OUT   money moving between the holder's own accounts -
+        #                  including a card bill. The purchases that bill
+        #                  pays for are already counted from the card's
+        #                  statement, so counting the payment too charged
+        #                  this holder twice: the Cashflow chart showed 5.5
+        #                  lakh of outflow that never left, and the forecast,
+        #                  which reads this figure to size discretionary
+        #                  spending, projected 3.8 lakh a month of it against
+        #                  a real 2.3 - and had the holder 19 lakh overdrawn
+        #                  by March on a ledger that saves 16% of income.
         if (t.direction == Direction.DEBIT and not t.is_mirror_leg
-                and role not in {FlowRole.EXCLUDED, FlowRole.CARD_SETTLEMENT}):
+                and role not in NEUTRAL_ROLES):
             b["outflow"] = b["outflow"] + t.amount
 
     out = []
@@ -635,7 +666,112 @@ def _days_to_half(salary: Transaction, outflows: list[Transaction]) -> int | Non
 # Net worth and anomalies
 # --------------------------------------------------------------------------
 
-def _net_worth(accounts: dict[str, Account]) -> dict[str, Decimal]:
+#: Bureau match states that mean a ledger account already covers the line.
+#: Mirrors `analytics.position._ATTRIBUTED`, and for the same reason: a line
+#: the matcher can plausibly attribute is not a second debt.
+_BUREAU_ATTRIBUTED = frozenset({"auto", "confirmed", "suggested"})
+
+
+def _unaccounted_debt(bureau_accounts, detail: dict) -> Decimal:
+    """Debt a lender reports that no tracked account covers.
+
+    Net worth read the ledger alone, and the ledger only knows about accounts
+    whose statements have been imported. This holder's largest liability by
+    far - a 66.7 lakh home loan - has never had a statement imported at all;
+    it is known only because a lender reported it to a bureau. Left out, the
+    Overview said 14.2 lakh to the good while the Position tab, which does
+    count it, said 68.4 lakh owed. Two screens, one question, a 67 lakh gap.
+
+    A missing figure is not a zero anywhere else in this app, and it is not
+    one here. Each such debt is named in the breakdown alongside the tracked
+    accounts, marked as the bureau's word rather than a statement's, because
+    it has not been through the reconciliation gate and nothing here should
+    imply it has.
+    """
+    total = ZERO
+    for line in bureau_accounts or []:
+        if (line.get("status") or "open") != "open":
+            continue
+        if line.get("account_id") or \
+                (line.get("match_status") or "") in _BUREAU_ATTRIBUTED:
+            continue
+        try:
+            owed = Decimal(str(line.get("current_balance") or 0))
+        except Exception:
+            continue
+        if owed <= 0:
+            continue
+        lender = str(line.get("lender") or "a lender").title()
+        kind = str(line.get("account_type") or "account").replace("_", " ")
+        detail[f"{lender} {kind} (reported by the bureau)"] = q(-owed)
+        total += owed
+    return total
+
+
+def mark_lender_ledgers(
+    transactions: list[Transaction],
+    accounts: dict[str, Account],
+) -> int:
+    """Stamp every row that belongs to a LENDER rather than to the holder.
+
+    Public, and called from both places that assemble a ledger - the import
+    and the rebuild-from-database - because a fact applied by only one of
+    them is a fact the app disagrees with itself about. It did: the import
+    knew these rows were the lender's and the rebuild did not, so correcting
+    a single transaction anywhere in the app silently put four years of a
+    loan account's internal history back into this month's spending.
+
+    Returns how many rows were stamped, so a caller can say so.
+    """
+    lender_ledgers = {
+        account_id for account_id, account in (accounts or {}).items()
+        if getattr(account, "account_type", None) in LOAN_TYPES
+    }
+    if not lender_ledgers:
+        return 0
+    marked = 0
+    for txn in transactions:
+        if txn.account_id in lender_ledgers:
+            txn.flow_role = FlowRole.LENDER_LEDGER.value
+            marked += 1
+    return marked
+
+
+def _without_lender_ledgers(
+    transactions: list[Transaction],
+    accounts: dict[str, Account],
+) -> list[Transaction]:
+    """Drop rows that belong to a LOAN account rather than to the holder.
+
+    A loan account statement is the lender's ledger, not the borrower's cash
+    flow. Its rows are the disbursement arriving, each EMI being received and
+    interest being charged - and every one of those is the far side of a
+    movement the funding account has already recorded. The EMI leaving the
+    savings account is the holder's outflow; the same EMI arriving at the
+    lender is not a second one.
+
+    This is the same double-count the transfer matcher prevents between a
+    card and the account that pays its bill, but the matcher cannot see it:
+    a loan statement's rows have no counterpart to pair with unless both
+    sides happen to have been imported, and the disbursement has no
+    counterpart at all - it would have read as 75 lakh of income.
+
+    A loan account is still read, still projected and still counted as debt.
+    What it does not do is contribute to income or spending.
+    """
+    if not accounts:
+        return list(transactions)
+    lender_ledgers = {
+        account_id for account_id, account in accounts.items()
+        if getattr(account, "account_type", None) in LOAN_TYPES
+    }
+    if not lender_ledgers:
+        return list(transactions)
+    return [t for t in transactions if t.account_id not in lender_ledgers]
+
+
+def _net_worth(accounts: dict[str, Account],
+               bureau_accounts=None) -> dict[str, Decimal]:
     assets, liabilities = ZERO, ZERO
     detail: dict[str, Decimal] = {}
 
@@ -649,6 +785,8 @@ def _net_worth(accounts: dict[str, Account]) -> dict[str, Decimal]:
         else:
             assets += signed
         detail[label] = q(signed)
+
+    liabilities += _unaccounted_debt(bureau_accounts, detail)
 
     detail["_assets"] = q(assets)
     detail["_liabilities"] = q(liabilities)

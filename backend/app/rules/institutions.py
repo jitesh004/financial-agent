@@ -125,7 +125,14 @@ REGISTRY: tuple[Institution, ...] = (
                 _ALL, password="Name(4) + DDMM"),
     Institution("Kotak Mahindra Bank", KIND_BANK, ("kotak",), _ALL,
                 password="Name(4) + DDMM"),
-    Institution("Yes Bank", KIND_BANK, ("yes", "yesbank", "yes.bank",
+    # No bare "yes". Every other fragment in this registry is a coined name
+    # - "kotak", "indusind", "idfc" - that appears in a document only when
+    # the institution does. "yes" is an ordinary English word, and it is the
+    # word forms answer themselves with: a depository client-master report
+    # says "Purchase Waiver YES", "SMS Registered YES", "Email DL Flag YES",
+    # and every one of those matched. That report was filed under Yes Bank,
+    # and so was anything else carrying a yes/no field.
+    Institution("Yes Bank", KIND_BANK, ("yesbank", "yes.bank",
                                         "yes bank"), _ALL,
                 password="Name(4) + DDMM"),
     Institution("IndusInd Bank", KIND_BANK, ("indusind",), _ALL,
@@ -227,6 +234,15 @@ REGISTRY: tuple[Institution, ...] = (
     Institution("CAMS", KIND_BROKER, ("cams", "cams.", "camsonline", "karvy"),
                 (SENDS_STATEMENT, SENDS_INVESTMENT), password="PAN",
                 portfolio_layout="cams"),
+    # KFintech's OTHER hat. The same company is a mutual fund registrar
+    # (statements keyed on PAN, matched by "kfintech" below) and a central
+    # recordkeeper for NPS, which mails from KCRA@ and protects the statement
+    # with the PRAN instead - a number this app cannot derive from anything
+    # it holds. Listed separately, before the registrar, so the file is
+    # reported as needing a PRAN rather than as a PAN that did not work.
+    Institution("KFintech CRA (NPS)", KIND_BROKER, ("kcra", "kfintech cra"),
+                (SENDS_INVESTMENT,), password="PRAN",
+                portfolio_layout="nps"),
     Institution("KFintech", KIND_BROKER, ("kfintech", "kfin technologies"),
                 (SENDS_STATEMENT, SENDS_INVESTMENT), password="PAN",
                 portfolio_layout="kfintech"),
@@ -238,7 +254,8 @@ REGISTRY: tuple[Institution, ...] = (
                 (SENDS_STATEMENT, SENDS_INVESTMENT), password="PAN",
                 portfolio_layout="cas"),
     Institution("Protean NPS", KIND_BROKER, ("protean", "proteantech"),
-                (SENDS_INVESTMENT,), password="PAN"),
+                (SENDS_INVESTMENT,), password="PAN",
+                portfolio_layout="nps"),
     Institution("MF Central", KIND_BROKER, ("mfcentral", "mf central"),
                 (SENDS_INVESTMENT,), password="PAN"),
 
@@ -440,6 +457,32 @@ def bureau_signatures() -> tuple[tuple[str, tuple[str, ...]], ...]:
 #: CDSL names the brokers whose holdings it consolidates, and reading it as a
 #: broker's own statement picks the wrong column map.
 LAYOUT_ORDER: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    # EPF first, and by phrase. A UAN passbook is a HOLDING - a retirement
+    # corpus - but it is laid out like a ledger, with a dated row per
+    # contribution and a running total, so the statement reader claimed it
+    # and read its closing balance as 31 rupees against a real 4.17 lakh.
+    # Nothing else in this list prints "member id" or a UAN.
+    ("epf", "EPFO",
+     ("employees provident fund", "epf passbook", "member id",
+      "uan number", "universal account number",
+      "provident fund organisation")),
+    # NPS is tried first, and by PHRASE rather than by issuer. A CAS mentions
+    # NPS in its own title ("...and investments in NPS"), so the issuer name
+    # decides nothing; and both central recordkeepers - Protean and KFintech
+    # - issue the same PFRDA-mandated statement, so keying on either one
+    # would miss the other. What the document calls itself is the fact.
+    ("nps", "NPS",
+     ("nps transaction statement", "national pension system",
+      "permanent retirement account", "nps account for the period",
+      # Phrases from the TABLES, not only the cover page. A retry re-reads a
+      # file from its extracted tables, where the title has gone - so an NPS
+      # statement recognisable only by its heading was routed correctly out
+      # of the mailbox and read as a bank statement out of a retry.
+      #
+      # Each of these is absent from a CAS, which is the document most at
+      # risk of being caught by a loose one: a CAS does mention NPS, and
+      # prints the word PRAN in its closing notes, so neither is usable.
+      "subscriber name", "tier i status", "value of your holdings")),
     ("cas", "CDSL/NSDL",
      ("consolidated account statement", "demat account", "depository")),
     ("cams", "CAMS", ("consolidated portfolio",)),

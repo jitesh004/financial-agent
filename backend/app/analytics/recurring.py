@@ -69,7 +69,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal
 
-from ..models.schemas import Category, Direction, Transaction
+from ..models.schemas import Category, Direction, FlowRole, Transaction
 from ..rules import formats, instalments
 
 # ---------------------------------------------------------------------------
@@ -396,8 +396,13 @@ class CadenceFit:
     coverage: float
     #: Periods in the span with no charge at all.
     missed: int
-    #: Periods holding more than one charge - proof this period is too long.
+    #: Periods holding more than one charge. NOT proof the period is too
+    #: long: an annual bonus paid alongside a monthly salary collides once
+    #: in twelve, and the salary is still monthly.
     collisions: int
+    #: How many periods held at least one payment. Weighs a collision
+    #: against the length of the series - see `score`.
+    occupied: int
     anchor_day: int | None
     #: Set instead of a fixed day when the series is anchored to the END of
     #: the month - "the last working day" - and says how many days back.
@@ -419,8 +424,26 @@ class CadenceFit:
         meter is read - is still monthly, and a full-weight anchor threw
         those away.
         """
-        collision_rate = self.collisions / max(1, self.collisions + self.missed
-                                               + 1)
+        # A collision is judged against HOW MANY periods there are, not
+        # against a constant.
+        #
+        # The old denominator was `collisions + missed + 1`, so the very
+        # first extra payment halved the score however long the series ran -
+        # one unscheduled payment in twelve months counted the same as one
+        # in two. It cost this ledger its salary: twelve payments on the 1st
+        # plus an annual bonus paid on 15 June put two dates in one monthly
+        # slot, the fit fell to 0.47, and the forecast's confidence floor
+        # dropped the most dependable income anyone has. Committed income
+        # came out as 915 rupees of bank interest against 1.9 lakh of
+        # outgoings, and the projection said the holder was spending two
+        # hundred times what they earned.
+        #
+        # An extra payment is not a broken rhythm. The schedule was kept -
+        # something additional happened alongside it - so what this measures
+        # is the share of payments that were unscheduled, which for a bonus
+        # is one in thirteen rather than one in two.
+        collision_rate = self.collisions / max(
+            1, self.occupied + self.collisions)
         return round(
             self.regularity
             * (0.5 + 0.5 * self.day_fit)
@@ -578,8 +601,8 @@ def _fit_one(dates: list[date], candidate: Candidate) -> CadenceFit | None:
 
     return CadenceFit(candidate=candidate, regularity=regularity,
                       day_fit=day_fit, coverage=coverage, missed=missed,
-                      collisions=collisions, anchor_day=anchor,
-                      anchor_from_end=from_end)
+                      collisions=collisions, occupied=occupied,
+                      anchor_day=anchor, anchor_from_end=from_end)
 
 
 # ---------------------------------------------------------------------------
@@ -841,7 +864,14 @@ def _countable(txn: Transaction) -> bool:
     # without this check it showed up as its own "recurring series" - a
     # phantom entry nobody could act on, sitting in the same list as their
     # actual subscriptions and EMIs.
-    return not txn.excluded
+    if txn.excluded:
+        return False
+    # A loan account's own statement repeats the holder's EMI from the
+    # lender's side. Both legs are perfectly regular and identical in amount,
+    # so both are found - and the Recurring list showed the same 42,850 twice,
+    # once as "BIL/Personal Loan XX24899 EMI" and once as "EMI Due for Inst.3",
+    # doubling the committed outflow for a loan with one instalment left.
+    return txn.flow_role != FlowRole.LENDER_LEDGER.value
 
 
 def _merge_variants(

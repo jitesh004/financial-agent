@@ -1026,7 +1026,12 @@ CREATE TABLE IF NOT EXISTS holdings (
     PRIMARY KEY (user_id, id),
     -- One row per instrument per folio per valuation date: re-importing the
     -- same statement updates the position rather than adding a second copy.
-    UNIQUE (user_id, account_id, isin, folio, as_of),
+    --
+    -- `instrument` is in the key because it is the only thing that separates
+    -- two holdings that carry no ISIN and no folio number - an NPS
+    -- subscriber's three schemes, which the narrower key collapsed into one.
+    CONSTRAINT holdings_identity
+        UNIQUE (user_id, account_id, isin, folio, instrument, as_of),
     FOREIGN KEY (user_id, statement_id)
         REFERENCES portfolio_statements(user_id, id) ON DELETE CASCADE,
     FOREIGN KEY (user_id, account_id)

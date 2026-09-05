@@ -65,6 +65,26 @@ def test_custom_passwords_are_tried_first():
     assert derive_passwords(profile)[0] == "myexactpassword"
 
 
+def test_custom_passwords_stay_first_once_the_issuer_is_known():
+    """The half of that claim that was not true.
+
+    With no institution the candidate list came back untouched and the user's
+    own password led it. With one, `_prioritise` re-sorted on shape alone and
+    knew nothing about where a candidate came from - so a password with no
+    letters in it, which is what an NPS PRAN is, sorted below every
+    name-and-digits guess and went from first to 121st. Each of those is a
+    decrypt attempt against a password already known to be wrong, and the
+    profile promises the opposite: tried before the derived candidates, so an
+    odd format is never a blocker.
+    """
+    profile = UserProfile(full_name="Asha Rao", date_of_birth=date(1990, 1, 1),
+                          pan="ABCDE1234F", mobile="9000000000",
+                          custom_passwords=["400080396530"])
+    for institution in (None, "KFintech", "HDFC Bank", "ICICI"):
+        candidates = derive_passwords(profile, institution)
+        assert candidates[0] == "400080396530",             f"demoted to {candidates.index('400080396530') + 1} for {institution}"
+
+
 def test_empty_profile_yields_nothing():
     assert derive_passwords(UserProfile()) == []
     assert derive_passwords(None) == []

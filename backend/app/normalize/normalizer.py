@@ -21,8 +21,8 @@ from datetime import date
 from decimal import Decimal
 
 from ..models.schemas import (Account, AccountType, Direction, ExtractedTable,
-                              ExtractionResult, LIABILITY_TYPES, SourceFormat,
-                              Statement, Transaction)
+                              ExtractionResult, LIABILITY_TYPES, LOAN_TYPES,
+                              SourceFormat, Statement, Transaction)
 from ..rules import directions, formats
 from .column_map import (ColumnMapping, find_header_row, infer_roles_from_data,
                          is_header_text, looks_like_header, map_columns)
@@ -56,6 +56,14 @@ def _apply_balance_to_account(account: Account, account_type: AccountType,
     """
     if statement.closing_balance is None:
         return
+    if account_type in LOAN_TYPES and account.principal_outstanding is not None:
+        # A loan statement's closing balance is not what is owed. Its ledger
+        # runs every instalment as a matched pair - the EMI falling due
+        # against the receipt that settles it - so it closes at zero however
+        # much principal is left, and the letterhead is the only part of the
+        # document that states the outstanding. Read there first
+        # (`loan_letterhead`), and not overwritten with the zero here.
+        return
     if account_type in LIABILITY_TYPES:
         account.principal_outstanding = statement.closing_balance
     else:
@@ -77,7 +85,8 @@ def normalize(
     """
 
     meta = extract_metadata(
-        _metadata_text(extraction), filename=filename, sender=sender
+        _metadata_text(extraction), filename=filename, sender=sender,
+        full_text=_whole_text(extraction),
     )
     account_type = account_type_hint or meta.account_type or AccountType.UNKNOWN
 
@@ -108,6 +117,26 @@ def normalize(
     # statement for a dormant account that says "No transactions found" with
     # every total at zero. Reporting that as a parse FAILURE is wrong: nothing
     # failed, and it sends the user hunting for a bug that isn't there.
+    # A LOAN statement's letterhead states the loan's terms; its ledger does
+    # not. Read before anything else uses the account, because it also
+    # corrects the account NUMBER - see `normalize.loan_letterhead`.
+    if account_type in LOAN_TYPES:
+        from . import loan_letterhead
+
+        facts = loan_letterhead.parse(_whole_text(extraction))
+        if facts is not None:
+            if facts.account_number:
+                account.account_number_masked = facts.account_number
+            if facts.interest_rate is not None:
+                account.interest_rate = facts.interest_rate
+            if facts.emi is not None:
+                account.emi_amount = facts.emi
+            if facts.outstanding is not None:
+                account.principal_outstanding = facts.outstanding
+                account.balance_as_of = meta.period_end
+            if facts.months_remaining is not None:
+                account.tenure_months_remaining = facts.months_remaining
+
     if _looks_empty(extraction.full_text):
         statement.extra["empty_statement"] = True
         statement.parse_warnings.append(
@@ -195,6 +224,23 @@ def _looks_empty(text: str) -> bool:
 #: How much of the document counts as "letterhead" for metadata purposes.
 _HEAD_LINES = 45
 _TAIL_LINES = 15
+
+
+def _whole_text(extraction: ExtractionResult) -> str:
+    """Every word the document produced, prose and table cells alike.
+
+    The opposite of `_metadata_text`, and used for the opposite reason: only
+    for labels that cannot occur in a transaction narration, to fill a gap
+    the windowed read left. A card's PAYMENT SUMMARY is often drawn as a
+    table, so its credit limit exists only in the cells - the prose has the
+    heading "Credit Card Number Credit Limit Available Credit Limit" and no
+    figure anywhere near it.
+    """
+    parts = [extraction.full_text or ""]
+    for table in extraction.tables or []:
+        for row in getattr(table, "rows", []) or []:
+            parts.append(" ".join(str(cell) for cell in row if cell))
+    return "\n".join(parts)
 
 
 def _metadata_text(extraction: ExtractionResult) -> str:

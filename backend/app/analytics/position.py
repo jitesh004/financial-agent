@@ -529,6 +529,7 @@ def build(items: list[dict[str, Any]], accounts: list[Any],
                 for b in bureau_accounts
                 if b["id"] not in claimed_bureau
                 and (b.get("status") or "open") == "open"
+                and not _is_attributed(b)
             ],
             "accounts": [
                 {"id": a.id, "name": a.display_name(),
@@ -618,11 +619,18 @@ def _totals(aged: list[AgedItem]) -> dict[str, Any]:
         "is_complete": not (loans_unknown or cards_unknown or assets_unknown),
         # The furthest-out payoff across every loan: when this person stops
         # owing anybody anything at the current instalments.
-        "debt_free_on": max(
-            (a.payoff_date for a in loans if a.payoff_date), default=None),
-        "next_due_on": min(
-            (a.next_due_on for a in cards if a.next_due_on), default=None),
-        "reviewed_oldest": min((a.reviewed_on for a in aged), default=None),
+        #
+        # ISO strings, like every date `_item_json` emits. `build` returns
+        # JSON and these three were the only raw `date`s left in it - which
+        # is invisible over HTTP, because FastAPI encodes them on the way
+        # out, and fatal anywhere else: an agent reading position() carried
+        # them into its transcript and the whole run failed to store.
+        "debt_free_on": _iso(max(
+            (a.payoff_date for a in loans if a.payoff_date), default=None)),
+        "next_due_on": _iso(min(
+            (a.next_due_on for a in cards if a.next_due_on), default=None)),
+        "reviewed_oldest": _iso(min((a.reviewed_on for a in aged),
+                                    default=None)),
         "stale_count": sum(1 for a in aged if a.stale),
         "drifting_count": sum(1 for a in aged if a.drift is not None),
     }
@@ -651,6 +659,10 @@ def _money(value: Decimal | None) -> float | None:
     if value is None:
         return None
     return float(round(Decimal(value), 2))
+
+
+def _iso(value: date | None) -> str | None:
+    return value.isoformat() if value else None
 
 
 def _dec(value: Any) -> Decimal | None:
@@ -685,6 +697,31 @@ def _as_date(value: Any) -> date | None:
 # ---------------------------------------------------------------------------
 # The first draft
 # ---------------------------------------------------------------------------
+
+#: Bureau match states that mean something in the ledger probably already
+#: covers this line.
+#:
+#: `account_id` alone is not that question. It is set only for an AUTOMATIC
+#: link, and an automatic link needs digits that agree - which for a credit
+#: card they never do: CRIF reports an internal account reference
+#: ("0000000014274199") where the statement reports the card's last four
+#: ("XXXX5001"), so the strongest evidence available is that the lender and
+#: the account type agree. The matcher scores that 0.55 and offers it rather
+#: than applying it, because a holder with four Axis cards would otherwise
+#: get them silently swapped.
+#:
+#: Treating "offered" as "unaccounted for" is what filled this screen with
+#: sixteen bureau cards beside the fifteen ledger cards they describe, and
+#: added 81 lakh of debt that is mostly one set of cards counted twice.
+#: A maybe belongs on the suggestions list, not in the totals.
+_ATTRIBUTED = frozenset({"auto", "confirmed", "suggested"})
+
+
+def _is_attributed(bureau: dict[str, Any]) -> bool:
+    """Whether the ledger already appears to account for this bureau line."""
+    return bool(bureau.get("account_id")) or \
+        (bureau.get("match_status") or "") in _ATTRIBUTED
+
 
 def seed(accounts: list[Any], bureau_accounts: list[dict[str, Any]],
          projections: list[Any], *, as_of: date | None = None,
@@ -771,8 +808,8 @@ def seed(accounts: list[Any], bureau_accounts: list[dict[str, Any]],
             continue
         if (bureau.get("status") or "open") != "open":
             continue
-        if bureau.get("account_id"):
-            continue  # already matched to a ledger account, drafted above
+        if _is_attributed(bureau):
+            continue  # the ledger already covers this - see _ATTRIBUTED
         order += 1
         kind = "card" if "card" in (bureau.get("account_type") or "").lower() \
             else "loan"

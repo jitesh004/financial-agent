@@ -28,6 +28,7 @@ Order matters at two points in particular:
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -75,13 +76,14 @@ def enrich_ledger(
     `progress` is an optional callback taking a phase label, so the Gmail job
     can report where it is without this module knowing anything about jobs.
     """
-    from ..analytics.engine import analyze
+    from ..analytics.engine import analyze, mark_lender_ledgers
     from ..analytics.periods import assign_accounting_months
     from ..analytics.recurring import detect_recurring
     from ..analytics import forecast as forecast_mod
     from ..analytics import loans as loans_mod
     from ..categorize.rules import categorize_by_rules, fallback_category
     from ..reconcile.settlement import match_settlements
+    from ..reconcile.settlement import card_purchases_already_counted
     from ..reconcile.transfers import (detect_reversals, detect_transfers,
                                        find_duplicate_transactions)
 
@@ -139,7 +141,59 @@ def enrich_ledger(
         result.transactions = transactions
         result.warnings.append(f"Dropped {artifact_count} parser artifact(s).")
 
-    # 2. Content identity, before anything wants to look a decision up by it.
+    # 1c. Mark the rows that belong to a LENDER rather than to the holder.
+    #
+    # Done HERE, once, before anything reads the ledger - and that placement
+    # is the whole point. `analyze()` has always dropped these internally,
+    # which meant the dashboard's totals were right while every other reader
+    # of the same list was wrong: recurring detection billed this holder for
+    # their car loan twice (the EMI leaving the bank account, and the very
+    # same EMI arriving at ICICI, 42,850 each, listed one above the other),
+    # the category breakdown counted four years of a loan's internal history
+    # as this year's spending, and the Transactions tab showed all 114 rows
+    # of it as though the holder had spent the money.
+    #
+    # One fact, applied at the altitude where the fact is true, instead of
+    # re-applied by each consumer that happens to remember.
+    marked = mark_lender_ledgers(transactions, accounts)
+    if marked:
+        result.warnings.append(
+            f"{marked} row(s) from loan account statements are the lender's "
+            f"own ledger and are not counted as income or spending. The loan "
+            f"is still tracked as debt.")
+
+    # 2. Identity, before anything wants to refer to a row.
+    #
+    # ROW identity first. `Transaction.id` used to be filled in by
+    # `save_transactions`, at the very end - so for the whole of enrichment
+    # every freshly parsed row had `id = None`, and anything that referred to
+    # a row by id referred to nothing.
+    #
+    # `assign_accounting_months` is built on exactly that reference. It reads
+    # `series.transaction_ids`, looks each one up, and skips the series if it
+    # resolves nothing:
+    #
+    #     txn_by_id = {t.id: t for t in transactions if t.id}   # empty
+    #     members = [txn_by_id[tid] for tid in series.transaction_ids ...]
+    #     if not members: continue
+    #
+    # So salary-drift correction silently did nothing on every import, and
+    # this holder was paid on 1 August and again on 31 August - two salaries
+    # counted in August, none in September, which is the precise failure that
+    # whole module exists to prevent. It looked fixed under test because a
+    # test builds rows that already carry ids, and it looked fixed on a
+    # rebuild because rows read back from the database have them. Only the
+    # real import path ran with None, and that is the only path that matters.
+    #
+    # An id here is per-rebuild, which is what it has always been: the
+    # staging pipeline clears the ledger and re-inserts it, so nothing
+    # outside this run holds one. What a human decided is keyed by
+    # fingerprint, stamped just below, and is unaffected.
+    for txn in transactions:
+        if not txn.id:
+            txn.id = str(uuid.uuid4())
+
+    # Then content identity, so a decision can be looked up by it.
     stamp_fingerprints(transactions, accounts)
 
     # 2b. Expand any split transaction into its parts, keyed by the
@@ -288,13 +342,37 @@ def enrich_ledger(
                     "else paid this bill. Counted as settling the card, not "
                     "as income."
                 )
+            elif card_purchases_already_counted(
+                    txn.txn_date, accounts, statements_by_account):
+                # The bill this settles has already been imported, so the
+                # purchases on it are already counted as spending. Counting
+                # the payment as well charges the holder twice for the same
+                # money - which is what happened here: August's card bills
+                # were paid through CRED on 2 September, and 6.27 lakh of
+                # bill payments were added on top of the purchases those
+                # bills were made of. It made card payments the second
+                # largest "category" of spending in the whole ledger.
+                #
+                # A transfer, then, not an expense: money moving from the
+                # bank account to settle a liability the app already tracks.
+                # Still flagged, because the far leg has not been seen and
+                # the holder may know something the ledger does not.
+                txn.flow_role = FlowRole.TRANSFER_OUT.value
+                txn.review_reason = (
+                    "Counted as settling your card, not as spending: a "
+                    "statement for one of your cards closed shortly before "
+                    "this, so the purchases this bill pays for are already "
+                    "in your totals. The card's own record of the payment "
+                    "will arrive on its next statement."
+                )
             else:
                 txn.review_reason = (
                     "This card-bill payment has no matching entry on the "
-                    "card's own statement, so it is counted as spending - "
-                    "the only record available without that statement. "
-                    "Connecting it would let this be excluded as a transfer "
-                    "instead."
+                    "card's own statement, and no card statement has closed "
+                    "recently either - so the purchases behind it were never "
+                    "imported and this is the only record that money was "
+                    "spent. Counted as spending. Import that card's "
+                    "statement and this becomes a transfer instead."
                 )
 
     if not run_analysis:

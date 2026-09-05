@@ -152,7 +152,8 @@ DOC_PORTFOLIO = "portfolio"
 DOC_UNREADABLE = "unreadable"
 
 
-def classify_document(text: str, filename: str = "") -> str:
+def classify_document(text: str, filename: str = "",
+                      full_text: str = "") -> str:
     """Which reader should handle this document.
 
     Order matters. A bureau report mentions credit limits and balances often
@@ -160,6 +161,19 @@ def classify_document(text: str, filename: str = "") -> str:
     statement carries - so the two specific tests run first and the statement
     pipeline is the fallback, which is also the safe default: it is the only
     one with a reconciliation gate to catch its own mistakes.
+
+    The two tests want DIFFERENT text, which is why `full_text` exists.
+
+    A bureau report announces itself in prose - "Consumer Credit Report",
+    "Credit Information Report" - and its tables say only what any statement
+    says, so it must be judged on the whole document or not at all. Given
+    tables alone, a real CRIF report classified as a bank statement.
+
+    A holdings statement is the opposite: judged on the whole document, a
+    mutual fund's monthly statement is reclassified by its own letterhead
+    ("Mutual Fund Consolidated Account Statement") when its body is a year
+    of SIP purchases that belong in the ledger. So that test keeps the
+    tables - see `text_of`.
     """
     from .bureau import looks_like_bureau_report
     from .portfolio import looks_like_portfolio, looks_like_trades
@@ -171,7 +185,7 @@ def classify_document(text: str, filename: str = "") -> str:
     if not (text or "").strip():
         return DOC_UNREADABLE
 
-    if looks_like_bureau_report(text, filename):
+    if looks_like_bureau_report(full_text or text, filename):
         return DOC_BUREAU
     # A record of TRADES is neither a ledger nor a portfolio: its quantities
     # are what changed hands and its "rate" may be a strike price. Checked
@@ -184,14 +198,39 @@ def classify_document(text: str, filename: str = "") -> str:
 
 
 def text_of(result: "ExtractionResult") -> str:
-    """All the text an extraction produced, tables included.
+    """The text `classify_document` reads: the TABLES, and nothing above them.
 
-    Classification needs to see everything: the marker that identifies a
-    document is as likely to be inside a table cell as in the running text,
-    depending on how the issuer laid the page out.
+    Deliberately not the whole document, which is the surprising part and so
+    is worth stating. A statement's cover matter says what the issuer would
+    like the document to be called; its tables say what it actually contains,
+    and where the two disagree the tables are right.
+
+    A mutual fund's monthly statement is the case that settles it. Its
+    heading reads "Mutual Fund Consolidated Account Statement" and it prints
+    a units-and-NAV summary underneath - every signal of a holdings
+    document - and then the body is a dated ledger of SIP purchases with a
+    running balance, which is a statement and has to reach the ledger as one.
+    Reading the heading reclassified it, and a year of SIPs stopped being
+    transactions.
+
+    A reader that has already been TOLD what kind of document it has wants
+    everything; that is `full_text_of`.
     """
-    text = getattr(result, "text", "") or ""
+    text = ""
     for table in getattr(result, "tables", []) or []:
         for row in getattr(table, "rows", []) or []:
             text += "\n" + " ".join(str(cell) for cell in row if cell)
     return text
+
+
+def full_text_of(result: "ExtractionResult") -> str:
+    """Everything an extraction produced - the running text and the tables.
+
+    For readers past the classification step, which know what they are
+    holding and need the fields a document prints outside its tables: a CAS
+    puts its grand total in a table but an NPS statement prints its valuation
+    date in prose, and a reader that saw only tables would date the holdings
+    from nothing.
+    """
+    text = getattr(result, "full_text", "") or getattr(result, "text", "") or ""
+    return text + text_of(result)

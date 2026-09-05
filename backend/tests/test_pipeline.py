@@ -824,6 +824,58 @@ def test_retry_parses_a_previously_failed_file_into_the_ledger(tmp_path):
         db_module._db = original
 
 
+def test_retry_routes_a_holdings_statement_to_the_portfolio(tmp_path):
+    """Retry is what a user presses after supplying a password, so the file
+    they have just unlocked must not come back looking broken.
+
+    This path went straight to the bank-statement reader without ever asking
+    what the document was. A holdings statement therefore extracted fine,
+    produced no transactions because it has none, and was reported as "Table
+    found but no rows parsed" - while the mailbox path, which does classify,
+    read the very same file into the portfolio without complaint.
+    """
+    from app.api import files_routes
+    from app.db import database as db_module
+    from app.db import repository as repo
+    from app.models.schemas import ExtractedTable, ExtractionResult
+
+    extraction = ExtractionResult(
+        full_text="NSDL Consolidated Account Statement\n"
+                  "Holdings as on 31-Jul-2026\n"
+                  "Total Portfolio Value: Rs. 1,54,530.00\n",
+        tables=[ExtractedTable(rows=[
+            ["ISIN", "Security Name", "Quantity", "Closing Price",
+             "Market Value"],
+            ["INE002A01018", "RELIANCE INDUSTRIES LTD", "50", "1,450.00",
+             "72,500.00"],
+            ["INE467B01029", "TATA CONSULTANCY SERVICES", "20", "4,101.50",
+             "82,030.00"],
+        ])],
+    )
+
+    original = db_module._db
+    try:
+        _client, db = _isolated_app_db(tmp_path)
+        record = repo.SourceFileRecord(
+            id="f1", filename="cas.pdf", filepath=str(tmp_path / "cas.pdf"),
+            parse_status="failed", error_message="was read as a ledger")
+        repo.upsert_source_file(db, record)
+
+        body = files_routes.merge_extracted_file_into_ledger(
+            db, record, extraction, None, "not_encrypted", "hash-cas")
+
+        assert body["status"] == "parsed", body.get("message")
+        assert body["kind"] == "portfolio"
+        assert body["holdings"] == 2
+        assert body["reconciliation"] == "passed", body["message"]
+
+        assert len(repo.get_holdings(db)) == 2
+        assert repo.count_transactions(db) == 0, \
+            "a holdings statement has none, and must not invent any"
+    finally:
+        db_module._db = original
+
+
 def test_upi_rail_filter_still_respects_the_account_filter(tmp_path):
     """Regression: an unparenthesized OR inside the rail clause let SQL's
     AND-binds-tighter-than-OR rule silently drop the account_id restriction

@@ -47,6 +47,12 @@ _COMPATIBLE: dict[str, set[str]] = {
 #: expected and must never be surfaced as a gap.
 NOT_REPORTED_BY_BUREAUS = {"savings", "current", "wallet", "investment", "unknown"}
 
+#: How far two credit limits may differ and still be the same card. A limit
+#: is raised between statements, and the bureau's copy is a month or two
+#: behind - but an increase is thousands, not tens, so a small gap is the
+#: same card and a large one is a different card.
+_LIMIT_TOLERANCE = Decimal("1000")
+
 AUTO_LINK_CONFIDENCE = 0.9
 SUGGEST_CONFIDENCE = 0.5
 
@@ -100,8 +106,26 @@ def score_pair(bureau: Any, account: Any) -> tuple[float, str]:
     if same_suffix:
         return 0.9, f"last 4 digits ({b_suffix}) match, lender name differs"
     if same_lender and b_type == a_type and b_type != "unknown":
-        # No digits to go on. Real often enough to offer, never enough to
-        # apply: a person with two HDFC cards would get them silently swapped.
+        # No digits to go on - and for a credit card there never are any.
+        # A bureau reports an internal account reference ("0000000014274199")
+        # where a statement reports the card's last four ("XXXX5001"), so
+        # the two identifiers cannot agree even when they describe the same
+        # card. Every card match on a real report scored here.
+        #
+        # The credit limit breaks the tie. It is not an identifier, but two
+        # cards from one issuer rarely carry the same limit to the rupee, and
+        # a holder with four Axis cards - which is what made "same lender and
+        # type" too weak to apply - has four different ones.
+        b_limit = _decimal(getattr(bureau, "credit_limit", None))
+        a_limit = _decimal(getattr(account, "credit_limit", None))
+        if b_limit is not None and a_limit is not None:
+            if abs(b_limit - a_limit) <= _LIMIT_TOLERANCE:
+                return 0.93, (f"same lender and type, and the credit limit "
+                              f"matches ({b_limit:,.0f})")
+            # Limits that disagree are evidence AGAINST, not merely absent.
+            # Two cards at one issuer with different limits are two cards.
+            return 0.15, (f"same lender and type, but the credit limits "
+                          f"differ ({b_limit:,.0f} vs {a_limit:,.0f})")
         return 0.55, "same lender and account type, but no digits to compare"
     if same_lender:
         return 0.35, "same lender only"
@@ -122,6 +146,33 @@ def match_accounts(bureau_accounts: Sequence[Any],
             confidence, reason = score_pair(bureau, account)
             if confidence > 0:
                 scored.append((confidence, reason, bureau, account))
+
+    # Evidence that fits more than one candidate is not evidence of WHICH.
+    #
+    # A credit limit separates two cards at one issuer only while they differ.
+    # This holder has four Axis cards and the bureau reports three Axis lines,
+    # every one of them at 3,60,000 - so the limit confirms the issuer and
+    # says nothing about the pairing, and a greedy first-past-the-post would
+    # hand out three confident links chosen by list order. Downgraded to a
+    # suggestion, which is what "I know these belong together but not which
+    # to which" actually means.
+    from collections import Counter
+
+    per_bureau = Counter(id(b) for c, _r, b, _a in scored
+                         if c >= AUTO_LINK_CONFIDENCE)
+    per_account = Counter(getattr(a, "id", None) for c, _r, _b, a in scored
+                          if c >= AUTO_LINK_CONFIDENCE)
+
+    scored = [
+        (min(c, SUGGEST_CONFIDENCE) if c >= AUTO_LINK_CONFIDENCE
+         and (per_bureau[id(b)] > 1 or per_account[getattr(a, "id", None)] > 1)
+         else c,
+         r + " - but it fits more than one of them" if c >= AUTO_LINK_CONFIDENCE
+         and (per_bureau[id(b)] > 1 or per_account[getattr(a, "id", None)] > 1)
+         else r,
+         b, a)
+        for c, r, b, a in scored
+    ]
 
     scored.sort(key=lambda item: item[0], reverse=True)
 

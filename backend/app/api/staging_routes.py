@@ -53,6 +53,7 @@ _REGISTRY_STATUS = {
 KIND_LABELS = {
     "statement": "Statement",
     "alert": "Transaction alert",
+    "loan_summary": "Loan summary",
     "bureau": "Credit report",
     "portfolio": "Investments",
     "trades": "Contract notes",
@@ -62,6 +63,10 @@ KIND_NOTES = {
     "statement": "Reconciled against the balances the issuer printed.",
     "alert": "Read from an alert email. Nothing has checked it against a "
              "statement.",
+    "loan_summary": "What the lender itself reported: balance, rate, EMI and "
+                    "instalments left. Some loans are collected by standing "
+                    "instruction and never produce a statement at all, so "
+                    "this email is the only record there is.",
     "bureau": "A credit bureau's own record of your accounts.",
     "portfolio": "Holdings on one date, not a ledger of transactions.",
     "trades": "A record of what was bought and sold. The money reaches your "
@@ -106,6 +111,7 @@ class SelectionRequest(BaseModel):
 #: inferred from what reading it revealed, which is the next best evidence.
 _INTENT_FOR_KIND = {
     "alert": "transactional",
+    "loan_summary": "loan_summary",
     "bureau": "bureau",
     "portfolio": "investment",
     "trades": "investment",
@@ -481,8 +487,74 @@ def _run_process(job_id: str) -> None:
             _register_documents(db)
         except Exception:  # pragma: no cover - the registry is not the ledger
             log.exception("could not record the file registry")
+        # Settle what each investment account is actually worth, now that
+        # every holding is written.
+        #
+        # A portfolio statement sets its account's balance to the total it
+        # declares, one file at a time, and nothing afterwards asked whether
+        # two files were describing the same shares. A CDSL consolidated
+        # statement reports every demat account the holder has, so an Upstox
+        # statement is a subset of it - 20 of this holder's securities appear
+        # on both, worth 3.01 lakh, and both totals were being added.
+        #
+        # `refresh_investment_balances` recomputes each balance from the
+        # deduplicated holdings view the Portfolio tab already reads, so the
+        # two screens stop disagreeing: assets read 22.97 lakh on the
+        # Overview against 19.88 lakh on Portfolio, and the difference was
+        # exactly one broker statement counted twice.
+        try:
+            progress.phase("Valuing your investments")
+            repo.refresh_investment_balances(db)
+        except Exception:  # pragma: no cover - a valuation is not the ledger
+            log.exception("could not refresh investment balances")
+
+        # Link the credit report to the accounts, now that both exist.
+        #
+        # `materialise` has just written every bureau line and every account
+        # in one pass, and until they are matched the app believes it has two
+        # of everything. It showed: the Position tab drafted the HDFC home
+        # loan twice - once as "HDFC BANK LTD 203-664757833" from the report
+        # and once as "HDFC Bank Home Loan (XX4757833)" from the lender's own
+        # email - and totalled them, reporting 1.38 crore owed against a real
+        # 69 lakh, over "30 cards" the holder does not have.
+        #
+        # The Gmail import has always done this. This path never did, so every
+        # bureau line sat at match_status "unmatched", confidence 0, whatever
+        # the ledger plainly showed.
+        try:
+            from ..reconcile import bureau_match
+            from .wealth_routes import _Attr
+
+            stored_bureau = repo.get_bureau_accounts(db)
+            if stored_bureau:
+                progress.phase("Matching your credit report to your accounts")
+                repo.apply_bureau_matches(db, bureau_match.match_accounts(
+                    [_Attr(row) for row in stored_bureau],
+                    repo.get_accounts(db)))
+        except Exception:  # pragma: no cover - a match is not the ledger
+            log.exception("could not match the credit report")
+
         transactions = built.pop("_transactions", [])
-        accounts = built.pop("_accounts", {})
+
+        # Read back from the database rather than using the dict materialise
+        # hands over. That dict holds only the accounts `resolve_account`
+        # built - the ones a statement described - and it is missing exactly
+        # the balances that make an asset an asset.
+        #
+        # Holdings accounts never pass through `resolve_account` at all: a
+        # portfolio statement upserts its account directly and the balance is
+        # written when the holdings are saved, so demat, NPS, EPF and the
+        # broker account existed in the database with 22.9 lakh between them
+        # and did not exist in this dict. The analysis computed net worth from
+        # the dict, found nothing but credit cards and loans, and published
+        # "Assets tracked 0" against "Liabilities 69,15,027" - then a cash
+        # runway of zero months, and a projection of the holder going 19 lakh
+        # overdrawn, from an opening balance of nothing.
+        #
+        # One read, and the analysis sees what the import actually stored.
+        accounts = {a.id: a for a in repo.get_accounts(db)} \
+            or built.pop("_accounts", {})
+        built.pop("_accounts", None)
         progress.advance(len(selected))
 
         report = {}
@@ -654,8 +726,25 @@ def _publish(db, enriched, job_id: str, statement_entries: list) -> dict:
     """
     from ..main import _build_payload, remember_run
 
+    # Accounts come from the DATABASE, not from `enriched` - and that is the
+    # difference between what the app knows and what it shows.
+    #
+    # `enriched.accounts` is the dict the parsers built as they went. By the
+    # time the run ends the database holds something better: accounts merged
+    # with ones already known, corrected by later files, and carrying the
+    # balances written after parsing. This holder's savings account was
+    # created from an Upstox client-master report, which names the bank it is
+    # held at; a later ICICI statement corrected the institution, and the
+    # balances were filled in afterwards. The database had "ICICI Bank
+    # Savings, 49,977.90". The frozen dict had "Upstox Saving Bank Savings",
+    # no balance - and the frozen dict is what the dashboard served, which is
+    # why the Position read "Assets tracked 0" and the forecast gave a cash
+    # runway of zero months against a funded account.
+    from ..db import repository as _repo
+    live_accounts = {a.id: a for a in _repo.get_accounts(db)}
+
     state = {
-        "accounts": enriched.accounts,
+        "accounts": live_accounts or enriched.accounts,
         "transactions": enriched.transactions,
         "transfer_report": enriched.transfer_report,
         "recurring": enriched.recurring,
@@ -666,25 +755,31 @@ def _publish(db, enriched, job_id: str, statement_entries: list) -> dict:
         "duplicate_count": enriched.duplicate_count,
     }
     payload = _build_payload(state)
+    from ..models.schemas import file_state
+
+    states = [file_state(e["recon_status"], e.get("kind") or "")
+              for e in statement_entries]
     payload["statements"] = [{
         "filename": e["filename"],
-        "status": ("ok" if e["recon_status"] in ("ok", "not_applicable")
-                   else "unreconciled"),
+        "status": state,
         "account": e["account_label"],
         "rows": e["row_count"],
         "detail": e["parse_message"],
-    } for e in statement_entries]
+    } for e, state in zip(statement_entries, states)]
     analysis = enriched.analysis
     payload["data_quality"] = {
         "files_processed": len(statement_entries),
-        "files_reconciled": sum(1 for e in statement_entries
-                                if e["recon_status"] in ("ok", "not_applicable")),
-        "files_unreconciled": sum(1 for e in statement_entries
-                                  if e["recon_status"] == "unreconciled"),
-        "files_failed": sum(1 for e in statement_entries
-                            if e["recon_status"] == "failed"),
+        "files_reconciled": sum(1 for st in states if st == "ok"),
+        "files_unreconciled": sum(1 for st in states if st == "unreconciled"),
+        "files_failed": sum(1 for st in states if st == "failed"),
+        "files_locked": sum(1 for st in states if st == "needs_password"),
         "duplicates_removed": enriched.duplicate_count,
         "uncategorized_count": getattr(analysis, "uncategorized_count", 0),
+        # The name the Overview's tile actually reads. Omitting it did not
+        # leave the tile blank - it left it reading a confident zero over
+        # however many rows a rule had in fact settled.
+        "rules_settled": getattr(enriched, "rules_settled", 0),
+        "llm_settled": getattr(enriched, "llm_settled", 0),
         "notes": list(getattr(analysis, "notes", [])),
     }
     remember_run(job_id, payload)

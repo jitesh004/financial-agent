@@ -504,6 +504,93 @@ def test_an_item_can_be_added_and_removed_by_hand(seeded):
     assert any(i["id"] == created["id"] for i in with_archived["items"])
 
 
+def test_a_blank_where_the_column_forbids_one_is_a_blank_not_a_null(seeded):
+    """A lender nobody recorded is an empty name, not a failed write.
+
+    `institution`, `label`, `notes` and `kind` are NOT NULL with defaults,
+    and a DEFAULT only applies to a column left OUT of the INSERT - an
+    explicit empty string arriving from the form reached the database as
+    NULL and took the whole screen down on a constraint the user could
+    neither see nor satisfy. It happens on the ordinary paths: adopting a
+    bureau line whose lender is missing, and seeding an account that never
+    carried an institution.
+    """
+    created = client.post("/api/position/items", json={
+        "kind": "loan", "label": "", "institution": "", "notes": "",
+        "outstanding": "180000", "reviewed_on": "2026-04-01",
+    })
+    assert created.status_code == 200, created.text
+
+    stored = repo.get_position_item(seeded, created.json()["id"])
+    assert stored["institution"] == ""
+    assert stored["label"] == ""
+    assert stored["notes"] == ""
+    assert stored["kind"] == "loan"
+
+    # And the same blank arriving as an edit, which is the other way the
+    # form sends one: clearing a box the user had filled in.
+    patched = client.patch(f"/api/position/items/{created.json()['id']}",
+                           json={"institution": ""})
+    assert patched.status_code == 200, patched.text
+    assert repo.get_position_item(seeded,
+                                  created.json()["id"])["institution"] == ""
+
+
+def test_an_account_with_no_institution_seeds(seeded):
+    """Seeding is the first thing the screen does, so it has to survive the
+    thinnest account in the ledger rather than only the well-filled ones."""
+    repo.upsert_account(seeded, Account(
+        id="loan-2", institution="", account_type=AccountType.PERSONAL_LOAN,
+        account_number_masked="0042",
+        principal_outstanding=Decimal("90000")))
+
+    response = client.post("/api/position/seed")
+    assert response.status_code == 200, response.text
+    assert response.json()["added"] == 4
+
+    seeded_row = next(i for i in client.get("/api/position").json()["items"]
+                      if i["account_id"] == "loan-2")
+    assert seeded_row["institution"] == ""
+
+
+def test_clearing_a_review_date_leaves_the_review_alone(seeded):
+    """`reviewed_on` is the one NOT NULL column with no honest default on an
+    edit. A blank date is a field to skip, not an attestation to erase -
+    nulling it would strand every figure derived from it."""
+    created = client.post("/api/position/items", json={
+        "kind": "loan", "label": "Car loan", "reviewed_on": "2026-04-01",
+    }).json()
+
+    assert client.patch(f"/api/position/items/{created['id']}",
+                        json={"reviewed_on": "", "label": "Car loan (SBI)"}
+                        ).status_code == 200
+    stored = repo.get_position_item(seeded, created["id"])
+    assert stored["reviewed_on"] == "2026-04-01"
+    assert stored["label"] == "Car loan (SBI)"
+
+
+def test_every_not_null_column_knows_what_a_blank_means(seeded):
+    """The guard, so the next column added does not repeat this.
+
+    `POSITION_FIELDS` is the promise that the API surface and the table
+    cannot drift apart. This is the other half of it: a settable column that
+    refuses NULL needs somewhere for a blank to land, or the first user who
+    leaves that box empty gets a constraint error instead of a saved row.
+    """
+    with seeded.connection() as conn:
+        not_null = {r["column_name"] for r in conn.execute(
+            "SELECT column_name FROM information_schema.columns"
+            " WHERE table_name = 'position_items' AND is_nullable = 'NO'")}
+
+    settable = not_null.intersection(repo.POSITION_FIELDS)
+    # `reviewed_on` is the deliberate exception: defaulted to today on
+    # insert, and skipped rather than nulled on an edit.
+    uncovered = settable - set(repo._POSITION_BLANKS) - {"reviewed_on"}
+    assert not uncovered, (
+        f"{sorted(uncovered)} refuse NULL but have no blank to fall back on"
+        " - add them to _POSITION_BLANKS")
+
+
 def test_a_bad_kind_is_refused(seeded):
     response = client.post("/api/position/items",
                            json={"kind": "spaceship", "label": "x"})

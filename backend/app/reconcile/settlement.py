@@ -159,6 +159,41 @@ def _has_bank_coverage(
     return False
 
 
+def card_purchases_already_counted(
+    txn_date: date,
+    accounts: dict[str, Account],
+    statements_by_account: dict[str, list] | None,
+    window_days: int = 62,
+) -> bool:
+    """Has a card statement closed recently enough for this to be its bill?
+
+    The mirror of `_has_bank_coverage`, asked from the other side, and it
+    decides whether a card-bill payment is SPENDING or a TRANSFER.
+
+    A bill is paid after the statement that raised it closes. If a credit
+    card's statement closed in the weeks before this debit, the purchases on
+    that statement are already in the ledger and already counted as spending
+    - so counting the payment too charges the holder twice for one purchase.
+    If no card statement has closed, the purchases were never imported and
+    the payment is the only evidence any money was spent, which is when
+    counting it is right.
+
+    Sixty-two days because a card cycle is a month and a bill is due a few
+    weeks after it closes; two cycles is generous without reaching back to
+    a statement whose bill was plainly already settled.
+    """
+    if not statements_by_account:
+        return False
+    for account_id, account in (accounts or {}).items():
+        if account.account_type != AccountType.CREDIT_CARD:
+            continue
+        for statement in statements_by_account.get(account_id, []):
+            closed = getattr(statement, "period_end", None)
+            if closed and 0 <= (txn_date - closed).days <= window_days:
+                return True
+    return False
+
+
 def _load_confirmed_fingerprints(db) -> set[str]:
     """Fingerprints belonging to groups the user has already confirmed."""
     if db is None:

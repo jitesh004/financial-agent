@@ -208,7 +208,8 @@ def derive_passwords(
     if last4_acct:
         candidates.append(last4_acct)
 
-    ordered = _prioritise(candidates, institution)
+    ordered = _prioritise(candidates, institution,
+                          pinned=profile.custom_passwords or [])
     # De-duplicate preserving order, then cap.
     seen: set[str] = set()
     unique = [c for c in ordered if c and not (c in seen or seen.add(c))]
@@ -226,21 +227,36 @@ _FORMAT_HINTS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _prioritise(candidates: list[str], institution: str | None) -> list[str]:
+def _prioritise(candidates: list[str], institution: str | None,
+                pinned: list[str] | None = None) -> list[str]:
     """Stable-sort so the likely formats for this bank come first.
 
     Kept intentionally simple: the only signal is "does a name-then-digits
     shape match", which covers the dominant format. Everything else keeps its
     original relative order.
+
+    `pinned` is what the USER told us, and it stays in front of every guess.
+    The profile calls these "tried before the derived candidates, so an odd
+    bank format is never a blocker" - and with no institution known that was
+    true, because this returned the list untouched. With one known, the sort
+    ranked on shape alone and knew nothing about where a candidate came from,
+    so an all-digit password the user had typed in themselves - an NPS PRAN,
+    say - sorted below every name-and-digits guess and went from first to
+    121st. Every one of those is a PDF decrypt attempt against a password
+    already known to be wrong.
     """
+    keep = [p for p in (pinned or []) if p]
     if not institution:
-        return candidates
+        return keep + [c for c in candidates if c not in set(keep)]
 
     inst = institution.lower()
     prefers_upper = any(h == "upper_dob" for k, hints in _FORMAT_HINTS.items()
                         if k in inst for h in hints)
+    pinned_set = set(keep)
 
     def rank(candidate: str) -> int:
+        if candidate in pinned_set:
+            return -1
         has_alpha = any(c.isalpha() for c in candidate)
         has_digit = any(c.isdigit() for c in candidate)
         name_then_digits = has_alpha and has_digit
@@ -314,6 +330,10 @@ def profile_can_satisfy(profile: UserProfile | None, label: str) -> bool:
     spec = formats.BY_LABEL.get(label)
     if spec is None:
         return True
+    # A user-supplied format needs no profile field and is satisfied by
+    # nothing the app can derive - only by a password the user has entered.
+    if spec.user_supplied:
+        return bool(profile.custom_passwords)
     for field in spec.needs:
         if not getattr(profile, field, None):
             return False

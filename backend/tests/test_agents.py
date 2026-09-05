@@ -8,6 +8,7 @@ has to survive without losing the work it already did.
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import date, timedelta
 from decimal import Decimal
@@ -446,6 +447,82 @@ def test_a_run_is_stored_with_its_working(ledger):
     # thing in the row and a list of twenty would be megabytes.
     listed = repo.get_agent_runs(ledger, "debt-strategist")
     assert len(listed) == 1 and "transcript" not in listed[0]
+
+
+def test_a_run_survives_a_tool_that_hands_back_a_date(ledger):
+    """A run costs a minute and real money. One unserialisable value in a
+    transcript must not throw all of it away.
+
+    This is not hypothetical: `position()` returned raw `date` objects in
+    its totals, which is invisible over HTTP - FastAPI encodes them on the
+    way out - and fatal here, where the transcript is stored as JSON. The
+    tool is fixed; this is the belt that stops the next one costing a run.
+    """
+    run_id = repo.save_agent_run(ledger, {
+        "agent": "debt-strategist", "status": "ok",
+        "started_at": "2026-09-01T10:00:00+00:00",
+        "answer": {"headline": "checked"},
+        "transcript": [{"index": 1, "thought": "reading the position",
+                        "calls": [{"tool": "position", "args": {}}],
+                        "results": [{"tool": "position", "result": {
+                            "totals": {"debt_free_on": date(2050, 10, 5)}}}]}],
+    })
+    stored = repo.get_agent_run(ledger, run_id)
+    result = stored["transcript"][0]["results"][0]["result"]
+    assert result["totals"]["debt_free_on"] == "2050-10-05"
+
+
+def _attest(db) -> None:
+    """A reviewed position on top of the ledger.
+
+    The tools behave differently once there is one - `position` returns
+    totals rather than a note saying nothing has been reviewed - and that
+    is exactly the state the serialisation broke in.
+    """
+    repo.save_position_item(db, {
+        "kind": "loan", "label": "Home loan", "institution": "Meridian",
+        "account_id": "loan-1", "outstanding": "4200000", "emi": "34200",
+        "interest_rate": "8.6", "reviewed_on": "2026-01-05"})
+    repo.save_position_item(db, {
+        "kind": "card", "label": "Northwind card", "institution": "Northwind",
+        "outstanding": "48000", "credit_limit": "400000",
+        "statement_day": 18, "due_day": 6, "reviewed_on": "2026-08-20"})
+
+
+def test_the_position_tool_is_json_all_the_way_down(ledger):
+    """The tool that caused it, checked at the shape the runner stores.
+
+    Every other tool passes its dates through `_iso` on the way out.
+    `position` hands `totals` straight through from the analytics, so the
+    guarantee has to hold THERE - and the only way to know it does is to
+    serialise the result strictly, with no `default=` to paper over it.
+    """
+    _attest(ledger)
+    result = toolbelt.call(ledger, "position", {})
+    json.dumps(result)
+
+    totals = result["totals"]
+    assert totals["reviewed_oldest"] == "2026-01-05", "an ISO string, not a date"
+    assert totals["debt_free_on"] > "2026-01-05"
+    assert totals["next_due_on"].endswith("-06")
+
+
+def test_every_tool_returns_json_the_transcript_can_hold(ledger):
+    """The general form of it, over the whole belt.
+
+    A tool is only useful if what it returns can be stored beside the answer
+    it produced. Run against a ledger that has been REVIEWED, because the
+    thin one hides this: with no position items there are no totals, and no
+    totals is where the dates were.
+    """
+    _attest(ledger)
+    unserialisable = {}
+    for name in toolbelt.TOOLS:
+        try:
+            json.dumps(toolbelt.call(ledger, name, {}))
+        except TypeError as exc:
+            unserialisable[name] = str(exc)
+    assert not unserialisable, unserialisable
 
 
 def test_the_previous_run_is_the_one_before_it(ledger):

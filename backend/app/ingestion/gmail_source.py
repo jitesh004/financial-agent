@@ -117,7 +117,29 @@ _ALERT_SUBJECT_TERMS = (
 #: The three things a scan can look for. Each is a different kind of document
 #: with a different reader behind it, so the search that finds one is no use
 #: for the others.
+#: A lender's periodic summary of a loan. The only intent that needs no
+#: attachment and is not an alert: a home loan repaid by standing instruction
+#: sends no statement at all, and this quarterly email in the body is the
+#: only thing the lender ever sends about it. Without it the debt is
+#: invisible to everything except a credit report.
+_LOAN_SUMMARY_SUBJECT_TERMS = (
+    "loan summary", "loan account summary", "quarterly loan",
+    "annual loan summary", "loan details", "loan statement summary",
+)
+
 SCAN_INTENTS: dict[str, dict[str, object]] = {
+    "loan_summary": {
+        "label": "Loan summaries",
+        "description": "The quarterly email a lender sends about a loan - "
+                       "balance, rate, EMI and remaining term. The only "
+                       "record of a loan that never sends a statement.",
+        "needs_attachment": False,
+        "subjects": _LOAN_SUMMARY_SUBJECT_TERMS,
+        # Deliberately none: see `build_query`. Every bank the app knows
+        # sends mail constantly, and a summary is recognised by its subject.
+        "senders": (),
+        "max_months": None,
+    },
     "statement": {
         "label": "Account statements",
         "description": "Bank, card, loan and portfolio statement PDFs.",
@@ -180,7 +202,18 @@ def build_query(months: int | None = None, extra: str = "",
     parts: list[str] = []
     if spec["needs_attachment"]:
         parts += ["has:attachment", "filename:pdf"]
-    parts += [f"(({subjects}) OR ({senders}))", _QUERY_EXCLUSIONS]
+    # An intent with no senders is matched on its subject alone, and the
+    # clause is left out rather than emitted empty - "(... OR ())" is not a
+    # query Gmail accepts.
+    #
+    # Leaving it out is the point for a body-only intent. The sender half
+    # names every bank the app knows, which on a real mailbox matches
+    # thousands of messages: a quarterly loan summary sat well past the
+    # message cap behind transaction alerts and e-voting notices, and the
+    # scan reported finding none. A lender's summary is identified by what
+    # it calls itself, not by the fact a bank sent it.
+    parts += [f"(({subjects}) OR ({senders}))" if senders else f"({subjects})",
+              _QUERY_EXCLUSIONS]
 
     # `max_months` is the DEFAULT window for a source, not a ceiling on it.
     #

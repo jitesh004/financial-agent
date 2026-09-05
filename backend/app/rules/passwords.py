@@ -26,6 +26,11 @@ class PasswordFormat:
     #: Profile fields required to generate a candidate for this format.
     #: Names match `models.profile.UserProfile` attributes.
     needs: tuple[str, ...]
+    #: True when the value is one only the user has - not derivable from any
+    #: profile field, and not guessable within a bounded candidate set. The
+    #: app can open such a file only if the user has entered the password
+    #: themselves, so saying so up front is the whole of the help available.
+    user_supplied: bool = False
 
 
 FORMATS: tuple[PasswordFormat, ...] = (
@@ -49,6 +54,12 @@ FORMATS: tuple[PasswordFormat, ...] = (
         "Card(4) + DDMM",
         "Last 4 digits of the card + date of birth as DDMM",
         ("date_of_birth",)),
+    PasswordFormat(
+        "PRAN",
+        "Your 12-digit PRAN for that NPS account - add it under extra "
+        "passwords in your profile; it cannot be worked out from anything "
+        "else you have entered",
+        (), user_supplied=True),
 )
 
 BY_LABEL: dict[str, PasswordFormat] = {f.label: f for f in FORMATS}

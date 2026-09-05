@@ -188,6 +188,18 @@ class FlowRole(str, Enum):
     REFUND = "refund"
     #: The user explicitly took this row out of every total.
     EXCLUDED = "excluded"
+    #: A row from a LOAN account's own statement. The lender's ledger, not
+    #: the borrower's cash flow: the disbursement arriving, each EMI being
+    #: received, interest being charged. Every one of those is the far side
+    #: of something the funding account already recorded - the EMI leaving
+    #: the savings account is the outflow, the same EMI arriving at the
+    #: lender is not a second one - and the disbursement has no near side at
+    #: all, so counting it read as 75 lakh of income.
+    #:
+    #: Neutral rather than excluded, because nobody chose it and nothing is
+    #: wrong with the row. The loan is still read, still projected, still
+    #: counted as debt. It just does not spend or earn.
+    LENDER_LEDGER = "lender_ledger"
 
 
 #: Roles that reduce spending rather than adding to income. Both offset an
@@ -197,7 +209,7 @@ CONTRA_EXPENSE_ROLES = {FlowRole.CLAIM_SETTLEMENT, FlowRole.REFUND}
 #: Roles that are not a flow of the user's own money in either direction.
 NEUTRAL_ROLES = {
     FlowRole.TRANSFER_OUT, FlowRole.TRANSFER_IN,
-    FlowRole.CARD_SETTLEMENT, FlowRole.EXCLUDED,
+    FlowRole.CARD_SETTLEMENT, FlowRole.EXCLUDED, FlowRole.LENDER_LEDGER,
 }
 
 
@@ -496,9 +508,16 @@ def derive_flow_role(txn: "Transaction") -> FlowRole:
     if txn.category == Category.TRANSFER:
         return FlowRole.TRANSFER_OUT
     if txn.category == Category.CC_PAYMENT:
-        # If it reached here, it failed to match any card statement (or none was uploaded).
-        # Without the itemized purchases, the bill payment itself is the only record of 
-        # that spending. Dropping it would artificially deflate the user's spend by lakhs.
+        # It failed to match any card statement, so this bill payment may
+        # be the only record that the money was spent at all - dropping it
+        # would deflate spending by lakhs.
+        #
+        # "May be", because the pipeline asks a question this function
+        # cannot: whether a card statement closed shortly BEFORE the
+        # payment. If one did, the purchases are already counted and this
+        # is a transfer, and `enrich_ledger` overwrites the role - see
+        # `settlement.card_purchases_already_counted`. Expense is the
+        # answer when nothing is known, not the final word.
         return FlowRole.EXPENSE
     return FlowRole.EXPENSE
 
@@ -508,6 +527,49 @@ class ReconciliationStatus(str, Enum):
     FAILED = "failed"
     #: Statement declared no opening/closing balance, so the check is unavailable.
     NOT_APPLICABLE = "not_applicable"
+
+
+#: What the Files tab renders, keyed by what the reconciler actually said.
+#:
+#: These are two different vocabularies and they had drifted. The reconciler
+#: speaks `ReconciliationStatus` - "passed", "failed", "not_applicable" - and
+#: the screen speaks "did this file land": ok, did-not-balance, unparseable,
+#: locked. Four separate call sites each translated between them by hand, and
+#: one of them tested for the string "ok", which `ReconciliationStatus` has
+#: never contained. Every file that PASSED reconciliation therefore fell to
+#: the else branch: 45 of this holder's statements balanced to the rupee and
+#: were reported on screen as "Did not balance", with the tile reading
+#: "Files reconciled 57/127" over a ledger that had in fact tied out.
+#:
+#: One table, so the two vocabularies meet in exactly one place.
+FILE_STATE_BY_RECON: dict[str, str] = {
+    ReconciliationStatus.PASSED.value: "ok",
+    # Nothing to check against - a holdings snapshot, a credit report, a
+    # statement that printed no opening balance. Not a failure.
+    ReconciliationStatus.NOT_APPLICABLE.value: "ok",
+    ReconciliationStatus.FAILED.value: "unreconciled",
+    # An emailed transaction alert. It has no balances by construction, so
+    # calling it unreconciled - which is what the staging table stores -
+    # counts a whole mailbox of them as problems on a screen about problems.
+    "alert": "ok",
+    "unreconciled": "unreconciled",
+    "ok": "ok",
+}
+
+
+def file_state(recon_status: str | None, kind: str = "") -> str:
+    """How one imported file should read on the Files tab.
+
+    `None` means the file was never reconciled because it was never opened -
+    a password-protected PDF that no derived password unlocked. That is a
+    distinct thing from a file that failed its balance check, and the screen
+    has always had a word for it; only the translation was missing.
+    """
+    if recon_status is None or recon_status == "":
+        return "needs_password"
+    if kind == "alert":
+        return "ok"
+    return FILE_STATE_BY_RECON.get(str(recon_status), "unreconciled")
 
 
 class ReconciliationResult(BaseModel):

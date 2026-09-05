@@ -139,6 +139,13 @@ class StatementMetadata:
     opening_balance: Decimal | None = None
     closing_balance: Decimal | None = None
     credit_limit: Decimal | None = None
+    #: What a card asks for this cycle, and when. Read for cards only, and
+    #: separately from the balance: `closing_balance` is what the ledger
+    #: reconciles against, while these drive reminders and the Position
+    #: tab's cycle arithmetic.
+    min_due: Decimal | None = None
+    statement_date: date | None = None
+    payment_due_date: date | None = None
     interest_rate: Decimal | None = None
     emi_amount: Decimal | None = None
     currency: str = "INR"
@@ -213,6 +220,37 @@ _LANDMARK_BEFORE = re.compile(
     r"|above|below|next\s+to|in\s+front\s+of|back\s+of|infront\s+of)\b"
     r"[\s.,:-]*$"
 )
+
+
+#: A bank named immediately after one of these labels is the bank the
+#: ACCOUNT is held at, whoever printed the page.
+#:
+#: This is the mirror of `_LANDMARK_BEFORE` above. That one demotes a bank
+#: name because of the words in front of it ("Opp State Bank of India" is an
+#: address); this one promotes one for the same reason, and the promotion
+#: matters whenever the document's letterhead belongs to somebody other than
+#: the bank. A broker's client-master report is exactly that shape:
+#:
+#:     UPSTOX SECURITIES PRIVATE LIMITED          <- who printed it
+#:     ...
+#:     Bank Name ICICI BANK LTD  Bank A/c Type Saving Bank  A/c No 0321…1951
+#:
+#: Read from the letterhead alone, that page opened a savings account called
+#: "Upstox Saving Bank Savings" - a bank account at a stockbroker, holding
+#: this holder's real ICICI balance and every transfer and EMI paid out of
+#: it. The document names the bank outright, one label away from the account
+#: number it belongs to; there is no need to guess from the masthead.
+_BANK_NAME_LABEL = re.compile(
+    r"\bbank\s*(?:name|with)\b[\s:.\-]*([^\n]{0,40})", re.IGNORECASE)
+
+
+def declared_bank(text: str) -> str | None:
+    """The bank a document names as holding the account it describes."""
+    for match in _BANK_NAME_LABEL.finditer(text or ""):
+        named = detect_institution(match.group(1))
+        if named:
+            return named
+    return None
 
 
 def detect_institution(text: str) -> str | None:
@@ -779,13 +817,189 @@ _IDENTITY_SCHEMA = {
 }
 
 
-def extract_metadata(text: str, filename: str = "", sender: str = "") -> StatementMetadata:
+#: Below this, a "credit limit" is not one. Read off real statements: an
+#: IndusInd summary yielded 734 and a slice one yielded 15, both of them some
+#: other figure that happened to sit near the words. No issued card has a
+#: limit in the hundreds, and a wrong limit is worse than none - it is what
+#: the bureau matcher would use to decide two cards are the same account.
+_MIN_PLAUSIBLE_CREDIT_LIMIT = Decimal("1000")
+
+
+#: A money figure immediately following a label on the same line. The gap
+#: allows for a colon, a currency symbol and a little whitespace, but not for
+#: a line break - a figure on the next line belongs to the next label.
+_AFTER_LABEL = (r"[^0-9\n]{0,12}"
+                r"((?:Rs\.?|INR|₹)?\s*[\d,]+(?:\.\d{1,2})?)")
+
+
+def _labeled_amounts(text: str, pattern: str) -> list:
+    """Every figure this label carries, in document order."""
+    found = []
+    for match in re.finditer(pattern + _AFTER_LABEL, text or "",
+                             re.IGNORECASE):
+        value = parse_amount(match.group(1)).value
+        if value is not None:
+            found.append(value)
+    return found
+
+
+#: The column headings a card's summary box uses, longest first so that
+#: "available credit limit" is never mistaken for the "credit limit" column
+#: sitting next to it. Scanned in order across a header line, these say how
+#: many columns the box has and which one is which.
+_SUMMARY_COLUMNS = (
+    r"available\s*credit\s*limit", r"available\s*cash\s*limit",
+    r"total\s*credit\s*limit", r"credit\s*card\s*number",
+    r"statement\s*generation\s*date", r"minimum\s*payment\s*due",
+    r"minimum\s*amount\s*due", r"total\s*payment\s*due",
+    r"total\s*amount\s*due", r"payment\s*due\s*date",
+    r"statement\s*period", r"statement\s*date", r"credit\s*limit",
+    r"cash\s*limit", r"card\s*number",
+)
+
+#: A cell on the values row: a masked card number, or money.
+#:
+#: Money means PUNCTUATED - a decimal part or a thousands separator. A bare
+#: run of digits in one of these columns is something else that happens to be
+#: numeric, and on a Yes Bank statement it was the year: "2026" read as a
+#: credit limit of two thousand rupees, which cleared the plausibility floor
+#: because it is above a thousand. Every Indian issuer prints money with
+#: separators, so requiring them costs nothing real.
+_VALUE_TOKEN = re.compile(
+    r"\d[\d,]*\.\d{2}|\b\d{6}[*Xx]{4,}\d{4}\b|\b\d{1,3}(?:,\d{2,3})+\b")
+
+#: How far below a header row to look for its values.
+_VALUES_WITHIN = 4
+
+
+def _column_aligned_amount(text: str, label: str) -> Decimal | None:
+    """A figure read from a header row's matching column.
+
+    The summary box is a TABLE flattened to lines, and the two halves do not
+    always end up adjacent:
+
+        Credit Card Number  Credit Limit  Available Credit Limit  Available Cash Limit
+        For hassle free payments register for
+        653047******5207    360,000.00    359,595.00              0.00   Auto-Debit ...
+
+    Reading the line immediately beneath the header finds a marketing
+    sentence; reading "the number after the label" finds nothing, because
+    the label's own line has no numbers on it at all. What does work is
+    counting: the header names four columns, and the first line below it
+    carrying four values is the values row - after which the answer is
+    simply the token in the label's position.
+
+    That row is why every Axis card had no credit limit. The nearest thing
+    to a number under the header was the card's own issuer prefix, and 653047
+    was duly recorded as a limit of 6.5 lakh.
+    """
+    lines = (text or "").splitlines()
+    wanted = re.compile(label, re.IGNORECASE)
+    columns = re.compile("|".join(_SUMMARY_COLUMNS), re.IGNORECASE)
+
+    for index, line in enumerate(lines):
+        headings = [m for m in columns.finditer(line)]
+        if len(headings) < 2:
+            continue
+        position = next((i for i, m in enumerate(headings)
+                         if wanted.fullmatch(re.sub(r"\s+", " ", m.group(0)))
+                         or wanted.match(m.group(0))), None)
+        if position is None:
+            continue
+
+        for candidate in lines[index + 1:index + 1 + _VALUES_WITHIN]:
+            # Another header ends this one's search. Yes Bank interleaves
+            # two of them - "Statement Period | Credit Limit" over its
+            # values, then "Available Credit Limit | ... Other Charges" over
+            # its own - and a lookahead that ran past the second read the
+            # wrong row against the first header's columns, calling a
+            # 17,098 balance a credit limit on a card whose limit is six
+            # lakh.
+            if columns.search(candidate):
+                break
+            values = _VALUE_TOKEN.findall(candidate)
+            # Exactly as many values as the header has columns. Fewer means
+            # a column holds something this does not recognise as a value -
+            # a date, a period - and the positions no longer correspond.
+            if len(values) != len(headings):
+                continue
+            token = values[position]
+            if re.search(r"[*Xx]{4,}", token):
+                continue  # that column holds the card number, not an amount
+            parsed = parse_amount(token).value
+            if parsed is not None:
+                return parsed
+    return None
+
+
+#: The issuer prefix of a card number, as printed beside a masked card:
+#: "Card No: 653047******5207". Six digits, and on an Axis statement they sit
+#: directly under a "Credit Card Number | Credit Limit | ..." header row - so
+#: the header-row reader, looking one line down for its value, returned the
+#: BIN. 653047 read as a credit limit of 6.5 lakh, 438628 as 4.4 lakh, on
+#: cards whose real limits are nothing of the sort.
+_CARD_BIN = re.compile(r"\b(\d{6})[*Xx]{4,}\d{4}\b")
+
+
+def _card_bins(text: str) -> set:
+    """Every card issuer prefix printed in this document."""
+    return {Decimal(m.group(1)) for m in _CARD_BIN.finditer(text or "")}
+
+
+def _unambiguous_amount(text: str, patterns: tuple[str, ...]):
+    """A labelled amount, but only where the document says it once.
+
+    A combined statement carries one summary per card. Axis sends all four of
+    this holder's on a single PDF, so "Total Amount Due" appears four times
+    with four different figures - and taking the first gave three cards the
+    fourth one's balance of 8,813.65 apiece.
+
+    Where the occurrences disagree there is no way to tell from the text
+    alone which card is which, so the honest answer is none of them.
+    """
+    for pattern in patterns:
+        seen = _labeled_amounts(text, pattern)
+        if not seen:
+            continue
+        if len(set(seen)) == 1:
+            return seen[0]
+        return None
+    return None
+
+
+#: Summary labels that cannot appear inside a transaction narration.
+#:
+#: `_metadata_text` hands this reader the letterhead and the footer and drops
+#: the middle, because a savings statement says "HOME LOAN EMI" on every EMI
+#: row and matching that would relabel the whole account. Sound rule, and it
+#: costs a credit card its balance: Axis prints PAYMENT SUMMARY halfway down,
+#: so "Total Amount Due 8,813.65" sat at line 104 of a document read at lines
+#: 1-45 and 187-201, and every Axis, HDFC and ICICI card came out with no
+#: balance at all - fifteen cards, five to fifteen statements each, not one
+#: of them carrying what was owed.
+#:
+#: These labels are safe to hunt for across the WHOLE document because no
+#: bank writes them into a narration. The generic ones the windowed pass uses
+#: - "current balance", "net balance" - are not, and stay windowed.
+_CARD_SUMMARY_CLOSING = (r"total\s*amount\s*due", r"total\s*payment\s*due",
+                         r"total\s*dues")
+_CARD_SUMMARY_OPENING = (r"previous\s*balance", r"opening\s*balance")
+_CARD_SUMMARY_LIMIT = (r"total\s*credit\s*limit", r"credit\s*limit")
+_CARD_SUMMARY_MIN_DUE = (r"minimum\s*amount\s*due", r"minimum\s*payment\s*due")
+
+
+def extract_metadata(text: str, filename: str = "", sender: str = "",
+                     full_text: str = "") -> StatementMetadata:
     """Pull everything we can from the statement letterhead.
 
     `text` should be the document's full text (or the text surrounding the
     transaction table), not the table rows themselves. `sender`, when the
     file came from an email, is the strongest institution signal available -
     see below.
+
+    `full_text` is the whole document, used only to fill a gap the windowed
+    text left - see `_CARD_SUMMARY_CLOSING`. It never overrules a figure the
+    window already found.
     """
     meta = StatementMetadata()
     if not text:
@@ -909,6 +1123,99 @@ def extract_metadata(text: str, filename: str = "", sender: str = "") -> Stateme
         r"emi\s*amount", r"instal?ment\s*amount", r"monthly\s*instal?ment",
     ])
 
+    # A card prints its summary wherever it likes. Filling gaps only, from
+    # labels no narration contains - see `_CARD_SUMMARY_CLOSING`.
+    whole = _before_mitc_illustration(full_text) if full_text else ""
+    closing_from_whole = False
+    if whole:
+        if meta.closing_balance is None:
+            meta.closing_balance = _unambiguous_amount(
+                whole, _CARD_SUMMARY_CLOSING)
+            # Where it came from matters. The windowed read looks at the
+            # letterhead and the footer; this one looks at the whole
+            # document, boilerplate included - and Axis prints "Total Amount
+            # Due 8813.65" inside its billing-dispute notice on a statement
+            # whose real total is 405.00.
+            closing_from_whole = meta.closing_balance is not None
+        if meta.opening_balance is None:
+            meta.opening_balance = _unambiguous_amount(
+                whole, _CARD_SUMMARY_OPENING)
+        if meta.credit_limit is None:
+            # The box read as a table first - it is the only reading that
+            # cannot confuse "Credit Limit" with "Available Credit Limit".
+            meta.credit_limit = _column_aligned_amount(
+                whole, r"(?:total\s*)?credit\s*limit")
+        if meta.credit_limit is None:
+            limit = _unambiguous_amount(whole, _CARD_SUMMARY_LIMIT)
+            if limit is not None and limit >= _MIN_PLAUSIBLE_CREDIT_LIMIT:
+                meta.credit_limit = limit
+        # Applies to whatever the windowed pass found too, which is where
+        # the BIN actually came from.
+        if meta.credit_limit is not None and \
+                meta.credit_limit in _card_bins(whole):
+            meta.notes.append(
+                f"Ignored a credit limit of {meta.credit_limit} - it is this "
+                f"card's issuer prefix, not a limit.")
+            meta.credit_limit = None
+
+    # A card's cycle, where the deterministic read could not find it.
+    #
+    # Cards only, gaps only, and never the closing balance - see
+    # `normalize.card_summary` for why this one reader is allowed to be
+    # non-deterministic and what it is forbidden from touching.
+    if meta.account_type == AccountType.CREDIT_CARD and whole and (
+            meta.credit_limit is None or meta.min_due is None
+            or meta.payment_due_date is None):
+        from . import card_summary
+
+        read = card_summary.read(whole, bins=_card_bins(whole))
+        if read is not None:
+            if meta.credit_limit is None:
+                meta.credit_limit = read.credit_limit
+            # The model read the summary BOX; the wide pass read anywhere in
+            # the document. On that evidence the box wins - but only over
+            # the wide pass, never over the windowed one.
+            if read.total_due is not None and (
+                    meta.closing_balance is None or closing_from_whole):
+                if meta.closing_balance != read.total_due:
+                    meta.notes.append(
+                        f"Total due read from the summary box as "
+                        f"{read.total_due}, not {meta.closing_balance} "
+                        f"found elsewhere in the document.")
+                meta.closing_balance = read.total_due
+            if meta.min_due is None:
+                meta.min_due = read.min_due
+            if meta.statement_date is None:
+                meta.statement_date = read.statement_date
+            if meta.payment_due_date is None:
+                meta.payment_due_date = read.payment_due_date
+            if meta.period_start is None:
+                meta.period_start = read.cycle_start
+            if meta.period_end is None:
+                meta.period_end = read.cycle_end
+
+    # Both guards run LAST, so they apply to whatever supplied the figure -
+    # windowed pass, wide pass or model alike. Placed inside the wide-pass
+    # block they policed only one of the three, and the two errors that
+    # survived came from the other two: an IndusInd "limit" of 734 read off
+    # the letterhead, and an ICICI card reported as owing exactly its limit
+    # because "Total Credit Limit 6,60,000" sits in its summary box and both
+    # readers took it.
+    if meta.credit_limit is not None and             meta.credit_limit < _MIN_PLAUSIBLE_CREDIT_LIMIT:
+        meta.notes.append(
+            f"Ignored a credit limit of {meta.credit_limit}; no issued card "
+            f"has one.")
+        meta.credit_limit = None
+    if (meta.credit_limit is not None
+            and meta.closing_balance == meta.credit_limit):
+        meta.notes.append(
+            "Ignored a card balance identical to the credit limit; the "
+            "summary label was almost certainly read twice.")
+        meta.closing_balance = None
+
+
+
+
     rate = _find_labeled(text, [
         r"rate\s*of\s*interest", r"interest\s*rate", r"roi",
     ])
@@ -1021,6 +1328,21 @@ def extract_metadata(text: str, filename: str = "", sender: str = "") -> Stateme
             except (LLMUnavailable, Exception) as e:
                 import logging
                 logging.getLogger(__name__).warning("LLM fallback failed: %s", e)
+
+    # A document that says outright which bank the account is held at beats
+    # every inference above - letterhead, sender and model alike.
+    #
+    # Last, because it is gated on the account type and the type is not
+    # settled until the block above has run: on the report that prompted
+    # this, the deterministic reader returned no type at all and the model
+    # supplied "savings" afterwards. Gated at all, because a "Bank Name"
+    # block only describes the subject of the page when the page is about a
+    # bank account; a card statement naming the bank a payment came from is
+    # not a card issued by that bank.
+    if meta.account_type in {AccountType.SAVINGS, AccountType.CURRENT}:
+        named = declared_bank(full_text or text)
+        if named:
+            meta.institution = named
 
     if meta.opening_balance is None and meta.closing_balance is None:
         meta.notes.append(

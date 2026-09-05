@@ -208,6 +208,24 @@ def project_loan(
         )
 
     months = months_to_payoff(outstanding, rate, emi)
+
+    # A term the LENDER states beats one derived here.
+    #
+    # The derivation amortises the outstanding at the regular EMI, and a
+    # final instalment is rarely the regular EMI - it is whatever clears the
+    # balance. ICICI states "Instl. Pending 0, Future 1, Future Instl.Amt
+    # 42,781" against a regular EMI of 42,850: one payment ends the loan. The
+    # derivation charged a month's interest on 42,781, found 42,850 fell 296
+    # short, and reported two instalments and a payoff a month late on a loan
+    # with a single payment left.
+    #
+    # Only ever shortens: a stated term longer than the arithmetic allows
+    # would mean the EMI cannot service the debt, which the warning below
+    # covers and a stated figure should not paper over.
+    stated = getattr(account, "tenure_months_remaining", None)
+    if stated and months is not None and 0 < stated < months:
+        months = stated
+
     if months is None:
         warnings.append(
             "The EMI does not cover the monthly interest, so this balance will "
@@ -223,6 +241,9 @@ def project_loan(
         )
 
     schedule = build_schedule(outstanding, rate, emi, _add_month(as_of))
+    # The schedule follows the term above, so a lender-stated final
+    # instalment does not acquire a phantom month behind it.
+    schedule = schedule[:months] if months else schedule
     total_interest = sum((r.interest for r in schedule), Decimal("0"))
     total_payable = sum((r.emi for r in schedule), Decimal("0"))
     next_interest = schedule[0].interest if schedule else Decimal("0")

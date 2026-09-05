@@ -239,6 +239,111 @@ class DemoRequest(BaseModel):
     enabled: bool
 
 
+@router.post("/cards/analyze")
+def analyze_cards() -> dict[str, Any]:
+    """Re-read every credit card's newest statement for its cycle.
+
+    A card's summary box - limit, amount due, minimum due, statement and due
+    dates - is the one part of a statement that resists a deterministic
+    reader, because the labels are a header row and the figures sit wherever
+    the issuer's layout puts them. `normalize.card_summary` handles it, and
+    it runs during parsing; this is the same read on demand, for cards
+    already in the ledger whose statements were parsed before it existed.
+
+    One statement per card - the newest - because that is the only one whose
+    figures are current. Answers are cached by the text they were read from,
+    so pressing this twice costs one round of model calls, not two.
+    """
+    from pathlib import Path
+
+    from ..ingestion import extractors
+    from ..ingestion.passwords import derive_passwords
+    from ..normalize.normalizer import normalize
+
+    db = get_db()
+    profile = repo.get_profile(db)
+    candidates = (derive_passwords(profile)
+                  if profile.has_password_material() else [])
+
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT ON (a.id) a.id, a.institution,"
+            "       a.account_number_masked AS masked, f.filepath, f.sender"
+            "  FROM accounts a"
+            "  JOIN statements s ON s.account_id = a.id"
+            "  JOIN source_files f ON f.statement_id = s.id"
+            " WHERE a.account_type = 'credit_card'"
+            " ORDER BY a.id, s.period_end DESC NULLS LAST").fetchall()
+
+    read: list[dict[str, Any]] = []
+    for row in rows:
+        entry: dict[str, Any] = {
+            "account_id": row["id"],
+            "card": f"{row['institution']} {row['masked'] or ''}".strip(),
+        }
+        path = Path(row["filepath"] or "")
+        if not path.exists():
+            entry["status"] = "the statement file is no longer on disk"
+            read.append(entry)
+            continue
+        try:
+            extraction = extractors.extract_pdf(
+                path, password_candidates=candidates)
+            statement, account = normalize(extraction, path.name,
+                                           sender=row["sender"] or "")
+        except Exception as exc:
+            log.warning("could not analyse %s: %s", path.name, exc)
+            entry["status"] = f"{type(exc).__name__}"
+            read.append(entry)
+            continue
+        if getattr(extraction, "needs_password", False):
+            entry["status"] = "still locked"
+            read.append(entry)
+            continue
+
+        # Written straight onto the account: the newest statement IS the
+        # current cycle, so there is nothing older to prefer.
+        with db.connection() as conn:
+            conn.execute(
+                "UPDATE accounts SET credit_limit = ?,"
+                "  principal_outstanding = ?, balance_as_of = ?"
+                " WHERE id = ?",
+                (_txt(account.credit_limit),
+                 _txt(statement.closing_balance),
+                 statement.period_end.isoformat()
+                 if statement.period_end else None,
+                 row["id"]))
+        entry.update({
+            "status": "read",
+            "credit_limit": _txt(account.credit_limit),
+            "amount_due": _txt(statement.closing_balance),
+            "cycle_start": (statement.period_start.isoformat()
+                            if statement.period_start else None),
+            "cycle_end": (statement.period_end.isoformat()
+                          if statement.period_end else None),
+            "notes": list(statement.parse_warnings)[:2],
+        })
+        read.append(entry)
+
+    complete = sum(1 for e in read
+                   if e.get("credit_limit") and e.get("amount_due"))
+    return {
+        "cards": read,
+        "analysed": len(read),
+        "complete": complete,
+        "note": (
+            f"{complete} of {len(read)} cards now carry both a limit and an "
+            f"amount due. A card left blank is one whose statement does not "
+            f"state the figure where it could be found - reporting nothing "
+            f"is deliberate, because a wrong limit is what would let the "
+            f"credit report be matched to the wrong card."),
+    }
+
+
+def _txt(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
 @router.get("/demo")
 def read_demo(user: User = Depends(current_user)) -> dict[str, Any]:
     """Whether this account is looking at its demo workspace, and what is in it."""

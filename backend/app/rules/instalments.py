@@ -77,6 +77,14 @@ LOAN_EVIDENCE: tuple[str, ...] = (
     # The lender's own wording for taking, missing or reversing an instalment.
     r"\bINSTAL?MENT\s+(?:DUE|RECOVERY|COLLECTION|BOUNCE|RETURN)\b",
     r"\bEMI\s+(?:DEBIT|RECOVERY|COLLECTION|BOUNCE|RETURN|PAYMENT\s+TO)\b",
+    # "EMI DUE FOR INST.49, NOV 25" - a lender saying what it is collecting
+    # and which instalment of the schedule this is. DUE is the word that
+    # makes it safe to match: the ambiguous "EMI" this module warns about is
+    # an issuer ADVERTISING that a purchase could be split into instalments,
+    # and an advert never says the instalment is due. Without it, 34 home
+    # loan instalments of 42,850 each sat uncategorised - the second largest
+    # hole in the spending breakdown.
+    r"\bEMI\s+DUE\b",
     r"\bEMI\s+(?:FOR|OF)\s+LOAN\b|\bLOAN\s+EMI\b",
     # An instalment counter standing on its own - "INSTALMENT 24 OF 60".
     r"\bINSTAL?MENTS?\b[^A-Za-z]{0,6}\d{1,3}\s*(?:OF|/)\s*\d{1,3}\b",
