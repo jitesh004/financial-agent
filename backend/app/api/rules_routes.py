@@ -22,6 +22,8 @@ them - which is the exact fault this package was built to remove.
 from __future__ import annotations
 
 import logging
+from datetime import date
+from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -29,7 +31,7 @@ from pydantic import BaseModel
 
 from ..categorize import rules as category_rules
 from ..ingestion import bureau, gmail_source, passwords, portfolio, txn_email
-from ..models.schemas import CATEGORY_GROUPS, Direction
+from ..models.schemas import CATEGORY_GROUPS, Direction, Transaction
 from ..normalize import column_map, metadata
 from ..rules import formats, institutions
 from ..rules import passwords as password_formats
@@ -232,6 +234,11 @@ def _check_rules() -> dict[str, Any]:
                 "confidence": rule.confidence,
                 "direction": rule.direction.value if rule.direction else None,
                 "pattern": _pattern(rule.pattern),
+                # The rule's veto, when it has one - a second pattern that
+                # stands the first one down. Shown because a rule that says
+                # "instalment means debt" without also saying "unless it is
+                # an RD instalment" is not the rule the app runs.
+                "excludes": _pattern(rule.exclude) if rule.exclude else None,
             }
             for i, rule in enumerate(category_rules.RULES)
         ],
@@ -299,10 +306,28 @@ def _ledger_rules() -> dict[str, Any]:
         "recurring": {
             "min_occurrences": recurring.MIN_OCCURRENCES,
             "amount_variance": recurring.AMOUNT_VARIANCE_TOLERANCE,
+            "min_confidence": recurring.MIN_CONFIDENCE,
+            "min_cadence_fit": recurring.MIN_CADENCE_FIT,
             "note": "Grouped by a merchant signature with numbers, month names and "
-                    "rail codes stripped, then tested for a regular cadence and a "
-                    "stable amount. Same payee, wildly different amounts is not a "
-                    "fixed charge.",
+                    "rail codes stripped, then every cadence is FITTED to the "
+                    "dates and the best-scoring one wins. The score weighs how "
+                    "close the dates sit to the rhythm they claim, how tightly "
+                    "they cluster on one day of the month, how many periods in "
+                    "the span actually hold a charge, and whether any period "
+                    "holds two - which is proof the rhythm is wrong.",
+            # Published because "the amount is stable" means something
+            # different for an EMI and for an electricity bill, and a single
+            # number could only ever be wrong in one direction or the other.
+            "amount_tolerance": [
+                {"category": category, "tolerance": tolerance}
+                for category, tolerance in sorted(
+                    recurring.AMOUNT_TOLERANCE.items())
+            ],
+            "amount_note": "A charge whose price ROSE is still one charge: a "
+                           "clean level shift keeps the series and the new "
+                           "level becomes the going-forward figure. So does a "
+                           "steady drift, which is what a loan's interest "
+                           "component does every month for twenty years.",
         },
         "pairing": [
             {
@@ -691,27 +716,58 @@ def _explain_description(text: str, direction: str) -> dict[str, Any]:
 
     normalized = normalize_description(text)
 
+    # The same strings `apply_rules` looks at, including the variant with the
+    # issuer's EMI offer marker removed. Assembled through the same helper
+    # rather than restated: this box is the app explaining itself, and an
+    # explanation that searches a different set of strings from the pipeline
+    # is a second implementation that will drift. It did - "EMI CLOUDNINE"
+    # was categorised as healthcare by the ledger and reported here as
+    # matching nothing at all.
+    haystacks = category_rules.haystacks_for(
+        Transaction(txn_date=date.today(), raw_description=text,
+                    normalized_description=normalized,
+                    amount=Decimal("0"), direction=way))
+
     # Every rule that COULD match, not just the winner. "Which rule fired" is
     # the answer; "what else nearly fired" is what explains a surprise.
     matches = []
+    vetoed = []
     for i, rule in enumerate(category_rules.RULES):
         if rule.direction is not None and rule.direction != way:
             continue
-        if rule.pattern.search(text) or rule.pattern.search(normalized):
-            matches.append({
-                "order": i + 1,
-                "category": rule.category,
-                "confidence": rule.confidence,
-                "direction": rule.direction.value if rule.direction else None,
-                "pattern": _pattern(rule.pattern),
-            })
+        if not any(rule.pattern.search(h) for h in haystacks):
+            continue
+        entry = {
+            "order": i + 1,
+            "category": rule.category,
+            "confidence": rule.confidence,
+            "direction": rule.direction.value if rule.direction else None,
+            "pattern": _pattern(rule.pattern),
+        }
+        veto = next((rule.exclude.search(h) for h in haystacks
+                     if rule.exclude is not None
+                     and rule.exclude.search(h)), None)
+        if veto is not None:
+            # It matched and stood down anyway. Reported separately, because
+            # "the loan rule matched but the word RD vetoed it" is the whole
+            # answer to why an RD instalment is filed as investment.
+            entry["vetoed_by"] = veto.group(0)
+            entry["excludes"] = _pattern(rule.exclude)
+            vetoed.append(entry)
+            continue
+        matches.append(entry)
 
     alert = txn_email.parse_alert(text)
 
     return {
         "normalized": normalized,
+        # What the rules were actually run against, marker-stripped variant
+        # included, so a surprising answer can be traced to the string that
+        # produced it rather than to the one that was typed.
+        "searched": haystacks,
         "winner": matches[0] if matches else None,
         "also_matched": matches[1:],
+        "vetoed": vetoed,
         "bill_payment": bool(formats.BILL_PAYMENT.search(text)),
         "rails_stripped": text != normalized,
         "alert": None if alert is None else {

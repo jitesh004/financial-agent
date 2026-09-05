@@ -18,7 +18,7 @@ one is built around a single constraint:
 > **The arithmetic must tie out to the rupee, and no language model is ever
 > allowed to produce a figure.**
 
-Three mechanisms enforce that.
+Four mechanisms enforce that.
 
 ### 1. The reconciliation gate
 
@@ -70,7 +70,37 @@ PDF/XLSX/DOCX/CSV → extract → normalize → reconcile ┐
 Categorization is rules-first with a learned merchant cache; a model only sees
 merchants nothing else recognised, and its answer is cached so it is never asked
 twice. **Without an API key the app still works completely** — you lose only the
-written narrative and the unknown-merchant tail.
+written narrative, the unknown-merchant tail, and the
+[Agents tab](#agents), which cannot degrade to a computed answer because
+choosing what to look at is the whole of what it does.
+
+The rule holds for the model's *categories* as well as its numbers. A model
+handed a merchant string will occasionally reach for a bucket that is a claim
+about a counterparty rather than about a purchase — `emi`, `loan_interest`,
+`cc_payment` — and such an answer is refused unless something in the string is
+actually a lender. Which brings us to the word "EMI".
+
+### 4. "EMI" in a narration is usually an advertisement
+
+Card issuers print the word against ordinary purchases to say the charge
+*could* be split into instalments if the cardholder asked. Nothing has been
+borrowed, no schedule exists, and the full price was paid:
+
+```
+22:01 EMI INFINITIRETAILLIMITEDMumbai      34,990.00
+EMI CLOUDNINE PNEPPSPUNE                1,25,000.00
+```
+
+Reading that as a category was wrong twice over: it threw away the merchant —
+the one thing the row does say — and it moved a hospital bill and a school fee
+into the figures that report what somebody *owes*. So the token carries no
+weight on its own. A row is debt only when it shows something a **lender**
+writes: a mandate collected by an NBFC, a named loan product, a loan account
+number, or a principal/interest split carrying its instalment counter. The
+whole vocabulary is in `rules/instalments.py`, and the same file explains why
+"instalment" alone is not enough either — a recurring deposit, a SIP and the
+*fee* for setting up a conversion are all written with that word, and each has
+a better home.
 
 ---
 
@@ -302,6 +332,12 @@ untouched, and is safe to run twice.
 ## What it produces
 
 - **Overview** — income, spending, savings rate, net position, and the narrative
+- **Position** — what *you* have checked and confirmed, aged to today. The one
+  screen the documents do not produce, and the only one that can hold a loan
+  no statement mentions. See below
+- **Agents** — the questions you would have had to know to ask. Each one is
+  handed the whole ledger and a job, decides for itself what to look at, and
+  shows its working. See below
 - **Budget** — what a month costs before you decide anything: which charges are
   fixed and *for how long*, which vary and by how much, and what is left
 - **Spending** — category and merchant breakdowns, per-month trends, outliers,
@@ -338,6 +374,41 @@ Not "what does the data say" — the questions people actually ask themselves:
 | What is my monthly budget? | **Budget → A month costs.** Commitments that leave for good, plus the median month of everything that varies. Nobody types a target in; it is what your own statements say a month costs |
 | Which expenses repeat month on month — EMI, school fees, utilities, recharges, insurance? | **Budget**, in two lists: charges that recur as a *series*, and categories that appear in *every month* even though no single merchant repeats (groceries are the usual case) |
 
+### How "this repeats" is decided
+
+Not by the median gap between charges. That is the obvious method and it is
+wrong in three ways that all show up on real statements: a single missed month
+turns a monthly charge into a "bi-monthly" one, months are not 30 days so the
+tolerance has to be wide enough to also admit coincidences, and it throws away
+the strongest signal there is — *the 5th of every month* is not a fact about
+gaps at all.
+
+So every candidate cadence is **fitted**. Each date is assigned to the period
+it lands in — whole months for the monthly family, days for the weekly one —
+and the fit is scored on four things at once: how close the dates sit to the
+rhythm they claim, how tightly they cluster on one day of the month, how many
+periods in the span actually hold a charge, and whether any period holds *two*,
+which is proof the rhythm is wrong. The best-scoring cadence wins and its score
+becomes the confidence.
+
+Three consequences worth knowing:
+
+- **A missed month costs coverage and nothing else.** It does not change what
+  cadence the charge is on.
+- **A salary paid on the last working day is monthly.** It lands on 31 May one
+  year and 2 June the next, so a date on the far side of a month boundary from
+  the anchor is counted as the anchor's month — the same correction that
+  decides which month a payment is *reported* in.
+- **A price rise keeps the series.** A clean level shift, or a steady drift
+  like a loan's interest component falling every month for twenty years, is
+  recognised as one charge with two levels — and the going-forward figure is
+  the *current* level. Rent that went from 41,500 to 45,000 costs 45,000 next
+  month, not the average of the two.
+
+Every detected series carries the sentences the detector wrote about its own
+reasoning, and the Recurring tab shows them next to the rows the series was
+inferred from.
+
 Two rules keep those answers honest:
 
 - **A SIP is not an expense.** Money moving into an investment every month is
@@ -348,6 +419,153 @@ Two rules keep those answers honest:
 - **"Typical" is the median month, never the mean.** One holiday, one hospital
   bill or one wedding would otherwise set the expectation for every month
   after it.
+
+---
+
+## Position
+
+Every other screen is derived from a document, and is therefore only as
+complete as the documents that have been imported. Position is the other half:
+the place where you say *this is my reality, I have been through it*. It exists
+because there are facts no statement carries — a loan serviced from an account
+nobody uploaded, a tenure agreed on the phone, a card whose PDF is lost.
+
+The obvious objection to letting anyone type "outstanding: 42,00,000" is that
+it is true for exactly one day. That is a property of the number, not a reason
+to refuse it, and two things answer it:
+
+**An attested figure ages.** Nothing here is displayed as typed. A loan is
+rolled forward from the day you confirmed it through the same closed-form
+amortization the Debt tab uses, so a balance signed off in January reads three
+instalments lighter in April — and the row shows both, with a sentence saying
+which is which:
+
+```
+Home loan          ₹41,26,891     221 left   paid off Jan 2045
+                   from ₹42,00,000 · 3 EMIs on
+                   as you reviewed it on 5 Jan 2026, rolled forward 3 instalment(s)
+```
+
+**An attested figure is checkable.** Where the row is mapped to a statement,
+the rolled-forward number is compared against what the bank actually says and
+the difference is reported — never resolved silently in either direction. A
+statement is checked and an attestation is not, so the statement is usually
+right; but the whole reason this table exists is that statements are sometimes
+absent or months behind.
+
+### A card is the deliberate exception
+
+A card balance does not amortize — it is whatever was spent minus whatever was
+paid — so projecting one would be inventing a liability, which is the single
+number on this screen that must not exist. What a card *does* have is a cycle,
+and that is arithmetic: the next statement date and the next due date are
+computed, and the balance is marked stale the moment a statement has been
+generated since you last looked.
+
+### Three of four terms are enough
+
+A loan has four numbers — balance, EMI, rate, remaining term — and any three
+determine the fourth. The rate is the one nobody remembers, so give the other
+three and it is recovered by bisection and labelled as *worked out* rather than
+confirmed. Give all four and disagree with yourself, and it says so at the
+moment you type it rather than letting a payoff date come out four years wrong.
+
+### What nothing accounts for
+
+The most important thing on the screen is the list of credit accounts your
+position does *not* cover. A bureau report names every account a lender has
+reported; anything open there and unmapped here means every total on this
+screen — and every answer an agent gives — is short by whatever it holds.
+Nothing else in this app can tell you that.
+
+### A blank is never a zero
+
+An account whose balance nobody has recorded is not an account holding nothing.
+Totals show an em dash where a figure is genuinely unknown and say how many
+rows are still blank, because "assets: ₹0" from a position with one empty field
+in it is a worse answer than no answer.
+
+### Reviews are a record, not a state
+
+*"No one can deny it, because I reviewed it myself"* only holds if the review
+is dated and kept. Signing off freezes the whole position as a snapshot, so
+*what was I carrying in September?* is answerable in December — and so a later
+roll-forward can be audited against it when the next statement finally arrives
+and disagrees.
+
+Nothing needs typing from scratch: **Draft it from what I have imported** fills
+in every figure the statements and the bureau already carry, dated to when each
+is actually true rather than to today. Your job is to correct what is wrong,
+which is a five-minute pass. Every field is editable in place, rows can be
+added and removed, each row maps to a statement and to a bureau line, and every
+column sorts — *which card is nearest its limit*, *what is due first*, *which
+loan has longest to run* are each one click.
+
+---
+
+## Agents
+
+Every tab above answers a question somebody already knew to ask. An agent is
+for the ones they cannot phrase — *am I actually going to be short in March?*,
+*which of these subscriptions is quietly the most expensive?*, *what have I
+already spent this year that counts against 80C?* — and it works by being
+handed the ledger and a job rather than an answer to narrate.
+
+Every agent opens with the [Position](#position) — it outranks the statements,
+because it is what the user confirmed themselves and it is the only source that
+can carry a debt no document mentions.
+
+| Agent | The question it answers |
+|---|---|
+| **Debt Strategist** | What is my debt actually costing me, and what would change it? Prices every loan out to its last instalment, works out how much of the *next* EMI is interest rather than principal, and simulates the same lump sum against each loan so the comparison is arithmetic rather than a rule of thumb |
+| **Subscription & Leak Auditor** | What is quietly draining money every month? Price rises nobody was told about, two services doing one job, annual renewals about to land, and charges that look abandoned rather than cancelled — ranked by *annual* cost, because that is the figure that decides anything |
+| **Cashflow Sentinel** | Am I going to be short, and exactly when? A dated, day-by-day projection: which date is lowest, and which charges in the days before it put it there. A month that balances can still be short on the 4th |
+| **Tax Utilisation** | What have I already spent that counts, and what is unused? Adds up qualifying spending under 80C, 80D, 24(b), 80CCD(1B), 80E and 80G *from the ledger* — including the home-loan principal and interest split, which is the deduction most often missed |
+| **Emergency Fund & Resilience** | How long could I last if the income stopped? Two burn rates, because "six months of expenses" means nothing without knowing which expenses: what a month costs today, and what still has to be paid in the month somebody loses their job |
+
+### How an agent works, and what it may not do
+
+It is a loop, not a prompt. The model is given the job and a **read-only
+toolbelt** — fourteen whitelisted computations over the user's own rows — and
+each turn it either asks for tools or gives its answer. The tools are executed
+here, the results go back, and it goes again until it answers or its step
+budget runs out.
+
+Three rules make that trustworthy:
+
+- **Numbers come from tools, never from the model.** Every figure is computed
+  in `Decimal` over the reconciled ledger and handed back exact. The model
+  chooses what to look at and what it means; it does not do the arithmetic.
+  This is the same rule as [§3 above](#3-the-llm-never-does-arithmetic), applied
+  to a loop instead of a single call.
+- **Every run keeps its working.** The full transcript — each tool call and
+  each result — is stored with the answer, and the screen shows it under *How
+  it got there*. Any number in a finding can be traced to the call that
+  produced it.
+- **Nothing can be written.** There is no tool that writes, no tool that takes
+  SQL, and no tool that reaches outside the tenant. `ledger_query` goes through
+  the same closed registry of dimensions and measures the Explore tab uses,
+  which is why it is safe to let a model describe a query.
+
+The advice boundary is unchanged from the narrative: an agent may say *"your
+EMIs are 43% of take-home, which is above the 40% lenders generally treat as
+stretched"* and may lay out the mechanics of an option in full. It may not tell
+anybody what to buy or sell, what to prioritise with their money, or what a
+market will do.
+
+### Runs are kept, and compared
+
+*"Your EMIs are 43% of take-home"* is a fact any screen can show. *"They were
+47% when this last ran in March"* is not, and it is the thing somebody
+actually wants to know — so each run is stored and read back against the one
+before it. Metrics that moved, findings that are new, findings that have gone.
+That comparison is the reason to re-run an agent at all, and it is why an
+agent run survives re-processing the statements: it is in the same clear tier
+as the merchant cache, not with the derived data.
+
+Agents are the one feature here that cannot degrade to a computed answer —
+choosing what to look at next is the whole of what they do — so with no model
+configured the screen says so rather than offering a button that cannot work.
 
 ---
 
@@ -470,12 +688,13 @@ reconciles.
 
 ## Language model
 
-Two things use a model, and neither of them touches a number:
+Three things use a model, and none of them touches a number:
 
 | Tier | What it does | Volume |
 | --- | --- | --- |
 | `fast` | Categorises merchants that rules and the learned cache did not recognise, forty to a call; reads an unfamiliar statement letterhead for its issuer and account type | Many calls, one per batch, answers cached forever |
 | `strong` | Writes the narrative from the already-computed brief | One call per analysis |
+| `strong` | Runs an **agent**: a tool-calling loop over the ledger, up to ten turns | One call per turn, only when you press Run |
 
 The default provider is **OpenRouter**, on models billed at zero per token:
 
@@ -596,14 +815,15 @@ backend/app/
   normalize/             Date/amount parsers, column mapping, metadata, normalizer
   reconcile/             The balance gate + transfer detection
   categorize/            Rules engine, merchant cache, LLM tail
-  analytics/             Cashflow, recurring, loans, forecast
+  analytics/             Cashflow, recurring, loans, forecast, position
+  agents/                Read-only toolbelt, agent catalogue, the tool loop
   graph/                 LangGraph state, nodes, assembly
   llm/                   Anthropic client (with redaction) + narrative
   db/                    PostgreSQL schema, engine and repository
   auth/                  Google sign-in, sessions, onboarding
   api/, main.py          FastAPI
 backend/tools/           Synthetic fixture generator
-backend/tests/           657 tests, including fault injection and isolation
+backend/tests/           948 tests, including fault injection and isolation
 frontend/src/            React UI
 ```
 

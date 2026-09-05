@@ -464,6 +464,56 @@ export async function watchJob(jobId, onTick, intervalMs = 700) {
 }
 
 
+/* ---------- Position ----------
+   The one screen whose figures the USER asserts rather than a document
+   declaring them. Everything here is a partial patch: correcting an
+   outstanding balance must never disturb a label fixed earlier, and sending
+   an explicit null is how a field is unset as distinct from left alone.
+
+   `reviewItem` is deliberately not a patch. Moving the review date is the act
+   that says "I have looked at this and it is right", and it resets the
+   roll-forward - so it must not happen as a side effect of fixing a typo. */
+
+api.position = (includeArchived = false) =>
+  request(`/api/position?include_archived=${includeArchived ? 'true' : 'false'}`);
+api.positionMappable = () => request('/api/position/mappable');
+api.seedPosition = () => jsonPost('/api/position/seed');
+api.addPositionItem = (fields) => jsonPost('/api/position/items', fields);
+api.updatePositionItem = (id, fields) =>
+  jsonPatch(`/api/position/items/${id}`, fields);
+api.reviewPositionItem = (id, reviewedOn) =>
+  jsonPost(`/api/position/items/${id}/review`, { reviewed_on: reviewedOn });
+api.deletePositionItem = (id, permanent = false) =>
+  request(`/api/position/items/${id}?permanent=${permanent ? 'true' : 'false'}`,
+    { method: 'DELETE' });
+api.reviewPosition = (body) => jsonPost('/api/position/review', body);
+api.positionSnapshots = () => request('/api/position/snapshots');
+api.positionSnapshot = (id) => request(`/api/position/snapshots/${id}`);
+api.deletePositionSnapshot = (id) =>
+  request(`/api/position/snapshots/${id}`, { method: 'DELETE' });
+
+
+/* ---------- Agents ----------
+   A run is a JOB, not a request: several model round trips with tool
+   execution between them takes tens of seconds, and an HTTP request held
+   open that long dies to a proxy timeout - taking the analysis, which is the
+   expensive part, with it. So `runAgent` hands back a job id and the screen
+   watches it with `watchJob` the same way an import is watched. */
+
+api.agents = () => request('/api/agents');
+api.runAgent = (key, question = '') =>
+  jsonPost(`/api/agents/${key}/run`, { question });
+api.agentRuns = (key, limit = 20) =>
+  request(`/api/agents/${key}/runs?limit=${limit}`);
+/* The transcript is every tool call and every result the agent read, which is
+   what makes its figures checkable - and easily the largest thing in the row,
+   so it is only fetched when somebody opens it. */
+api.agentRun = (id, { transcript = false } = {}) =>
+  request(`/api/agents/runs/${id}?transcript=${transcript ? 'true' : 'false'}`);
+api.deleteAgentRun = (id) =>
+  request(`/api/agents/runs/${id}`, { method: 'DELETE' });
+
+
 /* ---------- Settings, and the run that spends money ---------- */
 
 api.settings = () => request('/api/settings');

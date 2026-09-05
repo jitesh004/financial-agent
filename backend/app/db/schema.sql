@@ -362,14 +362,40 @@ CREATE TABLE IF NOT EXISTS recurring_series (
     label          TEXT NOT NULL,
     category       TEXT NOT NULL DEFAULT 'uncategorized',
     direction      TEXT NOT NULL,
+    -- The going-forward figure: what the NEXT charge is expected to be, which
+    -- for a series whose price rose is the level SINCE the rise rather than
+    -- the lifetime median. `lifetime_median` below keeps the other one.
     median_amount  TEXT NOT NULL,
     cadence_days   INTEGER NOT NULL DEFAULT 30,
+    -- Stored rather than mapped back from cadence_days by whoever reads this.
+    -- The frontend carried its own copy of that table and could not name a
+    -- cadence the detector learned about later.
+    cadence_name   TEXT NOT NULL DEFAULT '',
     occurrences    INTEGER NOT NULL DEFAULT 0,
     first_seen     TEXT,
     last_seen      TEXT,
     next_expected  TEXT,
     is_active      INTEGER NOT NULL DEFAULT 1,
+    -- "active", "overdue" (a charge has been missed, but not enough of them
+    -- to call it finished) or "ended". is_active collapses the first two.
+    status         TEXT NOT NULL DEFAULT 'active',
     confidence     DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    -- How the detector reached its verdict, so a series read back from
+    -- storage can still be explained. Coverage is the share of periods
+    -- between the first and last charge that actually hold one, which is the
+    -- difference between rent and a shop visited now and then.
+    coverage        DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    missed          INTEGER NOT NULL DEFAULT 0,
+    day_of_month    INTEGER,
+    amount_variance DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    -- "flat", "rose", "fell" or "drifting", with the level it moved from and
+    -- when, so a price rise is visible rather than averaged away.
+    amount_trend    TEXT NOT NULL DEFAULT 'flat',
+    lifetime_median TEXT,
+    last_amount     TEXT,
+    changed_on      TEXT,
+    -- The sentences the detector wrote about its own reasoning, as JSON.
+    evidence        TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (user_id, id),
     FOREIGN KEY (user_id, account_id)
         REFERENCES accounts(user_id, id) ON DELETE CASCADE
@@ -1009,3 +1035,147 @@ CREATE TABLE IF NOT EXISTS holdings (
 
 CREATE INDEX IF NOT EXISTS idx_holdings_asof ON holdings (as_of DESC);
 CREATE INDEX IF NOT EXISTS idx_holdings_statement ON holdings (statement_id);
+
+
+-- ---------------------------------------------------------------------------
+-- Agent runs.
+--
+-- An agent run is model output that cost real money to produce, so it is
+-- stored rather than recomputed - and, more importantly, stored so that TWO
+-- runs can be compared. "Your EMIs are 43% of take-home" is a fact anybody
+-- can read off a screen; "they were 47% when this last ran in March" is the
+-- thing somebody actually wants to know, and only a history can say it.
+--
+-- The transcript is kept alongside the answer because an agent's figures are
+-- only trustworthy if they can be traced: every tool call and every result is
+-- in there, so any number in an answer can be checked against the call that
+-- produced it.
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id              TEXT NOT NULL,
+    user_id         UUID NOT NULL DEFAULT current_tenant()
+                        REFERENCES users(id) ON DELETE CASCADE,
+    agent           TEXT NOT NULL,
+    -- "ok", "exhausted" (ran out of steps) or "failed".
+    status          TEXT NOT NULL DEFAULT 'ok',
+    started_at      TEXT NOT NULL DEFAULT fa_now(),
+    finished_at     TEXT,
+    seconds         DOUBLE PRECISION NOT NULL DEFAULT 0,
+    -- The question asked, when the user asked their own rather than taking
+    -- the agent's default.
+    question        TEXT NOT NULL DEFAULT '',
+    answer_json     TEXT NOT NULL DEFAULT '{}',
+    transcript_json TEXT NOT NULL DEFAULT '[]',
+    model           TEXT NOT NULL DEFAULT '',
+    provider        TEXT NOT NULL DEFAULT '',
+    steps           INTEGER NOT NULL DEFAULT 0,
+    tool_calls      INTEGER NOT NULL DEFAULT 0,
+    error           TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (user_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_runs_agent
+    ON agent_runs (user_id, agent, started_at DESC);
+
+
+-- The position: what the user says is true, and when they said it.
+--
+-- Everything else in this app is derived from a document. This table is the
+-- one place a human ASSERTS something, and it exists because there are facts
+-- no statement carries: a loan serviced from an account that was never
+-- uploaded, the tenure a lender agreed verbally, a card whose statement PDF
+-- nobody can find. Without somewhere to put those, the app's totals are
+-- confidently incomplete and nothing says so.
+--
+-- The obvious objection to a table like this is that a typed number goes
+-- stale and then quietly disagrees with the statements. Two things answer it,
+-- and both are why `reviewed_on` is NOT NULL:
+--
+--   * An attested figure AGES. A loan outstanding is only true on the day it
+--     was read; the day after, one EMI has moved some of it to principal. So
+--     nothing here is displayed as-is - it is rolled forward from
+--     `reviewed_on` through the same amortization the Debt tab uses, and the
+--     screen shows both the baseline and today's figure. See
+--     analytics/position.py.
+--   * An attested figure is CHECKABLE. Where the item is mapped to a ledger
+--     account, the rolled-forward number is compared against what the
+--     statements actually say, and the difference is reported rather than
+--     silently preferred either way.
+--
+-- A card is the exception and is treated as one: a card's balance does not
+-- amortize, it depends on what was spent, so it is never rolled forward. Its
+-- CYCLE does roll - the next statement and due dates are arithmetic - and the
+-- balance is marked stale once a cycle has closed since the review.
+CREATE TABLE IF NOT EXISTS position_items (
+    id            TEXT NOT NULL,
+    user_id       UUID NOT NULL DEFAULT current_tenant()
+                      REFERENCES users(id) ON DELETE CASCADE,
+    -- "loan", "card", "account", "investment" or "other".
+    kind          TEXT NOT NULL DEFAULT 'other',
+    label         TEXT NOT NULL DEFAULT '',
+    institution   TEXT NOT NULL DEFAULT '',
+
+    -- What this is the same thing as. Both nullable and both editable by
+    -- hand: an item can exist with no statement behind it (that is the point)
+    -- and the bureau's view of a loan is a third record of the same debt.
+    account_id        TEXT,
+    bureau_account_id TEXT,
+
+    -- The day the user reviewed this and said it was true. Everything derived
+    -- is derived FROM this date, so it is required.
+    reviewed_on   TEXT NOT NULL,
+
+    -- The attested baseline. Money is TEXT holding a decimal, as everywhere.
+    outstanding       TEXT,   -- owed on a loan or card; balance on an account
+    original_amount   TEXT,   -- what was borrowed, where it is known
+    emi               TEXT,
+    interest_rate     TEXT,   -- annual percent
+    months_remaining  INTEGER,
+    months_total      INTEGER,
+
+    -- Cards.
+    credit_limit  TEXT,
+    min_due       TEXT,
+    -- Day of the month the statement is generated, and the day payment is
+    -- due. Two numbers rather than dates, because a cycle repeats.
+    statement_day INTEGER,
+    due_day       INTEGER,
+
+    notes         TEXT NOT NULL DEFAULT '',
+    -- Removed by the user. Kept rather than deleted so a snapshot taken while
+    -- it existed still resolves, and so "I closed this in March" is a fact
+    -- the position can show rather than a gap it cannot explain.
+    archived      INTEGER NOT NULL DEFAULT 0,
+    sort_order    INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL DEFAULT fa_now(),
+    updated_at    TEXT NOT NULL DEFAULT fa_now(),
+    PRIMARY KEY (user_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_position_kind
+    ON position_items (user_id, kind, archived);
+
+
+-- The whole position, frozen on the day it was reviewed.
+--
+-- "No one can deny it, because I reviewed it myself" only holds if the review
+-- is a record rather than a state. A snapshot is what makes "this is what I
+-- was carrying in September" answerable in December, and what the
+-- roll-forward can be audited against when the next statement arrives.
+CREATE TABLE IF NOT EXISTS position_snapshots (
+    id         TEXT NOT NULL,
+    user_id    UUID NOT NULL DEFAULT current_tenant()
+                   REFERENCES users(id) ON DELETE CASCADE,
+    taken_on   TEXT NOT NULL,
+    note       TEXT NOT NULL DEFAULT '',
+    -- Every item exactly as it stood, and the totals computed from them.
+    -- Stored rather than recomputed: the point of a snapshot is that it does
+    -- not change when the items do.
+    items_json  TEXT NOT NULL DEFAULT '[]',
+    totals_json TEXT NOT NULL DEFAULT '{}',
+    item_count  INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT fa_now(),
+    PRIMARY KEY (user_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_position_snapshots_taken
+    ON position_snapshots (user_id, taken_on DESC);

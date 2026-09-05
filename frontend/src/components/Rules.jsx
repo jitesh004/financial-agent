@@ -216,9 +216,12 @@ function Explain() {
 
       {d && (
         <Card title="The transaction">
-          <Section title="What the app reads" sub="Rail prefixes and reference numbers are stripped before any rule sees it.">
-            <div style={{ fontFamily: 'var(--mono, monospace)', fontSize: 13 }}>
-              {d.normalized || <em>nothing left after cleaning</em>}
+          <Section title="What the app reads" sub="Rail prefixes and reference numbers are stripped before any rule sees it, and every rule is run against each of these.">
+            <div style={{ fontFamily: 'var(--mono, monospace)', fontSize: 13,
+              display: 'flex', flexDirection: 'column', gap: 4 }}>
+              {(d.searched?.length ? d.searched : [d.normalized]).map((line, i) => (
+                <div key={i}>{line || <em>nothing left after cleaning</em>}</div>
+              ))}
             </div>
           </Section>
 
@@ -248,6 +251,20 @@ function Explain() {
                 head={['Order', 'Category', 'Looks for']}
                 rows={d.also_matched.map((r) => [
                   r.order, titleCase(r.category), <Terms pattern={r.pattern} max={8} />,
+                ])}
+              />
+            </Section>
+          )}
+
+          {d.vetoed?.length > 0 && (
+            <Section title="Matched, then stood down"
+              sub="These found what they look for and gave the row up anyway, because a second pattern rules them out. Without that, an “RD instalment” would be filed as debt.">
+              <Table
+                head={['Order', 'Category', 'Looks for', 'Ruled out by']}
+                rows={d.vetoed.map((r) => [
+                  r.order, titleCase(r.category),
+                  <Terms pattern={r.pattern} max={6} />,
+                  <Chip tone="warn">{r.vetoed_by}</Chip>,
                 ])}
               />
             </Section>
@@ -614,7 +631,7 @@ function Categories({ data, q }) {
     <Card title={`${rows.length} rules, in order`}
       sub="The first match wins, so a specific rule must come before a general one: “HDFC HOME LOAN EMI” has to be seen as an EMI before the bare “HDFC” is seen as a bank transfer.">
       <Table
-        head={['#', 'Category', 'Applies to', 'Looks for']}
+        head={['#', 'Category', 'Applies to', 'Looks for', 'Unless']}
         rows={rows.map((r) => [
           r.order,
           <>
@@ -627,6 +644,9 @@ function Categories({ data, q }) {
             ? (r.direction === 'credit' ? 'money in' : 'money out')
             : 'either',
           <Terms pattern={r.pattern} max={10} />,
+          r.excludes
+            ? <Terms pattern={r.excludes} max={6} />
+            : <span className="xp-hint">—</span>,
         ])}
       />
     </Card>

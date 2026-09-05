@@ -345,6 +345,54 @@ def recurring_json(series: Any) -> dict[str, Any]:
         "is_active": series.is_active,
         "confidence": series.confidence,
         "transaction_ids": series.transaction_ids,
+        # How the detector reached its verdict. A series is an inference, and
+        # the tab that shows it already lets the user open the rows behind
+        # it; this is the other half - what about those rows made it a
+        # series, so a wrong one can be argued with rather than only deleted.
+        "status": series.status,
+        "coverage": series.coverage,
+        "missed": series.missed,
+        "day_of_month": series.day_of_month,
+        "amount_variance": series.amount_variance,
+        "amount_trend": series.amount_trend,
+        "lifetime_median": num(series.lifetime_median),
+        "last_amount": num(series.last_amount),
+        "changed_on": (series.changed_on.isoformat()
+                       if series.changed_on else None),
+        "evidence": list(series.evidence),
+    }
+
+
+def stored_recurring_json(row: dict[str, Any]) -> dict[str, Any]:
+    """A series read back from storage, in the same shape as a detected one.
+
+    Two things are added, and both exist because the frontend was working
+    them out for itself. `amount` because `recurring_json` above renames
+    `median_amount` to that, and a component reading one name rendered every
+    commitment as zero the moment the other shape arrived. And
+    `monthly_equivalent` because the client's own version of that conversion
+    divided 30.44 days by a nominal 30-day cadence - which publishes every
+    monthly commitment 1.5% above what the statement says, and the Recurring
+    tab adds fourteen of them up.
+
+    The conversion has one home, in analytics.recurring, for exactly that
+    reason. This is the seam that was letting a second copy exist.
+    """
+    from ..analytics.recurring import to_monthly
+
+    amount = row.get("median_amount")
+    cadence_name = row.get("cadence_name") or ""
+    cadence_days = int(row.get("cadence_days") or 30)
+    monthly = (to_monthly(Decimal(str(amount)), cadence_name, cadence_days)
+               if amount is not None else None)
+    return {
+        **row,
+        "amount": num(amount),
+        "median_amount": num(amount),
+        "lifetime_median": num(row.get("lifetime_median")),
+        "last_amount": num(row.get("last_amount")),
+        "cadence": cadence_name,
+        "monthly_equivalent": num(monthly),
     }
 
 

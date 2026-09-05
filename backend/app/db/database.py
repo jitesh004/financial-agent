@@ -88,7 +88,10 @@ _TIER_FILES = ("source_files",)
 _TIER_STAGING = ("staged_files",)
 
 #: Bought with real money. Never cleared as a side effect of anything else.
-_TIER_AI = ("ai_inferences", "merchant_categories")
+#: `agent_runs` belongs here rather than with the derived data. Re-parsing a
+#: statement should not throw away an analysis somebody paid a model to
+#: produce - and unlike a recurring series, no amount of CPU brings it back.
+_TIER_AI = ("agent_runs", "ai_inferences", "merchant_categories")
 
 #: Authored by a human. Cannot be regenerated from any input at any price.
 #: `claims` is listed before `claim_settlements` and `transaction_splits`
@@ -102,10 +105,16 @@ _TIER_AI = ("ai_inferences", "merchant_categories")
 #: re-parse and no amount of CPU brings back a board of questions they wrote
 #: themselves. Widgets are listed before their parent for readability only -
 #: they cascade from `dashboards` either way.
+#: `position_items` and `position_snapshots` belong here and nowhere else.
+#: The position is the one place in this app a human ASSERTS something rather
+#: than a document declaring it, and re-parsing every statement must not touch
+#: it - a loan the statements cannot see is exactly the thing the position
+#: exists to record.
 _TIER_DECISIONS = ("user_overrides", "claim_settlements", "transaction_splits",
                    "custom_categories", "recurring_series_overrides",
                    "claims", "split_rules", "settlement_group_legs",
                    "settlement_groups", "dashboard_widgets", "dashboards",
+                   "position_snapshots", "position_items",
                    "app_settings")
 
 _TIER_IDENTITY = ("user_profile",)
@@ -160,6 +169,9 @@ TENANT_TABLES: tuple[str, ...] = (
     "settlement_group_legs",
     "dashboards",
     "dashboard_widgets",
+    "agent_runs",
+    "position_items",
+    "position_snapshots",
     "jobs",
     "job_items",
     "staged_files",

@@ -1061,8 +1061,12 @@ def get_recurring_series(db: Database) -> list[dict[str, Any]]:
             d["category"] = o_category
         if o_is_active is not None:
             d["is_active"] = o_is_active
-        if "median_amount" in d:
-            d["median_amount"] = _dec(d["median_amount"])
+        for money in ("median_amount", "lifetime_median", "last_amount"):
+            if money in d:
+                d[money] = _dec(d[money])
+        # Stored as JSON so the row stays one row; handed back as a list so
+        # every reader does not have to know that.
+        d["evidence"] = _json(d.get("evidence"), [])
         out.append(d)
     return out
 
@@ -1083,6 +1087,22 @@ def recurring_overrides(db: Database) -> dict[str, dict[str, Any]]:
     return {r["series_id"]: _row_dict(r) for r in rows}
 
 
+#: The columns `save_recurring_series` writes, in order. Named once so the
+#: INSERT's placeholder count cannot drift away from the tuple being built -
+#: which it did, silently, the first time a column was added here.
+_SERIES_COLUMNS = (
+    "id", "account_id", "label", "category", "direction", "median_amount",
+    "cadence_days", "cadence_name", "occurrences", "first_seen", "last_seen",
+    "next_expected", "is_active", "status", "confidence", "coverage",
+    "missed", "day_of_month", "amount_variance", "amount_trend",
+    "lifetime_median", "last_amount", "changed_on", "evidence",
+)
+
+
+def _iso(value: Any) -> str | None:
+    return value.isoformat() if value else None
+
+
 def save_recurring_series(db: Database, series: Sequence[Any]) -> int:
     with db.connection() as conn:
         overrides = {r["series_id"]: r for r in conn.execute("SELECT * FROM recurring_series_overrides").fetchall()}
@@ -1093,9 +1113,26 @@ def save_recurring_series(db: Database, series: Sequence[Any]) -> int:
             label = o["label"] if o and o["label"] is not None else s.label
             category = o["category"] if o and o["category"] is not None else s.category
             is_active = o["is_active"] if o and o["is_active"] is not None else int(s.is_active)
-            rows.append((s.id, s.account_id, label, category, s.direction.value, _txt(s.median_amount), s.cadence_days, s.occurrences, s.first_seen.isoformat() if s.first_seen else None, s.last_seen.isoformat() if s.last_seen else None, s.next_expected.isoformat() if s.next_expected else None, is_active, s.confidence))
+            rows.append((
+                s.id, s.account_id, label, category, s.direction.value,
+                _txt(s.median_amount), s.cadence_days,
+                getattr(s, "cadence_name", ""), s.occurrences,
+                _iso(s.first_seen), _iso(s.last_seen), _iso(s.next_expected),
+                is_active, getattr(s, "status", "active"), s.confidence,
+                getattr(s, "coverage", 1.0), getattr(s, "missed", 0),
+                getattr(s, "day_of_month", None),
+                getattr(s, "amount_variance", 0.0),
+                getattr(s, "amount_trend", "flat"),
+                _txt(getattr(s, "lifetime_median", None)),
+                _txt(getattr(s, "last_amount", None)),
+                _iso(getattr(s, "changed_on", None)),
+                json.dumps(list(getattr(s, "evidence", []) or [])),
+            ))
+        placeholders = ",".join("?" * len(_SERIES_COLUMNS))
         conn.execute("DELETE FROM recurring_series")
-        conn.executemany("INSERT INTO recurring_series (id, account_id, label, category, direction, median_amount, cadence_days, occurrences, first_seen, last_seen, next_expected, is_active, confidence) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        conn.executemany(
+            f"INSERT INTO recurring_series ({', '.join(_SERIES_COLUMNS)})"
+            f" VALUES ({placeholders})", rows)
     return len(rows)
 
 
@@ -2405,3 +2442,330 @@ def save_settings(db: Database, values: dict[str, Any]) -> dict[str, Any]:
                 "   updated_at = datetime('now')",
                 (key, stored))
     return get_settings(db)
+
+
+# --------------------------------------------------------------------------
+# Agent runs
+#
+# Stored rather than recomputed, for two reasons that pull the same way: a run
+# cost real money to produce, and a run is only half as useful as two runs.
+# Comparing this month's answer with last month's is the thing that makes an
+# agent worth re-running, and no amount of CPU reconstructs a previous one.
+# --------------------------------------------------------------------------
+
+def save_agent_run(db: Database, run: dict[str, Any]) -> str:
+    """Record one run. Returns its id."""
+    run_id = run.get("id") or _new_id()
+    with db.connection() as conn:
+        conn.execute(
+            "INSERT INTO agent_runs (id, agent, status, started_at,"
+            " finished_at, seconds, question, answer_json, transcript_json,"
+            " model, provider, steps, tool_calls, error)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, run["agent"], run.get("status", "ok"),
+             run.get("started_at") or "", run.get("finished_at"),
+             float(run.get("seconds") or 0), run.get("question", ""),
+             json.dumps(run.get("answer") or {}),
+             json.dumps(run.get("transcript") or []),
+             run.get("model", ""), run.get("provider", ""),
+             int(run.get("steps") or 0), int(run.get("tool_calls") or 0),
+             run.get("error", "")),
+        )
+    return run_id
+
+
+def _agent_run_json(row, *, with_transcript: bool = False) -> dict[str, Any]:
+    out = {
+        "id": row["id"], "agent": row["agent"], "status": row["status"],
+        "started_at": row["started_at"], "finished_at": row["finished_at"],
+        "seconds": row["seconds"], "question": row["question"],
+        "answer": _json(row["answer_json"], {}),
+        "model": row["model"], "provider": row["provider"],
+        "steps": row["steps"], "tool_calls": row["tool_calls"],
+        "error": row["error"],
+    }
+    if with_transcript:
+        # Only on request. A transcript carries every tool result the agent
+        # read and is easily the largest thing in the row, so a list of
+        # twenty runs would otherwise be megabytes to render a date and a
+        # headline.
+        out["transcript"] = _json(row["transcript_json"], [])
+    return out
+
+
+def get_agent_runs(db: Database, agent: str | None = None,
+                   limit: int = 20) -> list[dict[str, Any]]:
+    """Runs, newest first."""
+    where = "WHERE agent = ?" if agent else ""
+    params: list[Any] = [agent] if agent else []
+    with db.connection() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM agent_runs {where}"
+            f" ORDER BY started_at DESC, id DESC LIMIT ?",
+            [*params, max(1, min(int(limit), 100))]).fetchall()
+    return [_agent_run_json(r) for r in rows]
+
+
+def get_agent_run(db: Database, run_id: str) -> dict[str, Any] | None:
+    """One run, transcript included."""
+    with db.connection() as conn:
+        row = conn.execute("SELECT * FROM agent_runs WHERE id = ?",
+                           (run_id,)).fetchone()
+    return _agent_run_json(row, with_transcript=True) if row else None
+
+
+def latest_agent_runs(db: Database) -> dict[str, dict[str, Any]]:
+    """The most recent run of each agent, keyed by agent.
+
+    One query rather than one per agent: the screen that lists the catalogue
+    needs "when did this last run and what did it say" for every card on it.
+    """
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM agent_runs r WHERE r.started_at = ("
+            "  SELECT MAX(s.started_at) FROM agent_runs s"
+            "   WHERE s.agent = r.agent AND s.user_id = r.user_id)"
+        ).fetchall()
+    return {r["agent"]: _agent_run_json(r) for r in rows}
+
+
+def previous_agent_run(db: Database, agent: str,
+                       before_id: str) -> dict[str, Any] | None:
+    """The run of this agent immediately before the given one.
+
+    Ordered by the same key the listing uses, so "previous" here and
+    "the one above it in the list" are the same run.
+    """
+    with db.connection() as conn:
+        anchor = conn.execute(
+            "SELECT started_at FROM agent_runs WHERE id = ?",
+            (before_id,)).fetchone()
+        if anchor is None:
+            return None
+        row = conn.execute(
+            "SELECT * FROM agent_runs WHERE agent = ?"
+            " AND (started_at < ? OR (started_at = ? AND id < ?))"
+            " ORDER BY started_at DESC, id DESC LIMIT 1",
+            (agent, anchor["started_at"], anchor["started_at"],
+             before_id)).fetchone()
+    return _agent_run_json(row) if row else None
+
+
+def delete_agent_run(db: Database, run_id: str) -> bool:
+    with db.connection() as conn:
+        cursor = conn.execute("DELETE FROM agent_runs WHERE id = ?", (run_id,))
+        return bool(cursor.rowcount)
+
+
+def prune_agent_runs(db: Database, agent: str, keep: int = 25) -> int:
+    """Keep the most recent runs of one agent and drop the rest.
+
+    A history is for comparing against, and comparing against a run from two
+    years ago says nothing about a ledger that has been re-imported since.
+    """
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT id FROM agent_runs WHERE agent = ?"
+            " ORDER BY started_at DESC, id DESC OFFSET ?", (agent, keep)
+        ).fetchall()
+        stale = [r["id"] for r in rows]
+        for run_id in stale:
+            conn.execute("DELETE FROM agent_runs WHERE id = ?", (run_id,))
+    return len(stale)
+
+
+# --------------------------------------------------------------------------
+# The position
+#
+# The one table in this app a human writes to directly. Everything else is
+# derived from a document, which is why `reviewed_on` is not optional: an
+# asserted figure without a date is a figure nothing can age or check.
+# --------------------------------------------------------------------------
+
+#: Every field a position item carries, and therefore every field the PATCH
+#: endpoint will accept. Named once so the API surface and the table cannot
+#: drift apart - a column added without being listed here is a column no
+#: caller can ever set.
+POSITION_FIELDS = (
+    "kind", "label", "institution", "account_id", "bureau_account_id",
+    "reviewed_on", "outstanding", "original_amount", "emi", "interest_rate",
+    "months_remaining", "months_total", "credit_limit", "min_due",
+    "statement_day", "due_day", "notes", "archived", "sort_order",
+)
+
+#: The ones holding money, so a Decimal or a stray "₹1,20,000" arriving from
+#: a form is stored as the exact decimal string the money rule requires.
+_POSITION_MONEY = frozenset({
+    "outstanding", "original_amount", "emi", "interest_rate", "credit_limit",
+    "min_due",
+})
+
+_POSITION_INTS = frozenset({
+    "months_remaining", "months_total", "statement_day", "due_day",
+    "archived", "sort_order",
+})
+
+
+def _position_value(field: str, value: Any) -> Any:
+    """One incoming field, in the shape the column wants."""
+    if value is None or value == "":
+        return None
+    if field in _POSITION_MONEY:
+        return _txt(_dec(value))
+    if field in _POSITION_INTS:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    if field == "reviewed_on":
+        parsed = _d(value)
+        return parsed.isoformat() if parsed else None
+    return str(value)
+
+
+def save_position_item(db: Database, item: dict[str, Any]) -> str:
+    """Insert one item. Returns its id."""
+    item_id = item.get("id") or _new_id()
+    fields = [f for f in POSITION_FIELDS if f in item]
+    if "reviewed_on" not in fields:
+        fields.append("reviewed_on")
+    values = [_position_value(f, item.get(f)) for f in fields]
+    # A review date is what makes the row meaningful, so it is defaulted
+    # rather than left null - to today, which is the only honest default when
+    # somebody is adding a row by hand right now.
+    for index, field in enumerate(fields):
+        if field == "reviewed_on" and values[index] is None:
+            values[index] = date.today().isoformat()
+    columns = ", ".join(["id", *fields])
+    placeholders = ", ".join("?" * (len(fields) + 1))
+    with db.connection() as conn:
+        conn.execute(f"INSERT INTO position_items ({columns})"
+                     f" VALUES ({placeholders})", [item_id, *values])
+    return item_id
+
+
+def update_position_item(db: Database, item_id: str,
+                        changes: dict[str, Any]) -> bool:
+    """Change any subset of one item's fields.
+
+    Sent as a partial patch, so correcting an outstanding balance never
+    disturbs a label the user fixed earlier - and `updated_at` moves while
+    `reviewed_on` does not, because editing a figure and re-attesting the
+    whole item are different acts. Re-attesting is `review_position_item`.
+    """
+    wanted = {k: v for k, v in changes.items() if k in POSITION_FIELDS}
+    if not wanted:
+        return False
+    assignments = ", ".join(f"{k} = ?" for k in wanted)
+    values = [_position_value(k, v) for k, v in wanted.items()]
+    with db.connection() as conn:
+        cursor = conn.execute(
+            f"UPDATE position_items SET {assignments}, updated_at = fa_now()"
+            f" WHERE id = ?", [*values, item_id])
+        return bool(cursor.rowcount)
+
+
+def review_position_item(db: Database, item_id: str,
+                         reviewed_on: str | None = None) -> bool:
+    """Re-baseline one item: this is true, as of this date.
+
+    Kept separate from an ordinary edit on purpose. Moving the review date is
+    the act that says "I have looked at this and it is right", and it resets
+    the roll-forward - so it must never happen as a side effect of fixing a
+    typo in a label.
+    """
+    when = _d(reviewed_on) or date.today()
+    with db.connection() as conn:
+        cursor = conn.execute(
+            "UPDATE position_items SET reviewed_on = ?, updated_at = fa_now()"
+            " WHERE id = ?", (when.isoformat(), item_id))
+        return bool(cursor.rowcount)
+
+
+def get_position_items(db: Database, *, include_archived: bool = False
+                       ) -> list[dict[str, Any]]:
+    where = "" if include_archived else "WHERE archived = 0"
+    with db.connection() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM position_items {where}"
+            f" ORDER BY sort_order, label").fetchall()
+    return [_row_dict(r) for r in rows]
+
+
+def get_position_item(db: Database, item_id: str) -> dict[str, Any] | None:
+    with db.connection() as conn:
+        row = conn.execute("SELECT * FROM position_items WHERE id = ?",
+                           (item_id,)).fetchone()
+    return _row_dict(row) if row else None
+
+
+def delete_position_item(db: Database, item_id: str, *,
+                         archive: bool = True) -> bool:
+    """Remove an item - by default by archiving it.
+
+    Archived rather than deleted because a snapshot taken while it existed
+    still refers to it, and because "I closed this in March" is a fact the
+    position can show rather than a gap it cannot explain. `archive=False` is
+    the real delete, for a row that was a mistake.
+    """
+    with db.connection() as conn:
+        if archive:
+            cursor = conn.execute(
+                "UPDATE position_items SET archived = 1, updated_at = fa_now()"
+                " WHERE id = ?", (item_id,))
+        else:
+            cursor = conn.execute("DELETE FROM position_items WHERE id = ?",
+                                  (item_id,))
+        return bool(cursor.rowcount)
+
+
+def save_position_snapshot(db: Database, taken_on: str, note: str,
+                           items: list[dict[str, Any]],
+                           totals: dict[str, Any]) -> str:
+    snapshot_id = _new_id()
+    with db.connection() as conn:
+        conn.execute(
+            "INSERT INTO position_snapshots (id, taken_on, note, items_json,"
+            " totals_json, item_count) VALUES (?,?,?,?,?,?)",
+            (snapshot_id, taken_on, note, json.dumps(items, default=str),
+             json.dumps(totals, default=str), len(items)))
+    return snapshot_id
+
+
+def get_position_snapshots(db: Database, limit: int = 24
+                           ) -> list[dict[str, Any]]:
+    """Every review, newest first, without the frozen items.
+
+    The items are the bulk of the row and a list of reviews only needs the
+    date, the note and the totals - which are what a "what was I carrying in
+    September?" question is actually asking.
+    """
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT id, taken_on, note, totals_json, item_count, created_at"
+            " FROM position_snapshots ORDER BY taken_on DESC, created_at DESC"
+            " LIMIT ?", (max(1, min(int(limit), 100)),)).fetchall()
+    return [{"id": r["id"], "taken_on": r["taken_on"], "note": r["note"],
+             "totals": _json(r["totals_json"], {}),
+             "item_count": r["item_count"], "created_at": r["created_at"]}
+            for r in rows]
+
+
+def get_position_snapshot(db: Database, snapshot_id: str
+                          ) -> dict[str, Any] | None:
+    with db.connection() as conn:
+        row = conn.execute("SELECT * FROM position_snapshots WHERE id = ?",
+                           (snapshot_id,)).fetchone()
+    if row is None:
+        return None
+    return {"id": row["id"], "taken_on": row["taken_on"], "note": row["note"],
+            "items": _json(row["items_json"], []),
+            "totals": _json(row["totals_json"], {}),
+            "item_count": row["item_count"], "created_at": row["created_at"]}
+
+
+def delete_position_snapshot(db: Database, snapshot_id: str) -> bool:
+    with db.connection() as conn:
+        cursor = conn.execute("DELETE FROM position_snapshots WHERE id = ?",
+                              (snapshot_id,))
+        return bool(cursor.rowcount)

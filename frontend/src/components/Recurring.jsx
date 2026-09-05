@@ -8,14 +8,40 @@ import { usePeriod } from '../period';
  * The expansion is the point: a series is an inference, and the only way to
  * judge whether it is right is to see the rows it was inferred from. */
 
+/* Only a fallback now. The server stores `cadence_name` alongside the series,
+   so this map is what answers for a row written before it did - and, being a
+   second copy of the server's table, it cannot name a cadence the detector
+   learns about later. That is the reason the column exists. */
 const CADENCE = {
-  7: 'weekly', 14: 'fortnightly', 30: 'monthly', 61: 'bi-monthly',
-  91: 'quarterly', 182: 'half-yearly', 365: 'yearly',
+  7: 'weekly', 14: 'fortnightly', 28: 'four-weekly', 30: 'monthly',
+  61: 'bi-monthly', 91: 'quarterly', 182: 'half-yearly', 365: 'yearly',
 };
 
 function cadenceLabel(series) {
   return series.cadence_name || CADENCE[series.cadence_days]
     || `every ${series.cadence_days} days`;
+}
+
+/* How a series' amount has moved, said in the tense that matters: a price
+   that ROSE is a fact about the past, and what the user needs from it is
+   what the next charge will be. */
+const TREND = {
+  rose: ['warn', 'price went up'],
+  fell: ['pos', 'price came down'],
+  drifting: ['accent', 'drifting'],
+};
+
+function Evidence({ series }) {
+  if (!series.evidence?.length) return null;
+  return (
+    <ul style={{
+      margin: '0 0 12px', paddingLeft: 18, color: 'var(--text-2)',
+      fontSize: 13, lineHeight: 1.6,
+    }}
+    >
+      {series.evidence.map((line, i) => <li key={i}>{line}</li>)}
+    </ul>
+  );
 }
 
 export default function Recurring() {
@@ -103,19 +129,17 @@ export default function Recurring() {
   if (loading) return <div className="spinner" style={{ margin: 40 }} />;
 
   const active = visible.filter((s) => s.is_active);
-  /* A series reaches the frontend in two shapes, and this reads both.
-     /api/recurring returns the stored rows as they are - `median_amount`, as
-     a string - while the dashboard payload runs them through
-     serializers.recurring_json, which renames it to `amount` and adds a
-     `monthly_equivalent` the server has already normalised. Reading one name
-     renders every commitment as zero the moment the other shape arrives. */
+  /* Both server shapes carry `amount` and `monthly_equivalent` now - see
+     serializers.stored_recurring_json - so this no longer has to normalise
+     one into the other, and there is no longer a second copy of the
+     cadence-to-monthly conversion living here. The old fallback divided 30.44
+     days by a nominal 30-day cadence, which published every monthly
+     commitment 1.5% above what the statement said and compounded across the
+     fourteen of them this stat adds up. */
   const seriesAmount = (s) => Number(s.amount ?? s.median_amount) || 0;
   const monthlyTotal = active.reduce((sum, s) => {
     if (s.direction !== 'debit') return sum;
-    const normalised = Number(s.monthly_equivalent);
-    if (Number.isFinite(normalised) && normalised) return sum + normalised;
-    const days = Number(s.cadence_days) || 30;
-    return sum + (seriesAmount(s) * 30.44) / days;
+    return sum + (Number(s.monthly_equivalent) || 0);
   }, 0);
 
   return (
@@ -126,7 +150,8 @@ export default function Recurring() {
           {scoped && <span className="section-note">{periodLabel}</span>}
         </h2>
         <p style={{ color: 'var(--text-2)', margin: 0 }}>
-          Click any row to see the transactions it was inferred from.
+          Click any row to see why it was called a series, and the
+          transactions it was inferred from.
           {scoped && ' Showing the commitments that were running at any point '
             + 'in this period.'}
         </p>
@@ -205,7 +230,19 @@ export default function Recurring() {
                   <Chip>{titleCase(s.category)}</Chip>
                   <Chip>{cadenceLabel(s)}</Chip>
                   <span>{s.occurrences} occurrences</span>
+                  {s.missed > 0 && (
+                    <span title="Periods in the span with no charge at all">
+                      · {s.missed} missed
+                    </span>
+                  )}
                   {s.next_expected && <span>· next {dateLabel(s.next_expected)}</span>}
+                  {TREND[s.amount_trend] && (
+                    <Chip tone={TREND[s.amount_trend][0]}>
+                      {TREND[s.amount_trend][1]}
+                    </Chip>
+                  )}
+                  {s.status === 'overdue' && <Chip tone="warn">overdue</Chip>}
+                  {s.status === 'ended' && <Chip>ended</Chip>}
                   {!s.is_active && <Chip tone="warn">not tracked</Chip>}
                 </div>
               </div>
@@ -220,6 +257,17 @@ export default function Recurring() {
                 >
                   {money(seriesAmount(s))}
                 </div>
+                {/* A series whose price changed has two amounts, and only one
+                    of them is next month's bill. Showing the old one beside
+                    the new is what makes the number above checkable against
+                    a statement from before the change. */}
+                {s.lifetime_median != null
+                  && Math.abs(s.lifetime_median - seriesAmount(s)) > 1 && (
+                  <div style={{ fontSize: 12, color: 'var(--text-3)' }}>
+                    was {money(s.lifetime_median)}
+                    {s.changed_on ? ` until ${dateLabel(s.changed_on)}` : ''}
+                  </div>
+                )}
                 <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
                   <button
                     className="btn"
@@ -249,6 +297,7 @@ export default function Recurring() {
                 borderTop: '1px solid var(--surface-2)',
               }}
               >
+                <Evidence series={s} />
                 {!rows && <div className="spinner" />}
                 {rows && !rows.length && (
                   <div style={{ color: 'var(--text-3)' }}>

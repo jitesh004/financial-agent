@@ -127,6 +127,16 @@ def _model_note(run: dict[str, int], from_model: int, still_pending: int) -> str
                 f" {'neither' if n == 2 else 'none'}"
                 f"; {'they need' if n > 1 else 'it needs'} a rule or a manual"
                 " category.")
+    if run.get("unevidenced"):
+        # A refused answer is not silence either, and it is the one case
+        # where the reader would otherwise go looking for a broken key over
+        # the app working exactly as intended.
+        n = run["unevidenced"]
+        return (f" The model called {n} of them a loan or a card bill with"
+                f" nothing in the name to support it, so"
+                f" {'those answers' if n > 1 else 'that answer'} was refused"
+                f" - see rules.instalments. They need a rule or a manual"
+                f" category.")
     return " The model returned nothing - check the API log."
 
 
@@ -198,6 +208,7 @@ def _run_categorize(job_id: str) -> None:
                     "changed_from_model": by_source.get("llm", 0),
                     "still_uncategorized": still_pending,
                     "model_declined": llm_categorizer.last_run["declined"],
+                    "model_unevidenced": llm_categorizer.last_run["unevidenced"],
                     "model_failed_batches": llm_categorizer.last_run["failed_batches"],
                     "dashboard_refreshed": refreshed},
             # Counted from what actually changed, not from what the
