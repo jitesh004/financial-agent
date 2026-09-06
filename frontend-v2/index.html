@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#0a0c11" />
+    <meta name="description" content="Understand where your money actually goes." />
+    <title>Prism</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!-- The theme, before the bundle loads.
+
+         Without this the first paint uses :root - the light palette - and a
+         dark-themed app opens with a white flash on every reload. It has to be
+         inline and synchronous in <head> to land before the first paint, which
+         is why this decision is written twice; the other copy is
+         src/core/theme.js, and the two must agree. -->
+    <script>
+      (function () {
+        var t;
+        try { t = localStorage.getItem('prism-theme'); } catch (e) { /* private mode */ }
+        if (t !== 'dark' && t !== 'light') {
+          t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches
+            ? 'light' : 'dark';
+        }
+        document.documentElement.dataset.theme = t;
+        var m = document.querySelector('meta[name="theme-color"]');
+        if (m) m.setAttribute('content', t === 'dark' ? '#0a0c11' : '#f7f8fa');
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root">
+      <!-- Painted by the document, not by React: the shell is worth showing in
+           the ~200ms before the bundle evaluates, and an empty white page in
+           its place is the difference between "fast" and "broken". -->
+      <div class="boot">
+        <div class="boot-mark" aria-hidden="true"></div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

@@ -1,0 +1,167 @@
+/* ────────────────────────────────────────────────────────────────────────────
+   Design tokens.
+
+   One palette, defined twice - light on :root, dark on [data-theme="dark"] -
+   so a colour is never written down at a call site. Every rule below this
+   file refers to a token; nothing refers to a hex value.
+
+   The palette is built in OKLCH, which is why the dark and light sets look
+   like siblings rather than like inversions: lightness is perceptual there,
+   so "the same blue, two steps darker" actually reads as the same blue. The
+   values are compiled to hex because CSS `oklch()` still trips some in-app
+   browsers, and a colour that silently fails to parse takes a whole surface
+   with it.
+
+   Surfaces are deliberately close together. A financial dashboard is stared
+   at for long stretches; contrast is spent on the figures and on the one
+   accent, not on the furniture around them.
+   ──────────────────────────────────────────────────────────────────────── */
+
+:root {
+  color-scheme: light;
+
+  /* ---- surfaces: 0 is the page, each step is one layer closer ---- */
+  --bg:            #f7f8fa;
+  --bg-sunken:     #eef0f4;
+  --surface:       #ffffff;
+  --surface-2:     #f4f6f9;
+  --surface-3:     #eaedf2;
+  --surface-hover: #f0f3f7;
+  --overlay:       rgba(17, 21, 28, .38);
+  --glass:         rgba(255, 255, 255, .74);
+
+  /* ---- lines ---- */
+  --line:        #e4e8ee;
+  --line-strong: #ccd3dd;
+  --line-accent: #c3cef8;
+
+  /* ---- type ---- */
+  --text:   #10141b;
+  --text-2: #545f6f;
+  --text-3: #838f9f;
+  --text-on-accent: #ffffff;
+
+  /* ---- the one accent ---- */
+  --accent:        #3454d1;
+  --accent-hover:  #2b47bb;
+  --accent-soft:   #e8ecfd;
+  --accent-border: #b9c6f6;
+  --accent-text:   #2b47bb;
+
+  /* ---- meaning ---- */
+  --pos:        #0f8a70;
+  --pos-soft:   #e3f5f0;
+  --pos-border: #a9ddd0;
+  --neg:        #cf3b38;
+  --neg-soft:   #fdeaea;
+  --neg-border: #f3bdbc;
+  --warn:       #a9720f;
+  --warn-soft:  #fdf3e0;
+  --warn-border:#eed6a4;
+
+  /* ---- twelve categorical slots ----
+     Ordered so neighbours stay apart at a glance, and checked against both
+     themes rather than only against white. Charts read these from CSS, which
+     is what makes a chart follow the theme without re-rendering. */
+  --c1:#3454d1; --c2:#0f8a70; --c3:#c2740c; --c4:#ad2a94;
+  --c5:#0b7f9c; --c6:#6640d8; --c7:#cf3b38; --c8:#4f8511;
+  --c9:#d2570a; --c10:#0d8299; --c11:#7b2b91; --c12:#4a5563;
+
+  /* ---- depth ----
+     Two shadows per level: a tight one that draws the edge, and a wide, soft
+     one that lifts it. One shadow can do either but not both. */
+  --shadow-1: 0 1px 2px rgba(15, 23, 42, .05), 0 1px 3px rgba(15, 23, 42, .05);
+  --shadow-2: 0 2px 4px rgba(15, 23, 42, .05), 0 6px 16px rgba(15, 23, 42, .07);
+  --shadow-3: 0 4px 8px rgba(15, 23, 42, .06), 0 18px 44px rgba(15, 23, 42, .13);
+  --ring: 0 0 0 3px var(--accent-soft), 0 0 0 1px var(--accent);
+
+  /* ---- geometry ---- */
+  --r-xs: 5px;
+  --r-sm: 8px;
+  --r:    11px;
+  --r-lg: 15px;
+  --r-xl: 22px;
+  --r-full: 999px;
+
+  /* ---- motion ----
+     Short and eased-out. Anything longer than ~220ms on a control reads as
+     lag rather than as polish. */
+  --e-out: cubic-bezier(.22, 1, .36, 1);
+  --e-in-out: cubic-bezier(.65, 0, .35, 1);
+  --t-fast: 110ms;
+  --t: 170ms;
+  --t-slow: 320ms;
+
+  /* ---- type stacks ---- */
+  --sans: "Inter Variable", -apple-system, BlinkMacSystemFont, "Segoe UI",
+          Inter, Roboto, "Helvetica Neue", sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+
+  /* ---- layout ---- */
+  --rail: 244px;
+  --rail-collapsed: 64px;
+  --topbar: 56px;
+  --page-max: 1560px;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg:            #0a0c11;
+  --bg-sunken:     #06080c;
+  --surface:       #12161e;
+  --surface-2:     #171c26;
+  --surface-3:     #1d2431;
+  --surface-hover: #1a2029;
+  --overlay:       rgba(3, 5, 9, .62);
+  --glass:         rgba(18, 22, 30, .76);
+
+  --line:        #222a36;
+  --line-strong: #313b4b;
+  --line-accent: #33427a;
+
+  --text:   #e8ecf3;
+  --text-2: #98a3b4;
+  --text-3: #67727f;
+  --text-on-accent: #0a0c11;
+
+  --accent:        #6d8cff;
+  --accent-hover:  #829dff;
+  --accent-soft:   #17203d;
+  --accent-border: #2f3f74;
+  --accent-text:   #a4b8ff;
+
+  --pos:        #37cfae;
+  --pos-soft:   #0d2b26;
+  --pos-border: #1d4d43;
+  --neg:        #ff7a72;
+  --neg-soft:   #2f1618;
+  --neg-border: #5a2a2c;
+  --warn:       #e8b25a;
+  --warn-soft:  #2b2214;
+  --warn-border:#4f3f1e;
+
+  --c1:#6d8cff; --c2:#37cfae; --c3:#f0a03c; --c4:#ec7ecd;
+  --c5:#3cc2dd; --c6:#a082ff; --c7:#ff7a72; --c8:#93cf46;
+  --c9:#fb9a4c; --c10:#4fd4e6; --c11:#c58cfa; --c12:#93a1b3;
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, .5);
+  --shadow-2: 0 2px 4px rgba(0, 0, 0, .45), 0 8px 22px rgba(0, 0, 0, .38);
+  --shadow-3: 0 4px 10px rgba(0, 0, 0, .5), 0 22px 54px rgba(0, 0, 0, .5);
+  --ring: 0 0 0 3px var(--accent-soft), 0 0 0 1px var(--accent);
+}
+
+/* Somebody who asks their system not to animate means it. Transitions become
+   instant rather than merely shorter - a 1ms transition still fires
+   transitionend handlers, which is what keeps sequenced UI working. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --t-fast: 1ms;
+    --t: 1ms;
+    --t-slow: 1ms;
+  }
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <!-- A prism: one white beam in, a spectrum out. The mark is the product's
+       whole claim - a statement goes in, and what it was actually made of
+       comes out the other side. -->
+  <defs>
+    <linearGradient id="p" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#6b8afd"/>
+      <stop offset="1" stop-color="#35c9b1"/>
+    </linearGradient>
+  </defs>
+  <path d="M16 4 L29 27 H3 Z" stroke="url(#p)" stroke-width="2.4"
+        stroke-linejoin="round" fill="none"/>
+  <path d="M2 16 H11" stroke="#9aa5b4" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M20 15 H30" stroke="#6b8afd" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M21 19.5 H30" stroke="#35c9b1" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M22 24 H30" stroke="#f0a03c" stroke-width="2.2" stroke-linecap="round"/>
+</svg>

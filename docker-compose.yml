@@ -88,6 +88,8 @@ services:
     entrypoint: ["python", "/app/docker-entrypoint.py"]
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8078", "--reload"]
 
+  # The V1 frontend, on its historical port. Left running and unchanged so the
+  # two can be compared side by side; `frontend-v2` below is the rewrite.
   frontend:
     build:
       context: ./frontend
@@ -97,6 +99,24 @@ services:
       - /app/node_modules
     ports:
       - "5173:5173"
+    environment:
+      - VITE_API_PROXY_TARGET=http://backend:8078
+
+  # V2. Same API, same session cookie, its own port - so both can be open at
+  # once against one backend and one database.
+  #
+  # To make V2 the only frontend: delete the `frontend` service above and move
+  # this one to 5173. Nothing on the server side changes; V2 talks to exactly
+  # the same endpoints.
+  frontend-v2:
+    build:
+      context: ./frontend-v2
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./frontend-v2:/app
+      - /app/node_modules
+    ports:
+      - "5174:5173"
     environment:
       - VITE_API_PROXY_TARGET=http://backend:8078
 
