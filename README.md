@@ -119,7 +119,9 @@ before the PostgreSQL migration starts and then dies on `import psycopg` -
 a dependency that is sitting right there in `requirements.txt`.
 
 Open <http://localhost:5173>, sign in, and the setup wizard takes it from
-there.
+there. The redesigned interface comes up alongside it on
+<http://localhost:5174>, against the same backend — see [The V2
+interface](#the-v2-interface).
 
 ### Configuration is `.env`, and only `.env`
 
@@ -522,6 +524,13 @@ can carry a debt no document mentions.
 | **Cashflow Sentinel** | Am I going to be short, and exactly when? A dated, day-by-day projection: which date is lowest, and which charges in the days before it put it there. A month that balances can still be short on the 4th |
 | **Tax Utilisation** | What have I already spent that counts, and what is unused? Adds up qualifying spending under 80C, 80D, 24(b), 80CCD(1B), 80E and 80G *from the ledger* — including the home-loan principal and interest split, which is the deduction most often missed |
 | **Emergency Fund & Resilience** | How long could I last if the income stopped? Two burn rates, because "six months of expenses" means nothing without knowing which expenses: what a month costs today, and what still has to be paid in the month somebody loses their job |
+| **Bill Shock Forecaster** | What large bill is about to land that I have forgotten? The annual and quarterly charges that are invisible eleven months of the year — and, the part that matters, whether the month each falls in can absorb it. Two annual bills in one month is the case that hurts, because each is affordable alone |
+| **Lifestyle Creep Detector** | What am I spending more on than I used to, without noticing? Separates *more often* (the count rose — a habit changed) from *more each time* (prices did) from *one expensive month*, which is not creep at all. Checks income over the same stretch before calling anything creep |
+| **Credit Health** | What is actually holding my score back? Utilisation per card rather than overall — one maxed card among four drags a file that looks calm — plus any days-past-due, the file's age, and anything reported that should not be. Leads with the single biggest drag rather than listing four evenly |
+| **Anomaly Watch** | Is anything here not mine, or not what I think? Large *for its own category* (a big flight is ordinary, a big coffee is not), billed twice, one appearance at a large amount, or a small test charge followed by a large one — which is the only shape that actually indicates a stolen card. Never asserts fraud |
+| **Fee & Waste Auditor** | What am I paying purely for the privilege? Late fees, ATM and forex charges, annual fees, bounce charges — and interest on a revolved card balance, which is usually the largest item and the one nobody files mentally as a fee. Says what would have avoided each, with the figure |
+| **Income Stability** | How reliable is what comes in, really? The spread rather than the total: typical against lowest month, how many sources and what share the largest is, whether pay lands on a date that wanders, and whether income has ever fallen below the committed outflow |
+| **Ledger Trust** | How much of this app's numbers should I believe? Audits the data, not the money — missing months, files that failed to read, live bureau accounts nothing covers — and then says *which figures elsewhere are affected and by how much*, which is the part a list of statistics cannot give |
 
 ### How an agent works, and what it may not do
 
@@ -552,6 +561,54 @@ EMIs are 43% of take-home, which is above the 40% lenders generally treat as
 stretched"* and may lay out the mechanics of an option in full. It may not tell
 anybody what to buy or sell, what to prioritise with their money, or what a
 market will do.
+
+### Every figure is checked against a tool result
+
+The rest of this app enforces "no model ever produces a figure" by
+construction. An agent breaks that arrangement — it chooses what to compute
+and then writes prose around the results — so the guarantee is restored
+mechanically instead.
+
+Every number any tool returned this run is collected; every number in the
+finished answer is extracted, in whatever form it was written (`41,24,762`,
+`41.2 lakh`, `4124761.64` all resolve to the same figure); and any
+**money-scale** figure with no match is reported as unverified, on the screen
+and in the run's history.
+
+Three limits, each deliberate. Only money is checked — a model is entitled to
+work out "43% of take-home" from two figures it was given, and flagging that
+would flag every correct derivation there is. A match is approximate, wide
+enough for rounding to two significant figures and narrow enough that a
+genuinely different number does not pass. And **nothing is deleted**: silently
+editing the prose would leave a sentence that reads as if it had been checked.
+
+### Fitting a small model
+
+Gemini's free tier meters **input tokens per minute** — 16,000, shared across
+every call in the same minute. Measured against that, this loop's original
+settings cost **91,250 input tokens for one ten-step run**: six minutes of
+ceiling spent in a burst, which in practice is a cascade of 429s and a run
+that never finishes.
+
+So a run has a budget, chosen per model:
+
+| | steps | one result | transcript | tools offered | brief |
+|---|---|---|---|---|---|
+| **compact** | 5 | 1,800 chars | 6,000 chars | 6 | the agent's short focus |
+| **full** | 10 | 8,000 chars | 40,000 chars | 12 | the agent's full brief |
+
+A whole compact run now costs **under 7,000 input tokens** — one minute's
+budget, once, with room to spare. `FA_AGENT_PROFILE` forces either; left on
+`auto` the model's own name decides, and an unknown name gets compact because
+compact still answers on a large model while full does not answer at all on a
+small one.
+
+The short brief is **written, not truncated**. Each agent says its job twice:
+once at length, once in the fewest lines that still name what to look at and
+what not to conclude. A prompt cut off mid-sentence produces reasoning cut off
+mid-thought, which is the failure this avoids rather than a cheaper version of
+it. And the screen says which budget is in force, because a compact run and a
+broken run look identical from outside.
 
 ### Runs are kept, and compared
 
@@ -694,7 +751,7 @@ Three things use a model, and none of them touches a number:
 | --- | --- | --- |
 | `fast` | Categorises merchants that rules and the learned cache did not recognise, forty to a call; reads an unfamiliar statement letterhead for its issuer and account type | Many calls, one per batch, answers cached forever |
 | `strong` | Writes the narrative from the already-computed brief | One call per analysis |
-| `strong` | Runs an **agent**: a tool-calling loop over the ledger, up to ten turns | One call per turn, only when you press Run |
+| `strong` | Runs an **agent**: a tool-calling loop over the ledger | One call per turn (5 on the compact budget, 10 on the full one), only when you press Run |
 
 The default provider is **OpenRouter**, on models billed at zero per token:
 
@@ -806,6 +863,170 @@ without a graph, and the graph reads as a flowchart.
 
 ---
 
+## The V2 interface
+
+`frontend-v2/` is a second, complete front end against the same API. It is a
+rewrite rather than a fork — no file was copied — but every feature V1 has, it
+has. Both are wired into the dev stack at once, against one backend and one
+database:
+
+```bash
+docker compose up --build
+```
+
+- V1 on <http://localhost:5173>
+- V2 on <http://localhost:5174>
+
+They share the session cookie and the ledger, so signing in on one signs you in
+on the other, and an import started in one appears in the other. Without
+Docker:
+
+```bash
+npm install --prefix frontend-v2 && npm run dev --prefix frontend-v2
+```
+
+Vite proxies `/api` to `VITE_API_PROXY_TARGET`, defaulting to the same
+`http://localhost:8078` the V1 dev server uses.
+
+### What is actually different
+
+**Every screen is a URL.** V1 held the current screen in a `useState` and the
+current sub-tab in another one, so nothing was linkable, the back button left
+the app, and a reload landed you on the overview. V2 has a small
+history-API router (`src/core/router.jsx`): `/ledger`,
+`/rules?section=categories`, `/review?mode=bulk` are addresses you can
+bookmark, share and reload. Filters write themselves into the query string
+with `replaceState`, so a filtered ledger is a link and the back button steps
+through screens rather than through keystrokes.
+
+**One cache, not a fetch per component.** `src/core/store.js` is a small
+stale-while-revalidate cache over `useSyncExternalStore`: identical in-flight
+requests are deduped rather than raced, cached data paints immediately while a
+revalidation runs behind it, mutations invalidate by key *prefix*, and rail
+links prefetch on hover. What used to be a spinner on every navigation is now a
+screen that is already there.
+
+**The chart library is gone.** V1 shipped Recharts to draw a dozen charts. V2
+draws them in about 670 lines of SVG (`src/ui/charts.jsx`) — bars, lines with
+a confidence band, combo, donut, sparkline, stacked bar — which also fixed the
+thing the library made awkward: the twelve categorical colours are CSS custom
+properties, so charts follow a theme switch without re-rendering. Runtime
+dependencies are now React, React-DOM and a self-hosted variable font. Nothing
+else.
+
+The two builds, measured on this repo:
+
+| | V1 | V2 |
+|---|---|---|
+| JavaScript before first paint | 962 KB (269 KB gzipped) | 266 KB (86 KB gzipped) |
+| Chunks | one, everything | react + shell, then one per screen |
+| Per-screen cost after that | — | 1–10 KB gzipped |
+| Runtime dependencies | 4 | 3 |
+
+V1 parses all thirty-odd screens before it can draw the first one. V2 loads the
+screen you asked for; the worst case — Explore, the largest — is still under
+half of V1's opening payload.
+
+**Long tables are windowed.** The ledger renders the rows in view plus a
+margin, with spacer rows holding the scrollbar honest (`src/ui/virtual.jsx`).
+Twenty thousand transactions scroll the same as two hundred.
+
+**Themes, and no flash.** Light and dark are two blocks of custom properties in
+`src/styles/tokens.css`, chosen before first paint by an inline script in
+`index.html`, which also sets `theme-color`. Every colour in the app — chart
+slots included — resolves through those tokens, so there is one place to change
+one, and `prefers-reduced-motion` turns the animation budget off wholesale.
+
+**Keyboard.** `⌘K` or `/` opens a command palette that matches routes and
+actions by subsequence; `⇧D` toggles the theme, `⇧I` opens the import wizard,
+`Escape` closes whatever is open. Dialogs trap focus and lock the scroll.
+
+**Numbers are read, not decoded.** Indian digit grouping throughout, tabular
+figures so columns of money line up, and a `₹…k/L/Cr` compact scale on axes and
+tiles where the exact rupee is noise. Every total is clickable: the drill sheet
+opens the rows behind it, editable in place, with the rows a figure *excludes*
+stated rather than silently dropped.
+
+### What was removed
+
+A migration is a good moment to stop carrying things:
+
+- **Four components nobody imported** — `CardTransactions`, `SavingsAccounts`,
+  `Transactions`, `UpiTransactions`, left behind when V1 folded those four tabs
+  into the Ledger — plus three dead imports inside `MailboxModal`. All of it
+  shipped in V1's single bundle, reachable from nothing.
+- **`DataHub` and `ReviewHub`**, wrapper components whose whole job was to hold
+  a tab index. Their sections are routes now (`/data?section=files`), which is
+  the same thing minus a component and plus a URL.
+- **`EmiPayments`**, already cut down in V1 to a strip of loan cards inside the
+  Ledger's EMI tab — cards the Debt screen states in full, with the
+  amortization they leave out. V2 keeps the preset and drops the component.
+- **The remount behind Ledger's preset tabs.** Switching preset in V1 replaced
+  the table wholesale, on purpose: React otherwise reused one instance and its
+  account filter survived into a preset it did not belong to, so a view with
+  28 matching rows rendered "no transactions match". The cost was a remount
+  and a refetch on every tab. In V2 a preset sets the filters on one table
+  that never unmounts, and each preset is a URL.
+- **Three separate destinations for files, staging and retention.** One `Data`
+  screen with three sections.
+- **`window.confirm` and `window.prompt`**, which the browser suppresses after
+  a couple of calls, silently turning a destructive action into a no-op.
+  Replaced by `ConfirmButton` and `PromptButton`.
+
+Nothing that reads or writes your ledger was dropped. Every endpoint V1 called,
+V2 calls.
+
+### Making it the only front end
+
+Nothing on the server side changes — V2 talks to exactly the same endpoints.
+
+**Production is one `.env` line.** Exactly one front end can answer for the
+domain, so there is no second service in `docker-compose.prod.yml` — there is a
+switch, and it lives where every other setting does:
+
+```bash
+echo 'FA_FRONTEND=./frontend-v2' >> .env
+docker compose -f docker-compose.prod.yml up -d --build frontend
+```
+
+Rolling back is the same line pointed at `./frontend`, or the line deleted —
+unset means V1, which is what a deployment that has never heard of this gets.
+
+Nothing else moves. Both images are nginx serving static files on port 80, both
+proxy `/api/` to `backend:8078` over the compose network, both allow the same
+60M upload, and Caddy reverse-proxies to `frontend:80` by service name, which is
+the same service either way. The database, the sessions and the statements are
+untouched by the switch: it changes which bundle the browser downloads and
+nothing else.
+
+**Development** runs both at once and needs no switch — V1 on 5173, V2 on 5174.
+To retire V1 there, delete its service from `docker-compose.yml` and move
+`frontend-v2` to port `5173`.
+
+`frontend/` is deliberately untouched, which keeps that switch reversible and
+keeps the suite passing. Six tests in `backend/tests/test_rules.py` read the
+front end's *source* — that every rule the backend defines has somewhere in the
+UI to edit it, that the mailbox period list is the server's and not a drifted
+local copy, that `CATEGORY_TONE` is declared exactly once and covers every
+account kind, that both themes declare a `color-scheme`, and that no input in
+the app is a shape the stylesheet misses. All six are pinned to V1's paths, so
+**deleting `frontend/` means repointing them at `frontend-v2/src` first**:
+`components/Rules.jsx` → `screens/Rules.jsx`, `styles.css` →
+`styles/app.css` (plus `base.css` and `tokens.css`), and the one
+`CATEGORY_TONE` now lives in `screens/import/steps.jsx`.
+
+V2 holds all six invariants — checked, not assumed — but one of them it holds
+differently enough to need rewriting rather than repointing. That test greps
+for the literal selectors `input:not([type])`, `input[type="date"]` and
+`input[type="number"]`, because V1 named the types it styled and a control with
+no `type` at all fell through to a white box on a dark page. V2 does not name
+them: it styles every input *except* the handful that are genuinely not text
+boxes, so a control written with no type, or with a type nobody has thought of
+yet, is covered by construction and the literals the test looks for are not
+there to find.
+
+---
+
 ## Layout
 
 ```
@@ -816,15 +1037,22 @@ backend/app/
   reconcile/             The balance gate + transfer detection
   categorize/            Rules engine, merchant cache, LLM tail
   analytics/             Cashflow, recurring, loans, forecast, position
-  agents/                Read-only toolbelt, agent catalogue, the tool loop
+  agents/                Read-only toolbelt, agent catalogue, the tool loop,
+                         and the check that every reported figure came from it
   graph/                 LangGraph state, nodes, assembly
   llm/                   Anthropic client (with redaction) + narrative
   db/                    PostgreSQL schema, engine and repository
   auth/                  Google sign-in, sessions, onboarding
   api/, main.py          FastAPI
 backend/tools/           Synthetic fixture generator
-backend/tests/           948 tests, including fault injection and isolation
-frontend/src/            React UI
+backend/tests/           1000 tests, including fault injection and isolation
+frontend/src/            React UI (V1)
+frontend-v2/src/
+  core/                  Router, query cache, auth, period, drill-down, prefs
+  ui/                    Design system, SVG charts, row windowing
+  app/                   Shell, rail, topbar, command palette, route table
+  screens/               One file per screen
+  styles/                Design tokens (light + dark), base, components
 ```
 
 ## Tests

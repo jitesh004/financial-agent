@@ -63,8 +63,25 @@ def list_agents() -> dict[str, Any]:
                 "error": run["error"],
             },
         })
+    budget = runner.profile_for()
     return {
         "agents": cards,
+        # Said out loud rather than left to be inferred from short answers.
+        # A compact run is not a broken run, and a reader who does not know
+        # which budget is in force cannot tell those apart.
+        "profile": {
+            "name": budget.name,
+            "max_steps": budget.max_steps,
+            "note": (
+                "This model is on the compact budget: fewer steps and "
+                "smaller tool results, sized so a whole run fits inside one "
+                "minute of a metered free tier. Answers are narrower, not "
+                "less accurate - every figure still comes from a tool and "
+                "is checked against one."
+                if budget.name == "compact" else
+                "This model is on the full budget: more steps and larger "
+                "tool results, so an agent can follow a thread further."),
+        },
         # Said once, here, rather than discovered by the user pressing Run:
         # an agent is the one feature in this app that cannot degrade to a
         # computed answer, because choosing what to look at IS the feature.
@@ -146,6 +163,15 @@ def _run_agent(job_id: str, key: str, question: str) -> None:
             "steps": len(result.steps),
             "tool_calls": result.tool_calls,
             "error": result.error,
+            # Which budget it ran under, and what it cost - so "it only
+            # looked at three things" reads as a fact about the profile
+            # rather than about the ledger.
+            "profile": result.profile,
+            "prompt_chars": result.prompt_chars,
+            # Money figures in the answer that no tool produced. Empty is
+            # the normal case and the one worth trusting.
+            "unverified": result.unverified,
+            "figures_checked": result.figures_checked,
         })
         repo.prune_agent_runs(db, agent.key, keep=KEEP_RUNS)
 
@@ -156,7 +182,8 @@ def _run_agent(job_id: str, key: str, question: str) -> None:
                         "status": result.status,
                         "headline": answer.get("headline", ""),
                         "findings": len(answer.get("findings", [])),
-                        "tool_calls": result.tool_calls},
+                        "tool_calls": result.tool_calls,
+                        "unverified": len(result.unverified)},
                 message=answer.get("headline")
                         or f"{agent.name} finished.")
         else:

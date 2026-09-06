@@ -250,7 +250,7 @@ def test_the_opening_facts_are_in_the_first_prompt(ledger):
     runner.run(agent, ledger, client=model)
 
     first = model.prompts[0]
-    assert "fetched for you" in first
+    assert "Fetched for you" in first
     assert "home_loan" in first, "the opening account facts must be present"
 
 
@@ -768,3 +768,392 @@ def test_a_real_balance_still_projects_a_real_shortfall(ledger):
     assert forecast["balance_known"] is True
     assert forecast["first_shortfall"] is not None
     assert forecast["first_shortfall"]["balance_after"] < 0
+
+
+# --------------------------------------------------------------------------
+# Fitting a small model's budget
+# --------------------------------------------------------------------------
+
+def test_a_whole_run_fits_inside_one_minute_of_a_metered_tier():
+    """The number that decides whether agents work at all on a free tier.
+
+    Gemini meters INPUT TOKENS PER MINUTE - 16,000, shared across every call
+    made in the same minute. The settings this loop shipped with cost 91,250
+    for a single ten-step run: six minutes of ceiling spent in a burst, which
+    in practice is a cascade of 429s and a run that never finishes.
+    """
+    from app.agents import runner as runner_mod
+
+    for agent in catalogue.AGENTS:
+        system = runner_mod._system(agent, runner_mod.COMPACT)
+        cost = runner_mod.COMPACT.estimate(len(system))
+        assert cost < 16000, (
+            f"{agent.key} costs ~{cost} input tokens a run, which does not "
+            f"fit one minute of a metered free tier")
+
+
+def test_the_compact_profile_sends_the_focus_and_the_full_one_the_brief():
+    """Written short, not truncated. A prompt cut off mid-sentence produces
+    reasoning cut off mid-thought, which is the failure being avoided rather
+    than a cheaper version of it."""
+    from app.agents import runner as runner_mod
+
+    agent = catalogue.get("debt-strategist")
+    compact = runner_mod._system(agent, runner_mod.COMPACT)
+    full = runner_mod._system(agent, runner_mod.FULL)
+
+    assert agent.focus in compact and agent.brief not in compact
+    assert agent.brief in full
+    assert len(compact) < len(full) / 1.5
+    # Both still carry the rule that keeps the answer honest.
+    for text in (compact, full):
+        assert "must appear in a tool result" in text \
+            or "must come from a tool result" in text
+
+
+def test_every_agent_writes_both_a_focus_and_a_brief():
+    for agent in catalogue.AGENTS:
+        assert agent.focus.strip(), f"{agent.key} has no compact focus"
+        assert agent.brief.strip(), f"{agent.key} has no brief"
+        assert len(agent.focus) < len(agent.brief), \
+            f"{agent.key}'s focus is not shorter than its brief"
+
+
+def test_the_compact_profile_offers_fewer_tools():
+    from app.agents import runner as runner_mod
+
+    agent = catalogue.get("debt-strategist")
+    assert len(agent.tools) > runner_mod.COMPACT.max_tools
+    compact = runner_mod._system(agent, runner_mod.COMPACT)
+    dropped = agent.tools[runner_mod.COMPACT.max_tools:]
+    for name in dropped:
+        assert f'"{name}"' not in compact
+    # And the ones it leads with survive, in order.
+    for name in agent.tools[:runner_mod.COMPACT.max_tools]:
+        assert f'"{name}"' in compact
+
+
+def test_a_small_model_is_recognised_by_its_name():
+    from app.agents import runner as runner_mod
+
+    for name in ("gemini-3.5-flash-lite", "gemini-2.0-flash-lite-001",
+                 "gpt-5-mini", "gemma-4-26b-a4b-it", "qwen-3b-instruct",
+                 "phi-4", "some-nano-model"):
+        assert runner_mod.profile_for(name) is runner_mod.COMPACT, name
+    # "mini" is a substring of "geMINI", so a substring match put Gemini Pro
+    # on the compact budget. These are the names that must NOT match.
+    for name in ("gemini-3-pro", "claude-opus-5", "gpt-5", "glm-5.2",
+                 "z-ai/glm-5.2:free"):
+        assert runner_mod.profile_for(name) is runner_mod.FULL, name
+
+
+def test_an_unknown_model_gets_the_compact_budget(monkeypatch):
+    """Compact still answers on a large model - it simply looks at fewer
+    things. Full does not answer at all on a small one, so the safe default
+    when nothing is known is the one that works either way."""
+    from app.agents import runner as runner_mod
+    from app.config import config
+
+    monkeypatch.setattr(config, "LLM_PROVIDER", "")
+    monkeypatch.setattr(config, "AGENT_PROFILE", "auto")
+    assert runner_mod.profile_for() is runner_mod.COMPACT
+
+
+def test_the_profile_can_be_forced(monkeypatch):
+    from app.agents import runner as runner_mod
+    from app.config import config
+
+    monkeypatch.setattr(config, "AGENT_PROFILE", "full")
+    assert runner_mod.profile_for("gemini-3.5-flash-lite") is runner_mod.FULL
+    monkeypatch.setattr(config, "AGENT_PROFILE", "compact")
+    assert runner_mod.profile_for("claude-opus-5") is runner_mod.COMPACT
+
+
+def test_the_budget_caps_the_steps_an_agent_may_take(ledger):
+    """An agent asking for ten steps gets five on the compact budget, and is
+    told it is on its last turn at the right moment."""
+    from app.agents import runner as runner_mod
+
+    agent = catalogue.get("debt-strategist")
+    assert agent.max_steps > runner_mod.COMPACT.max_steps
+    forever = {"thought": "again", "calls": [{"tool": "loans"}]}
+    model = ScriptedModel(*[forever] * runner_mod.COMPACT.max_steps)
+
+    result = runner.run(agent, ledger, client=model,
+                        budget=runner_mod.COMPACT)
+    assert result.status == "exhausted"
+    assert len(model.prompts) == runner_mod.COMPACT.max_steps
+    assert "LAST turn" in model.prompts[-1]
+    assert result.profile == "compact"
+
+
+def test_a_large_tool_result_is_truncated_to_the_budget(ledger):
+    from app.agents import runner as runner_mod
+
+    model = ScriptedModel(
+        {"thought": "everything", "calls": [{"tool": "ledger_query", "args": {
+            "spec": {"dimensions": ["date", "merchant"],
+                     "measures": [{"field": "outflow", "agg": "sum"}]}}}]},
+        ANSWER)
+    runner.run(catalogue.get("debt-strategist"), ledger, client=model,
+               budget=runner_mod.COMPACT)
+    # The second prompt carries the result, and the cap is what bounds it.
+    carried = model.prompts[1]
+    assert len(carried) < 20000, "a single result must not fill the window"
+
+
+# --------------------------------------------------------------------------
+# Every figure traced back to a tool
+# --------------------------------------------------------------------------
+
+def test_a_figure_the_tools_never_produced_is_flagged(ledger):
+    """The failure this catches is quiet, not wild: a total the model added
+    up itself and got slightly wrong, or a balance from two calls ago. Every
+    one of those reads exactly like a correct answer."""
+    invented = {
+        "thought": "done",
+        "answer": {
+            "headline": "You owe 87,65,432 in total.",
+            "summary": "Your EMI is 34,200 a month.",
+            "metrics": [], "findings": [], "actions": [], "caveats": [],
+        },
+    }
+    result = runner.run(catalogue.get("debt-strategist"), ledger,
+                        client=ScriptedModel(invented))
+
+    assert result.status == "ok", "a bad figure is reported, not a failed run"
+    assert "87,65,432" in result.unverified
+    assert "34,200" not in result.unverified, "the EMI IS in the loan tool"
+    # And the reader is told, where the answer's other qualifications are.
+    assert any("did not come from any tool" in c
+               for c in result.answer["caveats"])
+
+
+def test_an_answer_that_only_quotes_tool_figures_is_clean(ledger):
+    from app.agents import toolbelt as belt
+
+    loans = belt.call(ledger, "loans", {})
+    emi = loans["loans"][0]["emi"]
+    quoted = {
+        "thought": "done",
+        "answer": {"headline": f"Your EMI is {emi:,.0f} a month.",
+                   "summary": "Nothing else to report.",
+                   "metrics": [], "findings": [], "actions": [],
+                   "caveats": []},
+    }
+    result = runner.run(catalogue.get("debt-strategist"), ledger,
+                        client=ScriptedModel(quoted))
+    assert result.unverified == []
+    assert result.figures_checked >= 1
+    assert not any("did not come from any tool"
+                   for c in result.answer["caveats"] if False)
+
+
+def test_counts_and_percentages_are_not_treated_as_money(ledger):
+    """A model is entitled to work out "43% of take-home" from two figures it
+    was given. Checking that would flag every correct derivation there is."""
+    derived = {
+        "thought": "done",
+        "answer": {"headline": "EMIs are 43% of take-home across 2 loans.",
+                   "summary": "221 instalments left, at 8.45%.",
+                   "metrics": [], "findings": [], "actions": [],
+                   "caveats": []},
+    }
+    result = runner.run(catalogue.get("debt-strategist"), ledger,
+                        client=ScriptedModel(derived))
+    assert result.unverified == []
+
+
+def test_the_figure_check_reads_indian_formatting():
+    from app.agents import verify
+
+    figures = verify.collect_figures({"outstanding": "4124761.64"})
+    for written in ("41,24,762", "41.2 lakh", "41 lakh", "4124761.64"):
+        report = verify.check({"headline": f"You owe {written}."}, figures)
+        assert report.clean, f"{written} should verify"
+
+    for written in ("52,00,000", "60 lakh", "1.2 crore"):
+        report = verify.check({"headline": f"You owe {written}."}, figures)
+        assert not report.clean, f"{written} should not verify"
+
+
+def test_an_id_or_a_date_is_not_a_quantity():
+    from app.agents import verify
+
+    report = verify.check(
+        {"headline": "Reviewed 2026-04-10 on card XXXX9931, "
+                     "instalment (013/240)."},
+        set())
+    assert report.checked == 0 and report.clean
+
+
+def test_the_same_wrong_figure_twice_is_one_problem():
+    from app.agents import verify
+
+    report = verify.check(
+        {"headline": "You owe 87,65,432.",
+         "summary": "That 87,65,432 is the whole of it."},
+        set())
+    assert report.unverified == ["87,65,432"]
+
+
+# --------------------------------------------------------------------------
+# The whole catalogue
+# --------------------------------------------------------------------------
+
+def test_the_catalogue_is_complete_and_coherent():
+    """Twelve agents, each with a distinct key, a question, and tools that
+    exist. Checked as a set because the failure of a twelfth agent is
+    typically a copied block with one field not changed."""
+    keys = [a.key for a in catalogue.AGENTS]
+    assert len(keys) == len(set(keys)) == 12
+
+    for agent in catalogue.AGENTS:
+        assert agent.name and agent.question and agent.blurb, agent.key
+        assert agent.question.endswith("?"), agent.key
+        assert agent.tools, agent.key
+        assert len(agent.tools) == len(set(agent.tools)), agent.key
+        for name in agent.tools:
+            assert name in toolbelt.TOOLS, f"{agent.key}: {name}"
+        for name in agent.opening:
+            assert name in agent.tools, f"{agent.key} opens with {name}"
+
+
+def test_every_opening_tool_works_with_no_arguments(ledger):
+    """Opening facts are fetched before the model has said anything, so they
+    are called with an empty argument dict. A tool that needs one would come
+    back as an error in the very first thing the agent reads."""
+    for agent in catalogue.AGENTS:
+        for name in agent.opening:
+            result = toolbelt.call(ledger, name, {})
+            assert isinstance(result, dict), f"{agent.key}/{name}"
+            assert "error" not in result, \
+                f"{agent.key} opens with {name}, which needs arguments: " \
+                f"{result.get('error')}"
+
+
+def test_the_new_tools_all_answer_against_a_real_ledger(ledger):
+    """Each returns figures, not prose, and none of them raises on a ledger
+    with no bureau report, no portfolio and one account."""
+    for name in ("anomalies", "duplicate_charges", "income", "coverage_gaps",
+                 "review_queue"):
+        result = toolbelt.call(ledger, name, {})
+        assert isinstance(result, dict), name
+        assert "error" not in result, f"{name}: {result.get('error')}"
+
+
+def test_income_reports_a_distribution_not_a_total(ledger):
+    result = toolbelt.call(ledger, "income", {})
+    assert result["typical_month"] == 185000.0
+    assert result["lowest_month"] is not None
+    assert result["sources"], "an income source must be named"
+    assert result["months_below_half_typical"] == 0
+
+
+def test_duplicate_charges_finds_one_bill_taken_twice(ledger):
+    """And says it is a candidate rather than a verdict."""
+    from datetime import date as _date
+
+    from app.models.schemas import Direction as _Dir
+
+    rows = [
+        Transaction(id="dup-1", account_id="bank-1", txn_date=_date(2026, 3, 4),
+                    raw_description="ACME UTILITIES BILL",
+                    normalized_description="ACME UTILITIES BILL",
+                    merchant="ACME UTILITIES", amount=Decimal("4820"),
+                    direction=_Dir.DEBIT, category=Category.UTILITIES),
+        Transaction(id="dup-2", account_id="bank-1", txn_date=_date(2026, 3, 6),
+                    raw_description="ACME UTILITIES BILL",
+                    normalized_description="ACME UTILITIES BILL",
+                    merchant="ACME UTILITIES", amount=Decimal("4820"),
+                    direction=_Dir.DEBIT, category=Category.UTILITIES),
+    ]
+    repo.save_transactions(ledger, rows)
+
+    result = toolbelt.call(ledger, "duplicate_charges", {})
+    found = [c for c in result["candidates"] if "ACME" in c["merchant"]]
+    assert len(found) == 1
+    assert found[0]["days_apart"] == 2 and found[0]["amount"] == 4820.0
+    assert "not confirmed duplicates" in result["note"]
+
+
+def test_review_queue_says_how_much_money_is_waiting(ledger):
+    result = toolbelt.call(ledger, "review_queue", {})
+    assert "awaiting_review" in result and "uncategorized" in result
+    assert result["awaiting_review_total"] is not None
+
+
+def test_every_agent_runs_end_to_end_inside_the_budget(ledger):
+    """The whole thing, twelve times, against a model that behaves like a
+    small one: it calls what it is offered and then answers.
+
+    This is the test that would have caught the original problem. Each agent
+    individually looked fine; what was broken was the arithmetic across a
+    whole run, and nothing measured that.
+    """
+    from app.agents import runner as runner_mod
+
+    class SmallModel:
+        available = True
+
+        def __init__(self, tools):
+            self.tools = list(tools)
+            self.turn = 0
+            self.chars = 0
+
+        def complete_json(self, prompt, system="", **kwargs):
+            self.chars += len(prompt) + len(system)
+            self.turn += 1
+            if self.turn <= 2 and self.tools:
+                batch, self.tools = self.tools[:2], self.tools[2:]
+                return {"thought": "looking",
+                        "calls": [{"tool": t} for t in batch]}
+            return {"thought": "done", "answer": {
+                "headline": "Nothing notable.", "summary": "Checked.",
+                "metrics": [], "findings": [], "actions": [], "caveats": []}}
+
+    for agent in catalogue.AGENTS:
+        model = SmallModel([t for t in agent.tools if t not in agent.opening])
+        result = runner.run(agent, ledger, client=model,
+                            budget=runner_mod.COMPACT)
+        assert result.status == "ok", f"{agent.key}: {result.error}"
+        assert result.tool_calls >= len(agent.opening), agent.key
+        assert model.chars // 4 < 16000, (
+            f"{agent.key} spent ~{model.chars // 4} input tokens, which does "
+            f"not fit one minute of a metered free tier")
+
+
+def test_an_unverified_figure_survives_into_the_stored_run(ledger, monkeypatch):
+    """It has to reach the screen, or the check may as well not exist."""
+    from app.agents import runner as runner_mod
+    from app.api import agent_routes
+
+    model = ScriptedModel({
+        "thought": "done",
+        "answer": {"headline": "You owe 99,88,777.", "summary": "All of it.",
+                   "metrics": [], "findings": [], "actions": [],
+                   "caveats": []},
+    })
+    monkeypatch.setattr(agent_routes, "get_client", lambda *a, **k: model)
+    monkeypatch.setattr(runner_mod, "get_client", lambda *a, **k: model)
+
+    job_id = client.post("/api/agents/debt-strategist/run",
+                         json={}).json()["job_id"]
+    job = client.get(f"/api/jobs/{job_id}").json()
+    assert job["result"]["unverified"] == 1
+
+    run = client.get(f"/api/agents/runs/{job['result']['run_id']}").json()
+    assert any("did not come from any tool" in c
+               for c in run["answer"]["caveats"])
+    # And it is visible in the history without opening the run.
+    assert "not traceable to a tool result" in run["error"]
+
+
+def test_the_catalogue_says_which_budget_is_in_force(ledger):
+    """A compact run and a broken run look identical from outside - three
+    findings instead of six - so the screen has to be able to say which."""
+    payload = client.get("/api/agents").json()
+    assert payload["profile"]["name"] in {"compact", "full"}
+    assert payload["profile"]["max_steps"] >= 5
+    assert payload["profile"]["note"]
+    assert len(payload["agents"]) == 12

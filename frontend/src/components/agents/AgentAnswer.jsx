@@ -188,6 +188,9 @@ export default function AgentAnswer({ run, onBack }) {
             {run.started_at ? ` · ran ${dateLabel(run.started_at)}` : ''}
             {run.seconds ? ` in ${formatDuration(run.seconds)}` : ''}
             {run.tool_calls ? ` · ${run.tool_calls} tool calls` : ''}
+            {run.figures_checked
+              ? ` · ${run.figures_checked} figure${run.figures_checked > 1 ? 's' : ''} checked`
+              : ''}
           </div>
         </div>
       </div>
@@ -309,6 +312,40 @@ export default function AgentAnswer({ run, onBack }) {
             ))}
           </div>
         </Card>
+      )}
+
+      {/* Figures the tools never produced.
+
+          Shown as its own block rather than folded into the caveats, and
+          above them, because it is a different kind of statement: a caveat
+          qualifies an answer, this says a specific number in it could not be
+          traced. Nothing is deleted - editing the prose would leave a
+          sentence that reads as if it had been checked, and being able to
+          tell the difference is the entire point. */}
+      {run.unverified?.length > 0 && (
+        <Callout tone="neg">
+          <strong>
+            {run.unverified.length} figure
+            {run.unverified.length > 1 ? 's' : ''} could not be traced
+          </strong>
+          <p style={{ margin: '4px 0 8px', lineHeight: 1.55 }}>
+            No tool call in this run returned{' '}
+            {run.unverified.length > 1 ? 'these' : 'this'}. They may be
+            arithmetic the model did itself, or they may simply be wrong —
+            check them against the working below before relying on them.
+          </p>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            {run.unverified.map((figure) => (
+              <span key={figure} className="num" style={{
+                fontSize: 13, background: 'var(--negative-soft)',
+                color: 'var(--negative)', padding: '2px 8px', borderRadius: 5,
+              }}
+              >
+                {figure}
+              </span>
+            ))}
+          </div>
+        </Callout>
       )}
 
       {answer.caveats?.length > 0 && (
