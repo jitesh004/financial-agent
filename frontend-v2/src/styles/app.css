@@ -302,6 +302,19 @@ kbd {
 }
 .page-head .grow { flex: 1; min-width: 240px; }
 
+
+/* ── the agent grid ──────────────────────────────────────────────────────── */
+
+/* Twelve cards whose contents are nothing like the same length: one blurb runs
+   two lines and another four, and only some carry a last answer. Left alone,
+   every Run button in a row sits at a different height and the row reads as
+   broken rather than as varied. So each card is stretched to its row and its
+   controls are pinned to the bottom of it. */
+.agent-grid > .agent-card { display: flex; flex-direction: column; }
+.agent-grid > .agent-card > .card-body { display: flex; flex-direction: column; flex: 1; }
+.agent-actions { margin-top: auto; padding-top: 14px; }
+.agent-actions input { width: 100%; }
+
 /* ═══════════════════════════════════════════════════════ 3. grid ════════ */
 
 .grid { display: grid; gap: 14px; }
