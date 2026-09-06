@@ -2715,9 +2715,26 @@ def save_agent_run(db: Database, run: dict[str, Any]) -> str:
              json.dumps(run.get("transcript") or [], default=str),
              run.get("model", ""), run.get("provider", ""),
              int(run.get("steps") or 0), int(run.get("tool_calls") or 0),
-             run.get("error", "")),
+             _run_error_with_notes(run)),
         )
     return run_id
+
+
+def _run_error_with_notes(run: dict[str, Any]) -> str:
+    """The run's error, with the figure check appended when it found something.
+
+    Carried in `error` rather than in a column of its own because an
+    unverified figure IS a defect in the run - the same kind of thing as a
+    step that failed - and a reader scanning the history for "did this one go
+    wrong" should see it in the same place. The answer itself already carries
+    the caveat; this is what makes it visible without opening the run.
+    """
+    parts = [run.get("error", "")]
+    unverified = run.get("unverified") or []
+    if unverified:
+        parts.append(f"{len(unverified)} figure(s) not traceable to a tool "
+                     f"result: {', '.join(str(u) for u in unverified[:6])}")
+    return " · ".join(p for p in parts if p)
 
 
 def _agent_run_json(row, *, with_transcript: bool = False) -> dict[str, Any]:

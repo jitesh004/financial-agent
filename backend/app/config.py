@@ -137,6 +137,19 @@ class Config:
     LLM_PROVIDER = (
         _env('LLM_PROVIDER', default='openrouter') or 'openrouter').lower()
 
+    # ---- Agents ----------------------------------------------------------
+    #
+    # How much prompt one agent run may spend. "auto" reads the configured
+    # model's name and picks: a small one gets the compact budget, which is
+    # sized to fit a whole run inside one minute of Gemini's free-tier
+    # input-token ceiling. "compact" and "full" force it either way.
+    #
+    # Worth forcing to compact on any metered tier even with a large model:
+    # the ceiling that bites is tokens per MINUTE, shared across every call,
+    # and a run that spends 90,000 of them is rate limited into uselessness
+    # however capable the model at the other end is.
+    AGENT_PROFILE = (_env('FA_AGENT_PROFILE', default='auto') or 'auto').lower()
+
     # ---- Gemini (Google's own API) ---------------------------------------
     #
     # Distinct from pointing the OpenRouter provider at Google's
