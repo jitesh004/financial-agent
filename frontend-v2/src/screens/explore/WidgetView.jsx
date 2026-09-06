@@ -11,7 +11,7 @@ import {
   colorFor, compact, compactNumber, count, dateLabel, money, monthLabel, titleCase,
 } from '../../core/format';
 import { BarList, Legend, Spinner } from '../../ui';
-import { BarChart, Donut, LineChart } from '../../ui/charts';
+import { BarChart, Donut, Fill, LineChart } from '../../ui/charts';
 
 export const WIDGET_TYPES = [
   { key: 'stat', label: 'Number', glyph: '123' },
@@ -321,10 +321,15 @@ function DonutView({ result }) {
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       <div style={{ flex: 1, minHeight: 0 }}>
-        <Donut data={data} height={160}
-          format={measures[0].type === 'money' ? money : count} />
+        <Fill>
+          {(h) => (
+            <Donut data={data} height={h}
+              format={measures[0].type === 'money' ? money : count} />
+          )}
+        </Fill>
       </div>
-      <Legend items={data.slice(0, 8)} />
+      <Legend items={data.slice(0, 8)}
+        format={measures[0].type === 'money' ? compact : count} />
     </div>
   );
 }
@@ -337,7 +342,6 @@ function Cartesian({ result, type, viz, animate }) {
     data: chart.data,
     series: chart.series,
     labelOf: labelOf(chart.xType),
-    height: 190,
     animate,
     format: money$ ? money : count,
     axisFormat: money$ ? compact : compactNumber,
@@ -345,9 +349,11 @@ function Cartesian({ result, type, viz, animate }) {
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       <div style={{ flex: 1, minHeight: 0 }}>
-        {type === 'bar'
-          ? <BarChart {...shared} stacked={Boolean(viz.stacked)} />
-          : <LineChart {...shared} area={type === 'area'} />}
+        <Fill>
+          {(h) => (type === 'bar'
+            ? <BarChart {...shared} height={h} stacked={Boolean(viz.stacked)} />
+            : <LineChart {...shared} height={h} area={type === 'area'} />)}
+        </Fill>
       </div>
       {chart.series.length > 1 && <Legend items={chart.series.map((s) => ({
         label: s.name, color: s.color,

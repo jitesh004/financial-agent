@@ -38,7 +38,11 @@
   /* ---- type ---- */
   --text:   #10141b;
   --text-2: #545f6f;
-  --text-3: #838f9f;
+  /* 4.6:1 on every light surface. It was #838f9f, which read as a nice
+     quiet grey and failed WCAG AA at 3.0:1 - and this token carries every
+     column header, stat label and caption in the app, so "quiet" was the
+     whole interface being slightly unreadable. */
+  --text-3: #5f6b7b;
   --text-on-accent: #ffffff;
 
   /* ---- the one accent ---- */
@@ -49,13 +53,13 @@
   --accent-text:   #2b47bb;
 
   /* ---- meaning ---- */
-  --pos:        #0f8a70;
+  --pos:        #0d7861;
   --pos-soft:   #e3f5f0;
   --pos-border: #a9ddd0;
-  --neg:        #cf3b38;
+  --neg:        #c83330;
   --neg-soft:   #fdeaea;
   --neg-border: #f3bdbc;
-  --warn:       #a9720f;
+  --warn:       #92620d;
   --warn-soft:  #fdf3e0;
   --warn-border:#eed6a4;
 
@@ -122,7 +126,8 @@
 
   --text:   #e8ecf3;
   --text-2: #98a3b4;
-  --text-3: #67727f;
+  /* 4.6:1 on every dark surface; see the light block. */
+  --text-3: #818c98;
   --text-on-accent: #0a0c11;
 
   --accent:        #6d8cff;

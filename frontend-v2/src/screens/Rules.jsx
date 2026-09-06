@@ -98,12 +98,12 @@ function Terms({ pattern, max = 14 }) {
   );
 }
 
-function Rows({ head, rows }) {
+function Rows({ head, rows, cols }) {
   if (!rows.length) {
     return <div className="small dim">Nothing here matches your search.</div>;
   }
   return (
-    <Table>
+    <Table cols={cols}>
       <thead><tr>{head.map((h) => <th key={h}>{h}</th>)}</tr></thead>
       <tbody>
         {rows.map((cells, i) => (
@@ -790,6 +790,8 @@ function LedgerRules({ data, q }) {
 
 /* ──────────────────────────────────────────────────────────── numbers ──── */
 
+const THRESHOLD_COLS = ['28%', '14%', '58%'];
+
 function Numbers({ data, q }) {
   const rows = data.thresholds.filter((t) => !q || t.name.toLowerCase().includes(q)
     || t.group.toLowerCase().includes(q) || t.why.toLowerCase().includes(q));
@@ -811,9 +813,12 @@ function Numbers({ data, q }) {
         These are code, not settings — they are the same for every import and cannot be
         changed from here. The reason each one is what it is matters more than the number.
       </Callout>
+      {/* One card per group, all the same three columns. Left to size
+          themselves, "Value" landed in a different place in each card. */}
       {groups.map((group) => (
         <Card key={group} title={group} pad={false}>
           <Rows
+            cols={THRESHOLD_COLS}
             head={['', 'Value', 'Why']}
             rows={rows.filter((t) => t.group === group).map((t) => [
               <strong>{t.name}</strong>,
@@ -931,8 +936,16 @@ function Pipeline({ data, q }) {
           rows={p.formats.magic_bytes.filter((m) => match(m.kind))
             .map((m) => [<code>{m.bytes}</code>, m.kind.toUpperCase()])}
         />
+        {/* This row of chips sat here unlabelled, under a card whose subtitle
+            is about magic bytes - so it read as a list of something, of
+            nothing in particular. The card below it labels its own chips; so
+            does this one now. */}
         <div style={{ padding: '10px 14px' }}>
           <Chips list={p.formats.extensions} match={match} />
+          <div className="small dim" style={{ marginTop: 6 }}>
+            The extensions an upload will accept. Which reader runs is still decided by
+            what is inside the file, so a .csv holding a PDF is read as a PDF.
+          </div>
         </div>
       </Card>
 

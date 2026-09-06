@@ -410,7 +410,9 @@ export default function WidgetEditor({ schema, widget, board, onSave, onCancel, 
                 </span>
               )}
             </div>
-            <div className={`tile-body ${['table', 'pivot'].includes(draft.type) ? 'scroll' : ''}`}>
+            <div className={`tile-body
+              ${['table', 'pivot', 'hbar', 'text'].includes(draft.type) ? 'scroll' : ''}
+              ${['table', 'pivot'].includes(draft.type) ? 'flush' : ''}`}>
               <WidgetView widget={draft} result={preview} error={error}
                 loading={busy && !preview} />
             </div>

@@ -450,7 +450,7 @@ function Row({
           )}
         </td>
         <td>
-          <div style={{ overflowWrap: 'anywhere', lineHeight: 1.4 }}>{t.description}</div>
+          <div className="desc">{t.description}</div>
           <div className="row tight" style={{ marginTop: 3 }}>
             {t.is_internal_transfer && (
               <Chip tone="acc">{t.is_mirror_leg ? 'transfer (mirror)' : 'transfer'}</Chip>

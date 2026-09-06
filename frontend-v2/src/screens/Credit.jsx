@@ -110,7 +110,7 @@ export default function Credit({ onImport }) {
                       {Number(row.overdue) > 0
                         ? <span className="neg">{money(Number(row.overdue))}</span> : '—'}
                     </td>
-                    <td className="nowrap">{row.opened_on || '—'}</td>
+                    <td className="nowrap">{dateLabel(row.opened_on)}</td>
                   </tr>
                 ))}
               </tbody>

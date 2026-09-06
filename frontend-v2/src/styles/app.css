@@ -240,6 +240,9 @@ kbd {
 
 /* Shown only where the rail is a drawer. */
 .only-mobile { display: none !important; }
+/* And its opposite, for a label that is worth the room on a laptop and is not
+   worth it on a phone. */
+@media (max-width: 560px) { .wide-only { display: none; } }
 
 @media (max-width: 900px) {
   .only-mobile { display: inline-flex !important; }
@@ -577,7 +580,7 @@ select {
   padding-right: 28px;
   cursor: pointer;
   appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23838f9f' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%235f6b7b' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 9px center;
 }
@@ -754,7 +757,35 @@ input[type="search"]::-webkit-search-cancel-button { filter: grayscale(1) opacit
 .tbl-wrap { width: 100%; overflow-x: auto; }
 .tbl-wrap.scroll-y { max-height: 460px; overflow-y: auto; }
 
+/* The scroll affordance. Outside the scroller, or it would scroll away with
+   the content it is meant to be marking the edge of. Above the sticky header,
+   which is z-index 1, so the header fades out with everything else. */
+.tbl-outer { position: relative; min-width: 0; }
+.tbl-outer::before, .tbl-outer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 44px;
+  z-index: 2;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--t-fast);
+}
+.tbl-outer::before { left: 0; background: linear-gradient(to right, var(--surface), transparent); }
+.tbl-outer::after { right: 0; background: linear-gradient(to left, var(--surface), transparent); }
+.tbl-outer.more-left::before, .tbl-outer.more-right::after { opacity: 1; }
+/* The fade has to be the colour actually behind the table, not the default. */
+.card.sunken .tbl-outer::before, .tbl-wrap.on-2 + .tbl-outer::before,
+.sunken .tbl-outer::before {
+  background: linear-gradient(to right, var(--surface-2), transparent);
+}
+.card.sunken .tbl-outer::after, .sunken .tbl-outer::after {
+  background: linear-gradient(to left, var(--surface-2), transparent);
+}
+
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.fixed { table-layout: fixed; }
 
 thead th {
   position: sticky;
@@ -772,6 +803,13 @@ thead th {
   white-space: nowrap;
 }
 .card.sunken thead th, .tbl-wrap.on-2 thead th { background: var(--surface-2); }
+
+/* A statement narration has no spaces in it - UPI/SWIGGY/AUG/100000 - so it
+   is broken anywhere rather than allowed to push the table wider than the
+   screen. That is right, but only once the column has a sensible width: at
+   390px it had compressed to about 100px and was breaking every row into
+   three. The table already scrolls sideways, so a floor here costs nothing. */
+td .desc { overflow-wrap: anywhere; line-height: 1.4; min-width: 148px; }
 
 tbody td {
   padding: 9px 12px;
@@ -804,7 +842,12 @@ th.right, td.right { text-align: right; }
   gap: 4px;
   background: none;
   border: 0;
-  padding: 0;
+  /* Padded out to the header cell and pulled back by the same amount: the
+     click target is the whole cell, and the layout is exactly where it was.
+     Without it the target is the height of 11px text - 17px - which is a
+     miss most times you aim at it. */
+  padding: 8px 12px;
+  margin: -8px -12px;
   font: inherit;
   color: inherit;
   cursor: pointer;
@@ -1375,7 +1418,11 @@ button.barrow:hover { background: var(--surface-hover); }
 .tile-tools { display: flex; gap: 2px; opacity: 0; transition: opacity var(--t-fast); }
 .tile:hover .tile-tools, .tile:focus-within .tile-tools { opacity: 1; }
 .tile-body { flex: 1; min-height: 0; padding: 10px; position: relative; }
-.tile-body.scroll { overflow: auto; padding: 0; }
+/* Two different things, and folding them together is what left a ranked list
+   clipped: a table sits flush against the tile edge, a list still wants its
+   padding, and both need to scroll when they are longer than the tile. */
+.tile-body.scroll { overflow: auto; }
+.tile-body.flush { padding: 0; }
 .tile-drag { cursor: grab; color: var(--text-3); }
 .tile-drag:active { cursor: grabbing; }
 .tile-empty {

@@ -16,7 +16,7 @@
  * moves.
  */
 
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { api } from '../core/api';
 import { invalidate, useQuery } from '../core/store';
 import { useRouteParam } from '../core/router';
@@ -62,6 +62,41 @@ const ROLES = [
   ['transfer_in', 'Transfer — between your own accounts'],
   ['excluded', 'Ignore — leave out of every total'],
 ];
+
+/* How many rows of one group to put in the DOM at once.
+ *
+ * Review is the screen most likely to be holding a backlog - it is where
+ * everything the pipeline could not place ends up - and it rendered every one
+ * of them. Two hundred rows is sixteen screenfuls of scrolling with a <select>
+ * in each; two thousand, which is what the bulk query asks for, is not a page
+ * at all. A queue is worked top-down, so a page of it plus a way to ask for
+ * more is both faster and a better shape than an endless list. */
+const PAGE = 40;
+
+function usePaged(rows, step = PAGE) {
+  const [shown, setShown] = useState(step);
+  // A new group, or a row resolved out of this one, must not leave the page
+  // size stranded where it was.
+  useEffect(() => { setShown(step); }, [rows.length === 0, step]);
+  return {
+    slice: rows.length > shown ? rows.slice(0, shown) : rows,
+    hidden: Math.max(0, rows.length - shown),
+    more: () => setShown((n) => n + step),
+    all: () => setShown(rows.length),
+  };
+}
+
+function MoreRows({ hidden, total, shown, onMore, onAll }) {
+  if (!hidden) return null;
+  return (
+    <div className="row" style={{ padding: '10px 16px', borderTop: '1px solid var(--line)' }}>
+      <span className="small dim">Showing {count(shown)} of {count(total)}</span>
+      <div className="spacer" />
+      <Button size="sm" onClick={onMore}>Show {Math.min(hidden, PAGE)} more</Button>
+      {hidden > PAGE && <Button size="sm" onClick={onAll}>Show all {count(total)}</Button>}
+    </div>
+  );
+}
 
 const REASON_HINT = {
   unknown_funding:
@@ -134,7 +169,16 @@ function Queue() {
       )}
 
       {groups.map(([reason, rows]) => (
-        <Card key={reason} title={reason}
+        <QueueGroup key={reason} reason={reason} rows={rows} busy={busy} resolve={resolve} />
+      ))}
+    </>
+  );
+}
+
+function QueueGroup({ reason, rows, busy, resolve }) {
+  const paged = usePaged(rows);
+  return (
+        <Card title={reason}
           sub={`${rows.length} transaction${rows.length === 1 ? '' : 's'}`} pad={false}>
           {REASON_HINT[reason] && (
             <div style={{ padding: '12px 16px 0' }}>
@@ -149,7 +193,7 @@ function Queue() {
               </tr>
             </thead>
             <tbody>
-              {rows.map((t) => (
+              {paged.slice.map((t) => (
                 <tr key={t.id} style={{ opacity: busy === t.id ? 0.45 : 1 }}>
                   <td className="nowrap">{dateLabel(t.date)}</td>
                   <td>
@@ -175,7 +219,10 @@ function Queue() {
                         disabled={busy === t.id}
                         onChange={(v) => resolve(t, { flow_role: v })}
                         options={ROLES}
-                        style={{ maxWidth: 220 }}
+                        /* Was maxWidth 220, which cut "Income - money that
+                           genuinely came in" off mid-word in the closed
+                           control. The column has the room; let it use it. */
+                        style={{ flex: 1, minWidth: 200, maxWidth: 360 }}
                       />
                       <Button size="sm" disabled={busy === t.id}
                         onClick={() => resolve(t, {})}
@@ -188,9 +235,9 @@ function Queue() {
               ))}
             </tbody>
           </Table>
+          <MoreRows hidden={paged.hidden} total={rows.length} shown={paged.slice.length}
+            onMore={paged.more} onAll={paged.all} />
         </Card>
-      ))}
-    </>
   );
 }
 
@@ -269,6 +316,8 @@ function ByMerchant() {
   const remaining = groups.reduce((n, g) => n + g.items.length, 0);
   const value = groups.reduce((n, g) => n + g.total, 0);
 
+  const paged = usePaged(groups, 25);
+
   return (
     <>
       {error && <Callout tone="neg">{error.message}</Callout>}
@@ -307,7 +356,10 @@ function ByMerchant() {
         </Empty>
       )}
 
-      {groups.map((g) => (
+      {/* One card per merchant, and a real ledger has hundreds of them. The
+          expanded row list inside each is already bounded; this bounds the
+          list of cards. */}
+      {paged.slice.map((g) => (
         <Card key={g.key} pad>
           <div className="row" style={{ opacity: busy === g.key ? 0.5 : 1 }}>
             <div className="grow">
@@ -348,6 +400,19 @@ function ByMerchant() {
           )}
         </Card>
       ))}
+
+      {paged.hidden > 0 && (
+        <div className="row">
+          <span className="small dim">
+            Showing {count(paged.slice.length)} of {count(groups.length)} merchants
+          </span>
+          <div className="spacer" />
+          <Button size="sm" onClick={paged.more}>Show {Math.min(paged.hidden, 25)} more</Button>
+          {paged.hidden > 25 && (
+            <Button size="sm" onClick={paged.all}>Show all {count(groups.length)}</Button>
+          )}
+        </div>
+      )}
 
       {rows.length >= 2000 && (
         <Callout tone="warn">

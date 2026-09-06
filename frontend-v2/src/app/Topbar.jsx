@@ -217,8 +217,12 @@ export default function Topbar({ title, onMenu, onCommand, onImport, importBadge
 
       <SetupButton onImport={onImport} />
 
-      <Button icon="upload" onClick={onImport} title="Scan your mailbox, or add files">
-        Import
+      {/* The label goes on a narrow screen, not the button. It was the last
+          thing competing with the page title for room, and losing that
+          competition turned "Overview" into "Overvi…". */}
+      <Button icon="upload" onClick={onImport} aria-label="Import"
+        title="Scan your mailbox, or add files">
+        <span className="wide-only">Import</span>
         {importBadge > 0 && <span className="rail-count">{importBadge}</span>}
       </Button>
 

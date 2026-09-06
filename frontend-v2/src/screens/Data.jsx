@@ -17,7 +17,7 @@ import { useRouteParam } from '../core/router';
 import { useToast } from '../core/toast';
 import { useDashboard } from '../core/ledger';
 import {
-  bytes, count, dateLabel, money, monthLabel, monthLabelLong, titleCase,
+  bytes, count, dateLabel, money, monthLabel, monthLabelLong, stampLabel, titleCase,
 } from '../core/format';
 import {
   Button, Callout, Card, Chip, ConfirmButton, Empty, Loading, Search, Section,
@@ -772,7 +772,7 @@ function Manage() {
             <div key={s.name} className="list-row">
               <div className="grow">
                 <div className="truncate list-title">{s.name}</div>
-                <div className="tiny dim">{s.created_at} · {bytes(s.size_bytes)}</div>
+                <div className="tiny dim">{stampLabel(s.created_at)} · {bytes(s.size_bytes)}</div>
               </div>
               <ConfirmButton
                 disabled={busy}

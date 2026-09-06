@@ -674,14 +674,22 @@ export function BarList({ items, total, max = 12, format = compact, onPick, colo
   );
 }
 
-export function Legend({ items }) {
+/* A legend value is a figure like any other on this screen, so it goes through
+   the same formatter. Printed raw, the portfolio donut read "986000" beside
+   every other number in the app written as ₹9.9L. `format` is there for the
+   legends whose measure is a count rather than money. */
+export function Legend({ items, format = compact }) {
   return (
     <div className="legend">
       {items.map((it) => (
         <span className="legend-item" key={it.label}>
           <i className="swatch" style={{ background: it.color }} />
           {it.label}
-          {it.value != null && <strong className="num">&nbsp;{it.value}</strong>}
+          {it.value != null && (
+            <strong className="num">
+              &nbsp;{typeof it.value === 'number' ? format(it.value) : it.value}
+            </strong>
+          )}
         </span>
       ))}
     </div>
@@ -730,11 +738,56 @@ export function useSorted(rows, initial = { key: 'label', dir: 'asc' }) {
   return { sorted, sort, by };
 }
 
-export function Table({ children, scrollY, className = '', maxHeight }) {
+/* A table wide enough to scroll says so.
+ *
+ * Several tables here carry more columns than fit - Position's loans hide
+ * 191px at 1440 and 607px at 1024 - and the wrapper has always scrolled. What
+ * it never did was admit it: the last column was simply sliced mid-word at the
+ * card edge, which reads as a rendering fault rather than as an invitation.
+ * A fade on whichever side has more to show, and nothing at all when the table
+ * fits, which is most of them. */
+export function Table({ children, scrollY, className = '', maxHeight, cols }) {
+  const ref = useRef(null);
+  const [edges, setEdges] = useState('');
+
+  const measure = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    const max = el.scrollWidth - el.clientWidth;
+    // 2px, not 0: sub-pixel layout leaves a fraction of overflow on tables
+    // that actually fit, and a fade with nothing behind it is worse than none.
+    setEdges(`${el.scrollLeft > 2 ? 'more-left ' : ''}${max - el.scrollLeft > 2 ? 'more-right' : ''}`);
+  }, []);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return undefined;
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    // The table's own width changes when rows arrive, not just when the
+    // window does.
+    if (el.firstElementChild) ro.observe(el.firstElementChild);
+    return () => ro.disconnect();
+  }, [measure, children]);
+
   return (
-    <div className={`tbl-wrap ${scrollY ? 'scroll-y' : ''} ${className}`}
-      style={maxHeight ? { maxHeight, overflowY: 'auto' } : undefined}>
-      <table>{children}</table>
+    <div className={`tbl-outer ${edges}`}>
+      <div
+        ref={ref}
+        onScroll={measure}
+        className={`tbl-wrap ${scrollY ? 'scroll-y' : ''} ${className}`}
+        style={maxHeight ? { maxHeight, overflowY: 'auto' } : undefined}
+      >
+        {/* `cols` pins the column widths. Auto layout is right for a table
+            standing on its own, and wrong for several of the same shape
+            stacked down a page: each one sizes itself and the columns stop
+            lining up, which reads as three unrelated tables. */}
+        <table className={cols ? 'fixed' : ''}>
+          {cols && <colgroup>{cols.map((w, i) => <col key={i} style={{ width: w }} />)}</colgroup>}
+          {children}
+        </table>
+      </div>
     </div>
   );
 }

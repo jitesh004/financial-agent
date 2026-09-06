@@ -87,6 +87,18 @@ export function dateLabel(iso) {
   return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' });
 }
 
+/* A moment, not a day: "01 Sept 26, 10:14". For the handful of places where
+   the time of day is the point - a snapshot taken minutes ago is a different
+   thing from one taken this morning. Accepts the "2026-09-01 10:14" the API
+   writes as well as a full ISO string. */
+export function stampLabel(value) {
+  if (!value) return DASH;
+  const d = new Date(String(value).replace(' ', 'T'));
+  if (Number.isNaN(d.getTime())) return String(value);
+  return `${dateLabel(d.toISOString())}, ${d.toLocaleTimeString('en-IN', {
+    hour: '2-digit', minute: '2-digit', hour12: false })}`;
+}
+
 export function dateLabelLong(iso) {
   if (!iso) return DASH;
   const d = new Date(iso);

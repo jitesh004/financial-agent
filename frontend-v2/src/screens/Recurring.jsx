@@ -138,8 +138,10 @@ export default function Recurring() {
         const rows = isOpen
           ? (memberRows?.transactions || []).filter((t) => t.recurring_series_id === s.id)
           : null;
+        /* pad={false}: the body below is this card's own `.card-body`. Letting
+           Card add one as well nests two and pads every series twice. */
         return (
-          <Card key={s.id} className={s.is_active ? '' : 'sunken'}
+          <Card key={s.id} className={s.is_active ? '' : 'sunken'} pad={false}
             style={{ opacity: s.is_active ? 1 : 0.62 }}>
             <div className="card-body">
               <div className="row" style={{ alignItems: 'flex-start' }}>

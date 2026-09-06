@@ -322,7 +322,11 @@ export default function Explore() {
         <div className="board">
           {board.widgets.map((widget) => {
             const result = results[widget.id];
-            const scrolls = ['table', 'pivot'].includes(widget.type);
+            /* A ranked list or a block of text can be longer than the tile it is
+               in; a stat, a donut and the cartesian charts all size themselves
+               to the box. Only the first two sit flush. */
+            const flush = ['table', 'pivot'].includes(widget.type);
+            const scrolls = flush || ['hbar', 'text'].includes(widget.type);
             return (
               <div
                 key={widget.id}
@@ -375,7 +379,7 @@ export default function Explore() {
                       onClick={() => setEditing(widget)} />
                   </div>
                 </div>
-                <div className={`tile-body ${scrolls ? 'scroll' : ''}`}>
+                <div className={`tile-body ${scrolls ? 'scroll' : ''} ${flush ? 'flush' : ''}`}>
                   <WidgetView
                     widget={widget}
                     result={result && !result.error ? result : null}

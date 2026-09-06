@@ -26,6 +26,8 @@ import {
 } from '../ui';
 import { StackBar } from '../ui/charts';
 
+const COMMITMENT_COLS = ['30%', '14%', '14%', '9%', '15%', '18%'];
+
 const KIND = {
   debt: {
     label: 'Debt',
@@ -159,7 +161,10 @@ export default function Budget() {
       ) : (
         ['debt', 'spending', 'saving'].filter((k) => byKind[k].length).map((kind) => (
           <Card key={kind} title={KIND[kind].label} sub={KIND[kind].note}>
-            <Table>
+            {/* The same widths in all three, because they are the same table
+                split by kind and stacked - left to size themselves, "Per
+                month" landed in a different place in each one. */}
+            <Table cols={COMMITMENT_COLS}>
               <thead>
                 <tr>
                   <th>What</th><th>How often</th>

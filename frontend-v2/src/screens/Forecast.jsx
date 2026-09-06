@@ -13,7 +13,7 @@
 import React from 'react';
 import { useViewData } from '../core/ledger';
 import { usePrefs } from '../core/prefs';
-import { compact, money, monthLabel, pct } from '../core/format';
+import { compact, dateLabel, money, monthLabel, pct } from '../core/format';
 import {
   Callout, Card, Chip, Empty, Legend, Section, Skeleton, SkeletonStats, Stat, Table,
 } from '../ui';
@@ -194,7 +194,7 @@ export default function Forecast() {
                   <td><div className="truncate" style={{ maxWidth: 230 }}>{r.label}</div></td>
                   <td className="nowrap">{r.cadence}</td>
                   <td className="right num nowrap">{money(r.amount)}</td>
-                  <td className="right nowrap">{r.next_expected || '—'}</td>
+                  <td className="right nowrap">{dateLabel(r.next_expected)}</td>
                 </tr>
               ))}
               {!inflows.length && (

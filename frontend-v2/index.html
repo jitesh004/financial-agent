@@ -1,5 +1,10 @@
 <!doctype html>
-<html lang="en">
+<!-- en-IN, not en: the browser draws <input type="date"> and its picker
+     from the document language, and under plain "en" Chrome renders
+     07/14/1990 - month first - in an app whose every other date reads
+     "14 Jul 90" and whose every number is grouped in lakhs. The JS
+     formatters already name en-IN explicitly, so nothing else moves. -->
+<html lang="en-IN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />

@@ -47,6 +47,36 @@ export function useSize(ref) {
   return width;
 }
 
+/** Hands its own measured height to whatever it wraps.
+ *
+ * The rule above - that a chart never guesses its height - is right for a
+ * card, where the caller knows the height it wants. It is wrong for a
+ * dashboard tile the user resizes: there "whatever is left in the box" IS the
+ * answer, and a fixed 190px chart in a three-row tile left a third of it
+ * empty. So the box measures itself and the chart is told.
+ */
+export function Fill({ children, min = 110 }) {
+  const ref = useRef(null);
+  const [height, setHeight] = useState(0);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return undefined;
+    setHeight(el.clientHeight);
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver((e) => {
+      const h = e[0]?.contentRect?.height;
+      if (h != null) setHeight(Math.round(h));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return (
+    <div ref={ref} style={{ height: '100%', minHeight: min }}>
+      {height > 0 ? children(Math.max(min, height)) : null}
+    </div>
+  );
+}
+
 /* ── scales ──────────────────────────────────────────────────────────────── */
 
 /** Axis bounds a person would have chosen: 0, 25k, 50k rather than 0, 23.7k. */
