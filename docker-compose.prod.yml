@@ -69,14 +69,20 @@ services:
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8078"]
     restart: unless-stopped
 
-  # Which frontend the domain serves. Exactly one can, so this is the switch:
-  # point the context at ./frontend-v2 and rebuild to deploy V2, or back at
-  # ./frontend to roll it back. Both build to static files served by nginx and
-  # both talk to the same `backend` service over the same endpoints, so nothing
-  # else in this file changes either way.
+  # Which frontend the domain serves. Exactly one can, so rather than a second
+  # service this is a switch, and - like every other setting here - it is an
+  # .env line rather than an edit to this file:
+  #
+  #     FA_FRONTEND=./frontend-v2     deploys V2
+  #     FA_FRONTEND=./frontend        rolls back to V1
+  #     (unset)                       V1, which is the default below
+  #
+  # Then `docker compose -f docker-compose.prod.yml up -d --build frontend`.
+  # Both build to static files served by nginx and both talk to the same
+  # `backend` over the same endpoints, so nothing else changes either way.
   frontend:
     build:
-      context: ./frontend
+      context: ${FA_FRONTEND:-./frontend}
       dockerfile: Dockerfile
     # Also unpublished: Caddy is the only thing that should answer from the
     # public internet, so the certificate covers every request.

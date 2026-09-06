@@ -980,12 +980,28 @@ V2 calls.
 
 Nothing on the server side changes — V2 talks to exactly the same endpoints.
 
-- **Development** — delete the `frontend` service from `docker-compose.yml` and
-  move `frontend-v2` to port `5173`.
-- **Production** — point the `frontend` service's build `context` in
-  `docker-compose.prod.yml` at `./frontend-v2` and rebuild. Exactly one front
-  end can serve the domain, so that one line is both the switch and the
-  rollback.
+**Production is one `.env` line.** Exactly one front end can answer for the
+domain, so there is no second service in `docker-compose.prod.yml` — there is a
+switch, and it lives where every other setting does:
+
+```bash
+echo 'FA_FRONTEND=./frontend-v2' >> .env
+docker compose -f docker-compose.prod.yml up -d --build frontend
+```
+
+Rolling back is the same line pointed at `./frontend`, or the line deleted —
+unset means V1, which is what a deployment that has never heard of this gets.
+
+Nothing else moves. Both images are nginx serving static files on port 80, both
+proxy `/api/` to `backend:8078` over the compose network, both allow the same
+60M upload, and Caddy reverse-proxies to `frontend:80` by service name, which is
+the same service either way. The database, the sessions and the statements are
+untouched by the switch: it changes which bundle the browser downloads and
+nothing else.
+
+**Development** runs both at once and needs no switch — V1 on 5173, V2 on 5174.
+To retire V1 there, delete its service from `docker-compose.yml` and move
+`frontend-v2` to port `5173`.
 
 `frontend/` is deliberately untouched, which keeps that switch reversible and
 keeps the suite passing. Six tests in `backend/tests/test_rules.py` read the
