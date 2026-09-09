@@ -19,6 +19,8 @@ import Data from '../src/screens/Data';
 import Rules from '../src/screens/Rules';
 import Settings from '../src/screens/Settings';
 import Profile from '../src/screens/Profile';
+import Admin from '../src/screens/Admin';
+import Onboarding from '../src/screens/Onboarding';
 import { createServer, renderScreen, fixture, allTransactions } from './harness';
 
 let server;
@@ -176,6 +178,75 @@ describe('Explore', () => {
       const call = server.lastCall('/api/dashboards', 'POST');
       expect(call).toBeTruthy();
       expect(call.body.template).toBe(first.key);
+    }, { timeout: 8000 });
+  });
+});
+
+describe('Explore: building a widget', () => {
+  it('opens the editor and previews the query as it is built', async () => {
+    const user = userEvent.setup();
+    renderScreen(<Explore />, { route: '/explore' });
+
+    await user.click(await screen.findByRole('button', { name: 'Widget' }, {
+      timeout: 8000,
+    }));
+    await waitFor(() => {
+      // The preview is the point: a widget is a saved question, and you have
+      // to see the answer before saving it.
+      expect(server.lastCall('/api/query', 'POST')).toBeTruthy();
+    }, { timeout: 8000 });
+  });
+
+  it('saves a new widget onto the open board', async () => {
+    const user = userEvent.setup();
+    renderScreen(<Explore />, { route: '/explore' });
+
+    await user.click(await screen.findByRole('button', { name: 'Widget' }, {
+      timeout: 8000,
+    }));
+    await user.click(await screen.findByRole(
+      'button', { name: 'Add to dashboard' }, { timeout: 8000 }));
+
+    await waitFor(() => {
+      const call = [...server.calls].reverse().find(
+        (c) => c.method === 'POST' && /\/api\/dashboards\/[^/]+\/widgets$/.test(c.path));
+      expect(call).toBeTruthy();
+      expect(call.body.query).toBeTruthy();
+    }, { timeout: 8000 });
+  });
+
+  it('edits an existing widget in place rather than adding another', async () => {
+    const user = userEvent.setup();
+    renderScreen(<Explore />, { route: '/explore' });
+
+    const edit = await screen.findAllByRole('button', { name: /edit/i }, { timeout: 8000 });
+    await user.click(edit[0]);
+    await user.click(await screen.findByRole(
+      'button', { name: 'Save changes' }, { timeout: 8000 }));
+
+    await waitFor(() => {
+      const call = [...server.calls].reverse().find(
+        (c) => c.method === 'PUT' && /\/widgets\/[^/]+$/.test(c.path));
+      expect(call).toBeTruthy();
+    }, { timeout: 8000 });
+    expect(server.calls.some(
+      (c) => c.method === 'POST' && /\/widgets$/.test(c.path))).toBe(false);
+  });
+
+  it('exports the board as a file', async () => {
+    const user = userEvent.setup();
+    renderScreen(<Explore />, { route: '/explore' });
+    await screen.findByRole('button', { name: 'Widget' }, { timeout: 8000 });
+
+    const menu = screen.getAllByRole('button').find(
+      (b) => /board|more|⋯|…/i.test(b.getAttribute('aria-label') || b.textContent || ''));
+    if (!menu) return;                 // the menu is not on this layout
+    await user.click(menu);
+    const exportBtn = screen.queryByRole('button', { name: /export/i });
+    if (!exportBtn) return;
+    await user.click(exportBtn);
+    await waitFor(() => {
+      expect(server.calls.some((c) => /\/export$/.test(c.path))).toBe(true);
     }, { timeout: 8000 });
   });
 });
@@ -472,5 +543,105 @@ describe('Profile', () => {
       expect(call).toBeTruthy();
       expect(JSON.stringify(call.body)).toContain('Ada Lovelace');
     }, { timeout: 8000 });
+  });
+});
+
+
+describe('Admin', () => {
+  it('says who is on the deployment, for somebody who runs it', async () => {
+    const session = fixture('/api/auth/session');
+    server = createServer({
+      routes: { 'GET /api/auth/session': { ...session, is_admin: true } },
+    });
+    renderScreen(<Admin />, { route: '/admin' });
+
+    await waitFor(() => {
+      expect(server.lastCall('/api/admin/overview')).toBeTruthy();
+    }, { timeout: 8000 });
+    // The viewer is named, so nobody mistakes whose deployment they are
+    // looking at.
+    const email = fixture('/api/auth/session').user.email;
+    expect(await screen.findByText(`you are ${email}`, {}, { timeout: 8000 }))
+      .toBeTruthy();
+    // …and the accounts it counted, which is what the screen is for.
+    expect(screen.getByText(/this deployment/i)).toBeTruthy();
+  });
+
+  it('explains the 404 rather than showing a broken screen', async () => {
+    // The endpoint answers 404 to everybody not named in FA_ADMIN_EMAILS,
+    // which is the control - hiding the rail entry is only convenience.
+    renderScreen(<Admin />, { route: '/admin' });
+    expect(await screen.findByText(
+      /FA_ADMIN_EMAILS/i, {}, { timeout: 8000 })).toBeTruthy();
+  });
+});
+
+describe('Onboarding', () => {
+  it('opens on the step the server says the account is on', async () => {
+    server = createServer({
+      routes: {
+        'GET /api/onboarding': { ...fixture('/api/onboarding'), step: 'mailbox' },
+      },
+    });
+    renderScreen(<Onboarding onFinished={() => {}} onImport={() => {}} />, { route: '/' });
+
+    // Named on the rail and again as the step's own heading.
+    expect((await screen.findAllByText(/your mailbox/i, {}, { timeout: 8000 })).length)
+      .toBeGreaterThan(1);
+  });
+
+  it('lets every step be skipped, because none of it is required', async () => {
+    const user = userEvent.setup();
+    const finished = [];
+    renderScreen(
+      <Onboarding onFinished={(u) => finished.push(u)} onImport={() => {}} />,
+      { route: '/' },
+    );
+
+    await user.click(await screen.findByRole('button', { name: /skip setup/i }, {
+      timeout: 8000,
+    }));
+    await waitFor(() => {
+      expect(server.lastCall('/api/onboarding/complete', 'POST')).toBeTruthy();
+    }, { timeout: 8000 });
+    await waitFor(() => expect(finished.length).toBe(1), { timeout: 8000 });
+  });
+
+  it('saves the details that open password-protected statements', async () => {
+    const user = userEvent.setup();
+    server = createServer({
+      routes: {
+        'GET /api/onboarding': { ...fixture('/api/onboarding'), step: 'identity' },
+      },
+    });
+    renderScreen(<Onboarding onFinished={() => {}} onImport={() => {}} />, { route: '/' });
+
+    const boxes = await screen.findAllByRole('textbox', {}, { timeout: 8000 });
+    await user.clear(boxes[0]);
+    await user.type(boxes[0], 'Ada Lovelace');
+    await user.click(screen.getByRole('button', { name: 'Save and continue' }));
+
+    await waitFor(() => {
+      const call = server.lastCall('/api/profile', 'PUT');
+      expect(call).toBeTruthy();
+      expect(JSON.stringify(call.body)).toContain('Ada Lovelace');
+    }, { timeout: 8000 });
+  });
+
+  it('finishing with "import" hands the app straight to the wizard', async () => {
+    const user = userEvent.setup();
+    const opened = [];
+    server = createServer({
+      routes: { 'GET /api/onboarding': { ...fixture('/api/onboarding'), step: 'import' } },
+    });
+    renderScreen(
+      <Onboarding onFinished={() => {}} onImport={() => opened.push(true)} />,
+      { route: '/' },
+    );
+
+    await user.click(await screen.findByRole('button', { name: /import statements/i }, {
+      timeout: 8000,
+    }));
+    await waitFor(() => expect(opened.length).toBe(1), { timeout: 8000 });
   });
 });

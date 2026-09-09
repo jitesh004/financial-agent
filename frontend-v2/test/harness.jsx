@@ -382,6 +382,28 @@ export function createServer({ routes = {}, transactions } = {}) {
       return json({ status: 'ok', added: 0 });
     }
 
+    /* ---- the setup wizard's own writes ---- */
+    if (method === 'POST' && path.startsWith('/api/onboarding')) {
+      const session = fixtures['/api/auth/session'];
+      const done = path.endsWith('/complete');
+      return json({
+        ...clone(fixtures['/api/onboarding']),
+        user: { ...session.user, onboarded: done },
+        step: done ? 'done' : (body?.step || 'identity'),
+        complete: done,
+      });
+    }
+
+    /* ---- the operator's view ----
+       404 to anybody the server does not recognise as an admin, which is what
+       the screen has to handle. Served only when the fixture session says the
+       account is one. */
+    if (method === 'GET' && path === '/api/admin/overview') {
+      const session = routes['GET /api/auth/session'] || fixtures['/api/auth/session'];
+      if (!session?.is_admin) return json({ detail: 'Not found' }, 404);
+      return json(clone(fixtures['admin:overview']));
+    }
+
     /* ---- jobs: a run that finishes on the second poll ---- */
     if (method === 'GET' && path.startsWith('/api/jobs/')) {
       const id = path.split('/').pop();

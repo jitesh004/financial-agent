@@ -153,6 +153,22 @@ def capture(database_url: str, data_dir: str) -> dict[str, object]:
         if answer.status_code == 200:
             captured[f"explain:{label}"] = answer.json()
 
+    # The operator's view, which answers 404 to anybody not named in
+    # FA_ADMIN_EMAILS - so it is captured with this account named, and the
+    # front-end tests can render the screen both ways.
+    from app.config import config as _config
+
+    was_admin = _config.ADMIN_EMAILS
+    session = captured.get("/api/auth/session") or {}
+    email = ((session.get("user") or {}).get("email") or "").lower()
+    _config.ADMIN_EMAILS = (email,) if email else was_admin
+    try:
+        overview = client.get("/api/admin/overview?detail=true")
+        if overview.status_code == 200:
+            captured["admin:overview"] = overview.json()
+    finally:
+        _config.ADMIN_EMAILS = was_admin
+
     # One widget's result, as the editor's preview asks for it.
     board = captured.get("dashboard:detail") or {}
     widgets = board.get("widgets") or []
