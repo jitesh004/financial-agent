@@ -96,11 +96,19 @@ def _keys(value, prefix: str = "") -> set[str]:
     return out
 
 
+def _get_paths(committed: dict) -> list[str]:
+    """The captured keys that really are GET paths.
+
+    Some entries are filed under a label rather than a URL - a dashboard's
+    detail, a query result, an explanation - because the URL that produced
+    them carries an id that changes on every capture.
+    """
+    return [k for k in committed if k.startswith("/")]
+
+
 def test_every_endpoint_the_front_end_reads_still_answers(seeded, committed):
     """A route renamed or removed shows up here, not as a blank screen."""
-    for path in committed:
-        if path.startswith("dashboard:") or path.startswith("query:"):
-            continue        # captured from a POST; covered separately below
+    for path in _get_paths(committed):
         response = seeded.get(path)
         assert response.status_code == 200, \
             f"{path} answered {response.status_code}: {response.text[:200]}"
@@ -114,9 +122,8 @@ def test_no_endpoint_has_dropped_a_key_the_front_end_reads(seeded, committed):
     into `undefined`.
     """
     missing: dict[str, list[str]] = {}
-    for path, recorded in committed.items():
-        if path.startswith("dashboard:") or path.startswith("query:"):
-            continue
+    for path in _get_paths(committed):
+        recorded = committed[path]
         live = seeded.get(path).json()
         gone = sorted(_keys(recorded) - _keys(live))
         if gone:
@@ -255,3 +262,38 @@ def test_a_filtered_total_is_the_filtered_count(seeded):
         f"/api/transactions?limit=1&account_id={one_account['account_id']}").json()
     assert scoped["total"] <= everything["total"]
     assert scoped["total"] > 0
+
+
+def test_an_explanation_carries_the_keys_the_panel_reads(seeded, committed):
+    """The ledger's "why is this row the way it is?" panel.
+
+    It read `direction.signal`, `direction.detail`, `transfer.note` and
+    `transfer.counterpart` for a long time. None of them has ever been in this
+    payload, so two of the panel's three sections were structurally empty on
+    every row - which looks exactly like a row with nothing to say.
+    """
+    rows = seeded.get("/api/transactions?limit=1000").json()["transactions"]
+
+    plain = next(r for r in rows if not r["is_internal_transfer"])
+    answer = seeded.get(f"/api/rules/explain/{plain['id']}").json()
+    assert set(answer) == {"id", "category", "direction", "transfer"}
+    assert set(answer["direction"]) == {"value", "reason", "recorded"}
+    assert set(answer["category"]) >= {"value", "source", "rule", "pattern", "confidence"}
+
+    paired = next((r for r in rows if r["is_internal_transfer"]), None)
+    if paired is None:
+        pytest.skip("this ledger has no paired rows")
+    transfer = seeded.get(f"/api/rules/explain/{paired['id']}").json()["transfer"]
+    assert transfer is not None
+    assert set(transfer) >= {
+        "kind", "what_it_means", "confidence", "day_gap", "counted", "legs"}
+    assert any(not leg["is_this_row"] for leg in transfer["legs"]), \
+        "a pairing with no other leg is not a pairing"
+
+
+def test_a_recorded_direction_reason_is_a_record_not_a_string(seeded):
+    """What the panel renders as a label, a strength and a sentence."""
+    from app.rules import directions
+
+    described = directions.describe(next(iter(directions.BY_CODE)))
+    assert set(described) == {"code", "label", "detail", "strength"}
