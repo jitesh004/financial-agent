@@ -79,7 +79,7 @@ export default function Portfolio({ onImport }) {
           /* Says what the figure covers. A demat statement prints no cost, so
              the gain can only ever speak for the holdings that declare one -
              and a percentage over a partial basis is worse than none. */
-          note={gain == null ? 'No cost basis on these statements'
+          note={gain == null || !(invested > 0) ? 'No cost basis on these statements'
             : `${((gain / invested) * 100).toFixed(1)}% on cost`
               + (totals.uncosted_instruments
                 ? ` · excludes ${totals.uncosted_instruments} holding`

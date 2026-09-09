@@ -43,7 +43,7 @@ export function valueArity(op) {
 export function FilterValue({ field, filter, options, onChange }) {
   const arity = valueArity(filter.op);
   if (arity === 'none') return null;
-  const choices = field.options ? (options[field.options] || []) : null;
+  const choices = field?.options && options ? (options[field.options] || []) : null;
 
   if (arity === 'many' && choices) {
     const selected = Array.isArray(filter.value) ? filter.value : [];
@@ -126,7 +126,7 @@ export function reconcileFilter(filter, patch, fieldMap) {
 }
 
 export function FilterRow({ filter, fields, fieldMap, opLabels, options, onChange, onRemove }) {
-  const field = fieldMap[filter.field];
+  const field = fieldMap?.[filter.field];
   if (!field) return null;
   return (
     <div className="card sunken" style={{ padding: 10, display: 'grid', gap: 8 }}>
@@ -135,7 +135,7 @@ export function FilterRow({ filter, fields, fieldMap, opLabels, options, onChang
           onChange={(key) => onChange(reconcileFilter(filter, { field: key }, fieldMap))} />
         <select value={filter.op} style={{ maxWidth: 150 }}
           onChange={(e) => onChange(reconcileFilter(filter, { op: e.target.value }, fieldMap))}>
-          {field.ops.map((op) => <option key={op} value={op}>{opLabels[op] || op}</option>)}
+          {(field.ops || []).map((op) => <option key={op} value={op}>{opLabels?.[op] || op}</option>)}
         </select>
         <IconButton icon="x" label="Remove this filter" size="sm" className="ghost"
           onClick={onRemove} />

@@ -75,33 +75,43 @@ export default function Debt({ onImport }) {
                 <div className="tiny dim" style={{ marginBottom: 5 }}>
                   What your next EMI is made of
                 </div>
-                <StackBar
-                  height={14}
-                  total={loan.emi}
-                  segments={[
-                    {
-                      label: 'Interest',
-                      value: loan.emi * (loan.next_interest_share_pct / 100),
-                      color: 'var(--c7)',
-                    },
-                    {
-                      label: 'Principal',
-                      value: loan.emi * (1 - loan.next_interest_share_pct / 100),
-                      color: 'var(--c2)',
-                    },
-                  ]}
-                />
-                <Legend items={[
-                  { label: 'Interest', color: 'var(--c7)', value: pct(loan.next_interest_share_pct, 0) },
-                  {
-                    label: 'Reduces what you owe',
-                    color: 'var(--c2)',
-                    value: money(loan.emi * (1 - loan.next_interest_share_pct / 100)),
-                  },
-                ]} />
+                {(() => {
+                  const emi = Number(loan.emi) || 0;
+                  const sharePct = Number(loan.next_interest_share_pct) || 0;
+                  const interestAmt = emi * (sharePct / 100);
+                  const principalAmt = emi * (1 - sharePct / 100);
+                  return (
+                    <>
+                      <StackBar
+                        height={14}
+                        total={emi}
+                        segments={[
+                          {
+                            label: 'Interest',
+                            value: interestAmt,
+                            color: 'var(--c7)',
+                          },
+                          {
+                            label: 'Principal',
+                            value: principalAmt,
+                            color: 'var(--c2)',
+                          },
+                        ]}
+                      />
+                      <Legend items={[
+                        { label: 'Interest', color: 'var(--c7)', value: pct(sharePct, 0) },
+                        {
+                          label: 'Reduces what you owe',
+                          color: 'var(--c2)',
+                          value: money(principalAmt),
+                        },
+                      ]} />
+                    </>
+                  );
+                })()}
               </div>
 
-              {loan.next_interest_share_pct > 60 && (
+              {Number(loan.next_interest_share_pct) > 60 && (
                 <Callout tone="warn" style={{ marginTop: 12 }}>
                   Early in a long loan, most of each payment services interest rather
                   than principal. That is arithmetic, not a fault — but it is why a
@@ -150,7 +160,9 @@ export default function Debt({ onImport }) {
             note="bureaus generally treat sustained utilisation above 30% unfavourably" />
           <div className="grid cols-3">
             {cards.map((c) => {
-              const used = c.credit_limit ? c.principal_outstanding / c.credit_limit : null;
+              const limit = Number(c.credit_limit) || 0;
+              const outstanding = Number(c.principal_outstanding) || 0;
+              const used = limit > 0 ? outstanding / limit : null;
               return (
                 <Card key={c.id} title={c.display_name}>
                   <div className="row" style={{ justifyContent: 'space-between' }}>
@@ -169,16 +181,16 @@ export default function Debt({ onImport }) {
                     <div style={{ marginTop: 12 }}>
                       <StackBar
                         height={10}
-                        total={c.credit_limit}
+                        total={limit}
                         segments={[
                           {
                             label: 'Used',
-                            value: c.principal_outstanding,
+                            value: Math.max(0, outstanding),
                             color: used > 0.3 ? 'var(--warn)' : 'var(--pos)',
                           },
                           {
                             label: 'Available',
-                            value: Math.max(0, c.credit_limit - c.principal_outstanding),
+                            value: Math.max(0, limit - outstanding),
                             color: 'var(--surface-3)',
                           },
                         ]}

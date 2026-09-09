@@ -833,9 +833,11 @@ def test_the_compact_profile_offers_fewer_tools():
         assert f'"{name}"' in compact
 
 
-def test_a_small_model_is_recognised_by_its_name():
+def test_a_small_model_is_recognised_by_its_name(monkeypatch):
     from app.agents import runner as runner_mod
+    from app.config import config
 
+    monkeypatch.setattr(config, "AGENT_PROFILE", "auto")
     for name in ("gemini-3.5-flash-lite", "gemini-2.0-flash-lite-001",
                  "gpt-5-mini", "gemma-4-26b-a4b-it", "qwen-3b-instruct",
                  "phi-4", "some-nano-model"):

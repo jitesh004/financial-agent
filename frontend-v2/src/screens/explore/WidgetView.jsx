@@ -52,8 +52,8 @@ export function formatValue(value, type) {
   return titleCase(String(value));
 }
 
-const dimensionsOf = (r) => r.columns.filter((c) => c.role === 'dimension');
-const measuresOf = (r) => r.columns.filter((c) => c.role === 'measure');
+const dimensionsOf = (r) => (r?.columns || []).filter((c) => c.role === 'dimension');
+const measuresOf = (r) => (r?.columns || []).filter((c) => c.role === 'measure');
 
 /* Chart-ready rows.
  *
@@ -111,7 +111,7 @@ export default function WidgetView({ widget, result, error, loading, animate = t
   if (loading) return <div className="tile-empty"><Spinner /></div>;
   if (error) return <Note>{error}</Note>;
   if (!result) return <Note>Not loaded.</Note>;
-  if (!result.rows.length) return <Note>No rows matched.</Note>;
+  if (!result?.rows?.length) return <Note>No rows matched.</Note>;
 
   switch (widget.type) {
     case 'stat': return <StatView result={result} viz={widget.viz || {}} />;

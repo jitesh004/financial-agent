@@ -48,16 +48,36 @@ def _provision() -> str:
     """Build a throwaway database owned by an ordinary (non-superuser) role."""
     import psycopg
 
-    with psycopg.connect(ADMIN_URL, autocommit=True) as admin:
-        exists = admin.execute(
-            "SELECT 1 FROM pg_roles WHERE rolname = %s", (TEST_ROLE,)).fetchone()
-        if not exists:
-            admin.execute(
-                f"CREATE ROLE {TEST_ROLE} LOGIN PASSWORD '{TEST_PASSWORD}'")
-        admin.execute(f"DROP DATABASE IF EXISTS {TEST_DB}")
-        admin.execute(f"CREATE DATABASE {TEST_DB} OWNER {TEST_ROLE}")
+    urls_to_try = [ADMIN_URL]
+    # If the configured URL has no password specified, also attempt with standard/configured password
+    user_part = ADMIN_URL.split("@")[0].split("://")[-1] if "@" in ADMIN_URL else ""
+    if "@" in ADMIN_URL and ":" not in user_part:
+        default_pw = os.environ.get("POSTGRES_PASSWORD", "postgres")
+        pw_url = ADMIN_URL.replace(f"{user_part}@", f"{user_part}:{default_pw}@")
+        if pw_url not in urls_to_try:
+            urls_to_try.append(pw_url)
 
-    host = urlsplit(ADMIN_URL)
+    last_exc = None
+    used_url = None
+    for url in urls_to_try:
+        try:
+            with psycopg.connect(url, autocommit=True) as admin:
+                exists = admin.execute(
+                    "SELECT 1 FROM pg_roles WHERE rolname = %s", (TEST_ROLE,)).fetchone()
+                if not exists:
+                    admin.execute(
+                        f"CREATE ROLE {TEST_ROLE} LOGIN PASSWORD '{TEST_PASSWORD}'")
+                admin.execute(f"DROP DATABASE IF EXISTS {TEST_DB}")
+                admin.execute(f"CREATE DATABASE {TEST_DB} OWNER {TEST_ROLE}")
+            used_url = url
+            break
+        except Exception as exc:
+            last_exc = exc
+
+    if used_url is None:
+        raise last_exc
+
+    host = urlsplit(used_url)
     port = host.port or 5432
     return (f"postgresql://{TEST_ROLE}:{TEST_PASSWORD}"
             f"@{host.hostname or 'localhost'}:{port}/{TEST_DB}")
@@ -145,6 +165,7 @@ def no_outbound_model_calls():
     config.OPENROUTER_API_KEY = ""
     config.GEMINI_API_KEY = ""
     config.AZURE_OPENAI_API_KEY = ""
+    config.AGENT_PROFILE = "full"
     llm_client._clients.clear()
     yield
 

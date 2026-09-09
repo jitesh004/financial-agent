@@ -42,7 +42,7 @@ export default function Credit({ onImport }) {
   if (overview.loading) return <Loading label="Reading your credit report…" />;
 
   const data = overview.data;
-  if (!data.reports.length) {
+  if (!data?.reports?.length) {
     return (
       <Empty title="No credit report imported yet" icon="shield"
         action={onImport && (
@@ -64,7 +64,7 @@ export default function Credit({ onImport }) {
   return (
     <>
       <div className="grid cols-4">
-        {data.latest_by_bureau.map((report) => (
+        {(data.latest_by_bureau || []).map((report) => (
           <Card key={report.id} title={titleCase(report.bureau)}
             sub={report.pulled_on ? dateLabel(report.pulled_on) : ''}>
             <div className="stat-value" style={{ fontSize: 32 }}>{report.score ?? '—'}</div>
