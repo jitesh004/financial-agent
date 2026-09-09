@@ -16,7 +16,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../core/api';
-import { invalidate, useQuery } from '../core/store';
+import { invalidate, useDebounced, useQuery } from '../core/store';
 import { useRouteParam } from '../core/router';
 import { usePeriod } from '../core/period';
 import { usePrefs } from '../core/prefs';
@@ -93,13 +93,17 @@ export default function Ledger() {
   const toast = useToast();
   const { params: periodParams, paramsKey, label: periodLabel, scoped } = usePeriod();
   const [prefs] = usePrefs();
-  const { data: accounts = [] } = useAccounts();
+  const { data: accounts = [], loading: loadingAccounts } = useAccounts();
   const { data: categories = [] } = useCategories();
 
   const [view, setView] = useRouteParam('view', 'all');
   const [category, setCategory] = useRouteParam('cat', '');
   const [rail, setRail] = useRouteParam('rail', '');
   const [search, setSearch] = useRouteParam('q', '');
+  /* What reaches the server, a beat behind what is being typed. The box itself
+     stays instant - it renders `search` - but the request, the URL and the
+     query key all wait for the typing to stop. */
+  const settledSearch = useDebounced(search);
   const [sortBy, setSortBy] = useState('date');
   const [sortDir, setSortDir] = useState('desc');
   const [page, setPage] = useState(0);
@@ -117,7 +121,9 @@ export default function Ledger() {
      than a selection so a newly-arrived account (after a retry, say) defaults
      to included instead of silently missing. */
   useEffect(() => { setDropped(new Set()); setPage(0); }, [view]);
-  useEffect(() => { setPage(0); }, [category, rail, sortBy, sortDir, paramsKey, search]);
+  useEffect(() => {
+    setPage(0);
+  }, [category, rail, sortBy, sortDir, paramsKey, settledSearch]);
 
   const selectedIds = scopeIds.filter((id) => !dropped.has(id));
   /* Always an explicit list - never omit the filter just because every account
@@ -132,18 +138,28 @@ export default function Ledger() {
     account_id: accountParam,
     category: active.fixedCategory || category || undefined,
     rail: active.fixedRail || rail || undefined,
-    search: search || undefined,
+    search: settledSearch || undefined,
     sort_by: sortBy,
     sort_dir: sortDir,
     offset: page * pageSize,
     limit: pageSize,
     ...periodParams,
-  }), [accountParam, active, category, rail, search, sortBy, sortDir, page, pageSize,
+  }), [accountParam, active, category, rail, settledSearch, sortBy, sortDir, page, pageSize,
        periodParams]);
 
-  const key = `txns:${JSON.stringify(query)}`;
+  /* Nothing is asked until the account list is in.
+   *
+   * `accountParam` is built from the accounts in scope, and until they arrive
+   * that list is empty - which this screen sends as `__none__`, meaning "no
+   * accounts selected, so no rows". So every visit used to open with a request
+   * that could only answer zero, a flash of "No transactions match", and then
+   * the real query. Worse, the empty answer was cached under exactly the key
+   * that unticking every account produces, so afterwards "Clear all" showed a
+   * cached page instead of asking - and "Select all" could not undo it. */
+  const ready = !loadingAccounts;
+  const key = ready ? `txns:${JSON.stringify(query)}` : null;
   const { data, loading, fetching, error, refetch } =
-    useQuery(key, () => api.transactions(query));
+    useQuery(key, () => api.transactions(query), { enabled: ready });
 
   const rows = data?.transactions || [];
   const total = data?.total ?? 0;
@@ -329,7 +345,7 @@ export default function Ledger() {
       )}
 
       {/* ---- the table ---- */}
-      {loading ? (
+      {!ready || loading ? (
         <Loading label="Reading transactions…" />
       ) : !inScope.length && active.empty ? (
         <Empty title={active.empty} icon="rows">

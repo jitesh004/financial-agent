@@ -83,21 +83,52 @@ export function useRoute() {
 }
 
 /**
+ * Write one or more query parameters at once.
+ *
+ * `{ cat: '', q: '' }` clears both. A value equal to its fallback, empty or
+ * null is removed rather than written, so the URL only ever carries what
+ * differs from the default.
+ *
+ * Replaces rather than pushes: flipping a filter is not a navigation anybody
+ * wants twelve entries of in their back button, but the resulting URL is still
+ * the shareable one.
+ */
+export function useSetRouteParams() {
+  const { navigate } = useRouter();
+  return useCallback((changes) => {
+    /* Read from the address bar, not from a render's snapshot of it.
+     *
+     * These setters get called several at a time - the ledger's "Clear" sets
+     * the category, the rail and the search in one handler. Each call built
+     * its next URL from the `params` of the render it was created in, so the
+     * second call reinstated what the first had just removed and the third
+     * reinstated both: clearing three filters cleared exactly one, whichever
+     * happened to be set last. Reading the live URL makes them compose. */
+    const merged = new URLSearchParams(window.location.search);
+    for (const [name, next] of Object.entries(changes)) {
+      if (next === '' || next == null) merged.delete(name);
+      else merged.set(name, next);
+    }
+    const search = merged.toString();
+    const path = window.location.pathname.replace(/\/+$/, '') || '/';
+    navigate(`${path}${search ? `?${search}` : ''}`, { replace: true, scroll: false });
+  }, [navigate]);
+}
+
+/**
  * One query parameter, read and written like state.
  *
- * Writing replaces rather than pushes: flipping a filter is not a navigation
- * anybody wants twelve entries of in their back button, but the resulting URL
- * is still the shareable one.
+ * A value equal to `fallback` is dropped from the URL rather than written,
+ * because the default is what an absent parameter already means.
  */
 export function useRouteParam(name, fallback = '') {
-  const { path, params, navigate } = useRoute();
+  const { params } = useRoute();
+  const setParams = useSetRouteParams();
   const value = params[name] ?? fallback;
-  const set = useCallback((next) => {
-    const merged = { ...params };
-    if (next === '' || next == null || next === fallback) delete merged[name];
-    else merged[name] = next;
-    navigate({ path, params: merged }, { replace: true, scroll: false });
-  }, [path, params, navigate, name, fallback]);
+  const set = useCallback(
+    (next) => setParams({ [name]: next === fallback ? '' : next }),
+    [setParams, name, fallback],
+  );
   return [value, set];
 }
 

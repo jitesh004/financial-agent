@@ -438,10 +438,21 @@ def update_transaction_categories(db: Database, transactions: Iterable[Transacti
 #: docstring), so ordering by the raw column sorts lexicographically: "500"
 #: comes before "50" comes before "150". CAST to REAL for ordering only; the
 #: stored value and every arithmetic use of it are untouched.
+#:
+#: `description`, `category` and `merchant` are here because the ledger's sort
+#: control offers them. An unknown key falls back to `txn_date`, so a column
+#: missing from this table is not an error anywhere - the rows simply come back
+#: in date order and the control appears to do nothing, which is how sorting by
+#: description or category was silently dead.
 _SORTABLE_COLUMNS = {
     "date": "txn_date",
     "amount": "CAST(amount AS REAL)",
     "balance": "CAST(balance_after AS REAL)",
+    # Case-insensitively, or every capitalised narration sorts ahead of every
+    # lowercase one and the order reads as arbitrary.
+    "description": "LOWER(raw_description)",
+    "category": "LOWER(category)",
+    "merchant": "LOWER(COALESCE(NULLIF(merchant, ''), raw_description))",
 }
 
 
@@ -467,6 +478,8 @@ def _transaction_filters(
     flow_role: str | Sequence[str] | None = None,
     merchant: str | None = None,
     exclude_flow_role: Sequence[str] | None = None,
+    search: str | None = None,
+    recurring_series_id: str | None = None,
 ) -> tuple[list[str], list[Any]]:
     """Shared WHERE-clause builder, so a filtered count matches its list.
 
@@ -543,6 +556,34 @@ def _transaction_filters(
         clauses.append("needs_review = ?")
         params.append(1 if needs_review else 0)
 
+    if search and str(search).strip():
+        # Free text, over the three things a person would recognise a row by:
+        # what the statement printed, what the normaliser made of it, and the
+        # merchant it was attributed to. Anchored nowhere - somebody searching
+        # "swiggy" means the word anywhere in the narration, not a narration
+        # that begins with it, and a prefix match here would find almost
+        # nothing on rails like UPI whose narrations all start "UPI/".
+        #
+        # `_`, `%` and `\` are escaped: without that, searching for a merchant
+        # with an underscore in its name ("PAY_TM") matches any character in
+        # that position, and a lone "%" matches the entire ledger.
+        needle = str(search).strip().replace("\\", "\\\\")
+        needle = needle.replace("%", "\\%").replace("_", "\\_")
+        like = f"%{needle.lower()}%"
+        clauses.append(
+            "(LOWER(raw_description) LIKE ? ESCAPE '\\'"
+            " OR LOWER(COALESCE(normalized_description, '')) LIKE ? ESCAPE '\\'"
+            " OR LOWER(COALESCE(merchant, '')) LIKE ? ESCAPE '\\')")
+        params.extend([like, like, like])
+
+    if recurring_series_id:
+        # So "show me the rows this series was inferred from" is a filtered
+        # query rather than the whole ledger pulled down and sieved in the
+        # browser - which silently found nothing whenever the series' rows fell
+        # outside whatever page the client happened to have fetched.
+        clauses.append("recurring_series_id = ?")
+        params.append(recurring_series_id)
+
     # The reporting period a row belongs to, which is not always the calendar
     # month of its date - see analytics.periods. Filtering on txn_date instead
     # would put a salary paid on 1-Sep in September even when the ledger
@@ -587,11 +628,13 @@ def get_transactions(
     flow_role: str | Sequence[str] | None = None,
     merchant: str | None = None,
     exclude_flow_role: Sequence[str] | None = None,
+    search: str | None = None,
+    recurring_series_id: str | None = None,
 ) -> list[Transaction]:
     clauses, params = _transaction_filters(
         account_id, start, end, category, statement_id, rail,
         needs_review, accounting_month, month_start, month_end,
-        flow_role, merchant, exclude_flow_role)
+        flow_role, merchant, exclude_flow_role, search, recurring_series_id)
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     column = _SORTABLE_COLUMNS.get(sort_by, "txn_date")
@@ -614,6 +657,31 @@ def get_transaction(db: Database, txn_id: str) -> Transaction | None:
         row = conn.execute(
             "SELECT * FROM transactions WHERE id = ?", (txn_id,)).fetchone()
     return _row_to_transaction(row) if row else None
+
+
+def get_transactions_by_ids(db: Database, txn_ids: Sequence[str]) -> list[Transaction]:
+    """The named transactions, in no particular order.
+
+    For the bulk edit, which used to read the WHOLE ledger and filter the list
+    in Python to find the forty rows it was about - so categorising one
+    merchant on a large ledger paid for a full table scan first.
+
+    Chunked, because PostgreSQL refuses a statement with more than 65535 bound
+    parameters and "categorise everything in this filter" can name more ids
+    than that.
+    """
+    ids = [i for i in dict.fromkeys(txn_ids) if i]
+    if not ids:
+        return []
+    out: list[Transaction] = []
+    with db.connection() as conn:
+        for start in range(0, len(ids), 1000):
+            chunk = ids[start:start + 1000]
+            rows = conn.execute(
+                f"SELECT * FROM transactions WHERE id IN ({', '.join('?' * len(chunk))})",
+                chunk).fetchall()
+            out.extend(_row_to_transaction(r) for r in rows)
+    return out
 
 
 def transactions_in_pair(db: Database, pair_id: str) -> list[Transaction]:
@@ -659,11 +727,13 @@ def count_transactions(
     flow_role: str | Sequence[str] | None = None,
     merchant: str | None = None,
     exclude_flow_role: Sequence[str] | None = None,
+    search: str | None = None,
+    recurring_series_id: str | None = None,
 ) -> int:
     clauses, params = _transaction_filters(
         account_id, start, end, category, statement_id, rail,
         needs_review, accounting_month, month_start, month_end,
-        flow_role, merchant, exclude_flow_role)
+        flow_role, merchant, exclude_flow_role, search, recurring_series_id)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with db.connection() as conn:
         return conn.execute(
