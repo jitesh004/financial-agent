@@ -491,17 +491,20 @@ LAYOUT_ORDER: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 )
 
 
-def portfolio_layouts() -> tuple[tuple[str, str, tuple[str, ...]], ...]:
-    """(layout, provider, fragments) for `portfolio.detect_layout`.
+def portfolio_layouts() -> tuple[tuple[str, str, tuple[str, ...], tuple[str, ...]], ...]:
+    """(layout, provider, phrases, issuers) for `portfolio.detect_layout`.
 
-    Each layout's issuers come from the registry; the document phrases that
-    identify it without naming anyone come from LAYOUT_ORDER.
+    The two are kept apart because they carry different weight. A PHRASE is
+    what a document calls itself; an ISSUER is who wrote it. "Consolidated
+    account statement" is the title of a CDSL/NSDL demat CAS and also, word
+    for word, the title of every CAMS and KFintech mutual-fund statement -
+    while "camsonline" appears on one of those and nothing else.
     """
     out = []
     for layout, provider, phrases in LAYOUT_ORDER:
         issuers = tuple(f for inst in REGISTRY
                         if inst.portfolio_layout == layout for f in inst.match)
-        out.append((layout, provider, phrases + issuers))
+        out.append((layout, provider, phrases, issuers))
     return tuple(out)
 
 

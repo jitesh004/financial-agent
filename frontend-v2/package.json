@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "node e2e/run.mjs",
+    "test:e2e:import": "node e2e/run.mjs --import"
   },
   "dependencies": {
     "@fontsource-variable/inter": "^5.3.0",
@@ -14,7 +18,13 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.7",
     "@vitejs/plugin-react": "^4.3.4",
-    "vite": "^6.0.7"
+    "jsdom": "^26.1.0",
+    "playwright": "^1.63.0",
+    "vite": "^6.0.7",
+    "vitest": "^3.2.7"
   }
 }

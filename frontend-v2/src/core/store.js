@@ -281,3 +281,30 @@ export function useJobWatch(jobId, { interval = 800, onDone } = {}) {
 
   return job;
 }
+
+/* A value that settles before anything acts on it.
+ *
+ * The ledger's search box writes straight into the URL and into the query key,
+ * so without this every keystroke is a route change and a request: typing
+ * "brightpath" asks the server ten questions and throws nine answers away, and
+ * on a real ledger the answers arrive out of order.
+ *
+ * Deliberately here rather than in the screen. Three places want it - the
+ * ledger, the review screen's merchant filter, and the widget editor - and
+ * three copies of a debounce is three places for a stale timer to survive an
+ * unmount.
+ */
+export function useDebounced(value, delay = 250) {
+  const [settled, setSettled] = useState(value);
+
+  useEffect(() => {
+    if (value === settled) return undefined;
+    const timer = setTimeout(() => setSettled(value), delay);
+    return () => clearTimeout(timer);
+    // `settled` is deliberately out of the dependency list: including it
+    // restarts the timer on the very update it schedules.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value, delay]);
+
+  return settled;
+}

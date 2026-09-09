@@ -45,27 +45,56 @@ function periodsFor(periods, months) {
 
 export function SourceStep({
   intents, periods, chosen, onToggle, settingsFor, onSetting, sections, onUploaded,
+  mailboxReady = true,
 }) {
   const staged = Object.fromEntries((sections || []).map((s) => [s.key, s]));
+
+  /* Files first when there is no mailbox, because then they are the only way
+     in - and a page that opens on four tick boxes that cannot do anything
+     reads as a dead end. */
+  const uploader = (
+    <Group>
+      <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 2 }}>
+        Files from this computer
+      </div>
+      <div className="small muted" style={{ marginBottom: 8 }}>
+        {mailboxReady
+          ? 'Anything Gmail does not carry. They are read on the next step with every '
+            + 'other source.'
+          : 'Bank, card, loan and investment statements you already have. They are read '
+            + 'on the next step, exactly like anything a mailbox scan finds.'}
+        {staged.upload?.staged > 0 && ` ${staged.upload.staged} staged so far.`}
+      </div>
+      <Uploader compact onComplete={onUploaded} />
+    </Group>
+  );
 
   return (
     <>
       <p className="lead" style={{ margin: 0 }}>
-        Tick the sources to scan and set how far back each should look. One shared
-        window was wrong for every source at once — a holdings statement is a
-        photograph of one date, a bank statement is money still to be accounted for,
-        and alerts are noise a statement supersedes. They are scanned one after
-        another, and any one can be re-scanned on its own later.
+        {mailboxReady
+          ? 'Tick the sources to scan and set how far back each should look. One shared '
+            + 'window was wrong for every source at once — a holdings statement is a '
+            + 'photograph of one date, a bank statement is money still to be accounted '
+            + 'for, and alerts are noise a statement supersedes. They are scanned one '
+            + 'after another, and any one can be re-scanned on its own later.'
+          : 'Add the statements you have. Everything below works the same way whether a '
+            + 'document came from a mailbox or from your own disk.'}
       </p>
 
+      {!mailboxReady && uploader}
+
       {intents.map((one) => {
-        const on = chosen.has(one.key);
+        const on = chosen.has(one.key) && mailboxReady;
         const s = settingsFor(one.key);
         const c = staged[one.key];
         return (
           <Group key={one.key}>
-            <label className="row" style={{ cursor: 'pointer', alignItems: 'flex-start' }}>
-              <input type="checkbox" checked={on} onChange={() => onToggle(one.key)}
+            <label className="row"
+              style={{ cursor: mailboxReady ? 'pointer' : 'default', alignItems: 'flex-start',
+                opacity: mailboxReady ? 1 : 0.55 }}>
+              <input type="checkbox" checked={on} disabled={!mailboxReady}
+                onChange={() => onToggle(one.key)}
                 style={{ marginTop: 3, accentColor: 'var(--accent)' }} />
               <span style={{ flex: 1, minWidth: 0 }}>
                 <span style={{ display: 'block', fontWeight: 600, fontSize: 13 }}>
@@ -109,19 +138,9 @@ export function SourceStep({
         );
       })}
 
-      <Group>
-        <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 2 }}>
-          Files from this computer
-        </div>
-        <div className="small muted" style={{ marginBottom: 8 }}>
-          Anything Gmail does not carry. They are read on the next step with every
-          other source.
-          {staged.upload?.staged > 0 && ` ${staged.upload.staged} staged so far.`}
-        </div>
-        <Uploader compact onComplete={onUploaded} />
-      </Group>
+      {mailboxReady && uploader}
 
-      {chosen.size === 0 && (
+      {mailboxReady && chosen.size === 0 && (
         <Callout tone="warn">
           Nothing is ticked, so a scan has nothing to look for. Pick at least one
           source — or just add files above.

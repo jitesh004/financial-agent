@@ -16,7 +16,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../core/api';
-import { invalidate, useQuery } from '../core/store';
+import { invalidate, useDebounced, useQuery } from '../core/store';
 import { useRouteParam } from '../core/router';
 import { usePeriod } from '../core/period';
 import { usePrefs } from '../core/prefs';
@@ -93,13 +93,17 @@ export default function Ledger() {
   const toast = useToast();
   const { params: periodParams, paramsKey, label: periodLabel, scoped } = usePeriod();
   const [prefs] = usePrefs();
-  const { data: accounts = [] } = useAccounts();
+  const { data: accounts = [], loading: loadingAccounts } = useAccounts();
   const { data: categories = [] } = useCategories();
 
   const [view, setView] = useRouteParam('view', 'all');
   const [category, setCategory] = useRouteParam('cat', '');
   const [rail, setRail] = useRouteParam('rail', '');
   const [search, setSearch] = useRouteParam('q', '');
+  /* What reaches the server, a beat behind what is being typed. The box itself
+     stays instant - it renders `search` - but the request, the URL and the
+     query key all wait for the typing to stop. */
+  const settledSearch = useDebounced(search);
   const [sortBy, setSortBy] = useState('date');
   const [sortDir, setSortDir] = useState('desc');
   const [page, setPage] = useState(0);
@@ -117,7 +121,9 @@ export default function Ledger() {
      than a selection so a newly-arrived account (after a retry, say) defaults
      to included instead of silently missing. */
   useEffect(() => { setDropped(new Set()); setPage(0); }, [view]);
-  useEffect(() => { setPage(0); }, [category, rail, sortBy, sortDir, paramsKey, search]);
+  useEffect(() => {
+    setPage(0);
+  }, [category, rail, sortBy, sortDir, paramsKey, settledSearch]);
 
   const selectedIds = scopeIds.filter((id) => !dropped.has(id));
   /* Always an explicit list - never omit the filter just because every account
@@ -132,18 +138,28 @@ export default function Ledger() {
     account_id: accountParam,
     category: active.fixedCategory || category || undefined,
     rail: active.fixedRail || rail || undefined,
-    search: search || undefined,
+    search: settledSearch || undefined,
     sort_by: sortBy,
     sort_dir: sortDir,
     offset: page * pageSize,
     limit: pageSize,
     ...periodParams,
-  }), [accountParam, active, category, rail, search, sortBy, sortDir, page, pageSize,
+  }), [accountParam, active, category, rail, settledSearch, sortBy, sortDir, page, pageSize,
        periodParams]);
 
-  const key = `txns:${JSON.stringify(query)}`;
+  /* Nothing is asked until the account list is in.
+   *
+   * `accountParam` is built from the accounts in scope, and until they arrive
+   * that list is empty - which this screen sends as `__none__`, meaning "no
+   * accounts selected, so no rows". So every visit used to open with a request
+   * that could only answer zero, a flash of "No transactions match", and then
+   * the real query. Worse, the empty answer was cached under exactly the key
+   * that unticking every account produces, so afterwards "Clear all" showed a
+   * cached page instead of asking - and "Select all" could not undo it. */
+  const ready = !loadingAccounts;
+  const key = ready ? `txns:${JSON.stringify(query)}` : null;
   const { data, loading, fetching, error, refetch } =
-    useQuery(key, () => api.transactions(query));
+    useQuery(key, () => api.transactions(query), { enabled: ready });
 
   const rows = data?.transactions || [];
   const total = data?.total ?? 0;
@@ -329,7 +345,7 @@ export default function Ledger() {
       )}
 
       {/* ---- the table ---- */}
-      {loading ? (
+      {!ready || loading ? (
         <Loading label="Reading transactions…" />
       ) : !inScope.length && active.empty ? (
         <Empty title={active.empty} icon="rows">
@@ -634,13 +650,24 @@ function Explanation({ id }) {
             <Chip tone={d.value === 'credit' ? 'pos' : ''}>
               {d.value === 'credit' ? 'money in' : 'money out'}
             </Chip>
-            {d.signal && <Chip>{d.signal}</Chip>}
+            {/* The reason record, which the server sends as an object:
+                `{ code, label, detail, strength }`. This used to read
+                `d.signal` and `d.detail`, neither of which the endpoint has
+                ever returned - so the section that exists to say WHICH of the
+                five signals decided the direction showed one chip and nothing
+                else, on every row. */}
+            {d.reason?.label && <Chip>{d.reason.label}</Chip>}
+            {d.reason?.strength && <Chip tone="acc">{d.reason.strength}</Chip>}
           </div>
-          {d.detail && (
-            <div className="small muted" style={{ marginTop: 4, maxWidth: '70ch' }}>
-              {d.detail}
-            </div>
-          )}
+          <div className="small muted" style={{ marginTop: 4, maxWidth: '70ch' }}>
+            {d.reason?.detail
+              || (d.recorded
+                ? 'Recorded at import, from a signal this version does not have a '
+                  + 'description for.'
+                : 'This row was imported before the app recorded WHY it read the '
+                  + 'direction the way it did. The direction itself is what the '
+                  + 'statement said.')}
+          </div>
         </div>
       )}
 
@@ -649,10 +676,42 @@ function Explanation({ id }) {
           <div className="rail-group-label" style={{ padding: '0 0 6px' }}>
             What it is part of
           </div>
-          <div className="small muted" style={{ maxWidth: '70ch' }}>
-            {x.note || x.kind}
-            {x.counterpart && <> — paired with <strong>{x.counterpart}</strong></>}
+          <div className="row tight" style={{ marginBottom: 4 }}>
+            {x.kind && <Chip tone="acc">{titleCase(x.kind.replace(/_/g, ' '))}</Chip>}
+            <Chip tone={x.counted ? '' : 'warn'}>
+              {x.counted ? 'counted on this side' : 'the mirror leg — not counted here'}
+            </Chip>
+            {x.confidence > 0 && (
+              <span className="tiny dim">{Math.round(x.confidence * 100)}% confident</span>
+            )}
+            {x.day_gap != null && (
+              <span className="tiny dim">
+                {x.day_gap === 0 ? 'same day' : `${x.day_gap} day${x.day_gap === 1 ? '' : 's'} apart`}
+              </span>
+            )}
           </div>
+          <div className="small muted" style={{ maxWidth: '70ch' }}>
+            {x.what_it_means}
+          </div>
+          {/* The other legs, which is what makes the pairing checkable. The
+              panel used to promise a counterpart and read a `counterpart` key
+              that does not exist; the legs are what the server actually
+              sends. */}
+          {x.legs?.length > 1 && (
+            <table style={{ marginTop: 8 }}>
+              <tbody>
+                {x.legs.filter((leg) => !leg.is_this_row).map((leg) => (
+                  <tr key={leg.id}>
+                    <td className="nowrap tiny dim">{dateLabel(leg.date)}</td>
+                    <td className="small">{leg.description}</td>
+                    <td className="right num nowrap small">
+                      {leg.direction === 'credit' ? '+' : '−'}{money(Math.abs(leg.amount))}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
       )}
     </div>

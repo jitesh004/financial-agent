@@ -1211,6 +1211,8 @@ def list_transactions(
     end_month: str | None = None,
     flow_role: str | None = None,
     merchant: str | None = None,
+    search: str | None = None,
+    recurring_series_id: str | None = None,
 ) -> dict[str, Any]:
     """The ledger, filtered.
 
@@ -1227,6 +1229,11 @@ def list_transactions(
 
     `accounting_month` is the single-month shortcut, kept because the Months
     tab has always sent it.
+
+    `search` is free text over the narration, the normalised narration and the
+    merchant. It is a filter like any other, so the `total` beside a search
+    counts what the search matched rather than what the ledger holds - and a
+    page two of a search is the second page OF the search.
     """
     db = get_db()
     # Multiple accounts (or categories) come in as one comma-separated param -
@@ -1252,6 +1259,8 @@ def list_transactions(
         month_end=period.end_month,
         flow_role=roles,
         merchant=merchant,
+        search=search,
+        recurring_series_id=recurring_series_id,
         # A loan account's own statement is the lender's ledger, and it is
         # not the holder's activity - see `FlowRole.LENDER_LEDGER`. It is
         # kept out of every total already; this keeps it out of the LIST as
@@ -1326,9 +1335,8 @@ def bulk_update_transactions(payload: BulkTransactionUpdateReq) -> dict[str, Any
             raise HTTPException(400, f"'{update_args['category']}' is not a valid category.")
         update_args["category"] = category
 
-    all_txns = repo.get_transactions(db)
-    targets = [t for t in all_txns if t.id in set(payload.txn_ids)]
-    
+    targets = repo.get_transactions_by_ids(db, payload.txn_ids)
+
     from .pipeline.overrides import record_decision
     accounts = {a.id: a for a in repo.get_accounts(db) if a.id}
     
@@ -1366,13 +1374,15 @@ def update_transaction(txn_id: str, payload: TransactionUpdateReq) -> dict[str, 
             raise HTTPException(400, f"'{payload.category}' is not a valid category.")
         payload.category = category
 
-    matches = [t for t in repo.get_transactions(db) if t.id == txn_id]
-    if not matches:
+    # By id, not by scanning. This used to read every transaction in the ledger
+    # and filter the list in Python, so correcting one category on a ledger of
+    # any size loaded the whole thing first - seconds of latency on the single
+    # most-used write in the app, growing with the ledger.
+    txn = repo.get_transaction(db, txn_id)
+    if txn is None:
         raise HTTPException(404, f"No transaction with id {txn_id}")
 
     from .pipeline.overrides import record_decision
-
-    txn = matches[0]
     update_args = payload.model_dump(exclude_unset=True)
     if update_args:
         accounts = {a.id: a for a in repo.get_accounts(db) if a.id}
@@ -1866,10 +1876,9 @@ def split_transaction(txn_id: str, payload: SplitReq) -> dict[str, Any]:
     applied by the pipeline rather than computed inline.
     """
     db = get_db()
-    matches = [t for t in repo.get_transactions(db) if t.id == txn_id]
-    if not matches:
+    txn = repo.get_transaction(db, txn_id)
+    if txn is None:
         raise HTTPException(404, f"No transaction with id {txn_id}")
-    txn = matches[0]
     if not payload.splits:
         raise HTTPException(400, "At least one split part is required.")
 
@@ -1915,10 +1924,9 @@ def create_claim(txn_id: str, payload: ClaimReq) -> dict[str, Any]:
     the numbers is not a fix, it just moves the bug somewhere less visible.
     """
     db = get_db()
-    matches = [t for t in repo.get_transactions(db) if t.id == txn_id]
-    if not matches:
+    txn = repo.get_transaction(db, txn_id)
+    if txn is None:
         raise HTTPException(404, f"No transaction with id {txn_id}")
-    txn = matches[0]
 
     # record_decision stamps txn.fingerprint if it was ever empty (a row
     # saved before fingerprinting existed, or - as this session's own tests

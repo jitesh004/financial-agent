@@ -516,7 +516,24 @@ function Files({ onImport }) {
                         )}
                       </div>
                     </td>
-                    <td><Chip tone={tone}>{label}</Chip></td>
+                    <td>
+                      <Chip tone={tone}>{label}</Chip>
+                      {/* Why, in the reader's own words.
+                          "Failed" and a Retry button is not an answer to the
+                          question somebody opens this screen with, and the
+                          message has always been in the payload - a locked
+                          PDF, a layout nothing could read, a statement whose
+                          holdings table was not found - and never on screen.
+                          Shown for a parse that succeeded and produced nothing
+                          too, which otherwise reads as a green tick over an
+                          empty file. */}
+                      {f.error_message
+                        && (f.parse_status !== 'parsed' || !f.transaction_count) && (
+                        <div className="tiny dim" style={{ marginTop: 3, maxWidth: 260 }}>
+                          {f.error_message}
+                        </div>
+                      )}
+                    </td>
                     <td className="right num">{f.transaction_count || '—'}</td>
                     <td className="nowrap tiny dim">{dateLabel(f.last_attempted_at)}</td>
                     <td>
@@ -690,10 +707,33 @@ function Manage() {
                 </div>
               </div>
               <div className="col" style={{ alignItems: 'flex-end', gap: 6 }}>
-                <Button variant={a.destructive ? 'danger' : ''} disabled={busy}
-                  onClick={() => run(a)}>
-                  {a.label}
-                </Button>
+                {/* Two clicks, always.
+                    `run` only stops to ask when the action carries a
+                    `confirm_phrase`, and the server sends one for exactly two
+                    of the seven - so "Clear AI inference" and "Clear my
+                    decisions", both of which the server marks destructive and
+                    neither of which carries a phrase, used to go on a single
+                    click. One slip wiped every category correction the user
+                    had ever made. The phrase, where there is one, is still
+                    asked for on top of this. */}
+                {a.confirm_phrase ? (
+                  <Button variant={a.destructive ? 'danger' : ''} disabled={busy}
+                    onClick={() => run(a)}>
+                    {a.label}
+                  </Button>
+                ) : (
+                  <ConfirmButton
+                    variant={a.destructive ? 'danger' : ''}
+                    disabled={busy}
+                    question={`${a.label}? This removes `
+                      + `${(a.clears || []).join(', ') || 'the data listed above'}. `
+                      + 'A snapshot is taken first, so it is undoable.'}
+                    confirmLabel={a.label}
+                    onConfirm={() => run(a)}
+                  >
+                    {a.label}
+                  </ConfirmButton>
+                )}
                 <Button size="xs"
                   onClick={() => setPreviewOf(previewOf === a.scope ? null : a.scope)}>
                   {previewOf === a.scope ? 'Hide preview' : 'Preview data'}

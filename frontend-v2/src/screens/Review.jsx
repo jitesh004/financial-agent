@@ -168,6 +168,16 @@ function Queue() {
         </Empty>
       )}
 
+      {/* The queue is one page of the server's answer, and the badge on the
+          navigation counts every row that needs review - so a backlog longer
+          than a page has to say so here rather than let the two disagree. */}
+      {(data?.total ?? 0) > items.length && (
+        <Callout tone="warn">
+          {count(data.total)} transactions need review; the {count(items.length)} oldest
+          are below. Working through these brings the rest into view.
+        </Callout>
+      )}
+
       {groups.map(([reason, rows]) => (
         <QueueGroup key={reason} reason={reason} rows={rows} busy={busy} resolve={resolve} />
       ))}
@@ -262,7 +272,7 @@ function ByMerchant() {
   const [done, setDone] = useState(0);
 
   const query = useMemo(() => {
-    const q = { limit: 2000, ...params };
+    const q = { limit: api.PAGE_MAX, ...params };
     if (scope === 'uncategorized') q.category = 'uncategorized';
     if (scope === 'review') q.needs_review = true;
     return q;
@@ -414,10 +424,14 @@ function ByMerchant() {
         </div>
       )}
 
-      {rows.length >= 2000 && (
+      {/* The server answers at most `PAGE_MAX` rows however many are asked
+          for, so this used to compare against a limit it could never reach and
+          never warned - somebody working a long backlog saw a page and was
+          told it was everything. */}
+      {(data?.total ?? 0) > rows.length && (
         <Callout tone="warn">
-          Showing the first {count(2000)} rows in this filter. Narrow the period to work
-          through the rest.
+          Showing {count(rows.length)} of {count(data.total)} rows in this filter.
+          Narrow the period, or categorise these first, to work through the rest.
         </Callout>
       )}
     </>

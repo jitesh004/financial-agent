@@ -45,9 +45,21 @@ export default function Recurring() {
   const [editing, setEditing] = useState(null);
   const [draft, setDraft] = useState('');
 
-  const { data: memberRows } = useQuery(
-    open ? 'recurring-members' : null,
-    () => api.transactions({ limit: 2000, sort_by: 'date', sort_dir: 'desc' }),
+  /* The rows behind the open series, asked for BY series.
+   *
+   * This used to pull the ledger's most recent two thousand rows - capped to
+   * one thousand by the server - and sieve them in the browser for a matching
+   * series id. Anything whose payments fall outside that page found nothing
+   * and reported "no transactions are currently linked to this series", which
+   * on a ledger of any size is most of them. The key is per series too: one
+   * shared key meant opening a second series showed the first one's rows until
+   * the request came back. */
+  const { data: memberRows, loading: loadingMembers } = useQuery(
+    open ? `recurring-members:${open}` : null,
+    () => api.transactions({
+      recurring_series_id: open, limit: 500, sort_by: 'date', sort_dir: 'desc',
+    }),
+    { enabled: Boolean(open) },
   );
 
   /* A series is a fact about a stretch of time, not about one row, so the
@@ -135,9 +147,7 @@ export default function Recurring() {
 
       {visible.map((s) => {
         const isOpen = open === s.id;
-        const rows = isOpen
-          ? (memberRows?.transactions || []).filter((t) => t.recurring_series_id === s.id)
-          : null;
+        const rows = isOpen && !loadingMembers ? (memberRows?.transactions || []) : null;
         /* pad={false}: the body below is this card's own `.card-body`. Letting
            Card add one as well nests two and pads every series twice. */
         return (
