@@ -294,6 +294,130 @@ describe('Agents', () => {
   });
 });
 
+/* A finished run, in the shape `agents/runner.normalise` produces and
+   `agent_routes.read_run` returns. Written out rather than captured because
+   producing one needs a language model, which no test should. */
+const ANSWER = {
+  headline: 'Your card interest is costing more than your SIPs earn',
+  summary: 'Two of the four cards revolve every month.',
+  metrics: [
+    { label: 'Interest paid', value: '18,400', unit: 'INR', note: 'last 12 months' },
+  ],
+  findings: [{
+    title: 'The Northwind card revolved for nine of twelve months',
+    detail: 'Only the minimum was paid in each of those months.',
+    severity: 'urgent',
+    evidence: ['9 statements show a revolving balance'],
+  }],
+  actions: [{
+    title: 'Clear the Northwind balance before the next SIP',
+    detail: 'The card costs more than the fund returns.',
+    mechanism: 'Move the September SIP to the card once.',
+    effort: 'low',
+  }],
+  caveats: ['One statement in March could not be read.'],
+};
+
+function finishedRun(key) {
+  return {
+    id: 'run-1', agent: key, agent_name: 'Debt Strategist',
+    agent_question: 'What is my debt costing me?',
+    status: 'complete', started_at: '2026-09-01T10:00:00Z',
+    finished_at: '2026-09-01T10:00:42Z', seconds: 42,
+    question: '', answer: ANSWER, model: 'test', provider: 'test',
+    steps: 4, tool_calls: 9, error: null, previous: null, diff: null,
+    transcript: [
+      { tool: 'monthly_totals', result: { rows: 12 } },
+      { tool: 'card_utilisation', result: { cards: 4 } },
+    ],
+  };
+}
+
+describe('an agent answer', () => {
+  it('renders every part of what the agent said', async () => {
+    const key = fixture('/api/agents').agents[0].key;
+    server = createServer({
+      routes: {
+        'GET /api/agents': { ...fixture('/api/agents'), model_available: true },
+        [`POST /api/agents/${key}/run`]: { job_id: 'agent-1' },
+        'GET /api/jobs/agent-1': {
+          id: 'agent-1', kind: 'agent', active: false, status: 'complete',
+          progress: 1, result: { run_id: 'run-1' }, steps: [],
+        },
+        'GET /api/agents/runs/run-1': finishedRun(key),
+      },
+    });
+
+    const user = userEvent.setup();
+    renderScreen(<Agents />, { route: '/agents' });
+    await screen.findAllByRole('button', { name: /^run$/i }, { timeout: 8000 });
+    await user.click(screen.getAllByRole('button', { name: /^run$/i })[0]);
+
+    // The headline, the summary, and each of the four lists the agent fills.
+    expect(await screen.findByText(ANSWER.headline, {}, { timeout: 8000 })).toBeTruthy();
+    expect(screen.getByText(ANSWER.summary)).toBeTruthy();
+    expect(screen.getByText(ANSWER.findings[0].title)).toBeTruthy();
+    expect(screen.getByText(ANSWER.findings[0].detail)).toBeTruthy();
+    expect(screen.getByText(ANSWER.actions[0].title)).toBeTruthy();
+    expect(screen.getByText(ANSWER.caveats[0])).toBeTruthy();
+    expect(screen.getByText(/interest paid/i)).toBeTruthy();
+  });
+
+  it('shows its working, which is what makes the figures checkable', async () => {
+    const key = fixture('/api/agents').agents[0].key;
+    server = createServer({
+      routes: {
+        'GET /api/agents': { ...fixture('/api/agents'), model_available: true },
+        [`POST /api/agents/${key}/run`]: { job_id: 'agent-1' },
+        'GET /api/jobs/agent-1': {
+          id: 'agent-1', kind: 'agent', active: false, status: 'complete',
+          progress: 1, result: { run_id: 'run-1' }, steps: [],
+        },
+        'GET /api/agents/runs/run-1': finishedRun(key),
+      },
+    });
+
+    const user = userEvent.setup();
+    renderScreen(<Agents />, { route: '/agents' });
+    await screen.findAllByRole('button', { name: /^run$/i }, { timeout: 8000 });
+    await user.click(screen.getAllByRole('button', { name: /^run$/i })[0]);
+    await screen.findByText(ANSWER.headline, {}, { timeout: 8000 });
+
+    const show = screen.queryByRole('button', { name: /working|transcript|show/i });
+    if (!show) return;
+    await user.click(show);
+    await waitFor(() => {
+      // Fetched only when asked for: a transcript is the largest thing in a
+      // run and nobody wants it on every list.
+      expect(server.calls.some(
+        (c) => c.path === '/api/agents/runs/run-1' && c.search.includes('transcript=true')))
+        .toBe(true);
+    }, { timeout: 8000 });
+  });
+
+  it('reports a failed run instead of an empty answer', async () => {
+    const key = fixture('/api/agents').agents[0].key;
+    server = createServer({
+      routes: {
+        'GET /api/agents': { ...fixture('/api/agents'), model_available: true },
+        [`POST /api/agents/${key}/run`]: { job_id: 'agent-1' },
+        'GET /api/jobs/agent-1': {
+          id: 'agent-1', kind: 'agent', active: false, status: 'failed',
+          progress: 1, errors: ['the model refused the request'], steps: [],
+        },
+      },
+    });
+
+    const user = userEvent.setup();
+    renderScreen(<Agents />, { route: '/agents' });
+    await screen.findAllByRole('button', { name: /^run$/i }, { timeout: 8000 });
+    await user.click(screen.getAllByRole('button', { name: /^run$/i })[0]);
+
+    expect(await screen.findByText(
+      /the model refused the request/i, {}, { timeout: 8000 })).toBeTruthy();
+  });
+});
+
 describe('Data', () => {
   it('shows the coverage grid, one cell per account per month', async () => {
     renderScreen(<Data />, { route: '/data' });
