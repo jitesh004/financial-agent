@@ -348,19 +348,34 @@ export default function useImport({ open, onImported }) {
   const summary = (['stage_parse', 'alerts', 'stage_process', 'process'].includes(job?.kind)
     && job.status === 'complete') ? job.result : null;
 
+  /* What the import is doing, which is a fact about the SERVER's jobs.
+   *
+   * The mailbox's own state is asked about last, and only when there is
+   * nothing running. It used to be asked first, so a deployment with no Gmail
+   * OAuth configured reported 'setup' forever - through an upload, through the
+   * parse it starts, and through the build - and the wizard, which renders per
+   * stage, showed Google's setup instructions the whole way. Files from this
+   * computer are a source of their own and do not become unimportable because
+   * a mailbox is not configured. */
   const stage = useMemo(() => {
-    if (!status?.available) return 'setup';
-    if (!status?.connected) return 'connect';
     const fromJob = stageFor(job);
     // 'downloaded' means a download finished with nothing chained after it;
     // there is nothing further to watch, so fall back to the file list.
-    if (fromJob === 'downloaded') return 'select';
-    if (fromJob === 'select') {
+    let resolved = fromJob === 'downloaded' ? 'select' : fromJob;
+    if (resolved === 'select') {
       const found = scanIntent === 'transactional' ? alerts.length : rows.length;
-      return found ? 'select' : 'idle';
+      resolved = found ? 'select' : 'idle';
     }
-    return fromJob;
+    if (resolved !== 'idle') return resolved;
+    if (!status?.available) return 'setup';
+    if (!status?.connected) return 'connect';
+    return 'idle';
   }, [status, job, rows.length, alerts.length, scanIntent]);
+
+  /* Whether the MAILBOX can be used, kept apart from what the import is doing.
+     Two different questions, and conflating them is what hid the uploader. */
+  const mailboxReady = Boolean(status?.connected);
+  const mailboxAvailable = Boolean(status?.available);
 
   /* ---- actions ---------------------------------------------------------- */
 
@@ -526,6 +541,7 @@ export default function useImport({ open, onImported }) {
 
   return {
     status, periods, intents, error, setError, stage, job, scanJob, busy, activeCount,
+    mailboxReady, mailboxAvailable,
     rows, excluded, ignoredCount, summary, alerts, importableAlerts,
     intent, chosenIntents, toggleIntent, scanIntent,
     selection, setSelection: persistSelection,

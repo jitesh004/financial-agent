@@ -62,9 +62,13 @@ if (!window.matchMedia) {
 if (!URL.createObjectURL) URL.createObjectURL = () => 'blob:test';
 if (!URL.revokeObjectURL) URL.revokeObjectURL = () => {};
 
-/* `Element.scrollTo` is a no-op in jsdom but has to exist: the router calls it
-   on the main column after every navigation. */
+/* `Element.scrollTo` and `scrollIntoView` are no-ops in jsdom but have to
+   exist: the router scrolls the main column after every navigation, and the
+   command palette keeps the highlighted row in view. */
 if (!Element.prototype.scrollTo) Element.prototype.scrollTo = function scrollTo() {};
+if (!Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = function scrollIntoView() {};
+}
 
 /* Downloads: a real anchor click on a blob: href makes jsdom complain about
    navigation it cannot perform. The click itself is what tests assert on, so

@@ -50,7 +50,7 @@ export default function ImportWizard({ mailbox, open, onClose, onImported }) {
   const {
     status, periods, intents, error, stage, job, busy,
     rows, selection, setSelection, chosenIntents, toggleIntent, scanIntent,
-    importableAlerts, sections, sourceResults,
+    importableAlerts, sections, sourceResults, mailboxReady, mailboxAvailable,
   } = mailbox;
 
   const [step, setStep] = useState(0);
@@ -164,14 +164,10 @@ export default function ImportWizard({ mailbox, open, onClose, onImported }) {
               Import more
             </Button>
           )}
-          {status?.connected && (
-            <>
-              <Button disabled={step === 0} icon="chevron-left"
-                onClick={() => setStep((s) => s - 1)}>Back</Button>
-              <Button disabled={step >= STEPS.length - 1} iconRight="chevron"
-                onClick={() => setStep((s) => s + 1)}>Next</Button>
-            </>
-          )}
+          <Button disabled={step === 0} icon="chevron-left"
+            onClick={() => setStep((s) => s - 1)}>Back</Button>
+          <Button disabled={step >= STEPS.length - 1} iconRight="chevron"
+            onClick={() => setStep((s) => s + 1)}>Next</Button>
           <span className="spacer" />
           <ConfirmButton
             title="Empty the wizard and start again. Your ledger is untouched."
@@ -185,8 +181,13 @@ export default function ImportWizard({ mailbox, open, onClose, onImported }) {
         </>
       )}
     >
-      {status?.connected && (
-        <div className="steps">
+      {/* Always. These steps are the import, and only two of the six are about
+          a mailbox at all - so hiding the lot when Gmail is not configured
+          took the file uploader with them, on exactly the deployments where it
+          is the only way in. Both of the messages below told the reader to
+          "add files from your computer instead", and neither left any way to
+          do it. */}
+      <div className="steps">
           {STEPS.map((s, i) => (
             <React.Fragment key={s.key}>
               {i > 0 && <span className="step-link" aria-hidden="true" />}
@@ -201,13 +202,12 @@ export default function ImportWizard({ mailbox, open, onClose, onImported }) {
               </button>
             </React.Fragment>
           ))}
-          {behind && (
-            <Button size="xs" onClick={() => setStep(stageStep)}>
-              Back to {STEPS[stageStep].label}
-            </Button>
-          )}
-        </div>
-      )}
+        {behind && (
+          <Button size="xs" onClick={() => setStep(stageStep)}>
+            Back to {STEPS[stageStep].label}
+          </Button>
+        )}
+      </div>
 
       {error && <Callout tone="neg">{error}</Callout>}
 
@@ -228,125 +228,136 @@ export default function ImportWizard({ mailbox, open, onClose, onImported }) {
 
       {!status && <Loading label="Checking your mailbox connection…" />}
 
-      {stage === 'setup' && <SetupInstructions />}
-
-      {stage === 'connect' && (
-        <>
-          <Callout tone="acc">
-            Read-only access. Sign-in happens on Google&apos;s own page — this app never
-            sees your password, and the scope granted cannot send or delete mail.
-          </Callout>
-          <div>
-            <Button variant="primary" icon="mail" onClick={mailbox.connect}>
-              Connect Gmail
-            </Button>
-          </div>
-          <Callout>
-            You can skip this entirely and add files from your computer instead — they
-            go through exactly the same review.
-          </Callout>
-        </>
+      {/* The mailbox's own state, said where it is relevant: on Source, where
+          the alternative to it is, and on the two steps that are only about a
+          mailbox. Never instead of the wizard. */}
+      {!mailboxReady && (view === 'scanning' || view === 'choose') && (
+        <Callout tone="warn">
+          {mailboxAvailable
+            ? 'No mailbox is connected, so there is nothing to scan. Connect one on the '
+              + 'Source step, or add files from your computer there instead.'
+            : 'Mailbox import is not configured on this server, so there is nothing to '
+              + 'scan. Add files from your computer on the Source step instead — they go '
+              + 'through exactly the same review.'}
+        </Callout>
       )}
 
-      {status?.connected && (
-        <>
-          {view === 'source' && (
-            <SourceStep
-              intents={intents}
-              periods={periods}
-              chosen={chosenIntents}
-              onToggle={toggleIntent}
-              settingsFor={mailbox.settingsFor}
-              onSetting={mailbox.setSourceSetting}
-              sections={sections}
-              onUploaded={() => { mailbox.refreshSections?.(); mailbox.refresh?.(); }}
-            />
-          )}
+      {view === 'source' && !mailboxReady && (
+        mailboxAvailable ? (
+          <>
+            <Callout tone="acc">
+              Read-only access. Sign-in happens on Google&apos;s own page — this app never
+              sees your password, and the scope granted cannot send or delete mail.
+            </Callout>
+            <div>
+              <Button variant="primary" icon="mail" onClick={mailbox.connect}>
+                Connect Gmail
+              </Button>
+            </div>
+            <Callout>
+              Or skip it entirely and add files from your computer below — they go
+              through exactly the same review.
+            </Callout>
+          </>
+        ) : <SetupInstructions />
+      )}
 
-          {view === 'scanning' && (
-            <ScanStep
+        {view === 'source' && (
+          <SourceStep
+            intents={intents}
+            periods={periods}
+            chosen={chosenIntents}
+            onToggle={toggleIntent}
+            settingsFor={mailbox.settingsFor}
+            onSetting={mailbox.setSourceSetting}
+            sections={sections}
+            onUploaded={() => { mailbox.refreshSections?.(); mailbox.refresh?.(); }}
+            mailboxReady={mailboxReady}
+          />
+        )}
+
+        {view === 'scanning' && (
+          <ScanStep
+            intents={intents}
+            chosen={chosenIntents}
+            sections={sections}
+            sourceJobs={mailbox.sourceJobs}
+            busy={busy}
+            onScan={async (key) => {
+              const id = await mailbox.scanSource(key);
+              mailbox.refreshSections?.();
+              return id;
+            }}
+            onForget={async (key) => { await mailbox.forgetSource(key); setStaged({}); }}
+          />
+        )}
+
+        {view === 'choose' && (
+          <ChooseStep
+            intents={intents}
+            chosen={chosenIntents}
+            sections={sections}
+            sourceResults={sourceResults}
+            rows={rows}
+            selected={selection}
+            onToggle={toggleRow}
+            onToggleMany={toggleMany}
+            ignoredSenders={mailbox.ignoredSenders}
+            ignoredCount={mailbox.ignoredCount}
+            onIgnore={(who) => who && mailbox.setIgnored(
+              [...new Set([...(mailbox.ignoredSenders || []), who.trim()])])}
+            onClearIgnored={() => mailbox.setIgnored([])}
+          />
+        )}
+
+        {view === 'parse' && (
+          <>
+            <ReadStep
               intents={intents}
               chosen={chosenIntents}
+              chosenCounts={chosenCounts}
               sections={sections}
-              sourceJobs={mailbox.sourceJobs}
               busy={busy}
-              onScan={async (key) => {
-                const id = await mailbox.scanSource(key);
-                mailbox.refreshSections?.();
-                return id;
-              }}
-              onForget={async (key) => { await mailbox.forgetSource(key); setStaged({}); }}
-            />
-          )}
-
-          {view === 'choose' && (
-            <ChooseStep
-              intents={intents}
-              chosen={chosenIntents}
-              sections={sections}
-              sourceResults={sourceResults}
-              rows={rows}
-              selected={selection}
-              onToggle={toggleRow}
-              onToggleMany={toggleMany}
-              ignoredSenders={mailbox.ignoredSenders}
-              ignoredCount={mailbox.ignoredCount}
-              onIgnore={(who) => who && mailbox.setIgnored(
-                [...new Set([...(mailbox.ignoredSenders || []), who.trim()])])}
-              onClearIgnored={() => mailbox.setIgnored([])}
-            />
-          )}
-
-          {view === 'parse' && (
-            <>
-              <ReadStep
-                intents={intents}
-                chosen={chosenIntents}
-                chosenCounts={chosenCounts}
-                sections={sections}
-                busy={busy}
-                job={job}
-                onParse={mailbox.parseSource}
-                onRefresh={mailbox.refreshSections}
-              />
-              {(stage === 'downloading' || stage === 'parsing') && (
-                <div className="card sunken" style={{ padding: 12 }}>
-                  <JobProgress
-                    job={job}
-                    title={stage === 'downloading' ? 'Downloading documents' : 'Reading documents'}
-                    onCancel={mailbox.cancel}
-                  />
-                  <Callout style={{ marginTop: 10 }}>
-                    Nothing read here is in your ledger — it goes to Review first. You can
-                    close this. The work keeps running on the server, and the Import
-                    button in the bar shows how it is getting on.
-                  </Callout>
-                </div>
-              )}
-              {stage === 'interrupted' && (
-                <Callout tone="warn">
-                  <strong>That run stopped when the server restarted.</strong>{' '}
-                  {job.current} of {job.total} finished.{' '}
-                  <Button size="sm" onClick={mailbox.resume}>Resume it</Button>{' '}
-                  — anything already read is not read twice.
-                </Callout>
-              )}
-            </>
-          )}
-
-          {view === 'review' && <ReviewStep onChanged={setStaged} />}
-
-          {view === 'process' && (
-            <BuildStep
-              staged={stagedTotals}
               job={job}
-              stage={stage}
-              onRun={mailbox.process}
-              onFinished={() => { onImported?.(); onClose(); }}
+              onParse={mailbox.parseSource}
+              onRefresh={mailbox.refreshSections}
             />
-          )}
-        </>
-      )}
+            {(stage === 'downloading' || stage === 'parsing') && (
+              <div className="card sunken" style={{ padding: 12 }}>
+                <JobProgress
+                  job={job}
+                  title={stage === 'downloading' ? 'Downloading documents' : 'Reading documents'}
+                  onCancel={mailbox.cancel}
+                />
+                <Callout style={{ marginTop: 10 }}>
+                  Nothing read here is in your ledger — it goes to Review first. You can
+                  close this. The work keeps running on the server, and the Import
+                  button in the bar shows how it is getting on.
+                </Callout>
+              </div>
+            )}
+            {stage === 'interrupted' && (
+              <Callout tone="warn">
+                <strong>That run stopped when the server restarted.</strong>{' '}
+                {job.current} of {job.total} finished.{' '}
+                <Button size="sm" onClick={mailbox.resume}>Resume it</Button>{' '}
+                — anything already read is not read twice.
+              </Callout>
+            )}
+          </>
+        )}
+
+        {view === 'review' && <ReviewStep onChanged={setStaged} />}
+
+        {view === 'process' && (
+          <BuildStep
+            staged={stagedTotals}
+            job={job}
+            stage={stage}
+            onRun={mailbox.process}
+            onFinished={() => { onImported?.(); onClose(); }}
+          />
+        )}
     </Modal>
   );
 }
@@ -355,9 +366,10 @@ function SetupInstructions() {
   return (
     <>
       <Callout tone="warn">
-        <strong>Mailbox import is not configured on this server.</strong> You can still
-        add files from your computer — close this and use the Source step, or ask
-        whoever runs this deployment to set up an OAuth client.
+        <strong>Mailbox import is not configured on this server.</strong> Adding files
+        from your computer works regardless — the dropzone is below, and they go
+        through exactly the same review. To scan a mailbox as well, whoever runs this
+        deployment needs to set up an OAuth client.
       </Callout>
       <div className="card sunken" style={{ padding: 14 }}>
         <div style={{ fontWeight: 620, marginBottom: 8 }}>What is needed</div>

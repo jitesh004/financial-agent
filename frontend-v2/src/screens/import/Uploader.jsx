@@ -62,12 +62,26 @@ export default function Uploader({ onComplete, compact = false }) {
         onComplete?.({ staged: staged || 0 });
         return;
       }
+      /* A job the server cannot answer for is not a reason to stop quietly.
+         This used to `break` on the first unreadable poll, which left the
+         files still queued, no message on screen and nothing having happened -
+         indistinguishable, from the outside, from an upload that worked. A few
+         retries cover a restart or a dropped connection; after that it is
+         reported. */
+      let unanswered = 0;
       for (;;) {
         // eslint-disable-next-line no-await-in-loop
         await new Promise((r) => { setTimeout(r, 900); });
         // eslint-disable-next-line no-await-in-loop
         const job = await api.job(jobId).catch(() => null);
-        if (!job) break;
+        if (!job) {
+          unanswered += 1;
+          if (unanswered < 5) continue;
+          throw new Error(
+            'The server stopped reporting on this upload. Your files were saved — '
+            + 'the Data screen lists every file and what happened to it.');
+        }
+        unanswered = 0;
         if (!job.active) {
           if (job.status === 'failed') {
             throw new Error(job.errors?.join('; ') || 'Reading the files failed.');

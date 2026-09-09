@@ -117,7 +117,7 @@ def capture(database_url: str, data_dir: str) -> dict[str, object]:
 
     client = TestClient(app)
     client.cookies.set(config.SESSION_COOKIE, store.create_session(db, user.id, ttl_hours=6))
-    _populate(client)
+    populate(client)
 
     captured: dict[str, object] = {}
     for path in GETS:
@@ -151,7 +151,7 @@ def capture(database_url: str, data_dir: str) -> dict[str, object]:
     return captured
 
 
-def _populate(client) -> None:
+def populate(client) -> None:
     """Give the screens whose lists start empty something real to render.
 
     A demo ledger alone leaves Owed, Position and Explore with nothing in them,
@@ -159,6 +159,10 @@ def _populate(client) -> None:
     state. Each of these goes through the API rather than the database, so what
     ends up in the fixture is exactly what the app would have created.
     """
+    # Finished setting up. The fixtures stand in for an account somebody has
+    # been using, and an unfinished wizard would put every screen behind it.
+    client.post("/api/onboarding/complete")
+
     # Something owed: mark one ordinary card purchase as somebody else's.
     rows = client.get("/api/transactions?limit=200&sort_by=amount&sort_dir=desc").json()
     candidate = next(

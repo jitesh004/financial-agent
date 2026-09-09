@@ -145,7 +145,14 @@ export const api = {
 
   /* ---- transactions ---- */
   transactions: (params = {}) => get(`/api/transactions?${query(params)}`),
-  reviewQueue: (params = {}) => api.transactions({ needs_review: true, limit: 200, ...params }),
+  /* The most rows /api/transactions will return whatever `limit` asks for. A
+     caller that wants "as many as I can get" has to know this number, because
+     asking for more is answered silently with this many - and a screen that
+     believed its own larger limit reported "showing the first 2000 of N" over
+     a thousand rows, or quietly showed a page and called it the queue. */
+  PAGE_MAX: 1000,
+  reviewQueue: (params = {}) =>
+    api.transactions({ needs_review: true, limit: api.PAGE_MAX, ...params }),
   updateTransaction: (id, fields) => patch(`/api/transactions/${id}`, fields),
   /* The request model names this `txn_ids`; sending `ids` parses to an empty
      payload and silently updates nothing. */
