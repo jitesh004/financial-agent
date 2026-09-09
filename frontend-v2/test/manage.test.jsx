@@ -244,6 +244,45 @@ describe('Data', () => {
       new RegExp(file.filename.slice(0, 12), 'i'), {}, { timeout: 8000 })).toBeTruthy();
   });
 
+  it('says why a file failed, not just that it did', async () => {
+    server = createServer({
+      routes: {
+        'GET /api/files': [{
+          ...fixture('/api/files')[0],
+          filename: 'locked.pdf',
+          parse_status: 'failed',
+          transaction_count: 0,
+          error_message: 'No password derived from your details opened this PDF.',
+        }],
+      },
+    });
+    renderScreen(<Data />, { route: '/data?section=files' });
+
+    expect(await screen.findByText('locked.pdf', {}, { timeout: 8000 })).toBeTruthy();
+    // "Failed" and a Retry button is not an answer to the question somebody
+    // opens this screen with, and the reason has always been in the payload.
+    expect(await screen.findByText(
+      /no password derived from your details/i, {}, { timeout: 8000 })).toBeTruthy();
+  });
+
+  it('says so when a file was read and yielded nothing', async () => {
+    server = createServer({
+      routes: {
+        'GET /api/files': [{
+          ...fixture('/api/files')[0],
+          filename: 'holdings.pdf',
+          parse_status: 'parsed',
+          transaction_count: 0,
+          error_message: '0 holding(s). No holdings were read.',
+        }],
+      },
+    });
+    renderScreen(<Data />, { route: '/data?section=files' });
+
+    expect(await screen.findByText(
+      /no holdings were read/i, {}, { timeout: 8000 })).toBeTruthy();
+  });
+
   it('never clears anything without an explicit confirmation', async () => {
     const user = userEvent.setup();
     renderScreen(<Data />, { route: '/data?section=manage' });

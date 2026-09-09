@@ -12,6 +12,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { screen, waitFor, within, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
+import { ReviewStep } from '../src/screens/import/review';
 import Uploader from '../src/screens/import/Uploader';
 import ImportWizard from '../src/screens/import/ImportWizard';
 import useImport, { stageFor, suggestedCap, rowKey } from '../src/screens/import/useImport';
@@ -259,5 +260,109 @@ describe('ImportWizard', () => {
 
     await new Promise((r) => { setTimeout(r, 300); });
     expect(server.calls.filter((c) => /\/cancel$/.test(c.path)).length).toBe(before);
+  });
+});
+
+
+/* ── what the review step says about each document ───────────────────────── */
+
+/** One staging group, in the shape /api/staging/review answers. */
+function stagingWith(file) {
+  return {
+    groups: [{
+      key: 'g1',
+      account_label: 'CDSL/NSDL portfolio',
+      account_type: 'investment',
+      kind: 'portfolio',
+      kind_label: 'Investments',
+      kind_note: 'Holdings on one date, not a ledger of transactions.',
+      files: [{
+        id: 'f1',
+        filename: 'holdings.pdf',
+        origin: 'upload',
+        selected: true,
+        superseded_by: null,
+        parse_status: 'ok',
+        parse_message: '',
+        period_start: null,
+        period_end: null,
+        row_count: 0,
+        debits: '0',
+        credits: '0',
+        recon_status: 'not_applicable',
+        warnings: [],
+        ...file,
+      }],
+      file_count: 1,
+      selected_count: 1,
+      superseded_count: 0,
+      failed_count: 0,
+      unbalanced_count: 0,
+      row_count: file.row_count ?? 0,
+      debits: '0',
+      credits: '0',
+      first: null,
+      last: null,
+      included: true,
+      partial: false,
+    }],
+    total: 1, selected: 1, parsed: 1, pending: 0, superseded: 0,
+    rows: file.row_count ?? 0, items: 0, processed: 0,
+  };
+}
+
+describe('the review step', () => {
+  it('says when a document was read and yielded nothing', async () => {
+    createServer({
+      routes: {
+        'GET /api/staging/review': stagingWith({
+          parse_message: '0 holding(s). No holdings were read.',
+        }),
+      },
+    });
+    renderScreen(<ReviewStep onChanged={() => {}} />, { route: '/' });
+
+    // The parse did not fail and the reconciliation did not either, so this
+    // used to show a filename and nothing else - ticked, included in the
+    // build, and contributing no rows, with no explanation anywhere.
+    expect(await screen.findByText(
+      /no holdings were read/i, {}, { timeout: 8000 })).toBeTruthy();
+  });
+
+  it('falls back to plain words when the reader gave no message', async () => {
+    createServer({
+      routes: { 'GET /api/staging/review': stagingWith({ parse_message: '' }) },
+    });
+    renderScreen(<ReviewStep onChanged={() => {}} />, { route: '/' });
+    expect(await screen.findByText(
+      /nothing was found in it to count/i, {}, { timeout: 8000 })).toBeTruthy();
+  });
+
+  it('shows the limits the reader reported, even on a document that read fine', async () => {
+    createServer({
+      routes: {
+        'GET /api/staging/review': stagingWith({
+          row_count: 12,
+          warnings: ['No valuation date found; the holdings cannot be dated.'],
+        }),
+      },
+    });
+    renderScreen(<ReviewStep onChanged={() => {}} />, { route: '/' });
+    expect(await screen.findByText(
+      /no valuation date found/i, {}, { timeout: 8000 })).toBeTruthy();
+  });
+
+  it('does not repeat a warning that is already the note', async () => {
+    createServer({
+      routes: {
+        'GET /api/staging/review': stagingWith({
+          parse_message: 'Read, but nothing was found in it to count.',
+          warnings: ['Read, but nothing was found in it to count.'],
+        }),
+      },
+    });
+    renderScreen(<ReviewStep onChanged={() => {}} />, { route: '/' });
+    await screen.findByText(/nothing was found in it to count/i, {}, { timeout: 8000 });
+    expect(screen.getAllByText(/nothing was found in it to count/i).length).toBe(1);
   });
 });

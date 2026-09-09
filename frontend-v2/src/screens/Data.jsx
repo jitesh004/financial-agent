@@ -516,7 +516,24 @@ function Files({ onImport }) {
                         )}
                       </div>
                     </td>
-                    <td><Chip tone={tone}>{label}</Chip></td>
+                    <td>
+                      <Chip tone={tone}>{label}</Chip>
+                      {/* Why, in the reader's own words.
+                          "Failed" and a Retry button is not an answer to the
+                          question somebody opens this screen with, and the
+                          message has always been in the payload - a locked
+                          PDF, a layout nothing could read, a statement whose
+                          holdings table was not found - and never on screen.
+                          Shown for a parse that succeeded and produced nothing
+                          too, which otherwise reads as a green tick over an
+                          empty file. */}
+                      {f.error_message
+                        && (f.parse_status !== 'parsed' || !f.transaction_count) && (
+                        <div className="tiny dim" style={{ marginTop: 3, maxWidth: 260 }}>
+                          {f.error_message}
+                        </div>
+                      )}
+                    </td>
                     <td className="right num">{f.transaction_count || '—'}</td>
                     <td className="nowrap tiny dim">{dateLabel(f.last_attempted_at)}</td>
                     <td>

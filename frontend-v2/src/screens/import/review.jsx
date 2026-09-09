@@ -11,7 +11,7 @@
  * one". Both are checkboxes, because both questions get asked.
  */
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../../core/api';
 import { count, money } from '../../core/format';
 import {
@@ -51,13 +51,46 @@ function fileNote(file) {
   if (file.parse_status === 'pending') return 'Not read yet.';
   // Read fine, but the figures do not add up to what the issuer printed.
   if (file.recon_status === 'failed') return file.parse_message;
+  /* Read fine, and empty.
+   *
+   * The reader says so - "0 holding(s). No holdings were read." - and this
+   * used to say nothing at all, because the parse did not fail and the
+   * reconciliation did not either. So a holdings statement whose table could
+   * not be found sat here ticked, looking exactly like the four beside it that
+   * had six hundred rows between them, was included in the build, and
+   * contributed nothing. The Portfolio screen then stayed empty with no
+   * explanation anywhere in the app. */
+  if (!file.row_count) {
+    return file.parse_message
+      || 'Read, but nothing was found in it to count.';
+  }
   return null;
+}
+
+/* What the reader could not do, in its own words.
+ *
+ * Separate from the note above because these are not one sentence and not
+ * always about failure - "no valuation date found; the holdings cannot be
+ * dated" is a real limit on a document that otherwise read perfectly. The
+ * server has always sent them and nothing has ever shown them. */
+function fileWarnings(file) {
+  const warnings = file.warnings || [];
+  if (!warnings.length) return null;
+  // Not repeated when the note above already says the same thing.
+  const note = fileNote(file);
+  return warnings.filter((w) => w !== note);
 }
 
 export function ReviewStep({ onChanged }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
+  /* Collapsed by default, EXCEPT where something needs explaining. A group
+     that produced no rows, could not be read, did not balance, or whose reader
+     reported a limit is one whose per-file notes are the reason somebody is on
+     this screen - so those open themselves rather than hiding the answer
+     behind a chevron. */
   const [open, setOpen] = useState(() => new Set());
+  const auto = useRef(false);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
@@ -66,6 +99,13 @@ export function ReviewStep({ onChanged }) {
       const next = await api.stagingReview();
       setData(next);
       onChanged?.(next);
+      if (!auto.current) {
+        auto.current = true;
+        const notable = (next.groups || []).filter(
+          (g) => !g.row_count || g.failed_count > 0 || g.unbalanced_count > 0
+            || (g.files || []).some((f) => (f.warnings || []).length));
+        if (notable.length) setOpen(new Set(notable.map((g) => g.key)));
+      }
     } catch (e) { setError(e.message); }
   }, [onChanged]);
 
@@ -179,6 +219,13 @@ export function ReviewStep({ onChanged }) {
                     {group.file_count === 1 ? '' : 's'}
                   </Chip>
                   {group.row_count > 0 && <Chip>{group.row_count} rows</Chip>}
+                  {/* A group that read fine and produced nothing has no row
+                      count to show, so without this it looked exactly like one
+                      whose rows had simply not been counted yet - ticked, and
+                      about to contribute nothing to the build. */}
+                  {!group.row_count && !group.failed_count && !group.superseded_count && (
+                    <Chip tone="warn">nothing read from these</Chip>
+                  )}
                   {group.failed_count > 0 && (
                     <Chip tone="neg">{group.failed_count} unreadable</Chip>
                   )}
@@ -251,11 +298,18 @@ export function ReviewStep({ onChanged }) {
                       <div className="tiny" style={{
                         marginTop: 2,
                         color: file.parse_status === 'failed' ? 'var(--neg)'
-                          : file.recon_status === 'failed' ? 'var(--warn)' : 'var(--text-3)',
+                          : (file.recon_status === 'failed' || !file.row_count)
+                            ? 'var(--warn)' : 'var(--text-3)',
                       }}>
                         {note}
                       </div>
                     )}
+                    {(fileWarnings(file) || []).map((warning) => (
+                      <div key={warning} className="tiny"
+                        style={{ marginTop: 2, color: 'var(--text-3)' }}>
+                        {warning}
+                      </div>
+                    ))}
                   </div>
                   <div className="right tiny nowrap">
                     {Number(file.debits) > 0 && <div>−{money(file.debits)}</div>}
