@@ -12,7 +12,7 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 import Ledger from '../src/screens/Ledger';
-import { createServer, renderScreen, allTransactions, setPrefs } from './harness';
+import { createServer, renderScreen, allTransactions, setPrefs, fixture } from './harness';
 import { downloads } from './setup';
 
 let server;
@@ -283,6 +283,74 @@ describe('Ledger', () => {
       expect(bulk.body.txn_ids.length).toBeGreaterThan(1);
       expect(bulk.body.category).toBe('groceries');
     }, { timeout: 5000 });
+  });
+
+  it('explains which way the money went, and on what evidence', async () => {
+    const user = userEvent.setup();
+    renderScreen(<Ledger />, { route: '/ledger' });
+    await ledgerReady();
+
+    await user.click(screen.getAllByTitle('Why is this row the way it is?')[0]);
+    const panel = await screen.findByText('Which way the money went', {}, { timeout: 5000 });
+    const block = panel.parentElement;
+
+    // The direction itself…
+    expect(block.textContent).toMatch(/money (in|out)/);
+    // …and a sentence about WHY, which is the point of the section. It read
+    // two keys the endpoint has never returned, so this was a chip and
+    // nothing else on every row in the ledger.
+    expect(block.textContent.replace(/money (in|out)/, '').trim().length)
+      .toBeGreaterThan(30);
+  });
+
+  it('names the signal that decided the direction, when one was recorded', async () => {
+    const user = userEvent.setup();
+    /* The demo ledger is generated rather than parsed, so no row in it carries
+       a recorded direction reason. This is the shape the parser writes when
+       one is - see `app/rules/directions.describe`. */
+    const reason = {
+      code: 'running_balance',
+      label: 'The running balance moved this way',
+      detail: "The statement's own balance column went up or down by exactly this amount.",
+      strength: 1,
+    };
+    server = createServer({
+      routes: {
+        'GET /api/rules/explain/*': ({ path }) => ({
+          id: path.split('/').pop(),
+          category: fixture('explain:plain').category,
+          direction: { value: 'debit', reason, recorded: true },
+          transfer: null,
+        }),
+      },
+    });
+
+    renderScreen(<Ledger />, { route: '/ledger' });
+    await ledgerReady();
+    await user.click(screen.getAllByTitle('Why is this row the way it is?')[0]);
+
+    expect(await screen.findByText(reason.label, {}, { timeout: 5000 })).toBeTruthy();
+    expect(screen.getByText(reason.detail)).toBeTruthy();
+  });
+
+  it('shows the other legs of a transfer, so the pairing can be checked', async () => {
+    const user = userEvent.setup();
+    const paired = allTransactions().filter((t) => t.is_internal_transfer);
+    expect(paired.length).toBeGreaterThan(0);
+    server = createServer({ transactions: paired });
+
+    renderScreen(<Ledger />, { route: '/ledger' });
+    await ledgerReady();
+    await user.click(screen.getAllByTitle('Why is this row the way it is?')[0]);
+
+    const heading = await screen.findByText('What it is part of', {}, { timeout: 5000 });
+    const block = heading.parentElement;
+    const captured = fixture('explain:transfer').transfer;
+    // What the pairing MEANS, in a sentence…
+    expect(block.textContent).toContain(captured.what_it_means.slice(0, 40));
+    // …and the far leg, by description.
+    const far = captured.legs.find((l) => !l.is_this_row);
+    if (far) expect(block.textContent).toContain(far.description);
   });
 
   it('shows the error the server gave rather than an empty table', async () => {

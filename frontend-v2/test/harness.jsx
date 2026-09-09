@@ -176,9 +176,15 @@ export function createServer({ routes = {}, transactions } = {}) {
   );
 
   function handle(method, path, search, body) {
+    /* An exact key first, then a `…/*` prefix - so a route whose URL carries
+       an id ("GET /api/rules/explain/*") can be overridden without the test
+       having to know which id the screen will ask for. */
     const key = `${method} ${path}`;
-    if (Object.prototype.hasOwnProperty.call(routes, key)) {
-      const route = routes[key];
+    const matched = Object.prototype.hasOwnProperty.call(routes, key) ? key
+      : Object.keys(routes).find(
+        (k) => k.endsWith('*') && key.startsWith(k.slice(0, -1)));
+    if (matched) {
+      const route = routes[matched];
       const value = typeof route === 'function'
         ? route({ path, search, body, params: new URLSearchParams(search) })
         : route;
@@ -264,22 +270,28 @@ export function createServer({ routes = {}, transactions } = {}) {
       return json(state.ignoredSenders);
     }
 
-    /* ---- rules explain: derived from the row, like the server's ---- */
+    /* ---- why one row is the way it is ----
+       Replayed from a real answer rather than invented, because the panel that
+       renders it reads a dozen keys and a hand-written stand-in is exactly how
+       it came to read three the endpoint has never returned. Two were captured
+       - a plain row and a paired one - and which is served follows the row. */
     if (method === 'GET' && path.startsWith('/api/rules/explain/')) {
       const id = path.split('/').pop();
       const t = state.transactions.find((x) => x.id === id);
-      if (!t) return json({ detail: 'not found' }, 404);
+      if (!t) return json({ detail: 'No such transaction' }, 404);
+      const shape = clone(
+        fixtures[t.is_internal_transfer ? 'explain:transfer' : 'explain:plain']);
       return json({
-        transaction: { id: t.id, description: t.description, amount: t.amount },
+        ...shape,
+        id,
         category: {
+          ...shape.category,
           value: t.category,
           source: t.category_source,
           rule: t.category_rule || null,
-          pattern: null,
           confidence: t.category_confidence,
         },
-        direction: { value: t.direction, signal: t.direction_reason || null, detail: null },
-        transfer: t.is_internal_transfer ? { kind: 'transfer', note: 'paired', counterpart: null } : null,
+        direction: { ...shape.direction, value: t.direction },
       });
     }
 

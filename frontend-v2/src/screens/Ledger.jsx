@@ -650,13 +650,24 @@ function Explanation({ id }) {
             <Chip tone={d.value === 'credit' ? 'pos' : ''}>
               {d.value === 'credit' ? 'money in' : 'money out'}
             </Chip>
-            {d.signal && <Chip>{d.signal}</Chip>}
+            {/* The reason record, which the server sends as an object:
+                `{ code, label, detail, strength }`. This used to read
+                `d.signal` and `d.detail`, neither of which the endpoint has
+                ever returned - so the section that exists to say WHICH of the
+                five signals decided the direction showed one chip and nothing
+                else, on every row. */}
+            {d.reason?.label && <Chip>{d.reason.label}</Chip>}
+            {d.reason?.strength && <Chip tone="acc">{d.reason.strength}</Chip>}
           </div>
-          {d.detail && (
-            <div className="small muted" style={{ marginTop: 4, maxWidth: '70ch' }}>
-              {d.detail}
-            </div>
-          )}
+          <div className="small muted" style={{ marginTop: 4, maxWidth: '70ch' }}>
+            {d.reason?.detail
+              || (d.recorded
+                ? 'Recorded at import, from a signal this version does not have a '
+                  + 'description for.'
+                : 'This row was imported before the app recorded WHY it read the '
+                  + 'direction the way it did. The direction itself is what the '
+                  + 'statement said.')}
+          </div>
         </div>
       )}
 
@@ -665,10 +676,42 @@ function Explanation({ id }) {
           <div className="rail-group-label" style={{ padding: '0 0 6px' }}>
             What it is part of
           </div>
-          <div className="small muted" style={{ maxWidth: '70ch' }}>
-            {x.note || x.kind}
-            {x.counterpart && <> — paired with <strong>{x.counterpart}</strong></>}
+          <div className="row tight" style={{ marginBottom: 4 }}>
+            {x.kind && <Chip tone="acc">{titleCase(x.kind.replace(/_/g, ' '))}</Chip>}
+            <Chip tone={x.counted ? '' : 'warn'}>
+              {x.counted ? 'counted on this side' : 'the mirror leg — not counted here'}
+            </Chip>
+            {x.confidence > 0 && (
+              <span className="tiny dim">{Math.round(x.confidence * 100)}% confident</span>
+            )}
+            {x.day_gap != null && (
+              <span className="tiny dim">
+                {x.day_gap === 0 ? 'same day' : `${x.day_gap} day${x.day_gap === 1 ? '' : 's'} apart`}
+              </span>
+            )}
           </div>
+          <div className="small muted" style={{ maxWidth: '70ch' }}>
+            {x.what_it_means}
+          </div>
+          {/* The other legs, which is what makes the pairing checkable. The
+              panel used to promise a counterpart and read a `counterpart` key
+              that does not exist; the legs are what the server actually
+              sends. */}
+          {x.legs?.length > 1 && (
+            <table style={{ marginTop: 8 }}>
+              <tbody>
+                {x.legs.filter((leg) => !leg.is_this_row).map((leg) => (
+                  <tr key={leg.id}>
+                    <td className="nowrap tiny dim">{dateLabel(leg.date)}</td>
+                    <td className="small">{leg.description}</td>
+                    <td className="right num nowrap small">
+                      {leg.direction === 'credit' ? '+' : '−'}{money(Math.abs(leg.amount))}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
       )}
     </div>

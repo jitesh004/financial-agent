@@ -140,6 +140,19 @@ def capture(database_url: str, data_dir: str) -> dict[str, object]:
         if run.status_code == 200:
             captured["dashboard:run"] = run.json()
 
+    # Why one row is the way it is, for a plain row and for a paired one -
+    # the panel renders a different half of the payload for each.
+    ledger = captured.get("/api/transactions?limit=1000&sort_by=date&sort_dir=desc") or {}
+    rows = ledger.get("transactions") or []
+    plain = next((r for r in rows if not r["is_internal_transfer"]), None)
+    paired = next((r for r in rows if r["is_internal_transfer"]), None)
+    for label, row in (("plain", plain), ("transfer", paired)):
+        if not row:
+            continue
+        answer = client.get(f"/api/rules/explain/{row['id']}")
+        if answer.status_code == 200:
+            captured[f"explain:{label}"] = answer.json()
+
     # One widget's result, as the editor's preview asks for it.
     board = captured.get("dashboard:detail") or {}
     widgets = board.get("widgets") or []
