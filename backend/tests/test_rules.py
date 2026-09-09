@@ -234,6 +234,31 @@ def test_every_portfolio_layout_is_still_detected():
         assert portfolio.detect_layout(text)[0] == expected, text
 
 
+def test_who_wrote_a_statement_beats_what_it_calls_itself():
+    """A registrar's own name outranks a document title.
+
+    Every CAMS and KFintech mutual-fund statement is titled "Consolidated
+    Account Statement" - word for word the title of a CDSL/NSDL demat CAS,
+    which is tested first and so claimed all of them. A CAMS statement was
+    filed under "CDSL/NSDL portfolio" on every screen that names where a
+    document came from.
+    """
+    cams = ("CAMS\nConsolidated Account Statement\ncamsonline.com\n"
+            "Folio 1234 / 55 PARAG PARIKH FLEXI CAP FUND")
+    assert portfolio.detect_layout(cams) == ("cams", "CAMS")
+
+    kfin = "KFinTech\nConsolidated Account Statement\nFolio 999"
+    assert portfolio.detect_layout(kfin)[0] == "kfintech"
+
+    # …and order still settles it between two ISSUER matches, which is the
+    # right answer for the one document that legitimately carries both: an
+    # NSDL CAS names the registrar of the funds it consolidates, and is
+    # nonetheless a CAS.
+    both = ("NSDL Consolidated Account Statement\nDemat Account\n"
+            "Mutual funds serviced by CAMSONLINE")
+    assert portfolio.detect_layout(both) == ("cas", "CDSL/NSDL")
+
+
 def test_every_password_format_is_still_offered():
     for sender, expected in [
         ("x@hdfcbank.com", "Name(4) + DDMM"), ("x@icicibank.com", "Name(4) + DDMM"),

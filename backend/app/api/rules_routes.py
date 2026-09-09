@@ -152,8 +152,12 @@ def _read_rules() -> dict[str, Any]:
                           for field, aliases in bureau._LABELS.items()},
         "bureau_score_range": list(bureau.SCORE_RANGE),
         "portfolio_layouts": [
-            {"layout": layout, "provider": provider, "match": list(fragments)}
-            for layout, provider, fragments in portfolio.LAYOUT_SIGNATURES
+            {"layout": layout, "provider": provider,
+             # What the document calls itself, and who wrote it. An issuer
+             # name outranks a title - see `portfolio.detect_layout`.
+             "match": list(phrases) + list(issuers),
+             "phrases": list(phrases), "issuers": list(issuers)}
+            for layout, provider, phrases, issuers in portfolio.LAYOUT_SIGNATURES
         ],
         "portfolio_columns": [
             {"field": field, "headers": list(hints)}

@@ -35,24 +35,41 @@ log = logging.getLogger(__name__)
 # Layout detection
 # --------------------------------------------------------------------------
 
-#: (layout, provider, fragments) in the order they are tried - first match
-#: wins, so the depository layout must be tested before the generic broker one.
-#: Derived: each issuer's layout is recorded on its `rules.institutions`
-#: record, and the document phrases that identify a layout without naming
-#: anyone are in `institutions.LAYOUT_ORDER`.
-LAYOUT_SIGNATURES: list[tuple[str, str, tuple[str, ...]]] = [
-    (layout, provider, fragments)
-    for layout, provider, fragments in institutions.portfolio_layouts()
+#: (layout, provider, phrases, issuers) in the order they are tried, so the
+#: depository layout is tested before the generic broker one. Derived: each
+#: issuer's layout is recorded on its `rules.institutions` record, and the
+#: document phrases that identify a layout without naming anyone are in
+#: `institutions.LAYOUT_ORDER`.
+LAYOUT_SIGNATURES: list[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = [
+    (layout, provider, phrases, issuers)
+    for layout, provider, phrases, issuers in institutions.portfolio_layouts()
 ]
 
 
 def detect_layout(text: str, filename: str = "") -> tuple[str, str]:
-    """(layout, provider) for this document, or ("unknown", "")."""
+    """(layout, provider) for this document, or ("unknown", "").
+
+    Who wrote it beats what it calls itself.
+
+    Every CAMS and KFintech mutual-fund statement is titled "Consolidated
+    Account Statement" - the same words as a CDSL/NSDL demat CAS, which is
+    tested first and so claimed all of them. The registrars' own names are
+    on those documents ("camsonline", "kfintech", "karvy") and on nothing
+    else, so a match on one of those settles it.
+
+    Order still decides between two issuer matches, which is the right answer
+    for the one document that legitimately carries both: an NSDL CAS states
+    the mutual funds it consolidates, naming their registrar, and it is
+    nonetheless a CAS.
+    """
     haystack = f"{filename} {text[:6000]}".lower()
-    for layout, provider, fragments in LAYOUT_SIGNATURES:
-        if any(fragment in haystack for fragment in fragments):
+    by_phrase: tuple[str, str] | None = None
+    for layout, provider, phrases, issuers in LAYOUT_SIGNATURES:
+        if any(fragment in haystack for fragment in issuers):
             return layout, provider
-    return "unknown", ""
+        if by_phrase is None and any(fragment in haystack for fragment in phrases):
+            by_phrase = (layout, provider)
+    return by_phrase or ("unknown", "")
 
 
 #: Phrases that mark a securities document as a record of TRADES rather than
