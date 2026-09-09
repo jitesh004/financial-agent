@@ -248,11 +248,19 @@ function Coverage({ onImport }) {
 function CoverageGrid() {
   const toast = useToast();
   const { data, loading, refetch } = useQuery('coverage', () => api.coverage());
+  /* Whether a red cell can do anything at all. Fetching a missing month is a
+     Gmail search, so with no mailbox connected every one of them is a dead
+     end - and the grid used to invite the click anyway, run a job, and answer
+     "400: Gmail is not connected". Asked once here, so the cells can say what
+     they can do rather than finding out afterwards. */
+  const { data: gmail } = useQuery('gmail-status', () => api.gmailStatus());
   const [busyCell, setBusyCell] = useState(null);
+  const [openMonth, setOpenMonth] = useState(null);
   const [bulkJob, setBulkJob] = useState(null);
   const [bulkRunning, setBulkRunning] = useState(false);
 
   const rows = data?.accounts || [];
+  const canFetch = Boolean(gmail?.connected);
 
   // Every account starts its OWN month list from its first known statement, so
   // the columns need a shared, full-width axis to line up as a real grid.
@@ -327,14 +335,28 @@ function CoverageGrid() {
   return (
     <Card
       title="Coverage"
-      sub="One cell per account per month. Click an amber cell to retry the file, a red one to search your mailbox for just that month."
-      tools={missingCount > 0 && (
+      sub={'One cell per account per month. Click a green cell to see the rows that '
+        + 'month brought in, an amber one to retry the file that failed'
+        + (canFetch ? ', a red one to search your mailbox for just that month.' : '.')}
+      tools={missingCount > 0 && canFetch && (
         <Button size="sm" icon="download" busy={bulkRunning} onClick={fetchAllMissing}>
           Fetch {missingCount} missing
         </Button>
       )}
     >
       {bulkJob && bulkRunning && <JobProgress job={bulkJob} title="Fetching missing months" />}
+
+      {/* Said once, up here, rather than by every red cell failing in turn. */}
+      {missingCount > 0 && !canFetch && (
+        <Callout tone="warn">
+          {missingCount} month{missingCount === 1 ? ' is' : 's are'} missing a statement.
+          {gmail?.available
+            ? ' Connect your mailbox from the Import screen and the app can search it '
+              + 'for exactly those months — or add the files yourself.'
+            : ' Mailbox import is not configured on this server, so these have to be '
+              + 'added as files. Import them and the cells turn green.'}
+        </Callout>
+      )}
 
       <div className="cov" style={{ overflowX: 'auto' }}>
         <div className="cov-row">
@@ -344,36 +366,81 @@ function CoverageGrid() {
           </div>
         </div>
         {rows.map((row) => (
-          <div className="cov-row" key={row.account_id}>
-            <span className="cov-name" title={row.label}>{row.label}</span>
-            <div className="cov-cells">
-              {allMonths.map((month) => {
-                const cell = cellFor(row, month);
-                const status = cell?.status || 'na';
-                const key = `${row.account_id}:${month}`;
-                const clickable = status === 'failed' || status === 'missing';
-                return (
-                  <button
-                    key={month}
-                    type="button"
-                    className={`cov-cell ${status}`}
-                    disabled={!clickable || busyCell === key}
-                    title={`${row.label} · ${monthLabelLong(month)} — ${
-                      status === 'parsed' ? 'parsed'
-                        : status === 'failed' ? 'a file exists but failed to parse; click to retry'
-                          : status === 'missing' ? 'nothing found; click to search your mailbox'
-                            : 'before this account’s history'}`}
-                    onClick={() => {
-                      if (status === 'failed' && cell?.file_id) retry(cell.file_id, key);
-                      else if (status === 'missing') {
-                        fetchMonth(row.account_id, month, key, row.label);
-                      }
-                    }}
-                  />
-                );
-              })}
+          <React.Fragment key={row.account_id}>
+            <div className="cov-row">
+              {/* `display_name`, which is what /api/coverage sends. It read
+                  `row.label` - a key this payload has never carried - so every
+                  row of the grid was labelled with nothing, and the tooltip on
+                  each cell opened "undefined · Aug 2026". */}
+              {/* Built from the parts rather than from `display_name`.
+                  The full name is "Meridian Bank Home Loan Home Loan
+                  (XXXX9014)" - the product repeats the type, and the digits
+                  that identify the account sit at the very end, so a narrow
+                  column truncated away the only part worth reading. The whole
+                  thing is still one hover away. */}
+              <span className="cov-name" title={row.display_name}>
+                <span className="cov-name-text">
+                  {row.institution}
+                  {row.account_type && (
+                    <span className="cov-name-type">
+                      {' · '}{titleCase(row.account_type.replace(/_/g, ' '))}
+                    </span>
+                  )}
+                </span>
+                {row.masked && <span className="cov-name-masked">{row.masked}</span>}
+              </span>
+              <div className="cov-cells">
+                {allMonths.map((month) => {
+                  const cell = cellFor(row, month);
+                  const status = cell?.status || 'na';
+                  const key = `${row.account_id}:${month}`;
+                  /* What this particular cell can do, which is not the same as
+                     its colour. A failed cell with no file behind it has
+                     nothing to retry, and a missing one has nowhere to look
+                     without a mailbox - and a cell that cannot act must not
+                     look like it can, or clicking it reads as a dead button. */
+                  const action = status === 'parsed' ? 'rows'
+                    : status === 'failed' && cell?.file_id ? 'retry'
+                      : status === 'missing' && canFetch ? 'fetch' : null;
+                  const open = openMonth === key;
+                  return (
+                    <button
+                      key={month}
+                      type="button"
+                      className={`cov-cell ${status} ${action ? 'can' : ''} ${open ? 'open' : ''}`}
+                      disabled={!action || busyCell === key}
+                      aria-expanded={action === 'rows' ? open : undefined}
+                      title={`${row.display_name} · ${monthLabelLong(month)} — ${
+                        status === 'parsed'
+                          ? (action ? 'parsed; click to see its rows' : 'parsed')
+                          : status === 'failed'
+                            ? (action ? 'a file exists but failed to parse; click to retry'
+                              : 'a file for this month failed to parse')
+                            : status === 'missing'
+                              ? (action ? 'nothing found; click to search your mailbox'
+                                : 'no statement for this month has been imported')
+                              : 'before this account’s history'}`}
+                      onClick={() => {
+                        if (action === 'rows') setOpenMonth(open ? null : key);
+                        else if (action === 'retry') retry(cell.file_id, key);
+                        else if (action === 'fetch') {
+                          fetchMonth(row.account_id, month, key, row.display_name);
+                        }
+                      }}
+                    />
+                  );
+                })}
+              </div>
             </div>
-          </div>
+            {openMonth?.startsWith(`${row.account_id}:`) && (
+              <MonthRows
+                accountId={row.account_id}
+                month={openMonth.slice(row.account_id.length + 1)}
+                label={row.display_name}
+                onClose={() => setOpenMonth(null)}
+              />
+            )}
+          </React.Fragment>
         ))}
       </div>
 
@@ -384,6 +451,61 @@ function CoverageGrid() {
         <span className="legend-item"><i className="swatch" style={{ background: 'var(--surface-3)' }} />Before this account began</span>
       </div>
     </Card>
+  );
+}
+
+/* What one cell of the grid actually holds.
+ *
+ * Asked for by account and ACCOUNTING month - which is what a cell means -
+ * rather than by the file behind it. A parsed cell always knows its statement
+ * but often has no source-file record linked to it, so a panel keyed on the
+ * file opened for some months and silently not for others. */
+function MonthRows({ accountId, month, label, onClose }) {
+  const { data, loading, error } = useQuery(
+    `cov-rows:${accountId}:${month}`,
+    () => api.transactions({
+      account_id: accountId, accounting_month: month,
+      limit: api.PAGE_MAX, sort_by: 'date', sort_dir: 'asc',
+    }),
+  );
+  const rows = data?.transactions || [];
+
+  return (
+    <div className="cov-open">
+      <div className="row" style={{ padding: '8px 10px' }}>
+        <strong style={{ fontSize: 12 }}>{label} · {monthLabelLong(month)}</strong>
+        {data && <Chip>{count(data.total)} row{data.total === 1 ? '' : 's'}</Chip>}
+        <span className="spacer" />
+        <Button size="xs" onClick={onClose}>Hide</Button>
+      </div>
+      {loading && <Loading label="Reading that month…" pad={12} />}
+      {error && <div style={{ padding: 12 }}><Callout tone="neg">{error.message}</Callout></div>}
+      {data && !rows.length && (
+        <div className="small dim" style={{ padding: '0 12px 12px' }}>
+          A statement covering this month parsed, but no transaction is counted in it.
+        </div>
+      )}
+      {rows.length > 0 && (
+        <Table scrollY maxHeight={300} className="on-2">
+          <thead>
+            <tr><th>Date</th><th>Description</th><th>Category</th><th className="right">Amount</th></tr>
+          </thead>
+          <tbody>
+            {rows.map((t) => (
+              <tr key={t.id}>
+                <td className="nowrap">{dateLabel(t.date)}</td>
+                <td style={{ overflowWrap: 'anywhere' }}>{t.description}</td>
+                <td><Chip>{titleCase(t.category)}</Chip></td>
+                <td className="right num nowrap"
+                  style={{ color: t.direction === 'credit' ? 'var(--pos)' : 'inherit' }}>
+                  {t.direction === 'credit' ? '+' : '−'}{money(t.amount, true)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </Table>
+      )}
+    </div>
   );
 }
 

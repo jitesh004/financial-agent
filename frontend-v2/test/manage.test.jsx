@@ -418,6 +418,216 @@ describe('an agent answer', () => {
   });
 });
 
+/* A coverage grid with one of every kind of cell, in the shape
+   /api/coverage answers. */
+function coverageWith(months, row = {}) {
+  return {
+    accounts: [{
+      account_id: 'acc-1',
+      display_name: 'Northwind Card Everyday Rewards Credit Card (XXXX7731)',
+      institution: 'Northwind Card',
+      masked: 'XXXX7731',
+      account_type: 'credit_card',
+      months,
+      ...row,
+    }],
+  };
+}
+
+const gmailConnected = { ...fixture('/api/gmail/status'), available: true, connected: true };
+
+describe('the coverage grid', () => {
+  it('names every row', async () => {
+    renderScreen(<Data />, { route: '/data' });
+    const account = fixture('/api/coverage').accounts[0];
+
+    // It read `row.label` - a key /api/coverage has never carried - so every
+    // row of the grid was labelled with nothing at all.
+    await waitFor(() => {
+      const names = [...document.querySelectorAll('.cov-name')]
+        .map((el) => el.textContent.trim());
+      expect(names.length).toBe(fixture('/api/coverage').accounts.length);
+      expect(names.every((n) => n.length > 3)).toBe(true);
+      expect(names[0]).toContain(account.institution);
+    }, { timeout: 8000 });
+  });
+
+  it('shows the account number, which is what tells two cards apart', async () => {
+    renderScreen(<Data />, { route: '/data' });
+    const account = fixture('/api/coverage').accounts[0];
+    expect(await screen.findByText(account.masked, {}, { timeout: 8000 })).toBeTruthy();
+  });
+
+  it('keeps the full name one hover away', async () => {
+    renderScreen(<Data />, { route: '/data' });
+    const account = fixture('/api/coverage').accounts[0];
+    await waitFor(() => {
+      expect(document.querySelector(`[title="${account.display_name}"]`)).toBeTruthy();
+    }, { timeout: 8000 });
+  });
+
+  it('opens the rows a green cell stands for', async () => {
+    const user = userEvent.setup();
+    renderScreen(<Data />, { route: '/data' });
+
+    const cells = await waitFor(() => {
+      const found = document.querySelectorAll('.cov-cell.parsed');
+      expect(found.length).toBeGreaterThan(0);
+      return found;
+    }, { timeout: 8000 });
+    await user.click(cells[0]);
+
+    await waitFor(() => {
+      const call = [...server.calls].reverse().find(
+        (c) => c.path === '/api/transactions');
+      const params = new URLSearchParams(call.search);
+      // By account and ACCOUNTING month, which is what a cell means. A parsed
+      // cell often has no source file linked to it, so keying the panel on
+      // the file opened for some months and silently not for others.
+      expect(params.get('account_id')).toBeTruthy();
+      expect(params.get('accounting_month')).toMatch(/^\d{4}-\d{2}$/);
+    }, { timeout: 8000 });
+  });
+
+  it('never lets a cell with nothing to do look clickable', async () => {
+    renderScreen(<Data />, { route: '/data' });
+    await waitFor(() => {
+      expect(document.querySelectorAll('.cov-cell').length).toBeGreaterThan(0);
+    }, { timeout: 8000 });
+
+    // Every cell is either actionable AND enabled, or neither. A disabled
+    // button that still takes the pointer cursor and the hover animation is
+    // indistinguishable from a broken one.
+    for (const cell of document.querySelectorAll('.cov-cell')) {
+      expect(cell.classList.contains('can')).toBe(!cell.disabled);
+    }
+  });
+
+  it('a month before the account began is never actionable', async () => {
+    server = createServer({
+      routes: {
+        'GET /api/coverage': coverageWith([
+          { month: '2026-08', status: 'na', statement_id: null, file_id: null },
+        ]),
+      },
+    });
+    renderScreen(<Data />, { route: '/data' });
+    await waitFor(() => {
+      const cell = document.querySelector('.cov-cell.na');
+      expect(cell).toBeTruthy();
+      expect(cell.disabled).toBe(true);
+    }, { timeout: 8000 });
+  });
+
+  it('retries the file behind an amber cell', async () => {
+    const user = userEvent.setup();
+    server = createServer({
+      routes: {
+        'GET /api/coverage': coverageWith([
+          { month: '2026-08', status: 'failed', statement_id: null, file_id: 'file-9' },
+        ]),
+        'POST /api/files/file-9/retry': { status: 'ok', message: 'Parsed on the retry.' },
+      },
+    });
+    renderScreen(<Data />, { route: '/data' });
+
+    const cell = await waitFor(() => {
+      const found = document.querySelector('.cov-cell.failed');
+      expect(found).toBeTruthy();
+      return found;
+    }, { timeout: 8000 });
+    await user.click(cell);
+
+    await waitFor(() => {
+      expect(server.lastCall('/api/files/file-9/retry', 'POST')).toBeTruthy();
+    }, { timeout: 8000 });
+  });
+
+  it('an amber cell with no file behind it is not clickable', async () => {
+    server = createServer({
+      routes: {
+        'GET /api/coverage': coverageWith([
+          { month: '2026-08', status: 'failed', statement_id: null, file_id: null },
+        ]),
+      },
+    });
+    renderScreen(<Data />, { route: '/data' });
+    await waitFor(() => {
+      const cell = document.querySelector('.cov-cell.failed');
+      expect(cell).toBeTruthy();
+      // There is nothing to retry, so it must not offer to.
+      expect(cell.disabled).toBe(true);
+    }, { timeout: 8000 });
+  });
+
+  it('searches the mailbox for a red cell when there is a mailbox', async () => {
+    const user = userEvent.setup();
+    server = createServer({
+      routes: {
+        'GET /api/gmail/status': gmailConnected,
+        'GET /api/coverage': coverageWith([
+          { month: '2026-08', status: 'missing', statement_id: null, file_id: null },
+        ]),
+        'POST /api/coverage/acc-1/2026-08/fetch': { job_id: 'fetch-1' },
+        'GET /api/jobs/fetch-1': {
+          id: 'fetch-1', kind: 'process', active: false, status: 'complete',
+          result: { status: 'ok', message: 'Found it.' },
+        },
+      },
+    });
+    renderScreen(<Data />, { route: '/data' });
+
+    const cell = await waitFor(() => {
+      const found = document.querySelector('.cov-cell.missing');
+      expect(found).toBeTruthy();
+      expect(found.disabled).toBe(false);
+      return found;
+    }, { timeout: 8000 });
+    await user.click(cell);
+
+    await waitFor(() => {
+      expect(server.lastCall('/api/coverage/acc-1/2026-08/fetch', 'POST')).toBeTruthy();
+    }, { timeout: 8000 });
+  });
+
+  it('says why a red cell cannot be clicked when there is no mailbox', async () => {
+    server = createServer({
+      routes: {
+        'GET /api/coverage': coverageWith([
+          { month: '2026-08', status: 'missing', statement_id: null, file_id: null },
+        ]),
+      },
+    });
+    renderScreen(<Data />, { route: '/data' });
+
+    await waitFor(() => {
+      const cell = document.querySelector('.cov-cell.missing');
+      expect(cell).toBeTruthy();
+      // Clicking it used to start a job that could only come back
+      // "400: Gmail is not connected".
+      expect(cell.disabled).toBe(true);
+    }, { timeout: 8000 });
+    expect(await screen.findByText(
+      /missing a statement/i, {}, { timeout: 8000 })).toBeTruthy();
+    // …and the bulk button is not offered either, for the same reason.
+    expect(screen.queryByRole('button', { name: /fetch \d+ missing/i })).toBeNull();
+  });
+
+  it('offers the bulk fetch only when the mailbox can answer it', async () => {
+    server = createServer({
+      routes: {
+        'GET /api/gmail/status': gmailConnected,
+        'GET /api/coverage': coverageWith([
+          { month: '2026-08', status: 'missing', statement_id: null, file_id: null },
+        ]),
+      },
+    });
+    renderScreen(<Data />, { route: '/data' });
+    expect(await screen.findByRole(
+      'button', { name: /fetch 1 missing/i }, { timeout: 8000 })).toBeTruthy();
+  });
+});
+
 describe('Data', () => {
   it('shows the coverage grid, one cell per account per month', async () => {
     renderScreen(<Data />, { route: '/data' });
