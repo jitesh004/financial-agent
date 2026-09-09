@@ -376,6 +376,48 @@ if (!IMPORT_MODE) {
     await page.waitForTimeout(900);
     ok('the coverage grid lists the accounts', /Accounts detected/i.test(await text()));
 
+    /* The grid's row labels, which were blank for as long as they existed:
+       it read a key the payload does not carry. Checked against the API's own
+       answer rather than against a fixed string. */
+    const covered = await page.evaluate(
+      async () => (await (await fetch('/api/coverage')).json()).accounts);
+    const labels = await page.locator('.cov-name').allInnerTexts();
+    ok('every row of the grid is labelled',
+      labels.length === covered.length && labels.every((l) => l.trim().length > 3),
+      JSON.stringify(labels.map((l) => l.replace(/\n/g, ' '))));
+    ok('…and names the account it is about',
+      covered.every((a, i) => labels[i].includes(a.institution)
+        && (!a.masked || labels[i].includes(a.masked))));
+
+    /* A cell that cannot act must not look like it can. Most cells on a
+       healthy grid are green with nothing to do, and every one of them took
+       the pointer cursor and the hover animation. */
+    const cells = await page.locator('.cov-cell').evaluateAll((els) => els.map((e) => ({
+      disabled: e.disabled,
+      can: e.classList.contains('can'),
+      cursor: getComputedStyle(e).cursor,
+    })));
+    ok('there are cells to check', cells.length > 0, `${cells.length} cells`);
+    ok('no cell claims to be clickable while disabled',
+      cells.every((c) => c.can === !c.disabled && (c.can || c.cursor !== 'pointer')));
+
+    /* And a green one opens what it stands for. */
+    const green = page.locator('.cov-cell.parsed.can').first();
+    if ((await green.count()) > 0) {
+      await green.click();
+      await page.waitForTimeout(1400);
+      ok('a green cell opens the rows counted in that month',
+        (await page.locator('.cov-open').count()) > 0);
+      ok('…asked for by account and accounting month',
+        sent((r) => r.url.startsWith('/api/transactions?')
+          && r.url.includes('accounting_month=')));
+      await page.getByRole('button', { name: 'Hide' }).first().click();
+    } else {
+      ok('a green cell opens the rows counted in that month', false,
+        'no actionable green cell on this workspace');
+    }
+
+
     await page.goto(`${BASE}/data?section=files`, { waitUntil: 'networkidle' });
     await page.waitForTimeout(900);
     const files = await page.evaluate(

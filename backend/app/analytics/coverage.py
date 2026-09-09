@@ -192,6 +192,12 @@ def build_coverage(
             "account_id": account.id,
             "display_name": account.display_name(),
             "institution": account.institution,
+            # The last four digits, on their own. `display_name` ends with
+            # them in brackets, but the grid's row label is a narrow column
+            # that truncates - and the digits are the end of the string, so
+            # they were always the first thing to go. They are also the only
+            # part that tells two cards at one bank apart.
+            "masked": account.account_number_masked or "",
             "account_type": account.account_type.value,
             "months": months,
         })

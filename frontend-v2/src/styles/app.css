@@ -1483,25 +1483,44 @@ button.barrow:hover { background: var(--surface-hover); }
 /* ── coverage grid ───────────────────────────────────────────────────────── */
 
 .cov { display: grid; gap: 3px; font-size: 11px; }
-.cov-row { display: grid; grid-template-columns: 168px 1fr; gap: 8px; align-items: center; }
-.cov-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.cov-row { display: grid; grid-template-columns: 232px 1fr; gap: 8px; align-items: center; }
+/* Two halves: the name gives up its width first, the account number never
+   does. The digits are the end of `display_name`, so a single truncating
+   span dropped exactly the part that identifies the account. */
+.cov-name { display: flex; gap: 5px; align-items: baseline; min-width: 0; color: var(--text-2); }
+.cov-name-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cov-name-type { color: var(--text-3); }
+.cov-name-masked { flex: none; color: var(--text-3); font-variant-numeric: tabular-nums; }
 .cov-cells { display: flex; gap: 2px; overflow-x: auto; padding-bottom: 2px; }
 .cov-cell {
   width: 17px; height: 17px;
   border-radius: 3px;
   border: 0;
   flex: none;
-  cursor: pointer;
+  /* Default is NOT pointer. Most cells on a healthy grid are green and have
+     nothing to do; every one of them used to take the pointer cursor and the
+     hover animation, so twenty-eight inert squares advertised themselves as
+     buttons. Only `.can` - a cell with something to actually do - is
+     interactive. */
+  cursor: default;
   padding: 0;
   transition: transform var(--t-fast), outline-color var(--t-fast);
   outline: 1px solid transparent;
 }
-.cov-cell:hover { transform: scale(1.22); outline-color: var(--text); z-index: 1; }
+.cov-cell.can { cursor: pointer; }
+.cov-cell.can:hover { transform: scale(1.22); outline-color: var(--text); z-index: 1; }
+.cov-cell.open { transform: scale(1.22); outline-color: var(--text); z-index: 1; }
 .cov-cell.parsed  { background: var(--pos); }
 .cov-cell.failed  { background: var(--warn); }
 .cov-cell.missing { background: var(--neg); opacity: .55; }
-.cov-cell.na      { background: var(--surface-3); cursor: default; }
-.cov-cell.na:hover { transform: none; outline-color: transparent; }
+.cov-cell.na      { background: var(--surface-3); }
+.cov-open {
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  margin: 2px 0 6px;
+  overflow: hidden;
+}
 .cov-months { display: flex; gap: 2px; }
 .cov-month {
   width: 17px;

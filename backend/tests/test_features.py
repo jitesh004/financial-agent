@@ -1379,6 +1379,41 @@ def test_build_coverage_colors_each_month_correctly():
         assert by_month["2025-10"] == "missing"
 
 
+def test_a_coverage_row_names_the_account_it_is_about():
+    """Every field the grid's row label is built from.
+
+    The v2 grid read `row.label`, a key this payload has never carried, so
+    every row was labelled with nothing and each cell's tooltip opened
+    "undefined · Aug 2026". These are the names it reads now; dropping or
+    renaming one blanks the labels again.
+    """
+    from datetime import date
+    from types import SimpleNamespace
+    from app.analytics.coverage import build_coverage
+    from app.models.schemas import Account, AccountType
+
+    account = Account(id="a1", institution="Northwind Card",
+                      product_name="Everyday Rewards",
+                      account_type=AccountType.CREDIT_CARD,
+                      account_number_masked="XXXX7731")
+    stmt = SimpleNamespace(id="s1", period_start=date(2025, 8, 1),
+                           period_end=date(2025, 8, 31))
+
+    [row] = build_coverage([account], {"a1": [stmt]}, {"a1": []})
+
+    assert row["account_id"] == "a1"
+    assert row["institution"] == "Northwind Card"
+    assert row["account_type"] == "credit_card"
+    # The last four digits on their own. They are the tail of `display_name`,
+    # so a narrow, truncating column dropped exactly the part that tells two
+    # cards at one bank apart.
+    assert row["masked"] == "XXXX7731"
+    assert row["display_name"] == account.display_name()
+
+    # And every cell carries what the grid needs to act on it.
+    assert {"month", "status", "statement_id", "file_id"} <= set(row["months"][0])
+
+
 def test_build_coverage_prefers_parsed_over_a_prior_failed_attempt():
     """A file that failed once and was later retried successfully must show
     green for that month, not orange - the retry record's statement_id
