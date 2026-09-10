@@ -449,10 +449,11 @@ _SORTABLE_COLUMNS = {
     "amount": "CAST(amount AS REAL)",
     "balance": "CAST(balance_after AS REAL)",
     # Case-insensitively, or every capitalised narration sorts ahead of every
-    # lowercase one and the order reads as arbitrary.
-    "description": "LOWER(raw_description)",
-    "category": "LOWER(category)",
-    "merchant": "LOWER(COALESCE(NULLIF(merchant, ''), raw_description))",
+    # lowercase one and the order reads as arbitrary. "C" collation guarantees
+    # byte-order consistency matching Python's standard sorting.
+    "description": 'LOWER(raw_description) COLLATE "C"',
+    "category": 'LOWER(category) COLLATE "C"',
+    "merchant": 'LOWER(COALESCE(NULLIF(merchant, \'\'), raw_description)) COLLATE "C"',
 }
 
 
