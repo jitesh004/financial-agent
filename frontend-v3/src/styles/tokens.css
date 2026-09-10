@@ -1,0 +1,275 @@
+/* ────────────────────────────────────────────────────────────────────────────
+   Prism v3 Design Tokens
+   Obsidian Dark & Alabaster Light tailored palettes.
+   ──────────────────────────────────────────────────────────────────────── */
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces & Canvas */
+  --bg:            #f8fafc;
+  --bg-sunken:     #f1f5f9;
+  --bg-mesh:       radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.05) 0px, transparent 50%),
+                   radial-gradient(at 100% 100%, rgba(16, 185, 129, 0.04) 0px, transparent 50%);
+  --surface:       #ffffff;
+  --surface-2:     #f8fafc;
+  --surface-3:     #f1f5f9;
+  --surface-hover: #f1f5f9;
+  --overlay:       rgba(15, 23, 42, 0.45);
+  
+  /* Glassmorphism */
+  --glass:         rgba(255, 255, 255, 0.78);
+  --glass-border:  rgba(226, 232, 240, 0.8);
+  --glass-glow:    rgba(99, 102, 241, 0.06);
+  --glass-blur:    blur(16px);
+
+  /* Lines & Borders */
+  --line:          #e2e8f0;
+  --line-strong:   #cbd5e1;
+  --line-accent:   #c7d2fe;
+
+  /* Spacing Scale */
+  --space-0:       0px;
+  --space-1:       4px;
+  --space-2:       8px;
+  --space-3:       12px;
+  --space-4:       16px;
+  --space-5:       20px;
+  --space-6:       24px;
+  --space-7:       28px;
+  --space-8:       32px;
+  --space-10:      40px;
+  --space-12:      48px;
+  --space-16:      64px;
+
+  /* Typography Scale */
+  --text-2xs:      10px;
+  --text-xs:       11px;
+  --text-sm:       12.5px;
+  --text-base:     14px;
+  --text-lg:       16px;
+  --text-xl:       18px;
+  --text-2xl:      22px;
+  --text-3xl:      28px;
+  --text-4xl:      36px;
+
+  /* Typography */
+  --text:          #0f172a;
+  --text-1:        #0f172a;
+  --text-2:        #475569;
+  --text-3:        #64748b;
+  --text-on-accent:#ffffff;
+
+  /* Accent & Brand (Cyber Indigo & Emerald) */
+  --accent:        #4f46e5;
+  --brand-primary: #4f46e5;
+  --accent-hover:  #4338ca;
+  --accent-soft:   #eef2ff;
+  --accent-border: #c7d2fe;
+  --accent-text:   #4338ca;
+  --accent-glow:   rgba(79, 70, 229, 0.22);
+  --accent-teal:   #0f766e;
+  --border-subtle: #e2e8f0;
+
+  /* Semantic Meanings.
+     One step darker than the 600-weight versions these started as: at 11-13px
+     the lighter shades measured 3.1-4.3:1 against white and against their own
+     soft fills, so every badge, chip and figure using them failed AA. These
+     clear 4.5:1 on both. */
+  --pos:           #047857;
+  --state-pos:     #047857;
+  --pos-hover:     #065f46;
+  --pos-soft:      #ecfdf5;
+  --pos-border:    #a7f3d0;
+  --pos-glow:      rgba(5, 150, 105, 0.2);
+
+  --neg:           #be123c;
+  --state-neg:     #be123c;
+  --neg-hover:     #9f1239;
+  /* The shade a danger button paints behind white text. */
+  --neg-solid:     #be123c;
+  --neg-soft:      #fff1f2;
+  --neg-border:    #fecdd3;
+  --neg-glow:      rgba(225, 29, 72, 0.2);
+
+  --warn:          #b45309;
+  --state-warn:    #b45309;
+  --warn-hover:    #92400e;
+  --warn-soft:     #fffbeb;
+  --warn-border:   #fde68a;
+  --warn-glow:     rgba(217, 119, 6, 0.2);
+
+  --info:          #0284c7;
+  --state-info:    #0284c7;
+  --info-soft:     #f0f9ff;
+  --info-border:   #bae6fd;
+
+  /* Categorical Color Spectrum (Vibrant & Distinct) */
+  --c1:  #4f46e5; /* Indigo */
+  --c2:  #059669; /* Emerald */
+  --c3:  #d97706; /* Amber */
+  --c4:  #db2777; /* Pink */
+  --c5:  #0284c7; /* Sky */
+  --c6:  #7c3aed; /* Violet */
+  --c7:  #e11d48; /* Rose */
+  --c8:  #16a34a; /* Green */
+  --c9:  #ea580c; /* Orange */
+  --c10: #0891b2; /* Cyan */
+  --c11: #9333ea; /* Purple */
+  --c12: #475569; /* Slate */
+
+  /* Shadows with ambient tone */
+  --shadow-sm: 0 1px 2px 0 rgba(15, 23, 42, 0.05);
+  --shadow-1:  0 1px 3px 0 rgba(15, 23, 42, 0.06), 0 1px 2px -1px rgba(15, 23, 42, 0.06);
+  --shadow-2:  0 4px 12px -2px rgba(15, 23, 42, 0.08), 0 2px 6px -2px rgba(15, 23, 42, 0.04);
+  --shadow-3:  0 12px 28px -4px rgba(15, 23, 42, 0.12), 0 6px 14px -4px rgba(15, 23, 42, 0.06);
+  --shadow-glow: 0 0 24px -4px var(--accent-glow);
+  --ring: 0 0 0 3px var(--accent-soft), 0 0 0 1px var(--accent);
+
+  /* Geometry */
+  --r-xs: 6px;
+  --r-sm: 8px;
+  --r:    12px;
+  --r-lg: 16px;
+  --r-xl: 24px;
+  --r-full: 9999px;
+
+  /* Transitions */
+  --e-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --e-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --t-fast: 120ms;
+  --t: 180ms;
+  --t-slow: 300ms;
+
+  /* Typography Stacks */
+  --font-display: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+  --font-sans: 'Inter Variable', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  /* Dimensions */
+  --rail: 256px;
+  --rail-collapsed: 68px;
+  --topbar: 60px;
+  --copilot-width: 440px;
+  --page-max:      1600px;
+  /* Geometry & Surface Aliases */
+  --radius-xs:     var(--r-xs);
+  --radius-sm:     var(--r-sm);
+  --radius-md:     var(--r);
+  --radius-lg:     var(--r-lg);
+  --radius-xl:     var(--r-xl);
+  --radius-full:   var(--r-full);
+  --surface-primary: var(--surface);
+  --surface-secondary: var(--surface-2);
+  --surface-tertiary: var(--surface-3);
+  --surface-panel: var(--surface);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Obsidian Void Surfaces */
+  --bg:            #090b10;
+  --bg-sunken:     #05070a;
+  --bg-mesh:       radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.12) 0px, transparent 50%),
+                   radial-gradient(at 100% 100%, rgba(16, 185, 129, 0.08) 0px, transparent 50%);
+  --surface:       #111520;
+  --surface-2:     #161b28;
+  --surface-3:     #1d2436;
+  --surface-hover: #1c2333;
+  --overlay:       rgba(3, 5, 10, 0.72);
+
+  /* Glassmorphism */
+  --glass:         rgba(17, 21, 32, 0.75);
+  --glass-border:  rgba(255, 255, 255, 0.09);
+  --glass-glow:    rgba(99, 102, 241, 0.15);
+  --glass-blur:    blur(20px);
+
+  /* Lines & Borders */
+  --line:          rgba(255, 255, 255, 0.07);
+  --line-strong:   rgba(255, 255, 255, 0.14);
+  --line-accent:   rgba(99, 102, 241, 0.35);
+
+  /* Typography */
+  --text:          #f8fafc;
+  --text-1:        #f8fafc;
+  --text-2:        #94a3b8;
+  /* One step lighter than slate-500, which measured 3.3-4.1:1 against these
+     surfaces. Every muted label in the app uses this. */
+  --text-3:        #8695ab;
+  --text-on-accent:#090b10;
+
+  /* Accents */
+  --accent:        #6366f1;
+  --brand-primary: #6366f1;
+  --accent-hover:  #818cf8;
+  --accent-soft:   rgba(99, 102, 241, 0.15);
+  --accent-border: rgba(99, 102, 241, 0.35);
+  --accent-text:   #a5b4fc;
+  --accent-glow:   rgba(99, 102, 241, 0.35);
+  --accent-teal:   #14b8a6;
+  --border-subtle: rgba(255, 255, 255, 0.07);
+
+  /* Semantic Meanings */
+  --pos:           #10b981;
+  --state-pos:     #10b981;
+  --pos-hover:     #34d399;
+  --pos-soft:      rgba(16, 185, 129, 0.14);
+  --pos-border:    rgba(16, 185, 129, 0.32);
+  --pos-glow:      rgba(16, 185, 129, 0.3);
+
+  --neg:           #f43f5e;
+  --state-neg:     #f43f5e;
+  --neg-hover:     #fb7185;
+  /* #f43f5e reads at 3.67:1 under white text; this clears 4.5:1. */
+  --neg-solid:     #c81e3f;
+  --neg-soft:      rgba(244, 63, 94, 0.14);
+  --neg-border:    rgba(244, 63, 94, 0.32);
+  --neg-glow:      rgba(244, 63, 94, 0.3);
+
+  --warn:          #f59e0b;
+  --state-warn:    #f59e0b;
+  --warn-hover:    #fbbf24;
+  --warn-soft:     rgba(245, 158, 11, 0.14);
+  --warn-border:   rgba(245, 158, 11, 0.32);
+  --warn-glow:     rgba(245, 158, 11, 0.3);
+
+  --info:          #38bdf8;
+  --state-info:    #38bdf8;
+  --info-soft:     rgba(56, 189, 248, 0.14);
+  --info-border:   rgba(56, 189, 248, 0.32);
+
+  /* 12 Categorical Slots */
+  --c1:  #818cf8; /* Indigo */
+  --c2:  #34d399; /* Emerald */
+  --c3:  #fbbf24; /* Amber */
+  --c4:  #f472b6; /* Pink */
+  --c5:  #38bdf8; /* Sky */
+  --c6:  #a78bfa; /* Violet */
+  --c7:  #fb7185; /* Rose */
+  --c8:  #4ade80; /* Green */
+  --c9:  #fb923c; /* Orange */
+  --c10: #22d3ee; /* Cyan */
+  --c11: #c084fc; /* Purple */
+  --c12: #94a3b8; /* Slate */
+
+  /* Depth Shadows with Obsidian Glow */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.5);
+  --shadow-1:  0 2px 4px 0 rgba(0, 0, 0, 0.4), 0 1px 2px -1px rgba(0, 0, 0, 0.4);
+  --shadow-2:  0 6px 18px -3px rgba(0, 0, 0, 0.6), 0 3px 8px -3px rgba(0, 0, 0, 0.4);
+  --shadow-3:  0 16px 36px -6px rgba(0, 0, 0, 0.8), 0 8px 18px -4px rgba(0, 0, 0, 0.6);
+  --shadow-glow: 0 0 32px -4px var(--accent-glow);
+  --ring: 0 0 0 3px var(--accent-soft), 0 0 0 1px var(--accent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --t-fast: 1ms;
+    --t: 1ms;
+    --t-slow: 1ms;
+  }
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

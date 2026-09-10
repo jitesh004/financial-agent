@@ -120,5 +120,21 @@ services:
     environment:
       - VITE_API_PROXY_TARGET=http://backend:8078
 
+  # V3. Complete redesign: Obsidian dark theme, interactive debt/budget simulators,
+  # custom analytics widget studio, copilot assistant, and audit telemetry.
+  # Runs side-by-side with v1 (5173) and v2 (5174) on port 5175.
+  frontend-v3:
+    build:
+      context: ./frontend-v3
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./frontend-v3:/app
+      - /app/node_modules
+    ports:
+      - "5175:5175"
+    environment:
+      - VITE_API_PROXY_TARGET=http://backend:8078
+
 volumes:
   pgdata:
+

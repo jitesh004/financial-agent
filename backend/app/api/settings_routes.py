@@ -62,7 +62,21 @@ def _llm_status() -> dict[str, Any]:
         provider, configured = status()
     except Exception:  # pragma: no cover - settings must never 500
         provider, configured = "unknown", False
-    return {"llm_provider": provider, "llm_configured": bool(configured)}
+
+    try:
+        from ..llm import settings as llm_settings
+        live = llm_settings.effective()
+        model = live["llm_model_strong"] or live["llm_model_fast"]
+        customised = bool(llm_settings.public()["overridden"])
+    except Exception:  # pragma: no cover
+        model, customised = "", False
+
+    return {
+        "llm_provider": provider,
+        "llm_configured": bool(configured),
+        "llm_model": model,
+        "llm_customised": customised,
+    }
 
 
 def _settings_payload() -> dict[str, Any]:
@@ -76,7 +90,12 @@ def _settings_payload() -> dict[str, Any]:
     db = get_db()
     pending = sum(1 for t in repo.get_transactions(db)
                   if _awaiting_a_category(t))
-    return {**repo.get_settings(db), **_llm_status(),
+    stored = repo.get_settings(db)
+    # The API key is write-only over HTTP. It lives in the same table as the
+    # rest of a user's settings, so a blanket spread would hand it back on
+    # every GET; the masked hint is served by /api/settings/llm instead.
+    stored.pop("llm_api_key", None)
+    return {**stored, **_llm_status(),
             "uncategorized_count": pending}
 
 
@@ -116,7 +135,8 @@ def start_categorize(background: BackgroundTasks,
     if not status["llm_configured"]:
         raise HTTPException(
             400, "No model provider is configured, so there is nothing to "
-                 "call. Add an API key to your .env and restart the API.")
+                 "call. Choose a provider and paste an API key under "
+                 "Settings, or set one in .env.")
 
     pending = [t for t in repo.get_transactions(db)
                if _awaiting_a_category(t)]
@@ -437,3 +457,130 @@ def _reread(db, user_id: str) -> User | None:
     from ..auth import store
 
     return store.get_user(db, user_id)
+
+
+# --------------------------------------------------------------------------
+# Which model this workspace calls
+#
+# `.env` sets the deployment default; anything saved here overrides it for
+# this user and persists. The key is accepted but never returned: reads get a
+# masked hint, which is enough to recognise a key without disclosing it.
+# --------------------------------------------------------------------------
+
+class LlmConfig(BaseModel):
+    #: Every field is optional, and an empty string is meaningful - it clears
+    #: the override and hands that one setting back to .env. `None` means
+    #: "leave whatever is stored alone".
+    provider: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    model_fast: str | None = None
+    model_strong: str | None = None
+    agent_profile: str | None = None
+
+
+@router.get("/llm")
+def read_llm_config() -> dict[str, Any]:
+    from ..llm import settings as llm_settings
+
+    return {**llm_settings.public(), **_llm_status()}
+
+
+@router.put("/llm")
+def write_llm_config(payload: LlmConfig) -> dict[str, Any]:
+    """Save the overrides, after checking they name something real."""
+    from ..llm import settings as llm_settings
+    from ..llm.client import reset_clients
+
+    if payload.provider:
+        if payload.provider not in llm_settings.BY_KEY:
+            raise HTTPException(
+                400, f"Unknown provider {payload.provider!r}. Choose one of: "
+                     f"{', '.join(llm_settings.BY_KEY)}.")
+    if payload.agent_profile:
+        if payload.agent_profile not in llm_settings.AGENT_PROFILE_KEYS:
+            raise HTTPException(
+                400, f"Unknown agent budget {payload.agent_profile!r}. Choose "
+                     f"one of: {', '.join(sorted(llm_settings.AGENT_PROFILE_KEYS))}.")
+
+    changes = {
+        "llm_provider": payload.provider,
+        "llm_api_key": payload.api_key,
+        "llm_base_url": payload.base_url,
+        "llm_model_fast": payload.model_fast,
+        "llm_model_strong": payload.model_strong,
+        "agent_profile": payload.agent_profile,
+    }
+    # A field left out of the request keeps its stored value; a field sent
+    # empty clears the override. Both are useful, and only `None` is silent.
+    writes = {k: v.strip() if isinstance(v, str) else v
+              for k, v in changes.items() if v is not None}
+    if writes:
+        repo.save_settings(get_db(), writes)
+        # Cached clients are bound to the provider they were built for.
+        reset_clients()
+
+    return {**llm_settings.public(), **_llm_status()}
+
+
+@router.delete("/llm")
+def clear_llm_config() -> dict[str, Any]:
+    """Drop every override and go back to what .env configured."""
+    from ..llm import settings as llm_settings
+    from ..llm.client import reset_clients
+
+    repo.save_settings(get_db(), {k: "" for k in llm_settings.OVERRIDE_KEYS})
+    reset_clients()
+    return {**llm_settings.public(), **_llm_status()}
+
+
+@router.post("/llm/test")
+def test_llm_config() -> dict[str, Any]:
+    """Make one tiny real call, so "configured" means "answers".
+
+    A key can be present, well-formed and still rejected - wrong provider,
+    revoked, out of quota, a model name the account cannot reach. None of
+    that is visible from the settings alone, and finding out during an import
+    is the worst time to find out.
+    """
+    from ..llm import settings as llm_settings
+    from ..llm.client import get_client, reset_clients
+
+    reset_clients()
+    live = llm_settings.effective()
+    client = get_client("fast")
+
+    if not live["llm_provider"]:
+        return {"ok": False, "detail": "No provider selected.",
+                **llm_settings.public()}
+    if not client.available:
+        return {"ok": False,
+                "detail": "No API key for this provider, so nothing can be called.",
+                **llm_settings.public()}
+
+    try:
+        # Generous for a one-word answer on purpose: a reasoning model spends
+        # tokens thinking before it emits anything, and a 16-token ceiling had
+        # it return an empty string - which reads as "broken key" when the key
+        # is fine and only the budget was too tight.
+        reply = client.complete(
+            prompt="Reply with the single word: ready",
+            system="You are a connectivity probe. Answer in one word.",
+            max_tokens=512,
+        )
+    except Exception as exc:
+        detail = str(exc).strip() or exc.__class__.__name__
+        return {"ok": False, "detail": detail[:400], **llm_settings.public()}
+
+    answer = (reply or "").strip()
+    model = live["llm_model_fast"] or "the default model"
+    return {
+        "ok": bool(answer),
+        "detail": (f"{live['llm_provider']} answered with {answer[:60]!r} using {model}."
+                   if answer else
+                   f"{live['llm_provider']} accepted the call on {model} but returned "
+                   f"no text. The key works; this model may be spending its whole "
+                   f"budget on internal reasoning, or refusing the prompt."),
+        "model": live["llm_model_fast"],
+        **llm_settings.public(),
+    }

@@ -20,6 +20,7 @@ import re
 from typing import Any
 
 from ..config import config
+from . import settings as llm_settings
 from .providers import (Provider, OpenRouterProvider, AzureOpenAIProvider,
                         GeminiProvider)
 
@@ -224,39 +225,56 @@ class LLMClient:
         )
 
 
-_clients: dict[str, LLMClient] = {}
+_clients: dict[tuple[str, str], LLMClient] = {}
+
+_UNKNOWN_PROVIDER_WARNED: set[str] = set()
 
 
 def get_client(model: str = DEFAULT_MODEL) -> LLMClient:
-    global _clients
-    
-    if model not in _clients:
-        provider = None
-        if config.LLM_PROVIDER == "openrouter":
-            provider = OpenRouterProvider()
-        elif config.LLM_PROVIDER == "gemini":
-            provider = GeminiProvider()
-        elif config.LLM_PROVIDER == "azure":
-            provider = AzureOpenAIProvider()
-        elif config.LLM_PROVIDER:
-            # A name nothing implements is not the same as no name at all.
-            # Unnamed, the app is deliberately running without a model and
-            # says so on the Settings screen. Misnamed - a typo, or a
-            # provider spelled the way another tool spells it - it degrades
-            # to exactly the same silent no-model path, so a user who has set
-            # a key and a model sees no narrative and no explanation of why.
-            # Said once, at the top of the log.
-            log.warning(
-                "LLM_PROVIDER=%r is not a provider this app implements "
-                "(known: openrouter, gemini, azure), so no model will be "
-                "called. Gemini can be reached either way: natively with "
-                "LLM_PROVIDER=gemini and GEMINI_API_KEY, or through its "
-                "OpenAI-compatible endpoint by pointing "
-                "OPENROUTER_BASE_URL at it - see .env.example.",
-                config.LLM_PROVIDER,
-            )
+    """A client for one tier, built against the settings in force right now.
 
-        # fallback if requested provider isn't available, but it's set in config
-        _clients[model] = LLMClient(provider=provider, tier=model)
-        
-    return _clients[model]
+    Keyed on the resolved provider as well as the tier: the provider can be
+    changed from the Settings screen mid-process, and a cache keyed on tier
+    alone kept handing back a client bound to the previous one - so saving a
+    new provider appeared to do nothing until a restart.
+    """
+    provider_name = (llm_settings.effective()["llm_provider"] or "").lower()
+    cache_key = (model, provider_name)
+
+    cached = _clients.get(cache_key)
+    if cached is not None:
+        return cached
+
+    provider = None
+    if provider_name == "openrouter":
+        provider = OpenRouterProvider()
+    elif provider_name == "gemini":
+        provider = GeminiProvider()
+    elif provider_name == "azure":
+        provider = AzureOpenAIProvider()
+    elif provider_name and provider_name not in _UNKNOWN_PROVIDER_WARNED:
+        # A name nothing implements is not the same as no name at all.
+        # Unnamed, the app is deliberately running without a model and says
+        # so on the Settings screen. Misnamed - a typo, or a provider spelled
+        # the way another tool spells it - it degrades to exactly the same
+        # silent no-model path, so a user who has set a key and a model sees
+        # no narrative and no explanation of why. Said once per name.
+        _UNKNOWN_PROVIDER_WARNED.add(provider_name)
+        log.warning(
+            "LLM provider %r is not one this app implements "
+            "(known: openrouter, gemini, azure), so no model will be "
+            "called. Gemini can be reached either way: natively as "
+            "'gemini' with a Gemini key, or through its OpenAI-compatible "
+            "endpoint by selecting OpenRouter and pointing the base URL at "
+            "it - see .env.example.",
+            provider_name,
+        )
+
+    client = LLMClient(provider=provider, tier=model)
+    _clients[cache_key] = client
+    return client
+
+
+def reset_clients() -> None:
+    """Drop cached clients after the LLM settings change."""
+    _clients.clear()

@@ -1,5 +1,6 @@
 from typing import Any
 from ..config import config
+from . import settings as llm_settings
 import httpx
 import json
 import logging
@@ -284,11 +285,10 @@ class OpenRouterProvider(Provider):
 
     @property
     def available(self) -> bool:
-        return bool(config.OPENROUTER_API_KEY)
+        return bool(llm_settings.for_provider("openrouter")["api_key"])
 
     def _model(self, tier: str) -> str:
-        return (config.OPENROUTER_MODEL_FAST if tier == "fast"
-                else config.OPENROUTER_MODEL_STRONG)
+        return llm_settings.model_for(tier, "openrouter")
 
     def complete(self, prompt: str, system: str = "", max_tokens: int = 4096,
                  tier: str = "fast", temperature: float = 0.0,
@@ -341,7 +341,8 @@ class OpenRouterProvider(Provider):
         if config.OPENROUTER_REASONING_EFFORT:
             payload["reasoning_effort"] = config.OPENROUTER_REASONING_EFFORT
 
-        headers = {"Authorization": f"Bearer {config.OPENROUTER_API_KEY}"}
+        live = llm_settings.for_provider("openrouter")
+        headers = {"Authorization": f"Bearer {live['api_key']}"}
         # Attribution, so a shared key's traffic is identifiable on
         # openrouter.ai. Neither header carries anything about the user.
         if config.OPENROUTER_APP_URL:
@@ -349,7 +350,8 @@ class OpenRouterProvider(Provider):
         if config.OPENROUTER_APP_TITLE:
             headers["X-Title"] = config.OPENROUTER_APP_TITLE
 
-        url = f"{config.OPENROUTER_BASE_URL}/chat/completions"
+        base_url = (live["base_url"] or "https://openrouter.ai/api/v1").rstrip("/")
+        url = f"{base_url}/chat/completions"
         with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
             resp = _post_with_retries(client, url, json=payload,
                                       headers=headers, provider="OpenRouter")
@@ -496,11 +498,10 @@ class GeminiProvider(Provider):
 
     @property
     def available(self) -> bool:
-        return bool(config.GEMINI_API_KEY)
+        return bool(llm_settings.for_provider("gemini")["api_key"])
 
     def _model(self, tier: str) -> str:
-        return (config.GEMINI_MODEL_FAST if tier == "fast"
-                else config.GEMINI_MODEL_STRONG)
+        return llm_settings.model_for(tier, "gemini")
 
     def complete(self, prompt: str, system: str = "", max_tokens: int = 4096,
                  tier: str = "fast", temperature: float = 0.0,
@@ -522,9 +523,12 @@ class GeminiProvider(Provider):
         if system:
             body["systemInstruction"] = {"parts": [{"text": system}]}
 
-        url = (f"{config.GEMINI_BASE_URL}/models/"
+        live = llm_settings.for_provider("gemini")
+        gemini_base = (live["base_url"]
+                       or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+        url = (f"{gemini_base}/models/"
                f"{self._model(tier)}:generateContent")
-        headers = {"x-goog-api-key": config.GEMINI_API_KEY,
+        headers = {"x-goog-api-key": live["api_key"],
                    "Content-Type": "application/json"}
 
         with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
@@ -555,11 +559,13 @@ class GeminiProvider(Provider):
 class AzureOpenAIProvider(Provider):
     @property
     def available(self) -> bool:
-        return bool(config.AZURE_OPENAI_ENDPOINT and config.AZURE_OPENAI_API_KEY)
-        
+        live = llm_settings.for_provider("azure")
+        return bool(live["base_url"] and live["api_key"])
+
     def complete(self, prompt: str, system: str = "", max_tokens: int = 4096, tier: str = "fast", temperature: float = 0.0, schema: dict | None = None) -> str:
-        deployment = config.AZURE_OPENAI_DEPLOYMENT_FAST if tier == "fast" else config.AZURE_OPENAI_DEPLOYMENT_STRONG
-        base_url = config.AZURE_OPENAI_ENDPOINT.rstrip('/')
+        live = llm_settings.for_provider("azure")
+        deployment = llm_settings.model_for(tier, "azure")
+        base_url = (live["base_url"] or "").rstrip('/')
         if config.AZURE_OPENAI_USE_CLASSIC:
             # The original per-deployment surface.
             url = (f"{base_url}/openai/deployments/{deployment}/chat/completions"
@@ -590,8 +596,8 @@ class AzureOpenAIProvider(Provider):
         if not config.AZURE_OPENAI_USE_CLASSIC:
             payload["model"] = deployment
 
-        headers = {"api-key": config.AZURE_OPENAI_API_KEY,
-                   "Authorization": f"Bearer {config.AZURE_OPENAI_API_KEY}"}
+        headers = {"api-key": live["api_key"],
+                   "Authorization": f"Bearer {live['api_key']}"}
         
         with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
             resp = client.post(url, json=payload, headers=headers)

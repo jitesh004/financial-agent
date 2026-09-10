@@ -3,9 +3,12 @@ __pycache__/
 *.pyc
 .env
 node_modules/
-frontend/dist/
+dist/
 
 .pytest_cache/
 credentials.json
 data
 .claude/scheduled_tasks.lock
+
+# Local browser-driving scratch (audit scripts, Chrome profiles)
+frontend-v3/temp-profile/
