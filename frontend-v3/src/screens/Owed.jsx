@@ -169,7 +169,7 @@ export default function Owed() {
       </div>
 
       {/* Metric Tiles */}
-      <div className="stats-grid" style={{ gridTemplateColumns: '1fr 1fr' }}>
+      <div className="grid-2">
         <Stat
           label="Owed to Me (Receivables)"
           value={money(totalOutstanding(owedToMe))}

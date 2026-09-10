@@ -238,7 +238,7 @@ export default function Budget() {
             </div>
           </div>
 
-          <div style={{ marginTop: 'var(--space-4)', display: 'grid', gridTemplateColumns: '1fr 280px', gap: 'var(--space-6)', alignItems: 'center' }}>
+          <div className="budget-trim-grid">
             <div>
               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
                 <span className="small font-medium">Variable Discretionary Budget Trim</span>

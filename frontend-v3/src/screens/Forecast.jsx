@@ -98,7 +98,7 @@ export default function Forecast() {
       )}
 
       {/* Main Trajectory Projection Chart & Summary Grid */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr minmax(320px, 400px)', gap: 'var(--space-4)' }}>
+      <div className="forecast-main-grid">
         <GlassCard
           glowing
           title="Projected Cash Balance Cone"
@@ -116,7 +116,7 @@ export default function Forecast() {
         </GlassCard>
 
         <Card title="Monthly Cash Ledger Progression">
-          <div style={{ maxHeight: 320, overflowY: 'auto' }}>
+          <div style={{ maxHeight: 320, overflow: 'auto' }}>
             <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
                 <tr>
@@ -154,9 +154,9 @@ export default function Forecast() {
           subtitle="Contractual obligations anchoring the projection model."
         />
 
-        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(340px, 1fr) minmax(340px, 1fr)', gap: 'var(--space-4)' }}>
+        <div className="grid-2">
           <Card title="Scheduled Outflow Commitments" subtitle={`${outflows.length} active outflows detected`}>
-            <div style={{ maxHeight: 300, overflowY: 'auto' }}>
+            <div style={{ maxHeight: 300, overflow: 'auto' }}>
               <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
                 <thead>
                   <tr>
@@ -197,7 +197,7 @@ export default function Forecast() {
           </Card>
 
           <Card title="Expected Inbound Cashflows" subtitle={`${inflows.length} active inflows detected`}>
-            <div style={{ maxHeight: 300, overflowY: 'auto' }}>
+            <div style={{ maxHeight: 300, overflow: 'auto' }}>
               <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
                 <thead>
                   <tr>

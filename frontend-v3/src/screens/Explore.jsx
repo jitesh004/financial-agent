@@ -222,14 +222,7 @@ export default function Explore() {
 
       {/* Widgets 12-Column Responsive Grid */}
       {board && (
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(12, 1fr)',
-            gap: 'var(--space-4)',
-            minHeight: 400,
-          }}
-        >
+        <div className="explore-grid">
           {!(board.widgets || []).length ? (
             <div style={{ gridColumn: 'span 12' }}>
               <Empty

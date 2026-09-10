@@ -205,13 +205,13 @@ function CategoriesManager() {
 
   return (
     <Card title="Custom Category Taxonomy" subtitle="Define bespoke classification categories stored permanently with your ledger">
-      <div style={{ display: 'flex', gap: 'var(--space-2)', marginBottom: 'var(--space-4)' }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-2)', marginBottom: 'var(--space-4)' }}>
         <input
           className="input"
           placeholder="New Category Name (e.g. Pet Care, Woodworking)"
           value={name}
           onChange={(e) => setName(e.target.value)}
-          style={{ flex: 1 }}
+          style={{ flex: '1 1 200px' }}
         />
         <Select
           value={group}

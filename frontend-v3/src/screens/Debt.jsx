@@ -238,15 +238,16 @@ export default function Debt({ onImport }) {
 
             {/* Simulated Outcomes Display */}
             {simulation && (
-              <div style={{
-                display: 'grid',
-                gridTemplateColumns: '1fr 1fr',
-                gap: 'var(--space-3)',
-                padding: 'var(--space-4)',
-                background: 'var(--surface-2)',
-                borderRadius: 'var(--radius-lg)',
-                border: '1px solid var(--border-subtle)',
-              }}>
+              <div
+                className="grid-2"
+                style={{
+                  gap: 'var(--space-3)',
+                  padding: 'var(--space-4)',
+                  background: 'var(--surface-2)',
+                  borderRadius: 'var(--radius-lg)',
+                  border: '1px solid var(--border-subtle)',
+                }}
+              >
                 <div>
                   <div className="stat-label">Interest Saved</div>
                   <div className="stat-value pos" style={{ fontSize: 'var(--text-2xl)' }}>
@@ -290,7 +291,7 @@ export default function Debt({ onImport }) {
               subtitle={`Contracted interest rate: ${loan.annual_rate}% p.a. · Next EMI due: ${money(loan.emi)}`}
             />
 
-            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(320px, 380px) 1fr', gap: 'var(--space-4)' }}>
+            <div className="loan-details-grid">
               {/* Terms & Structure Card */}
               <Card title="Loan Contract Terms">
                 <dl className="kv" style={{ display: 'grid', gridTemplateColumns: '1fr auto', rowGap: 10, margin: 0 }}>

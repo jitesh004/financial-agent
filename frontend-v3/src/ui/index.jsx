@@ -364,6 +364,7 @@ export function Segmented({ options = [], value, onChange, ariaLabel, className 
     <div className={`segmented-control ${className}`} role="tablist" aria-label={ariaLabel} style={{
       display: 'inline-flex', gap: 2, padding: 3, borderRadius: 'var(--r-sm)',
       background: 'var(--surface-2)', border: '1px solid var(--line)',
+      maxWidth: '100%', overflowX: 'auto', flexShrink: 0, scrollbarWidth: 'none',
     }}>
       {options.map(([v, label, title]) => {
         const isActive = value === v;

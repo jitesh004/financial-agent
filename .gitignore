@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 .env
 node_modules/
-frontend/dist/
+dist/
 
 .pytest_cache/
 credentials.json

@@ -94,7 +94,7 @@ export default function Admin() {
       </div>
 
       {/* Sign-ups Trajectory & Ingestion Routes */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(340px, 1fr) minmax(340px, 1fr)', gap: 'var(--space-4)' }}>
+      <div className="grid-2">
         <Card title="Monthly User Registrations" subtitle={`${signups.length} months active`}>
           {signups.length ? (
             <ComboChart
@@ -108,7 +108,7 @@ export default function Admin() {
         </Card>
 
         <Card title="Statement Ingestion Channels" subtitle="Route through which files entered the system" pad={false}>
-          <div style={{ maxHeight: 250, overflowY: 'auto' }}>
+          <div style={{ maxHeight: 250, overflow: 'auto' }}>
             <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
                 <tr>
@@ -153,7 +153,7 @@ export default function Admin() {
         </div>
 
         <Card pad={false}>
-          <div style={{ maxHeight: 520, overflowY: 'auto' }}>
+          <div style={{ maxHeight: 520, overflow: 'auto' }}>
             <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
                 <tr>

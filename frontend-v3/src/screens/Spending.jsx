@@ -107,7 +107,7 @@ export default function Spending() {
       </div>
 
       {/* Category / Group Breakdown & Top Merchants */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(340px, 1fr) minmax(340px, 1fr)', gap: 'var(--space-4)' }}>
+      <div className="grid-2">
         {/* Category breakdown */}
         <Card
           title={groupBy === 'category' ? 'Outflow by Category' : 'Outflow by Group'}
@@ -138,32 +138,19 @@ export default function Spending() {
                 subtitle: item.categories
                   ? `${money(item.value)} across ${item.categories.length} categories: ${item.categories.map(titleCase).join(', ')}`
                   : `${money(item.value)} across ${item.count} transactions`,
-                params: {
-                  category: item.categories ? item.categories.join(',') : item.category,
-                  flow_role: SPEND_ROLES,
-                },
+                params: groupBy === 'category' ? { category: item.category } : { group: item.group },
               })}
             />
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 'var(--space-4)', padding: 'var(--space-2) 0' }}>
               <DonutChart
-                data={items.filter((i) => i.value > 0).slice(0, 8).map((i) => ({
-                  label: titleCase(i.label),
-                  value: i.value,
-                  color: i.color,
-                }))}
+                data={items}
                 size={220}
-                strokeWidth={32}
+                strokeWidth={30}
                 centerLabel="Total Outflow"
                 centerValue={compact(analysis.totals?.spend)}
               />
-              <Legend
-                items={items.filter((i) => i.value > 0).slice(0, 8).map((i) => ({
-                  label: `${titleCase(i.label)} (${pct((i.value / (analysis.totals?.spend || 1)) * 100, 0)})`,
-                  color: i.color,
-                  value: compact(i.value),
-                }))}
-              />
+              <Legend items={items} />
             </div>
           )}
         </Card>
@@ -173,7 +160,7 @@ export default function Spending() {
           title="Top Merchants & Counterparties"
           subtitle={`${merchants.length} tracked entities — click to inspect ledger history`}
         >
-          <div style={{ maxHeight: 420, overflowY: 'auto' }}>
+          <div style={{ maxHeight: 420, overflow: 'auto' }}>
             <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
                 <tr>
@@ -227,7 +214,7 @@ export default function Spending() {
             subtitle="Tracks burn rate and capital drainage in the days immediately following salary credit."
           />
 
-          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(340px, 1fr) minmax(340px, 1fr)', gap: 'var(--space-4)' }}>
+          <div className="grid-2">
             <Card
               title={`${monthLabel(latestSalary.month)} Cycle — Salary ${money(latestSalary.salary_amount)}`}
               subtitle={latestSalary.days_to_half_spent != null
@@ -271,7 +258,7 @@ export default function Spending() {
             </Card>
 
             <Card title="Historical Cycle Burn Velocity" subtitle="Days required to exhaust half of each incoming paycheck">
-              <div style={{ maxHeight: 320, overflowY: 'auto' }}>
+              <div style={{ maxHeight: 320, overflow: 'auto' }}>
                 <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
                   <thead>
                     <tr>

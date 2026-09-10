@@ -21,10 +21,9 @@ export default function Topbar({
       <div className="topbar-left">
         <button
           type="button"
-          className="btn btn-ghost btn-sm md-hidden"
+          className="btn btn-ghost btn-sm mobile-menu-btn"
           onClick={onMenu}
           aria-label="Open Navigation"
-          style={{ display: 'none' }}
         >
           <Icon name="menu" size={18} />
         </button>
@@ -38,7 +37,7 @@ export default function Topbar({
           title="Search anything (⌘K or /)"
         >
           <Icon name="search" size={14} />
-          <span>Quick actions & search...</span>
+          <span className="topbar-search-text">Quick actions & search...</span>
           <span className="topbar-search-kbd">⌘K</span>
         </button>
       </div>
@@ -53,7 +52,7 @@ export default function Topbar({
           title="Open AI Financial Copilot (⌘J)"
         >
           <Icon name="sparkles" size={15} />
-          <span>Copilot</span>
+          <span className="copilot-trigger-text">Copilot</span>
           {running && <span className="beacon-live" style={{ background: '#ffffff', marginLeft: 2 }} />}
         </button>
 

@@ -107,7 +107,7 @@ export default function Portfolio({ onImport }) {
       </div>
 
       {/* Allocation Breakdown & Top Holdings */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(340px, 1fr) minmax(340px, 1fr)', gap: 'var(--space-4)' }}>
+      <div className="grid-2">
         <GlassCard glowing title="Asset Class Allocation">
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 'var(--space-4)', padding: 'var(--space-2) 0' }}>
             <DonutChart
@@ -138,7 +138,7 @@ export default function Portfolio({ onImport }) {
         <Section title="Constituent Securities" subtitle={`${holdings.length} reconciled holding lines`} />
 
         <Card pad={false}>
-          <div style={{ maxHeight: 560, overflowY: 'auto' }}>
+          <div style={{ maxHeight: 560, overflow: 'auto' }}>
             <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
                 <tr>

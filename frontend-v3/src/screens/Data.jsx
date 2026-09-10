@@ -77,7 +77,7 @@ function Coverage({ onImport }) {
       {accounts.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
           <Section title="Ingested Account Identities" subtitle={`${accounts.length} unique accounts verified`} />
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 'var(--space-4)' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 260px), 1fr))', gap: 'var(--space-4)' }}>
             {accounts.map((a) => (
               <GlassCard key={a.id} style={{ padding: 'var(--space-4)' }}>
                 <div className="font-semibold">{a.display_name}</div>
@@ -125,7 +125,7 @@ function Coverage({ onImport }) {
 
         {statements.length > 0 && (
           <Card pad={false}>
-            <div style={{ maxHeight: 380, overflowY: 'auto' }}>
+            <div style={{ maxHeight: 380, overflow: 'auto' }}>
               <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
                 <thead>
                   <tr>
@@ -168,7 +168,7 @@ function Coverage({ onImport }) {
             subtitle={`${money(transfers.double_count_avoided)} in double-counting prevented.`}
           />
           <Card pad={false}>
-            <div style={{ maxHeight: 300, overflowY: 'auto' }}>
+            <div style={{ maxHeight: 300, overflow: 'auto' }}>
               <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
                 <thead>
                   <tr>

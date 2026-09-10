@@ -132,7 +132,7 @@ export default function WidgetEditor({ schema, widget, board, onSave, onCancel, 
         </div>
       )}
     >
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-5)' }}>
+      <div className="grid-2">
         {/* Left: Query Configuration */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)', maxHeight: 540, overflowY: 'auto', paddingRight: 4 }}>
           <Field label="Widget Title">

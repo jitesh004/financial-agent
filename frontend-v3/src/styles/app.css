@@ -25,6 +25,10 @@
   grid-row: 1 / -1;
   display: flex;
   flex-direction: column;
+  height: 100vh;
+  max-height: 100vh;
+  min-height: 0;
+  overflow: hidden;
   background: var(--surface);
   border-right: 1px solid var(--line);
   position: relative;
@@ -80,10 +84,30 @@
 }
 
 .rail-scroll {
-  flex: 1;
+  flex: 1 1 0%;
+  min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
   padding: 12px 10px 24px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+.rail-scroll::-webkit-scrollbar {
+  width: 5px;
+}
+
+.rail-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.rail-scroll::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: var(--r-full);
+}
+
+.rail-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--text-3);
 }
 
 .rail-group {
@@ -733,21 +757,124 @@
 
 /* ═══════════════════════════════════════════════════════ 11. Responsive Grids & Utils ═══════ */
 
-.grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
-.grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
-.grid-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 20px; }
+.grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); }
+.grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-4); }
+.grid-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--space-4); }
+
+.forecast-main-grid {
+  display: grid;
+  grid-template-columns: 1fr minmax(320px, 400px);
+  gap: var(--space-4);
+}
+
+.loan-details-grid {
+  display: grid;
+  grid-template-columns: minmax(320px, 380px) 1fr;
+  gap: var(--space-4);
+}
+
+.budget-trim-grid {
+  margin-top: var(--space-4);
+  display: grid;
+  grid-template-columns: 1fr 280px;
+  gap: var(--space-6);
+  align-items: center;
+}
+
+.explore-grid {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: var(--space-4);
+  min-height: 400px;
+}
+
+.mobile-menu-btn {
+  display: none;
+}
 
 @media (max-width: 1200px) {
   .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
+@media (max-width: 900px) {
+  .forecast-main-grid,
+  .loan-details-grid {
+    grid-template-columns: 1fr;
+  }
+  .explore-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .explore-grid > * {
+    grid-column: span 1 !important;
+  }
+}
+
 @media (max-width: 768px) {
   .shell { grid-template-columns: 1fr; }
   .shell.rail-collapsed { grid-template-columns: 1fr; }
   .rail { display: none; }
-  .grid-4, .grid-3, .grid-2 { grid-template-columns: 1fr; }
+  .rail.drawer-open {
+    display: flex;
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: min(300px, 85vw);
+    height: 100vh;
+    max-height: 100vh;
+    min-height: 0;
+    overflow: hidden;
+    z-index: 100;
+    box-shadow: var(--shadow-3);
+    animation: slideInLeft 0.25s var(--e-out);
+  }
+  .mobile-menu-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .grid-4, .grid-3, .grid-2, .budget-trim-grid { grid-template-columns: 1fr; }
   .page-container { padding: 16px; }
+}
+
+@media (max-width: 640px) {
+  .page-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+  }
+  .topbar {
+    padding: 0 12px;
+  }
+  .topbar-left {
+    gap: 10px;
+  }
+  .topbar-search-trigger {
+    width: auto;
+    padding: 6px 10px;
+  }
+  .topbar-search-text {
+    display: none;
+  }
+  .topbar-right {
+    gap: 8px;
+  }
+  .copilot-trigger-btn {
+    padding: 6px 10px;
+  }
+  .copilot-trigger-text {
+    display: none;
+  }
+}
+
+@media (max-width: 480px) {
+  .page-container {
+    padding: 12px;
+  }
+  .topbar-search-kbd {
+    display: none;
+  }
 }
 
 .flex { display: flex; }

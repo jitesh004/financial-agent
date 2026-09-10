@@ -247,7 +247,7 @@ function Institutions({ data, q }) {
 
   return (
     <Card title="Recognized Financial Institutions" subtitle={`${list.length} banking, card, and depository entities supported`} pad={false}>
-      <div style={{ maxHeight: 540, overflowY: 'auto' }}>
+      <div style={{ maxHeight: 540, overflow: 'auto' }}>
         <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr>
@@ -283,7 +283,7 @@ function EmailFilters({ data }) {
   const filters = data?.find?.email_queries || [];
   return (
     <Card title="Gmail Scan Matchers" subtitle="Search syntax queries applied during automatic mailbox synchronization" pad={false}>
-      <div style={{ maxHeight: 500, overflowY: 'auto' }}>
+      <div style={{ maxHeight: 500, overflow: 'auto' }}>
         <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr>
@@ -309,7 +309,7 @@ function Reading({ data }) {
   const readers = data?.read?.formats || [];
   return (
     <Card title="Document Readers & Coordinate Parsers" subtitle="Supported statement layout templates" pad={false}>
-      <div style={{ maxHeight: 500, overflowY: 'auto' }}>
+      <div style={{ maxHeight: 500, overflow: 'auto' }}>
         <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr>
@@ -342,7 +342,7 @@ function Categories({ data, q }) {
 
   return (
     <Card title="Categorization Heuristics" subtitle="Deterministic regex patterns tried in strict priority order" pad={false}>
-      <div style={{ maxHeight: 560, overflowY: 'auto' }}>
+      <div style={{ maxHeight: 560, overflow: 'auto' }}>
         <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr>
@@ -370,7 +370,7 @@ function LedgerRules({ data }) {
   const roles = data?.ledger?.flow_roles || [];
   return (
     <Card title="Accounting Flow Roles" subtitle="Double-entry classifications guaranteeing mathematical tie-out" pad={false}>
-      <div style={{ maxHeight: 500, overflowY: 'auto' }}>
+      <div style={{ maxHeight: 500, overflow: 'auto' }}>
         <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr>
@@ -398,7 +398,7 @@ function Numbers({ data }) {
   const thresholds = data?.thresholds || [];
   return (
     <Card title="Tolerances & Standard Deviations" subtitle="Deterministic thresholds governing anomaly detection and matching" pad={false}>
-      <div style={{ maxHeight: 500, overflowY: 'auto' }}>
+      <div style={{ maxHeight: 500, overflow: 'auto' }}>
         <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr>

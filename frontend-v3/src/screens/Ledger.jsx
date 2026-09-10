@@ -258,7 +258,7 @@ export default function Ledger() {
         )}
 
         {!loading && visibleRows.length > 0 && (
-          <div className="table-wrapper" ref={scrollRef} style={{ maxHeight: 'calc(100vh - 280px)', overflowY: 'auto' }}>
+          <div className="table-wrapper" ref={scrollRef} style={{ maxHeight: 'calc(100vh - 280px)', overflow: 'auto' }}>
             <table className={`terminal-table ${prefs.density}`}>
               <thead>
                 <tr>

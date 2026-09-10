@@ -85,7 +85,7 @@ export default function Profile() {
             />
           </Field>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-4)' }}>
+          <div className="grid-2">
             <Field label="Date of Birth">
               <input
                 className="input"
