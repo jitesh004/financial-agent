@@ -41,7 +41,7 @@ export default function Credit({ onImport }) {
   };
 
   if (overview.error) return <Callout tone="warn">{overview.error.message}</Callout>;
-  if (overview.loading) return <Loading label="Retrieving credit bureau files and cross-referencing statements…" />;
+  if (overview.loading) return <Loading message="Retrieving credit bureau files and cross-referencing statements…" />;
 
   const data = overview.data;
   if (!data?.reports?.length) {
@@ -94,7 +94,7 @@ export default function Credit({ onImport }) {
                 </Badge>
               )}
             </div>
-            <div className="num font-bold" style={{ fontSize: 'var(--text-3xl)', color: 'var(--brand-primary)' }}>
+            <div className="num font-bold" style={{ fontSize: 'var(--text-3xl)', color: 'var(--accent-text)' }}>
               {report.score ?? '—'}
             </div>
             <div className="tiny muted" style={{ marginTop: 4 }}>
@@ -206,7 +206,7 @@ export default function Credit({ onImport }) {
                     }}
                   >
                     <div>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                         <strong className="font-medium">{row.lender}</strong>
                         <span className="tiny num muted">{row.masked}</span>
                       </div>
@@ -215,11 +215,14 @@ export default function Credit({ onImport }) {
                       </div>
                     </div>
 
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-4)' }}>
-                      <span className="small font-medium brand">
+                    <div style={{
+                      display: 'flex', alignItems: 'center', gap: 'var(--space-4)',
+                      flexWrap: 'wrap', minWidth: 0,
+                    }}>
+                      <span className="small font-medium brand" style={{ overflowWrap: 'anywhere' }}>
                         → {account?.display_name || account?.institution || row.suggestion}
                       </span>
-                      <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
+                      <div style={{ display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
                         <Button
                           variant="primary"
                           size="sm"

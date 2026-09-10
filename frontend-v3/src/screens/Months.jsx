@@ -259,7 +259,7 @@ export default function Months() {
         </Card>
       )}
 
-      {(loading || loadingView) && <Loading label="Synthesizing multi-month records…" />}
+      {(loading || loadingView) && <Loading message="Synthesizing multi-month records…" />}
 
       {data && !rows.length && (scoped
         ? <PeriodEmpty available={view?.available} />

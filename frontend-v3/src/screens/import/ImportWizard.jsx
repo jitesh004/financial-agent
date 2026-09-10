@@ -316,7 +316,14 @@ export default function ImportWizard({ mailbox, open, onClose, onImported }) {
           onToggleMany={toggleMany}
           ignoredSenders={mailbox.ignoredSenders}
           ignoredCount={mailbox.ignoredCount}
-          onIgnore={(who) => who && mailbox.setIgnored([...new Set([...(mailbox.ignoredSenders || []), who.trim()])])}
+          onIgnore={(who, remove = false) => {
+            const target = String(who || '').trim();
+            if (!target) return;
+            const current = mailbox.ignoredSenders || [];
+            mailbox.setIgnored(remove
+              ? current.filter((one) => one !== target)
+              : [...new Set([...current, target])]);
+          }}
           onClearIgnored={() => mailbox.setIgnored([])}
         />
       )}
@@ -411,9 +418,9 @@ function SetupInstructions() {
               href="https://console.cloud.google.com"
               target="_blank"
               rel="noreferrer"
-              style={{ color: 'var(--accent)', textDecoration: 'underline' }}
+              style={{ color: 'var(--accent-text)', textDecoration: 'underline' }}
             >
-              console.cloud.google.com <Icon name="external-link" size={11} />
+              console.cloud.google.com <Icon name="external" size={11} />
             </a>{' '}
             and create or select a project.
           </li>

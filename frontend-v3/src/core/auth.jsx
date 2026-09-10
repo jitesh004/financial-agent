@@ -60,6 +60,19 @@ export function AuthProvider({ children }) {
     try { await api.logout(); } finally { clearCache(); setUser(null); }
   }, []);
 
+  /* Ends every session for this account, including the one making the call -
+     the server clears this device's cookie in the same response. Local state
+     is cleared regardless of the outcome: a failed sign-out that leaves the
+     app looking signed in is worse than one that asks you to sign in again. */
+  const signOutEverywhere = useCallback(async () => {
+    try {
+      return await api.logoutEverywhere();
+    } finally {
+      clearCache();
+      setUser(null);
+    }
+  }, []);
+
   const value = useMemo(() => ({
     user,
     config,
@@ -69,9 +82,11 @@ export function AuthProvider({ children }) {
     dismissAuthError: () => setAuthError(null),
     signIn,
     signOut,
+    signOutEverywhere,
     refresh,
     setUser,
-  }), [user, config, isAdmin, loading, authError, signIn, signOut, refresh]);
+  }), [user, config, isAdmin, loading, authError, signIn, signOut,
+      signOutEverywhere, refresh]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

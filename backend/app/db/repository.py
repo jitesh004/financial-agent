@@ -2714,8 +2714,18 @@ def get_portfolio_statements(db: Database) -> list[dict[str, Any]]:
 #: Every switch, with the value it takes when nobody has said otherwise.
 #: `use_llm` defaults OFF: calling a model costs real money, and an app that
 #: starts spending it because a default said so is not one you can trust.
+#: The LLM keys default to the empty string, which means "inherit whatever
+#: .env configured". Only a non-empty value is treated as a user override, so
+#: clearing a field in the UI hands that one setting back to the environment
+#: rather than blanking the model out entirely. See `llm.settings.effective`.
 SETTING_DEFAULTS: dict[str, Any] = {
     "use_llm": False,
+    "llm_provider": "",
+    "llm_api_key": "",
+    "llm_base_url": "",
+    "llm_model_fast": "",
+    "llm_model_strong": "",
+    "agent_profile": "",
 }
 
 
@@ -2745,8 +2755,14 @@ def save_settings(db: Database, values: dict[str, Any]) -> dict[str, Any]:
         for key, value in values.items():
             if key not in SETTING_DEFAULTS:
                 continue
-            stored = "1" if value else "0" if isinstance(
-                SETTING_DEFAULTS[key], bool) else str(value)
+            # Parenthesised deliberately: written as one chained ternary
+            # this read as `"1" if value else ("0" if bool else str(value))`,
+            # so every truthy value - including a model name - was stored as
+            # the string "1". Only the boolean switches are 1/0.
+            if isinstance(SETTING_DEFAULTS[key], bool):
+                stored = "1" if value else "0"
+            else:
+                stored = "" if value is None else str(value)
             conn.execute(
                 "INSERT INTO app_settings (key, value, updated_at)"
                 " VALUES (?, ?, datetime('now'))"

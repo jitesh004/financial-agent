@@ -24,7 +24,7 @@ export default function Profile() {
     setCustomText((data.custom_passwords || []).join(', '));
   }, [data, form]);
 
-  if (loading || !form) return <Loading label="Reading identity parameters…" />;
+  if (loading || !form) return <Loading message="Reading identity parameters…" />;
 
   const set = (key) => (e) => setForm((f) => ({ ...f, [key]: e.target.value }));
 

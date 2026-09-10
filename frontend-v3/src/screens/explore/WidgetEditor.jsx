@@ -26,6 +26,10 @@ const EMPTY = {
 };
 
 export default function WidgetEditor({ schema, widget, board, onSave, onCancel, onDelete }) {
+  /* The query endpoint overlays a board's *filters* object ({date_range,
+     filters}) onto the widget spec. Handing it the whole board made it spread
+     that object's keys into the filter list and 500 on every preview. */
+  const boardFilters = board?.filters || null;
   const [draft, setDraft] = useState(() => ({
     ...EMPTY,
     ...widget,
@@ -61,13 +65,13 @@ export default function WidgetEditor({ schema, widget, board, onSave, onCancel, 
     clearTimeout(timer.current);
     timer.current = setTimeout(() => {
       setBusy(true);
-      api.runQuery(draft.query, board)
+      api.runQuery(draft.query, boardFilters)
         .then((result) => { setPreview(result); setError(null); })
         .catch((e) => { setError(e.message); setPreview(null); })
         .finally(() => setBusy(false));
     }, 300);
     return () => clearTimeout(timer.current);
-  }, [signature, draft.type, board]);
+  }, [signature, draft.type, boardFilters]);
 
   const dimensions = draft.query.dimensions || [];
   const measures = draft.query.measures || [];
@@ -352,7 +356,7 @@ export default function WidgetEditor({ schema, widget, board, onSave, onCancel, 
                   size="sm"
                   onClick={() => api.exportQueryCsv(
                     draft.query,
-                    board,
+                    boardFilters,
                     (draft.title || 'widget').replace(/[^\w -]/g, '')
                   )}
                 >
@@ -362,7 +366,7 @@ export default function WidgetEditor({ schema, widget, board, onSave, onCancel, 
 
               {showSql && (
                 <div style={{ padding: 'var(--space-3)', background: 'var(--surface-3)', borderRadius: 'var(--radius-md)', fontSize: 11, fontFamily: 'var(--font-mono)' }}>
-                  <pre style={{ margin: 0, whiteSpace: 'pre-wrap', color: 'var(--brand-primary)' }}>{preview.sql}</pre>
+                  <pre style={{ margin: 0, whiteSpace: 'pre-wrap', color: 'var(--accent-text)' }}>{preview.sql}</pre>
                 </div>
               )}
             </div>

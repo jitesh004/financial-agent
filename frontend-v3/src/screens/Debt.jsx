@@ -15,42 +15,18 @@ export default function Debt({ onImport }) {
   const [lumpSum, setLumpSum] = useState(0);
   const [strategy, setStrategy] = useState('avalanche'); // 'avalanche' | 'snowball'
 
-  if (loading) {
-    return (
-      <div className="debt-screen page-enter">
-        <SkeletonStats count={4} />
-        <div style={{ marginTop: 24 }}>
-          <Skeleton lines={8} height={260} />
-        </div>
-      </div>
-    );
-  }
-
   const loans = data?.loans || [];
   const accounts = data?.accounts || [];
   const cards = accounts.filter((a) => a.account_type === 'credit_card');
 
-  if (!loans.length && !cards.length) {
-    return (
-      <Empty
-        title="No debt or credit obligations found"
-        icon="credit"
-        action={onImport && (
-          <Button variant="primary" icon="upload" onClick={onImport}>
-            Import Statements
-          </Button>
-        )}
-      >
-        Import loan statements or credit card bills to see your verified amortization schedules,
-        exact payoff horizons, interest costs, and prepayment optimization.
-      </Empty>
-    );
-  }
-
-  const totalOutstanding = loans.reduce((s, l) => s + (l.outstanding || 0), 0);
-  const totalInterest = loans.reduce((s, l) => s + (l.total_interest_remaining || 0), 0);
-  const totalEmi = loans.reduce((s, l) => s + (l.emi || 0), 0);
-  const totalCardDues = cards.reduce((s, c) => s + (Number(c.principal_outstanding) || Math.abs(Number(c.current_balance ?? c.balance) || 0)), 0);
+  const totalOutstanding = loans.reduce((sum, l) => sum + (l.outstanding || 0), 0);
+  const totalInterest = loans.reduce((sum, l) => sum + (l.total_interest_remaining || 0), 0);
+  const totalEmi = loans.reduce((sum, l) => sum + (l.emi || 0), 0);
+  const totalCardDues = cards.reduce(
+    (sum, c) => sum + (Number(c.principal_outstanding)
+      || Math.abs(Number(c.current_balance ?? c.balance) || 0)),
+    0,
+  );
 
   // Prepayment Simulation Calculations
   const simulation = useMemo(() => {
@@ -123,6 +99,35 @@ export default function Debt({ onImport }) {
     };
   }, [loans, extraMonthly, lumpSum, strategy, totalInterest]);
 
+  if (loading) {
+    return (
+      <div className="debt-screen page-enter">
+        <SkeletonStats count={4} />
+        <div style={{ marginTop: 24 }}>
+          <Skeleton lines={8} height={260} />
+        </div>
+      </div>
+    );
+  }
+
+  if (!loans.length && !cards.length) {
+    return (
+      <Empty
+        title="No debt or credit obligations found"
+        icon="credit"
+        action={onImport && (
+          <Button variant="primary" icon="upload" onClick={onImport}>
+            Import Statements
+          </Button>
+        )}
+      >
+        Import loan statements or credit card bills to see your verified amortization schedules,
+        exact payoff horizons, interest costs, and prepayment optimization.
+      </Empty>
+    );
+  }
+
+
   return (
     <div className="debt-screen page-enter" style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-6)' }}>
       {/* Header */}
@@ -168,7 +173,7 @@ export default function Debt({ onImport }) {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 'var(--space-4)', marginBottom: 'var(--space-5)' }}>
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
-                <span style={{ color: 'var(--brand-primary)', display: 'inline-flex' }}>
+                <span style={{ color: 'var(--accent-text)', display: 'inline-flex' }}>
                   <Icon name="sparkles" size={20} />
                 </span>
                 <h3 className="h3" style={{ margin: 0 }}>Prepayment Accelerator Lab</h3>
@@ -178,7 +183,10 @@ export default function Debt({ onImport }) {
               </p>
             </div>
 
-            <div style={{ display: 'flex', gap: 'var(--space-2)', background: 'var(--surface-3)', padding: 4, borderRadius: 'var(--radius-md)' }}>
+            <div style={{
+              display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap', maxWidth: '100%',
+              background: 'var(--surface-3)', padding: 4, borderRadius: 'var(--radius-md)',
+            }}>
               <button
                 className={`btn btn-sm ${strategy === 'avalanche' ? 'btn-primary' : 'btn-ghost'}`}
                 onClick={() => setStrategy('avalanche')}
@@ -202,7 +210,7 @@ export default function Debt({ onImport }) {
               <div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
                   <span className="small font-medium">Extra Monthly Prepayment</span>
-                  <span className="num font-semibold" style={{ color: 'var(--brand-primary)' }}>
+                  <span className="num font-semibold" style={{ color: 'var(--accent-text)' }}>
                     +{money(extraMonthly)}/mo
                   </span>
                 </div>
@@ -369,20 +377,28 @@ export default function Debt({ onImport }) {
               <Card title="Amortization Balance Trajectory" subtitle="Principal run-down sampled by year">
                 <GlowAreaChart
                   data={scheduleData}
-                  series={[{ key: 'closing', name: 'Balance Owed', color: 'var(--c7)' }]}
+                  dataKey="closing"
+                  color="var(--c7)"
                   height={260}
-                  fillOpacity={0.15}
+                  fillOpacity={0.22}
                 />
               </Card>
             </div>
 
             {/* Interest vs Principal Yearly Stacked */}
             {scheduleData.length > 1 && (
-              <Card title="Yearly Payment Breakdown" subtitle="Interest portion shrinks as principal pays down over time">
+              <Card
+              title="Yearly Payment Breakdown"
+              subtitle="Interest portion shrinks as principal pays down over time"
+              tools={<Legend items={[
+                { label: 'Principal reduction', color: 'var(--accent-teal)' },
+                { label: 'Interest serviced', color: 'var(--c7)' },
+              ]} />}
+            >
                 <ComboChart
                   data={scheduleData}
-                  bars={[{ key: 'principal', name: 'Principal Reduction', color: 'var(--accent-teal)' }]}
-                  lines={[{ key: 'interest', name: 'Interest Serviced', color: 'var(--c7)' }]}
+                  bars={[{ key: 'principal', label: 'Principal reduction', color: 'var(--accent-teal)' }]}
+                  lines={[{ key: 'interest', label: 'Interest serviced', color: 'var(--c7)' }]}
                   height={220}
                 />
               </Card>

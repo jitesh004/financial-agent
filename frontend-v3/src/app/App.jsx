@@ -20,6 +20,7 @@ import CommandPalette from './CommandPalette';
 import CopilotDrawer from './CopilotDrawer';
 import PeriodBar from './PeriodBar';
 import { LAZY, routeFor } from './routes';
+import ErrorBoundary from './ErrorBoundary';
 import ImportWizard from '../screens/import/ImportWizard';
 import useImport from '../screens/import/useImport';
 import { Button, Callout, Icon, Skeleton, SkeletonStats } from '../ui';
@@ -108,11 +109,13 @@ function Chrome({ openImport, onImportOpened }) {
     if (loading && route.needsLedger) return <FirstLoad />;
     if (blocked) return <NoLedger onImport={openWizard} />;
     return (
-      <Suspense fallback={<FirstLoad />}>
-        <Screen onImport={openWizard} />
-      </Suspense>
+      <ErrorBoundary resetKey={path}>
+        <Suspense fallback={<FirstLoad />}>
+          <Screen onImport={openWizard} />
+        </Suspense>
+      </ErrorBoundary>
     );
-  }, [known, loading, blocked, route, Screen, openWizard, navigate]);
+  }, [known, loading, blocked, route, Screen, openWizard, navigate, path]);
 
   return (
     <div className={`shell ${collapsed ? 'rail-collapsed' : ''}`}>

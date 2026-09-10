@@ -320,13 +320,13 @@ export function ComboChart({
           <div style={{ fontWeight: 700, marginBottom: 4 }}>{data[f.hover.i][xKey]}</div>
           {bars.map((b) => (
             <div key={b.key} className="flex items-center justify-between gap-3">
-              <span style={{ color: b.color }}>{b.label || b.key}:</span>
+              <span style={{ color: b.color }}>{b.label || b.name || b.key}:</span>
               <span className="tabular-nums font-semibold">{money(data[f.hover.i][b.key])}</span>
             </div>
           ))}
           {lines.map((l) => (
             <div key={l.key} className="flex items-center justify-between gap-3">
-              <span style={{ color: l.color }}>{l.label || l.key}:</span>
+              <span style={{ color: l.color }}>{l.label || l.name || l.key}:</span>
               <span className="tabular-nums font-semibold">{money(data[f.hover.i][l.key])}</span>
             </div>
           ))}
@@ -341,15 +341,23 @@ export function ComboChart({
 export function GlowAreaChart({
   data = [],
   height = 240,
-  dataKey = 'value',
+  dataKey,
+  series,
   xKey = 'label',
-  color = 'var(--accent)',
+  color,
+  fillOpacity,
   formatY = compact,
 }) {
+  /* Callers may describe the plotted field either directly (`dataKey`/`color`)
+     or as a one-entry `series` list, the shape the other charts take. */
+  const key = dataKey || series?.[0]?.key || 'value';
+  const stroke = color || series?.[0]?.color || 'var(--accent)';
+  const topOpacity = fillOpacity == null ? 0.32 : Number(fillOpacity);
+
   let min = 0;
   let max = 0;
   data.forEach((d) => {
-    const v = Number(d[dataKey] || 0);
+    const v = Number(d[key] || 0);
     if (v < min) min = v;
     if (v > max) max = v;
   });
@@ -357,7 +365,7 @@ export function GlowAreaChart({
   const f = useFrame({ data, height, valueMin: min, valueMax: max });
   const gradId = useId();
 
-  const points = data.map((d, i) => [f.cx(i), f.y(Number(d[dataKey] || 0))]);
+  const points = data.map((d, i) => [f.cx(i), f.y(Number(d[key] || 0))]);
   let lineD = '';
   let areaD = '';
 
@@ -385,15 +393,15 @@ export function GlowAreaChart({
         >
           <defs>
             <linearGradient id={`${gradId}-grad`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={color} stopOpacity="0.32" />
-              <stop offset="100%" stopColor={color} stopOpacity="0.0" />
+              <stop offset="0%" stopColor={stroke} stopOpacity={topOpacity} />
+              <stop offset="100%" stopColor={stroke} stopOpacity="0" />
             </linearGradient>
           </defs>
 
           <GridAndAxes f={f} format={formatY} />
 
           {areaD && <path d={areaD} fill={`url(#${gradId}-grad)`} />}
-          {lineD && <path d={lineD} fill="none" stroke={color} strokeWidth={2.5} strokeLinecap="round" />}
+          {lineD && <path d={lineD} fill="none" stroke={stroke} strokeWidth={2.5} strokeLinecap="round" />}
 
           {data.map((d, i) => {
             if (i % f.labelStep !== 0) return null;
@@ -417,7 +425,7 @@ export function GlowAreaChart({
               cy={points[f.hover.i][1]}
               r={5}
               fill="var(--surface)"
-              stroke={color}
+              stroke={stroke}
               strokeWidth={3}
             />
           )}
@@ -437,8 +445,8 @@ export function GlowAreaChart({
           }}
         >
           <div style={{ fontWeight: 600 }}>{data[f.hover.i][xKey]}</div>
-          <div className="tabular-nums font-bold" style={{ color }}>
-            {money(data[f.hover.i][dataKey])}
+          <div className="tabular-nums font-bold" style={{ color: stroke }}>
+            {money(data[f.hover.i][key])}
           </div>
         </div>
       )}
@@ -535,7 +543,7 @@ export function StackedBarChart({
           <div style={{ fontWeight: 700, marginBottom: 4 }}>{data[f.hover.i][xKey]}</div>
           {series.map((s) => (
             <div key={s.key} className="flex items-center justify-between gap-3">
-              <span style={{ color: s.color }}>{s.label || s.key}:</span>
+              <span style={{ color: s.color }}>{s.label || s.name || s.key}:</span>
               <span className="tabular-nums font-semibold">{money(data[f.hover.i][s.key])}</span>
             </div>
           ))}
@@ -583,6 +591,7 @@ export function ConfidenceBandChart({
   expectedKey = 'expected',
   lowKey = 'low',
   highKey = 'high',
+  color = 'var(--accent)',
 }) {
   let min = 0;
   let max = 0;
@@ -622,15 +631,15 @@ export function ConfidenceBandChart({
         <svg width={f.width} height={height} onMouseMove={f.onMove} onMouseLeave={f.clear}>
           <defs>
             <linearGradient id={`${gradId}-cone`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.2" />
-              <stop offset="100%" stopColor="var(--accent)" stopOpacity="0.05" />
+              <stop offset="0%" stopColor={color} stopOpacity="0.24" />
+              <stop offset="100%" stopColor={color} stopOpacity="0.05" />
             </linearGradient>
           </defs>
 
           <GridAndAxes f={f} format={compact} />
 
           {bandPath && <path d={bandPath} fill={`url(#${gradId}-cone)`} />}
-          {lineD && <path d={lineD} fill="none" stroke="var(--accent)" strokeWidth={2.5} />}
+          {lineD && <path d={lineD} fill="none" stroke={color} strokeWidth={2.5} />}
 
           {data.map((d, i) => {
             if (i % f.labelStep !== 0) return null;

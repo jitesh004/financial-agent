@@ -129,9 +129,9 @@ def profile_for(model_name: str | None = None) -> Budget:
     still produces a sound answer on a large model - it simply looks at
     fewer things - whereas full on a small one produces no answer at all.
     """
-    from ..config import config
+    from ..llm import settings as llm_settings
 
-    forced = (config.AGENT_PROFILE or "auto").strip().lower()
+    forced = (llm_settings.effective()["agent_profile"] or "auto").strip().lower()
     if forced == "compact":
         return COMPACT
     if forced == "full":
@@ -144,18 +144,19 @@ def profile_for(model_name: str | None = None) -> Budget:
 
 
 def _configured_model() -> str:
-    """The model this deployment will actually call, whoever provides it."""
-    from ..config import config
+    """The model this workspace will actually call, whoever provides it.
 
-    provider = (config.LLM_PROVIDER or "").lower()
-    if provider == "gemini":
-        return config.GEMINI_MODEL_STRONG or ""
-    if provider == "openrouter":
-        return config.OPENROUTER_MODEL_STRONG or ""
-    if provider == "azure":
-        return getattr(config, "AZURE_OPENAI_DEPLOYMENT_STRONG", "") or ""
-    return ""
+    Empty when no implemented provider is selected: "no model" and "a model
+    whose name says nothing" both have to land on the compact budget, and only
+    an empty answer here gets them both there.
+    """
+    from ..llm import settings as llm_settings
 
+    provider = llm_settings.selected_provider()
+    if provider not in llm_settings.BY_KEY:
+        return ""
+    return (llm_settings.model_for("strong", provider)
+            or llm_settings.model_for("fast", provider))
 
 @dataclass
 class Step:

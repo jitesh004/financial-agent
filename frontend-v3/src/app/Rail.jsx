@@ -8,6 +8,7 @@ import { Link, useRouter } from '../core/router';
 import { Icon, Logo } from '../ui/icons';
 import { readTheme, setTheme } from '../core/theme';
 import { useAuth } from '../core/auth';
+import AccountMenu from './AccountMenu';
 
 export default function Rail({
   collapsed,
@@ -92,24 +93,22 @@ export default function Rail({
         })}
       </div>
 
-      {/* Footer Controls */}
+      {/* Footer Controls. Stacked rather than side by side: sharing one row
+          left the account trigger a few characters wide, which is not a
+          recognisable way to find your own name. */}
       <div className="rail-foot">
+        {user && <AccountMenu collapsed={collapsed} onNavigate={onClose} />}
+
         <button
           type="button"
           className="btn btn-ghost btn-sm flex items-center gap-2"
           onClick={toggleTheme}
           title="Toggle Dark / Light Theme"
-          style={{ width: collapsed ? '100%' : 'auto', justifyContent: collapsed ? 'center' : 'flex-start' }}
+          style={{ width: '100%', justifyContent: collapsed ? 'center' : 'flex-start' }}
         >
           <Icon name={currentTheme === 'dark' ? 'sun' : 'moon'} size={16} />
           {!collapsed && <span>{currentTheme === 'dark' ? 'Light mode' : 'Dark mode'}</span>}
         </button>
-
-        {!collapsed && user && (
-          <Link to="/profile" className="btn btn-ghost btn-sm" title="Profile Credentials">
-            <Icon name="user" size={15} />
-          </Link>
-        )}
       </div>
     </aside>
   );

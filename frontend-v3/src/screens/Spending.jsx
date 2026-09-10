@@ -3,12 +3,13 @@ import { usePeriod } from '../core/period';
 import { useDrill } from '../core/drill';
 import { useViewData } from '../core/ledger';
 import { usePrefs } from '../core/prefs';
-import { colorFor, count, dateLabel, money, monthLabel, pct, SPEND_ROLES, titleCase } from '../core/format';
+import { colorFor, compact, count, dateLabel, money, monthLabel, pct, SPEND_ROLES, titleCase } from '../core/format';
 import {
   BarList, Callout, Card, GlassCard, Chip, Empty, Legend, Section, Segmented, Skeleton,
   SkeletonStats, Stat, Badge,
 } from '../ui';
 import { DonutChart } from '../ui/gauges';
+import { StackedBarChart } from '../ui/charts';
 import { PeriodEmpty } from '../app/PeriodBar';
 
 export default function Spending() {
@@ -138,7 +139,9 @@ export default function Spending() {
                 subtitle: item.categories
                   ? `${money(item.value)} across ${item.categories.length} categories: ${item.categories.map(titleCase).join(', ')}`
                   : `${money(item.value)} across ${item.count} transactions`,
-                params: groupBy === 'category' ? { category: item.category } : { group: item.group },
+                params: groupBy === 'category'
+                  ? { category: item.category }
+                  : { category: (item.categories || []).join(',') },
               })}
             />
           ) : (
@@ -146,7 +149,7 @@ export default function Spending() {
               <DonutChart
                 data={items}
                 size={220}
-                strokeWidth={30}
+                thickness={30}
                 centerLabel="Total Outflow"
                 centerValue={compact(analysis.totals?.spend)}
               />
@@ -205,6 +208,21 @@ export default function Spending() {
           </div>
         </Card>
       </div>
+
+      {/* Monthly Category Composition */}
+      {stack.data.length > 1 && (
+        <Card
+          title="Monthly Category Composition"
+          subtitle="How the top categories stack up month over month"
+          tools={<Legend items={stack.keys.map((k, i) => ({ label: titleCase(k), color: colorFor(i) }))} />}
+        >
+          <StackedBarChart
+            data={stack.data}
+            height={280}
+            series={stack.keys.map((k, i) => ({ key: k, label: titleCase(k), color: colorFor(i) }))}
+          />
+        </Card>
+      )}
 
       {/* Salary Flow Velocity Tracker */}
       {latestSalary && (

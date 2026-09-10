@@ -5,9 +5,13 @@ import { usePeriod } from '../core/period';
 import { useDrill } from '../core/drill';
 import { compact, count, dateLabel, money, pct, titleCase } from '../core/format';
 import {
-  Button, Callout, Card, GlassCard, Chip, Empty, Legend, Loading, Section, Stat, Table, Badge,
+  Button, Callout, Card, GlassCard, Chip, Empty, Loading, Section, Stat, Badge,
 } from '../ui';
 import { Icon } from '../ui/icons';
+
+/* Category groups the backend emits, mapped onto the 50/30/20 buckets. */
+const WANT_GROUPS = new Set(['Lifestyle', 'Discretionary']);
+const SAVE_GROUPS = new Set(['Wealth', 'Investments', 'Savings']);
 
 const KIND_META = {
   debt: {
@@ -44,7 +48,7 @@ export default function Budget() {
   }, [data]);
 
   if (error) return <Callout tone="neg">{error.message}</Callout>;
-  if (loading) return <Loading label="Synthesizing typical baseline budget from statement history…" />;
+  if (loading) return <Loading message="Synthesizing typical baseline budget from statement history…" />;
 
   if (data?.status === 'empty') {
     return (
@@ -72,10 +76,37 @@ export default function Budget() {
   const simAnnualSavings = simSavingsMonthly * 12;
   const simAdjustedHeadroom = rawHeadroom + simSavingsMonthly;
 
-  // 50/30/20 Framework Evaluation (Needs: debt + fixed spend + essential var; Wants: discretionary; Savings: committed save + headroom)
-  const needsTotal = debt + fixedSpend + (varSpend * 0.6);
-  const wantsTotal = varSpend * 0.4;
-  const savingsTotal = committedSave + Math.max(0, rawHeadroom);
+  /* 50/30/20 evaluation. Variable spend is apportioned by the group the
+     backend already assigns each category, rather than an invented 60/40
+     split. The group mix is used as a *ratio* and applied to
+     `variable_typical`: a sum of per-category medians is not the median of the
+     total, so adding them up directly overshoots the variable figure every
+     other number on this screen is quoted against. */
+  const variableRows = data.variable || [];
+  const mix = variableRows.reduce((acc, v) => {
+    const amount = Math.max(0, Number(v.typical_monthly) || 0);
+    if (WANT_GROUPS.has(v.group)) acc.wants += amount;
+    else if (SAVE_GROUPS.has(v.group)) acc.savings += amount;
+    else acc.needs += amount;
+    acc.all += amount;
+    return acc;
+  }, { needs: 0, wants: 0, savings: 0, all: 0 });
+
+  const varShare = (part) => (mix.all > 0 ? (part / mix.all) * varSpend : 0);
+
+  const needsTotal = debt + fixedSpend + varShare(mix.needs);
+  const wantsTotal = varShare(mix.wants);
+  const savingsTotal = committedSave + varShare(mix.savings) + Math.max(0, rawHeadroom);
+
+  const ALLOCATION_BANDS = [
+    { key: 'debt', label: 'Debt', color: 'var(--c7)', value: debt },
+    { key: 'fixed', label: 'Fixed Bills', color: 'var(--c3)', value: fixedSpend },
+    { key: 'saving', label: 'Committed Savings', color: 'var(--accent-teal)', value: committedSave },
+    { key: 'variable', label: 'Variable Spend', color: 'var(--c6)', value: varSpend },
+    { key: 'headroom', label: 'Uncommitted Headroom', color: 'var(--line-strong)', value: Math.max(0, rawHeadroom) },
+  ];
+  const allocated = ALLOCATION_BANDS.reduce((sum, band) => sum + band.value, 0);
+  const allocationScale = Math.max(income, allocated) || 1;
 
   const needsPct = income > 0 ? (needsTotal / income) * 100 : 0;
   const wantsPct = income > 0 ? (wantsTotal / income) * 100 : 0;
@@ -143,68 +174,50 @@ export default function Budget() {
                 Standard benchmark targets 50% Needs, 30% Wants, 20% Wealth Building.
               </p>
             </div>
-            <div style={{ display: 'flex', gap: 'var(--space-3)' }}>
+            <div style={{ display: 'flex', gap: 'var(--space-3)', flexWrap: 'wrap' }}>
               <Badge tone={needsPct <= 50 ? 'pos' : 'warn'}>Needs: {pct(needsPct, 0)} (Goal ≤50%)</Badge>
               <Badge tone={wantsPct <= 30 ? 'pos' : 'warn'}>Wants: {pct(wantsPct, 0)} (Goal ≤30%)</Badge>
               <Badge tone={savingsPct >= 20 ? 'pos' : 'warn'}>Savings: {pct(savingsPct, 0)} (Goal ≥20%)</Badge>
             </div>
           </div>
 
-          {/* Allocation Stack Bar */}
-          <div style={{ height: 24, borderRadius: 'var(--radius-md)', display: 'flex', overflow: 'hidden', background: 'var(--surface-3)', position: 'relative' }}>
-            {debt > 0 && (
+          {/* Allocation Stack Bar. Widths are scaled against whichever is
+              larger - income, or what the month actually allocates - so an
+              over-committed month reads as over-committed instead of being
+              silently squeezed back to fit by flexbox. */}
+          <div style={{
+            height: 24, borderRadius: 'var(--radius-md)', display: 'flex',
+            overflow: 'hidden', background: 'var(--surface-3)', position: 'relative',
+          }}>
+            {ALLOCATION_BANDS.filter((band) => band.value > 0).map((band) => (
               <div
-                style={{ width: `${(debt / income) * 100}%`, background: 'var(--c7)' }}
-                title={`Debt: ${money(debt)} (${pct((debt / income) * 100, 1)})`}
+                key={band.key}
+                style={{
+                  width: `${(band.value / allocationScale) * 100}%`,
+                  background: band.color,
+                  flexShrink: 0,
+                }}
+                title={`${band.label}: ${money(band.value)} (${pct((band.value / income) * 100, 1)} of inflow)`}
               />
-            )}
-            {fixedSpend > 0 && (
-              <div
-                style={{ width: `${(fixedSpend / income) * 100}%`, background: 'var(--c3)' }}
-                title={`Fixed Bills: ${money(fixedSpend)} (${pct((fixedSpend / income) * 100, 1)})`}
-              />
-            )}
-            {committedSave > 0 && (
-              <div
-                style={{ width: `${(committedSave / income) * 100}%`, background: 'var(--accent-teal)' }}
-                title={`Committed Savings: ${money(committedSave)} (${pct((committedSave / income) * 100, 1)})`}
-              />
-            )}
-            {varSpend > 0 && (
-              <div
-                style={{ width: `${(varSpend / income) * 100}%`, background: 'var(--c6)' }}
-                title={`Variable Spend: ${money(varSpend)} (${pct((varSpend / income) * 100, 1)})`}
-              />
-            )}
-            {rawHeadroom > 0 && (
-              <div
-                style={{ width: `${(rawHeadroom / income) * 100}%`, background: 'var(--surface-4)' }}
-                title={`Surplus Headroom: ${money(rawHeadroom)} (${pct((rawHeadroom / income) * 100, 1)})`}
-              />
-            )}
+            ))}
           </div>
 
+          {allocated > income && (
+            <div className="tiny warn" style={{ marginTop: 6 }}>
+              A typical month allocates {money(allocated)} against {money(income)} of inflow &mdash;
+              {' '}{money(allocated - income)} more than comes in.
+            </div>
+          )}
+
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-4)', marginTop: 'var(--space-3)' }} className="tiny muted">
-            <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <span style={{ width: 10, height: 10, borderRadius: '50%', background: 'var(--c7)' }} />
-              Debt: {compact(debt)} ({pct((debt / income) * 100, 0)})
-            </span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <span style={{ width: 10, height: 10, borderRadius: '50%', background: 'var(--c3)' }} />
-              Fixed Bills: {compact(fixedSpend)} ({pct((fixedSpend / income) * 100, 0)})
-            </span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <span style={{ width: 10, height: 10, borderRadius: '50%', background: 'var(--accent-teal)' }} />
-              Committed Savings: {compact(committedSave)} ({pct((committedSave / income) * 100, 0)})
-            </span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <span style={{ width: 10, height: 10, borderRadius: '50%', background: 'var(--c6)' }} />
-              Variable Spend: {compact(varSpend)} ({pct((varSpend / income) * 100, 0)})
-            </span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <span style={{ width: 10, height: 10, borderRadius: '50%', background: 'var(--surface-4)' }} />
-              Uncommitted Headroom: {compact(rawHeadroom)} ({pct((rawHeadroom / income) * 100, 0)})
-            </span>
+            {ALLOCATION_BANDS.map((band) => (
+              <span key={band.key} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{
+                  width: 10, height: 10, borderRadius: '50%', background: band.color, flexShrink: 0,
+                }} />
+                {band.label}: {compact(band.value)} ({pct((band.value / income) * 100, 0)})
+              </span>
+            ))}
           </div>
         </GlassCard>
       )}
@@ -215,7 +228,7 @@ export default function Budget() {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 'var(--space-4)' }}>
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
-                <span style={{ color: 'var(--accent-emerald)', display: 'inline-flex' }}>
+                <span style={{ color: 'var(--pos)', display: 'inline-flex' }}>
                   <Icon name="sparkles" size={18} />
                 </span>
                 <h3 className="h3" style={{ margin: 0 }}>Discretionary Spend Trim Simulator</h3>
@@ -242,7 +255,7 @@ export default function Budget() {
             <div>
               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
                 <span className="small font-medium">Variable Discretionary Budget Trim</span>
-                <span className="num font-semibold" style={{ color: 'var(--accent-emerald)' }}>
+                <span className="num font-semibold" style={{ color: 'var(--pos)' }}>
                   −{variableCutPct}%
                 </span>
               </div>
@@ -253,7 +266,7 @@ export default function Budget() {
                 step="1"
                 value={variableCutPct}
                 onChange={(e) => setVariableCutPct(Number(e.target.value))}
-                style={{ width: '100%', accentColor: 'var(--accent-emerald)', cursor: 'pointer' }}
+                style={{ width: '100%', accentColor: 'var(--pos)', cursor: 'pointer' }}
               />
             </div>
 
@@ -273,6 +286,10 @@ export default function Budget() {
               <div className="tiny muted">Annual Compound Surplus:</div>
               <div className="num font-semibold brand">
                 +{money(simAnnualSavings)}/yr
+              </div>
+              <div className="tiny muted" style={{ marginTop: 6 }}>Headroom after trim:</div>
+              <div className={`num font-semibold ${simAdjustedHeadroom >= 0 ? 'pos' : 'neg'}`}>
+                {money(simAdjustedHeadroom)}/mo
               </div>
             </div>
           </div>
@@ -385,6 +402,10 @@ export default function Budget() {
           drill={drill}
         />
       )}
+
+      {(data.notes || []).map((note, i) => (
+        <Callout key={i} tone="warn">{note}</Callout>
+      ))}
 
       {knownMonths?.length > 1 && scoped && (
         <Callout tone="info">

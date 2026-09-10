@@ -4,13 +4,14 @@
    ──────────────────────────────────────────────────────────────────────── */
 
 import React, { useState } from 'react';
+import { Link } from '../core/router';
 import { api, watchJob } from '../core/api';
 import { useQuery } from '../core/store';
 import { useToast } from '../core/toast';
-import { useDrill } from '../core/drill';
-import { ago, dateLabel, duration, money, plural } from '../core/format';
-import { Button, Callout, Card, GlassCard, Chip, ConfirmButton, Empty, Icon, Loading, Table } from '../ui';
+import { ago, plural, stampLabel } from '../core/format';
+import { Button, Callout, Card, GlassCard, Chip, ConfirmButton, Empty, Icon, Loading } from '../ui';
 import JobProgress from '../ui/JobProgress';
+import { AgentAnswerView, AgentRunDiff } from '../ui/AgentAnswerView';
 
 const ICONS = {
   scale: 'scales',
@@ -69,6 +70,7 @@ export default function Agents() {
   if (error) return <Callout tone="neg">{error.message}</Callout>;
 
   const agents = catalogue?.agents || [];
+  const budget = catalogue?.profile || {};
   const blocked = catalogue && !catalogue.model_available;
 
   if (openRun) {
@@ -89,7 +91,18 @@ export default function Agents() {
 
       {blocked && (
         <Callout tone="warn">
-          {catalogue.model_note || 'Model provider not configured. Add an API key in Settings to run AI agents.'}
+          {catalogue.model_note
+            || 'No model provider is configured. Choose one and add an API key in Settings to run AI agents.'}
+        </Callout>
+      )}
+
+      {budget.name && (
+        <Callout tone="info">
+          <strong>{budget.name === 'compact' ? 'Minimum' : 'Full'} step budget</strong>
+          {budget.max_steps ? ` — up to ${plural(budget.max_steps, 'reasoning step')} per run.` : '.'}
+          {budget.note ? ` ${budget.note}` : ''}
+          {' '}
+          <Link to="/settings">Change it in Settings</Link>.
         </Callout>
       )}
 
@@ -110,6 +123,7 @@ export default function Agents() {
               disabled={blocked}
               running={runningKey === agent.key}
               question={question[agent.key] || ''}
+              maxSteps={Math.min(agent.max_steps || 0, budget.max_steps || agent.max_steps || 0)}
               onQuestion={(v) => setQuestion((p) => ({ ...p, [agent.key]: v }))}
               onRun={() => run(agent)}
               onOpen={() => open(agent.last_run.id)}
@@ -122,7 +136,9 @@ export default function Agents() {
   );
 }
 
-function AgentCard({ agent, disabled, running, question, onQuestion, onRun, onOpen, onHistory }) {
+function AgentCard({
+  agent, disabled, running, question, maxSteps, onQuestion, onRun, onOpen, onHistory,
+}) {
   const icon = ICONS[agent.icon] || 'sparkles';
   const hasLastRun = agent.last_run?.id;
 
@@ -133,46 +149,45 @@ function AgentCard({ agent, disabled, running, question, onQuestion, onRun, onOp
           <div className="flex items-center gap-2.5">
             <div style={{
               width: 36, height: 36, borderRadius: 'var(--r-sm)',
-              background: 'var(--accent-soft)', color: 'var(--accent)',
+              background: 'var(--accent-soft)', color: 'var(--accent-text)',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
             }}>
               <Icon name={icon} size={18} />
             </div>
-            <div>
+            <div style={{ minWidth: 0 }}>
               <h3 style={{ fontSize: 16, fontWeight: 700 }}>{agent.name}</h3>
-              <span className="text-3 text-xs">{agent.category || 'Specialized Agent'}</span>
+              <span className="text-3 text-xs">
+                {agent.tools?.length ? plural(agent.tools.length, 'read-only tool') : 'Specialized agent'}
+                {maxSteps ? ` · up to ${maxSteps} steps` : ''}
+              </span>
             </div>
           </div>
-          {agent.runs_count > 0 && (
-            <button
-              type="button"
-              className="badge badge-accent"
-              onClick={onHistory}
-              title="View past executions"
-              style={{ cursor: 'pointer', border: 'none' }}
-            >
-              {plural(agent.runs_count, 'run')}
-            </button>
-          )}
+          <button
+            type="button"
+            className="badge badge-accent"
+            onClick={onHistory}
+            title="View past executions"
+            style={{ cursor: 'pointer', border: 'none' }}
+          >
+            History
+          </button>
         </div>
 
         <p style={{ fontSize: 13, color: 'var(--text-2)', lineHeight: 1.5, marginBottom: 14 }}>
-          {agent.description}
+          {agent.blurb}
         </p>
 
-        {agent.recommended_prompts?.length > 0 && (
+        {agent.question && (
           <div className="flex-col gap-1.5" style={{ marginBottom: 14 }}>
-            {agent.recommended_prompts.slice(0, 2).map((rp, i) => (
-              <button
-                key={i}
-                type="button"
-                className="text-xs text-3 flex items-center gap-1.5"
-                onClick={() => onQuestion(rp)}
-                style={{ textAlign: 'left', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--accent)' }}
-              >
-                <span>✦ {rp}</span>
-              </button>
-            ))}
+            <button
+              type="button"
+              className="text-xs flex items-start gap-1.5"
+              onClick={() => onQuestion(agent.question)}
+              title="Use the agent's own default question"
+              style={{ textAlign: 'left', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--accent-text)' }}
+            >
+              <span>&#10022; {agent.question}</span>
+            </button>
           </div>
         )}
       </div>
@@ -202,8 +217,13 @@ function AgentCard({ agent, disabled, running, question, onQuestion, onRun, onOp
           </Button>
 
           {hasLastRun && (
-            <Button size="sm" variant="ghost" onClick={onOpen}>
-              Latest Answer ({ago(agent.last_run.created_at)})
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={onOpen}
+              title={agent.last_run.headline || 'Open the most recent answer'}
+            >
+              Latest answer ({ago(agent.last_run.started_at)})
             </Button>
           )}
         </div>
@@ -213,27 +233,35 @@ function AgentCard({ agent, disabled, running, question, onQuestion, onRun, onOp
 }
 
 function AgentAnswer({ run, onBack }) {
-  const { drill } = useDrill();
   const [showTranscript, setShowTranscript] = useState(false);
+  const failed = run.status && run.status !== 'ok';
 
   return (
     <div className="flex-col gap-4 animate-fade-in">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-2">
         <Button variant="ghost" size="sm" icon="arrow-left" onClick={onBack}>
           Back to Agents
         </Button>
-        <span className="text-3 text-xs">Executed {dateLabel(run.created_at)} · {duration(run.elapsed_ms)}</span>
+        <span className="text-3 text-xs">
+          {run.agent_name || run.agent} · {stampLabel(run.started_at)}
+          {run.seconds != null ? ` · ${run.seconds.toFixed(1)}s` : ''}
+          {run.steps != null ? ` · ${plural(run.steps, 'step')}` : ''}
+          {run.tool_calls != null ? ` · ${plural(run.tool_calls, 'tool call')}` : ''}
+        </span>
       </div>
 
       <GlassCard pad>
-        <div className="flex items-center gap-2" style={{ marginBottom: 12 }}>
-          <span className="badge badge-accent">
-            <Icon name="check-circle" size={13} /> Reconciled Finding
+        <div className="flex items-center gap-2 flex-wrap" style={{ marginBottom: 12 }}>
+          <span className={`badge ${failed ? 'badge-warn' : 'badge-accent'}`}>
+            <Icon name={failed ? 'warning' : 'check-circle'} size={13} />
+            {failed ? ' Completed with warnings' : ' Reconciled finding'}
           </span>
-          <span className="text-3 text-xs">All arithmetic audited</span>
+          {run.provider && (
+            <span className="text-3 text-xs">
+              {run.provider}{run.model ? ` · ${run.model}` : ''}
+            </span>
+          )}
         </div>
-
-        <h2 style={{ fontSize: 20, fontWeight: 800, marginBottom: 10 }}>{run.headline || run.agent_name || 'Agent Analysis'}</h2>
 
         {run.question && (
           <div style={{ padding: '8px 12px', background: 'var(--surface-2)', borderRadius: 'var(--r-sm)', fontSize: 13, marginBottom: 14 }}>
@@ -241,58 +269,61 @@ function AgentAnswer({ run, onBack }) {
           </div>
         )}
 
-        <div style={{ fontSize: 14, lineHeight: 1.65, color: 'var(--text)', whiteSpace: 'pre-wrap' }}>
-          {run.output || run.answer || run.summary}
-        </div>
-
-        {/* Traced Figures */}
-        {run.figures?.length > 0 && (
-          <div style={{ marginTop: 20, paddingTop: 16, borderTop: '1px solid var(--line)' }}>
-            <div style={{ fontSize: 12, fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-3)', marginBottom: 8 }}>
-              Audited Figures (Click to view transactions in ledger)
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {run.figures.map((fig, i) => (
-                <button
-                  key={i}
-                  type="button"
-                  className="chip chip-pos tabular-nums"
-                  onClick={() => drill({ title: `Audited figure: ${fig.value || fig}`, params: fig.params || {} })}
-                  title="Drill down into matching rows"
-                >
-                  ✓ {fig.value || fig}
-                </button>
-              ))}
-            </div>
-          </div>
+        {run.error && (
+          <Callout tone="warn">{run.error}</Callout>
         )}
+
+        <AgentAnswerView answer={run.answer} />
       </GlassCard>
+
+      <AgentRunDiff diff={run.diff} />
 
       {/* Execution Transcript Accordion */}
       {run.transcript?.length > 0 && (
-        <Card pad title="Tool Execution Transcript" sub="Exact read-only tool invocations and results">
+        <Card pad title="Tool Execution Transcript" sub="Exact read-only tool invocations and their results">
           <Button size="xs" variant="secondary" onClick={() => setShowTranscript((v) => !v)}>
-            {showTranscript ? 'Hide Step Details' : `Show ${run.transcript.length} Tool Steps`}
+            {showTranscript ? 'Hide step details' : `Show ${run.transcript.length} reasoning steps`}
           </Button>
 
           {showTranscript && (
             <div className="flex-col gap-2" style={{ marginTop: 14 }}>
               {run.transcript.map((step, idx) => (
-                <div key={idx} className="card" style={{ padding: '10px 14px', fontSize: 12.5, background: 'var(--surface-2)' }}>
-                  <div className="flex items-center justify-between font-mono font-bold text-accent" style={{ marginBottom: 4 }}>
-                    <span>Step {idx + 1}: {step.tool || step.action}</span>
-                    <span className="text-3 text-xs">{duration(step.duration_ms)}</span>
+                <div key={step.index ?? idx} className="card" style={{ padding: '10px 14px', fontSize: 12.5, background: 'var(--surface-2)' }}>
+                  <div className="flex items-center justify-between gap-2 flex-wrap" style={{ marginBottom: 6 }}>
+                    <span className="font-mono font-bold brand">Step {(step.index ?? idx) + 1}</span>
+                    <span className="text-3 text-xs">
+                      {step.seconds != null ? `${step.seconds.toFixed(2)}s` : ''}
+                    </span>
                   </div>
-                  {step.args && (
-                    <div className="mono text-3 text-xs" style={{ marginBottom: 4 }}>
-                      Args: {JSON.stringify(step.args)}
+
+                  {step.thought && (
+                    <div className="text-2" style={{ marginBottom: 6, lineHeight: 1.5, whiteSpace: 'normal' }}>
+                      {step.thought}
                     </div>
                   )}
-                  {step.result && (
-                    <div className="text-2 text-xs truncate">
-                      Result: {typeof step.result === 'object' ? JSON.stringify(step.result) : String(step.result)}
+
+                  {step.calls?.length > 0 && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 6 }}>
+                      {step.calls.map((call, ci) => (
+                        <Chip key={ci} tone="brand" size="sm" title={JSON.stringify(call.args || {})}>
+                          {call.tool}
+                        </Chip>
+                      ))}
                     </div>
                   )}
+
+                  {step.results?.length > 0 && (
+                    <div className="trace-box">
+                      {step.results.map((res, ri) => (
+                        <div key={ri} className="trace-row">
+                          <strong style={{ flexShrink: 0 }}>{res.tool}</strong>
+                          <span>{summarise(res.result ?? res.error)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {step.error && <Callout tone="neg">{step.error}</Callout>}
                 </div>
               ))}
             </div>
@@ -303,8 +334,31 @@ function AgentAnswer({ run, onBack }) {
   );
 }
 
+/* Tool results are large nested objects; show a readable one-liner. */
+function summarise(value) {
+  if (value == null) return '—';
+  if (typeof value !== 'object') return String(value);
+  const text = JSON.stringify(value);
+  return text.length > 400 ? `${text.slice(0, 400)}…` : text;
+}
+
 function History({ agent, onOpen, onClose, onDeleted }) {
-  const { data: runs = [], loading } = useQuery(`agent-runs:${agent.key}`, () => api.agentRuns(agent.key));
+  const toast = useToast();
+  const { data, loading, refetch } = useQuery(
+    `agent-runs:${agent.key}`, () => api.agentRuns(agent.key),
+  );
+  const runs = data?.runs || [];
+
+  const remove = async (id) => {
+    try {
+      await api.deleteAgentRun(id);
+      await refetch();
+      onDeleted?.();
+      toast.ok('Run deleted');
+    } catch (e) {
+      toast.fail('Could not delete run', e.message);
+    }
+  };
 
   return (
     <Card
@@ -320,17 +374,38 @@ function History({ agent, onOpen, onClose, onDeleted }) {
           {runs.map((r) => (
             <div
               key={r.id}
-              className="card flex items-center justify-between"
-              style={{ padding: '12px 16px', cursor: 'pointer' }}
-              onClick={() => onOpen(r.id)}
+              className="card flex items-center justify-between gap-3 flex-wrap"
+              style={{ padding: '12px 16px' }}
             >
-              <div>
-                <div style={{ fontWeight: 600, fontSize: 13.5 }}>{r.headline || r.question || 'Agent Run'}</div>
-                <div style={{ fontSize: 11.5, color: 'var(--text-3)' }}>
-                  {dateLabel(r.created_at)} · {duration(r.elapsed_ms)}
+              <button
+                type="button"
+                onClick={() => onOpen(r.id)}
+                style={{
+                  flex: 1, minWidth: 220, textAlign: 'left', background: 'none',
+                  border: 'none', cursor: 'pointer', color: 'inherit', font: 'inherit', padding: 0,
+                }}
+              >
+                <div style={{ fontWeight: 600, fontSize: 13.5 }}>
+                  {r.answer?.headline || r.question || 'Agent run'}
                 </div>
+                <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 2 }}>
+                  {stampLabel(r.started_at)}
+                  {r.seconds != null ? ` · ${r.seconds.toFixed(1)}s` : ''}
+                  {r.status && r.status !== 'ok' ? ` · ${r.status}` : ''}
+                </div>
+              </button>
+              <div className="flex items-center gap-2">
+                <Button size="xs" variant="secondary" onClick={() => onOpen(r.id)}>View answer</Button>
+                <ConfirmButton
+                  size="xs"
+                  variant="danger"
+                  question="Delete this run permanently?"
+                  confirmLabel="Delete"
+                  onConfirm={() => remove(r.id)}
+                >
+                  Delete
+                </ConfirmButton>
               </div>
-              <Button size="xs" variant="secondary">View Answer</Button>
             </div>
           ))}
         </div>

@@ -44,7 +44,9 @@ p { margin-bottom: 0.5rem; }
 p:last-child { margin-bottom: 0; }
 
 a {
-  color: var(--accent);
+  /* `--accent-text` rather than `--accent`: the fill shade reads at 4.1:1 on
+     the dark surfaces links sit on, below AA for body text. */
+  color: var(--accent-text);
   text-decoration: none;
   transition: color var(--t-fast) var(--e-out);
 }

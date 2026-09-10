@@ -146,9 +146,9 @@ export default function Admin() {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 'var(--space-3)' }}>
           <Section title="Deployment Tenants" subtitle={`${rows.length} accounts on record`} />
-          <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
-            <Select value={sort} onChange={setSort} options={SORTS} style={{ minWidth: 220 }} />
-            <Search value={search} onChange={setSearch} placeholder="Filter accounts…" style={{ width: 200 }} />
+          <div style={{ display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap', maxWidth: '100%' }}>
+            <Select value={sort} onChange={setSort} options={SORTS} style={{ minWidth: 180, maxWidth: '100%' }} />
+            <Search value={search} onChange={setSearch} placeholder="Filter accounts…" style={{ width: 200, maxWidth: '100%' }} />
           </div>
         </div>
 

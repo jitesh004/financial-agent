@@ -99,7 +99,7 @@ export default function WidgetView({ widget, result, running, error }) {
   if (!result && running) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', padding: 'var(--space-6)' }}>
-        <Spinner size="md" />
+        <Spinner />
       </div>
     );
   }
@@ -121,9 +121,15 @@ export default function WidgetView({ widget, result, running, error }) {
     const val = primaryMeasure ? firstRow[primaryMeasure.key] : null;
 
     return (
-      <div style={{ padding: 'var(--space-5)', display: 'flex', flexDirection: 'column', justifyContent: 'center', height: '100%' }}>
-        <div className="stat-label">{widget.title || primaryMeasure?.label || 'Total'}</div>
-        <div className="stat-value" style={{ fontSize: 'var(--text-3xl)', color: 'var(--brand-primary)' }}>
+      <div style={{
+        padding: 'var(--space-4)', display: 'flex', flexDirection: 'column',
+        justifyContent: 'center', height: '100%', minWidth: 0,
+      }}>
+        <div className="stat-label truncate">{widget.title || primaryMeasure?.label || 'Total'}</div>
+        <div
+          className="stat-value truncate"
+          style={{ fontSize: 'var(--text-2xl)', lineHeight: 1.2, color: 'var(--accent-text)' }}
+        >
           {formatValue(val, primaryMeasure?.type)}
         </div>
         {dims[0] && (
@@ -162,7 +168,7 @@ export default function WidgetView({ widget, result, running, error }) {
 
     return (
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 'var(--space-3)', height: '100%' }}>
-        <Donut data={items.slice(0, 8)} size={180} strokeWidth={24} />
+        <Donut data={items.slice(0, 8)} size={180} thickness={24} />
         <Legend items={items.slice(0, 6)} />
       </div>
     );

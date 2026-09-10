@@ -119,17 +119,32 @@ export function Stat({
 
 /* ═══════════════════════════════════════════════════════ Badges & Chips ═══════ */
 
-export function Chip({ tone = '', children, className = '', ...rest }) {
-  const t = tone === 'pos' ? 'chip-pos' : tone === 'neg' ? 'chip-neg' : tone === 'warn' ? 'chip-warn' : tone === 'acc' ? 'chip-accent' : '';
-  return <span className={`chip ${t} ${className}`} {...rest}>{children}</span>;
+/* Tone names accepted everywhere: pos | neg | warn | acc/accent/brand. */
+function toneClass(prefix, tone) {
+  if (tone === 'pos' || tone === 'neg' || tone === 'warn') return `${prefix}-${tone}`;
+  if (tone === 'acc' || tone === 'accent' || tone === 'brand') return `${prefix}-accent`;
+  return '';
 }
 
-export function Badge({ tone = '', children, className = '', ...rest }) {
-  const t = tone === 'pos' ? 'badge-pos' : tone === 'neg' ? 'badge-neg' : tone === 'warn' ? 'badge-warn' : tone === 'acc' ? 'badge-accent' : '';
-  return <span className={`badge ${t} ${className}`} {...rest}>{children}</span>;
+export function Chip({ tone = '', size, children, className = '', ...rest }) {
+  return (
+    <span className={`chip ${toneClass('chip', tone)} ${size === 'sm' ? 'tiny' : ''} ${className}`} {...rest}>
+      {children}
+    </span>
+  );
 }
 
-const CALLOUT_ICON = { pos: 'check-circle', neg: 'alert', warn: 'warning', acc: 'info' };
+export function Badge({ tone = '', size, children, className = '', ...rest }) {
+  return (
+    <span className={`badge ${toneClass('badge', tone)} ${size === 'sm' ? 'tiny' : ''} ${className}`} {...rest}>
+      {children}
+    </span>
+  );
+}
+
+const CALLOUT_ICON = {
+  pos: 'check-circle', neg: 'alert', warn: 'warning', acc: 'info', info: 'info',
+};
 
 export function Callout({ tone = '', children, icon, className = '', ...rest }) {
   const name = icon ?? CALLOUT_ICON[tone] ?? 'info';
@@ -171,17 +186,17 @@ export function Empty({ title, icon = 'inbox', children, action }) {
   );
 }
 
-export function Loading({ message = 'Loading...' }) {
+export function Loading({ message, label }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12, padding: '40px 0' }}>
       <Spinner />
-      <span style={{ fontSize: 13.5, color: 'var(--text-2)' }}>{message}</span>
+      <span style={{ fontSize: 13.5, color: 'var(--text-2)' }}>{message ?? label ?? 'Loading…'}</span>
     </div>
   );
 }
 
-export function Spinner({ sm = false }) {
-  const sz = sm ? 14 : 20;
+export function Spinner({ sm = false, size }) {
+  const sz = size || (sm ? 14 : 20);
   return (
     <div style={{
       width: sz, height: sz, borderRadius: '50%',
@@ -201,7 +216,8 @@ export function Button({
   const vClass = variant === 'primary' ? 'btn-primary'
     : variant === 'ghost' ? 'btn-ghost'
       : variant === 'danger' ? 'btn-danger'
-        : 'btn-secondary';
+        : variant === 'link' ? 'link'
+          : 'btn-secondary';
   const sClass = size === 'sm' || size === 'xs' ? 'btn-sm' : size === 'lg' ? 'btn-lg' : '';
 
   return (
@@ -311,46 +327,74 @@ export function PromptButton({
   );
 }
 
+/* `type="money"` and `type="number"` commit a Number (or null when blank) so
+   numeric API fields never receive a string; every other type commits text. */
+const NUMERIC_EDIT = new Set(['money', 'number']);
+
 export function InlineEdit({
-  value, onSave, label = 'Edit value', placeholder = '', type = 'text', size = '',
+  value, onSave, label = 'Edit value', placeholder = '', type = 'text',
+  width, align = 'right', suffix = '',
 }) {
+  const numeric = NUMERIC_EDIT.has(type);
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(value);
-  useEffect(() => setDraft(value), [value]);
+  const [draft, setDraft] = useState(value ?? '');
+  useEffect(() => setDraft(value ?? ''), [value]);
 
   const commit = async () => {
     setEditing(false);
-    if (draft !== value) await onSave?.(draft);
+    const next = numeric
+      ? (String(draft).trim() === '' ? null : Number(draft))
+      : draft;
+    if (numeric && next !== null && Number.isNaN(next)) return;
+    if (next !== value) await onSave?.(next);
   };
+
+  const shown = value === null || value === undefined || value === ''
+    ? (placeholder || '—')
+    : (type === 'money' ? money(value) : String(value));
 
   if (!editing) {
     return (
       <button
         type="button"
-        className="flex items-center gap-1.5"
-        style={{ color: 'inherit', textAlign: 'left', cursor: 'pointer', background: 'none', border: 'none' }}
+        className="flex items-center gap-1"
+        style={{
+          color: 'inherit',
+          textAlign: align,
+          justifyContent: align === 'right' ? 'flex-end' : 'flex-start',
+          width: width ? `${width}px` : undefined,
+          maxWidth: '100%',
+          cursor: 'pointer',
+          background: 'none',
+          border: 'none',
+          padding: 0,
+          font: 'inherit',
+        }}
         onClick={() => setEditing(true)}
         title={label}
       >
-        <span>{value || placeholder || '—'}</span>
-        <Icon name="edit" size={12} style={{ opacity: 0.5 }} />
+        <span className={numeric ? 'tabular-nums' : ''}>{shown}{suffix && value != null && value !== '' ? suffix : ''}</span>
+        <Icon name="edit" size={12} style={{ opacity: 0.4, flexShrink: 0 }} />
       </button>
     );
   }
 
   return (
     <input
-      type={type}
+      type={numeric ? 'number' : type}
+      step={type === 'money' ? '0.01' : undefined}
       value={draft ?? ''}
       autoFocus
       onChange={(e) => setDraft(e.target.value)}
       onBlur={commit}
       onKeyDown={(e) => {
         if (e.key === 'Enter') commit();
-        if (e.key === 'Escape') { setDraft(value); setEditing(false); }
+        if (e.key === 'Escape') { setDraft(value ?? ''); setEditing(false); }
       }}
       style={{
         padding: '3px 8px', fontSize: 13, borderRadius: 'var(--r-xs)',
+        width: width ? `${width}px` : undefined, maxWidth: '100%',
+        textAlign: align,
         border: '1px solid var(--accent)', background: 'var(--surface)', color: 'var(--text)',
       }}
     />
@@ -362,9 +406,13 @@ export function InlineEdit({
 export function Segmented({ options = [], value, onChange, ariaLabel, className = '' }) {
   return (
     <div className={`segmented-control ${className}`} role="tablist" aria-label={ariaLabel} style={{
-      display: 'inline-flex', gap: 2, padding: 3, borderRadius: 'var(--r-sm)',
+      display: 'flex', gap: 2, padding: 3, borderRadius: 'var(--r-sm)',
       background: 'var(--surface-2)', border: '1px solid var(--line)',
-      maxWidth: '100%', overflowX: 'auto', flexShrink: 0, scrollbarWidth: 'none',
+      /* `inline-flex` + `flexShrink: 0` meant a long option set pushed its
+         whole row past the viewport instead of scrolling inside its own box.
+         `minWidth: 0` is what actually lets a flex child shrink below its
+         content width, which is the precondition for the scroll to engage. */
+      maxWidth: '100%', minWidth: 0, overflowX: 'auto', scrollbarWidth: 'none',
     }}>
       {options.map(([v, label, title]) => {
         const isActive = value === v;
@@ -378,9 +426,10 @@ export function Segmented({ options = [], value, onChange, ariaLabel, className 
             onClick={() => onChange(v)}
             style={{
               padding: '4px 10px', borderRadius: 'var(--r-xs)',
+              flexShrink: 0, whiteSpace: 'nowrap',
               fontSize: 12.5, fontWeight: isActive ? 600 : 500,
               background: isActive ? 'var(--surface)' : 'transparent',
-              color: isActive ? 'var(--accent)' : 'var(--text-2)',
+              color: isActive ? 'var(--accent-text)' : 'var(--text-2)',
               border: 'none', cursor: 'pointer',
               boxShadow: isActive ? 'var(--shadow-sm)' : 'none',
               transition: 'all var(--t-fast)',
@@ -449,9 +498,13 @@ export function Field({ label, hint, error, children, id: given }) {
   );
 }
 
-export function Search({ value, onChange, placeholder = 'Search…', ...rest }) {
+export function Search({ value, onChange, placeholder = 'Search…', style = {}, ...rest }) {
+  /* `style` sizes the wrapper (callers pass width/flex); the input keeps its own
+     chrome so an incoming style object can never strip its border and padding. */
   return (
-    <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center', width: '100%' }}>
+    <div style={{
+      position: 'relative', display: 'inline-flex', alignItems: 'center', width: '100%', ...style,
+    }}>
       <span style={{ position: 'absolute', left: 10, color: 'var(--text-3)', pointerEvents: 'none', display: 'flex' }}>
         <Icon name="search" size={14} />
       </span>
@@ -515,7 +568,7 @@ export function Tabs({ tabs = [], active, onChange }) {
               padding: '6px 14px', borderRadius: 'var(--r-sm)',
               fontSize: 13, fontWeight: isActive ? 600 : 500,
               background: isActive ? 'var(--surface)' : 'transparent',
-              color: isActive ? 'var(--accent)' : 'var(--text-2)',
+              color: isActive ? 'var(--accent-text)' : 'var(--text-2)',
               border: 'none', cursor: 'pointer', display: 'inline-flex',
               alignItems: 'center', gap: 6,
               boxShadow: isActive ? 'var(--shadow-sm)' : 'none',
@@ -717,10 +770,10 @@ export function Skeleton({ lines = 4, height = 18 }) {
   );
 }
 
-export function SkeletonStats() {
+export function SkeletonStats({ count = 4 }) {
   return (
-    <div className="grid-4" style={{ marginBottom: 20 }}>
-      {[0, 1, 2, 3].map((i) => (
+    <div className={count === 3 ? 'grid-3' : 'grid-4'} style={{ marginBottom: 20 }}>
+      {Array.from({ length: count }).map((_, i) => (
         <div key={i} className="stat-widget">
           <Skeleton lines={2} height={24} />
         </div>
@@ -729,22 +782,28 @@ export function SkeletonStats() {
   );
 }
 
-export function BarList({ items = [], max }) {
-  const topVal = max || Math.max(...items.map((i) => Math.abs(Number(i.value) || 0)), 1);
+/* `max` caps how many rows render; bars are always scaled against the largest
+   value present (or `total`, when the caller wants share-of-whole widths).
+   Passing `onPick` makes each row a button that drills into its rows. */
+export function BarList({ items = [], max, total, onPick }) {
+  const shown = max ? items.slice(0, max) : items;
+  const scale = Number(total) > 0
+    ? Number(total)
+    : shown.reduce((top, i) => Math.max(top, Math.abs(Number(i.value) || 0)), 1);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-      {items.map((item, idx) => {
-        const ratio = Math.min(100, (Math.abs(Number(item.value) || 0) / topVal) * 100);
-        return (
-          <div key={item.label || idx} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <div className="flex items-center justify-between text-xs">
-              <span className="font-semibold truncate" style={{ maxWidth: 220 }}>{item.label}</span>
+      {shown.map((item, idx) => {
+        const ratio = Math.min(100, (Math.abs(Number(item.value) || 0) / (scale || 1)) * 100);
+        const body = (
+          <>
+            <div className="flex items-center justify-between text-xs" style={{ gap: 12 }}>
+              <span className="font-semibold truncate" style={{ maxWidth: 240 }}>{item.label}</span>
               <span className="tabular-nums font-bold">{money(item.value)}</span>
             </div>
             <div style={{
               width: '100%', height: 6, borderRadius: 'var(--r-full)',
-              background: 'var(--surface-3)', overflow: 'hidden',
+              background: 'var(--surface-3)', overflow: 'hidden', marginTop: 4,
             }}>
               <div style={{
                 width: `${ratio}%`, height: '100%',
@@ -752,7 +811,25 @@ export function BarList({ items = [], max }) {
                 borderRadius: 'var(--r-full)',
               }} />
             </div>
-          </div>
+          </>
+        );
+
+        if (!onPick) {
+          return <div key={item.label || idx}>{body}</div>;
+        }
+        return (
+          <button
+            key={item.label || idx}
+            type="button"
+            onClick={() => onPick(item)}
+            title="Show the transactions behind this"
+            style={{
+              display: 'block', width: '100%', textAlign: 'left', cursor: 'pointer',
+              background: 'none', border: 'none', padding: 0, color: 'inherit', font: 'inherit',
+            }}
+          >
+            {body}
+          </button>
         );
       })}
     </div>
@@ -786,7 +863,7 @@ export function SortHeader({ label, field, sort, onSort, align = 'left' }) {
         type="button"
         onClick={() => onSort?.(field)}
         style={{
-          background: 'none', border: 'none', color: isSorted ? 'var(--accent)' : 'inherit',
+          background: 'none', border: 'none', color: isSorted ? 'var(--accent-text)' : 'inherit',
           cursor: 'pointer', font: 'inherit', fontWeight: isSorted ? 700 : 600,
           display: 'inline-flex', alignItems: 'center', gap: 4,
           padding: 0,

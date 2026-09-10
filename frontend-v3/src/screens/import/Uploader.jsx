@@ -116,7 +116,7 @@ export default function Uploader({ onComplete, compact = false }) {
           textAlign: 'center',
           cursor: 'pointer',
           background: over ? 'var(--surface-3)' : 'var(--surface-2)',
-          transition: 'all var(--transition-fast)',
+          transition: 'all var(--t-fast)',
         }}
       >
         <div style={{ color: 'var(--brand-primary)', marginBottom: 8, display: 'inline-flex' }}>

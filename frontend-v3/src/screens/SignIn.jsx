@@ -43,7 +43,7 @@ export default function SignIn() {
             <Logo size={22} />
           </div>
           <div>
-            <h2 style={{ fontSize: 22, fontWeight: 800 }}>PRISM <span style={{ color: 'var(--accent)' }}>v3</span></h2>
+            <h2 style={{ fontSize: 22, fontWeight: 800 }}>PRISM <span style={{ color: 'var(--accent-text)' }}>v3</span></h2>
             <div style={{ fontSize: 12, color: 'var(--text-3)' }}>Intelligent Financial Operating System</div>
           </div>
         </div>

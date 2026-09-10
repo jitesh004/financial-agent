@@ -16,8 +16,10 @@ export function HealthScoreGauge({ score = 82, size = 160, grade = 'Strong', not
   const strokeDashoffset = circumference - (progress / 100) * circumference;
   const id = useId();
 
+  /* Used for the ring stroke and for the grade caption below it. The caption
+     is small text, so the accent band takes the reading shade. */
   const color = progress >= 80 ? 'var(--pos)'
-    : progress >= 60 ? 'var(--accent)'
+    : progress >= 60 ? 'var(--accent-text)'
       : progress >= 40 ? 'var(--warn)'
         : 'var(--neg)';
 
@@ -123,8 +125,11 @@ export function RunwayDial({ months = 6.4, burnMonthly = 85000, liquidTotal = 54
 
 /* ═══════════════════════════════════════════════════════ 3. Donut Breakdown ═══════ */
 
-export function DonutChart({ data = [], size = 180, thickness = 26, centerLabel = '', centerValue = '' }) {
-  const radius = (size - thickness) / 2;
+export function DonutChart({
+  data = [], size = 180, thickness, strokeWidth, centerLabel = '', centerValue = '',
+}) {
+  const ring = Number(thickness ?? strokeWidth) || 26;
+  const radius = (size - ring) / 2;
   const circumference = 2 * Math.PI * radius;
   const total = data.reduce((acc, d) => acc + Math.abs(Number(d.value) || 0), 0) || 1;
 
@@ -153,10 +158,10 @@ export function DonutChart({ data = [], size = 180, thickness = 26, centerLabel 
             r={radius}
             fill="none"
             stroke={s.color}
-            strokeWidth={thickness}
+            strokeWidth={ring}
             strokeDasharray={s.strokeDasharray}
             strokeDashoffset={s.offset}
-            strokeLinecap="round"
+            strokeLinecap={slices.length > 1 ? 'butt' : 'round'}
           />
         ))}
       </svg>

@@ -3,39 +3,48 @@
    Context-aware AI Financial Assistant with live reasoning trace and verified figures.
    ──────────────────────────────────────────────────────────────────────── */
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { api } from '../core/api';
+import { useQuery } from '../core/store';
 import { useCopilot } from '../core/copilot';
 import { useRoute } from '../core/router';
 import { usePeriod } from '../core/period';
-import { useDrill } from '../core/drill';
 import { Icon } from '../ui/icons';
-import { Button, Chip, Loading, IconButton } from '../ui';
+import { Button, Callout, IconButton } from '../ui';
 import JobProgress from '../ui/JobProgress';
+import { AgentAnswerView } from '../ui/AgentAnswerView';
 
-const AGENTS_LIST = [
-  { key: 'debt_strategist', name: 'Debt Strategist', icon: 'scales', desc: 'Snowball vs avalanche & interest savings' },
-  { key: 'subscription_auditor', name: 'Subscription Auditor', icon: 'repeat', desc: 'Hidden creeps & annualized leak audit' },
-  { key: 'cashflow_sentinel', name: 'Cashflow Sentinel', icon: 'gauge', desc: 'Upcoming pinches & 60-day low-water marks' },
-  { key: 'emergency_resilience', name: 'Emergency Resilience', icon: 'shield', desc: 'Liquidity runway & shock cushion' },
-  { key: 'lifestyle_creep', name: 'Lifestyle Creep', icon: 'trending', desc: 'Discretionary inflation trends' },
-  { key: 'tax_utilisation', name: 'Tax Utilisation', icon: 'file', desc: '80C/D deductions & tax headroom' },
-];
+/* Backend icon name → the icon set this app ships. */
+const ICONS = {
+  scale: 'scales', drip: 'repeat', wave: 'gauge', receipt: 'file', shield: 'shield',
+  alarm: 'clock', stairs: 'trending', gauge: 'target', magnifier: 'search',
+  coin: 'wallet', pulse: 'briefcase', scales: 'database',
+};
 
 export default function CopilotDrawer() {
   const {
     open, closeCopilot, suggestedPrompts, runAgentJob,
-    running, activeJob, currentRun, history,
+    running, activeJob, currentRun,
   } = useCopilot();
   const { path } = useRoute();
   const { label: periodLabel } = usePeriod();
-  const { drill } = useDrill();
 
-  const [selectedAgent, setSelectedAgent] = useState('debt_strategist');
+  /* The agent roster comes from the server: hard-coding keys here silently
+     404s every run the moment the backend renames or adds one. */
+  const { data: catalogue } = useQuery('agents', () => api.agents(), { enabled: open });
+  const agents = catalogue?.agents || [];
+
+  const [selectedAgent, setSelectedAgent] = useState('');
   const [customPrompt, setCustomPrompt] = useState('');
+
+  useEffect(() => {
+    if (!selectedAgent && agents.length) setSelectedAgent(agents[0].key);
+  }, [agents, selectedAgent]);
 
   if (!open) return null;
 
   const handleRun = (promptText = customPrompt) => {
+    if (!selectedAgent) return;
     runAgentJob(selectedAgent, promptText);
     setCustomPrompt('');
   };
@@ -78,7 +87,7 @@ export default function CopilotDrawer() {
                   key={i}
                   type="button"
                   onClick={() => handleRun(p)}
-                  disabled={running}
+                  disabled={running || !selectedAgent}
                   style={{
                     textAlign: 'left', padding: '9px 12px', borderRadius: 'var(--r)',
                     background: 'var(--surface-2)', border: '1px solid var(--line)',
@@ -106,38 +115,20 @@ export default function CopilotDrawer() {
           {/* Current Run Answer */}
           {currentRun && !running && (
             <div className="glass-card" style={{ padding: '18px', border: '1px solid var(--accent-border)' }}>
-              <div className="flex items-center justify-between" style={{ marginBottom: 12 }}>
+              <div className="flex items-center justify-between gap-2 flex-wrap" style={{ marginBottom: 12 }}>
                 <span className="badge badge-accent">
                   <Icon name="check-circle" size={13} /> Answer verified
                 </span>
-                <span style={{ fontSize: 11, color: 'var(--text-3)' }}>To the exact rupee</span>
+                <span style={{ fontSize: 11, color: 'var(--text-3)' }}>
+                  {currentRun.agent_name || currentRun.agent}
+                  {currentRun.seconds != null ? ` · ${currentRun.seconds.toFixed(1)}s` : ''}
+                </span>
               </div>
 
-              <div style={{ fontSize: 13.5, lineHeight: 1.6, color: 'var(--text)' }}>
-                {currentRun.output || currentRun.answer || currentRun.summary || 'Analysis complete.'}
-              </div>
+              {currentRun.error && <Callout tone="warn">{currentRun.error}</Callout>}
 
-              {/* Verified Figures Audit */}
-              {currentRun.figures?.length > 0 && (
-                <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--line)' }}>
-                  <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-3)', marginBottom: 6 }}>
-                    Traced figures in ledger
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    {currentRun.figures.map((fig, fi) => (
-                      <button
-                        key={fi}
-                        type="button"
-                        className="chip chip-pos tabular-nums"
-                        onClick={() => drill({ title: `Audited figure: ${fig.value || fig}`, params: fig.params || {} })}
-                        title="Click to see matching ledger rows"
-                      >
-                        ✓ {fig.value || fig}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
+              {/* `answer` is a structured object, never a renderable string. */}
+              <AgentAnswerView answer={currentRun.answer} compact />
             </div>
           )}
 
@@ -147,10 +138,11 @@ export default function CopilotDrawer() {
               Specialized Agent
             </div>
             <div className="grid-2" style={{ gap: 8 }}>
-              {AGENTS_LIST.map((ag) => (
+              {agents.map((ag) => (
                 <button
                   key={ag.key}
                   type="button"
+                  title={ag.blurb || ag.question}
                   onClick={() => setSelectedAgent(ag.key)}
                   style={{
                     padding: '8px 10px', borderRadius: 'var(--r-sm)',
@@ -158,13 +150,16 @@ export default function CopilotDrawer() {
                     background: selectedAgent === ag.key ? 'var(--accent-soft)' : 'var(--surface-2)',
                     color: selectedAgent === ag.key ? 'var(--accent)' : 'var(--text)',
                     fontSize: 12.5, fontWeight: 600, textAlign: 'left', cursor: 'pointer',
-                    display: 'flex', alignItems: 'center', gap: 6,
+                    display: 'flex', alignItems: 'center', gap: 6, minWidth: 0,
                   }}
                 >
-                  <Icon name={ag.icon} size={14} />
+                  <Icon name={ICONS[ag.icon] || 'sparkles'} size={14} />
                   <span className="truncate">{ag.name}</span>
                 </button>
               ))}
+              {!agents.length && (
+                <span className="tiny muted">Loading agent catalogue…</span>
+              )}
             </div>
           </div>
         </div>
@@ -188,7 +183,7 @@ export default function CopilotDrawer() {
             <Button
               variant="primary"
               onClick={() => handleRun()}
-              disabled={running || !customPrompt.trim()}
+              disabled={running || !customPrompt.trim() || !selectedAgent}
               busy={running}
             >
               Ask

@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { api } from '../../core/api';
+import { useJobWatch } from '../../core/store';
 import { bytes, count, money } from '../../core/format';
 import {
   Button, Callout, Chip, ConfirmButton, Empty, IconButton, PromptButton, Select, Badge,
@@ -145,12 +145,7 @@ export function SourceStep({
 }
 
 function ScanSection({ source, jobId, running, onScan, onForget }) {
-  const [open, setOpen] = useState(false);
-  const { data: job } = useQuery(
-    jobId ? `scan-section:${jobId}` : null,
-    () => api.job(jobId),
-    { enabled: Boolean(jobId), refetchInterval: 1200 }
-  );
+  const job = useJobWatch(jobId);
 
   const done = job && !job.active && job.status === 'complete';
   const found = done ? job.result?.attachments?.length ?? job.result?.alerts?.length : null;
@@ -222,7 +217,7 @@ export function ScanStep({ intents, chosen, sections, sourceJobs, busy, onScan, 
   );
 }
 
-function FileRows({ rows, selected, onToggle }) {
+function FileRows({ rows, selected, onToggle, onIgnore }) {
   const [all, setAll] = useState(false);
   const shown = all ? rows : rows.slice(0, 10);
 
@@ -239,7 +234,7 @@ function FileRows({ rows, selected, onToggle }) {
               alignItems: 'center',
               gap: 8,
               padding: '6px 8px',
-              borderRadius: 'var(--radius-sm)',
+              borderRadius: 'var(--r-sm)',
               background: on ? 'var(--surface-3)' : 'transparent',
               cursor: 'pointer',
             }}
@@ -259,6 +254,16 @@ function FileRows({ rows, selected, onToggle }) {
               </div>
             </div>
             <span className="tiny num muted nowrap">{row.size ? bytes(row.size) : ''}</span>
+            {onIgnore && row.sender && (
+              <button
+                type="button"
+                className="link tiny"
+                title={`Never scan mail from ${row.sender} again`}
+                onClick={(e) => { e.preventDefault(); onIgnore(row.sender); }}
+              >
+                Ignore sender
+              </button>
+            )}
           </label>
         );
       })}
@@ -273,6 +278,7 @@ function FileRows({ rows, selected, onToggle }) {
 
 export function ChooseStep({
   intents, chosen, sections, sourceResults, rows, selected, onToggle, onToggleMany,
+  ignoredSenders = [], ignoredCount = 0, onIgnore, onClearIgnored,
 }) {
   const all = rows || [];
   const staged = Object.fromEntries((sections || []).map((s) => [s.key, s]));
@@ -283,6 +289,64 @@ export function ChooseStep({
       <p className="lead" style={{ margin: 0 }}>
         Review attachments discovered by the scan. Check what to download and read into staging.
       </p>
+
+      {(onIgnore || ignoredSenders.length > 0) && (
+        <Group>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+            <div>
+              <strong style={{ fontSize: 13 }}>Ignored senders</strong>
+              <div className="tiny muted" style={{ marginTop: 2 }}>
+                {ignoredCount > 0
+                  ? `${count(ignoredCount)} message${ignoredCount === 1 ? '' : 's'} skipped in the last scan by these rules.`
+                  : 'Mail from these addresses is skipped on every future scan.'}
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              {onIgnore && (
+                <PromptButton
+                  size="sm"
+                  placeholder="sender@example.com"
+                  submitLabel="Ignore"
+                  onSubmit={onIgnore}
+                >
+                  Ignore a sender
+                </PromptButton>
+              )}
+              {ignoredSenders.length > 0 && onClearIgnored && (
+                <ConfirmButton
+                  size="sm"
+                  question={`Stop ignoring all ${ignoredSenders.length} senders?`}
+                  confirmLabel="Clear"
+                  onConfirm={onClearIgnored}
+                >
+                  Clear all
+                </ConfirmButton>
+              )}
+            </div>
+          </div>
+
+          {ignoredSenders.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
+              {ignoredSenders.map((who) => (
+                <Chip key={who}>
+                  {who}
+                  {onIgnore && (
+                    <button
+                      type="button"
+                      className="link"
+                      aria-label={`Stop ignoring ${who}`}
+                      style={{ marginLeft: 6 }}
+                      onClick={() => onIgnore(who, true)}
+                    >
+                      ×
+                    </button>
+                  )}
+                </Chip>
+              ))}
+            </div>
+          )}
+        </Group>
+      )}
 
       {picked.map((one) => {
         const sourceRows = all.filter((r) => (r.intent || 'statement') === one.key);
@@ -312,7 +376,12 @@ export function ChooseStep({
             </div>
 
             {sourceRows.length > 0 && (
-              <FileRows rows={sourceRows} selected={selected} onToggle={onToggle} />
+              <FileRows
+                rows={sourceRows}
+                selected={selected}
+                onToggle={onToggle}
+                onIgnore={onIgnore}
+              />
             )}
           </Group>
         );

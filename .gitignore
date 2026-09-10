@@ -9,3 +9,6 @@ dist/
 credentials.json
 data
 .claude/scheduled_tasks.lock
+
+# Local browser-driving scratch (audit scripts, Chrome profiles)
+frontend-v3/temp-profile/

@@ -68,27 +68,33 @@
   --accent-border: #c7d2fe;
   --accent-text:   #4338ca;
   --accent-glow:   rgba(79, 70, 229, 0.22);
-  --accent-teal:   #0d9488;
+  --accent-teal:   #0f766e;
   --border-subtle: #e2e8f0;
 
-  /* Semantic Meanings */
-  --pos:           #059669;
-  --state-pos:     #059669;
-  --pos-hover:     #047857;
+  /* Semantic Meanings.
+     One step darker than the 600-weight versions these started as: at 11-13px
+     the lighter shades measured 3.1-4.3:1 against white and against their own
+     soft fills, so every badge, chip and figure using them failed AA. These
+     clear 4.5:1 on both. */
+  --pos:           #047857;
+  --state-pos:     #047857;
+  --pos-hover:     #065f46;
   --pos-soft:      #ecfdf5;
   --pos-border:    #a7f3d0;
   --pos-glow:      rgba(5, 150, 105, 0.2);
 
-  --neg:           #e11d48;
-  --state-neg:     #e11d48;
-  --neg-hover:     #be123c;
+  --neg:           #be123c;
+  --state-neg:     #be123c;
+  --neg-hover:     #9f1239;
+  /* The shade a danger button paints behind white text. */
+  --neg-solid:     #be123c;
   --neg-soft:      #fff1f2;
   --neg-border:    #fecdd3;
   --neg-glow:      rgba(225, 29, 72, 0.2);
 
-  --warn:          #d97706;
-  --state-warn:    #d97706;
-  --warn-hover:    #b45309;
+  --warn:          #b45309;
+  --state-warn:    #b45309;
+  --warn-hover:    #92400e;
   --warn-soft:     #fffbeb;
   --warn-border:   #fde68a;
   --warn-glow:     rgba(217, 119, 6, 0.2);
@@ -188,7 +194,9 @@
   --text:          #f8fafc;
   --text-1:        #f8fafc;
   --text-2:        #94a3b8;
-  --text-3:        #64748b;
+  /* One step lighter than slate-500, which measured 3.3-4.1:1 against these
+     surfaces. Every muted label in the app uses this. */
+  --text-3:        #8695ab;
   --text-on-accent:#090b10;
 
   /* Accents */
@@ -213,6 +221,8 @@
   --neg:           #f43f5e;
   --state-neg:     #f43f5e;
   --neg-hover:     #fb7185;
+  /* #f43f5e reads at 3.67:1 under white text; this clears 4.5:1. */
+  --neg-solid:     #c81e3f;
   --neg-soft:      rgba(244, 63, 94, 0.14);
   --neg-border:    rgba(244, 63, 94, 0.32);
   --neg-glow:      rgba(244, 63, 94, 0.3);

@@ -1,15 +1,13 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { api } from '../core/api';
 import { useQuery } from '../core/store';
 import { useRouteParam } from '../core/router';
-import { usePrefs } from '../core/prefs';
 import { useToast } from '../core/toast';
 import { read, write } from '../core/storage';
 import {
-  Button, Callout, Empty, IconButton, Loading, Modal, Select, Spinner, GlassCard, Card, Badge,
+  Button, Callout, Empty, Loading, PromptButton, GlassCard, Badge,
 } from '../ui';
 import { Icon } from '../ui/icons';
-import { FilterRow } from './explore/fields';
 import WidgetEditor from './explore/WidgetEditor';
 import WidgetView from './explore/WidgetView';
 
@@ -24,7 +22,6 @@ const stepWidth = (current, dir) => {
 
 export default function Explore() {
   const toast = useToast();
-  const [prefs] = usePrefs();
   const [boardId, setBoardId] = useRouteParam('board', '');
 
   const schemaQ = useQuery('query-schema', () => api.querySchema());
@@ -37,10 +34,6 @@ export default function Explore() {
   const [error, setError] = useState(null);
 
   const [editing, setEditing] = useState(null);
-  const [renaming, setRenaming] = useState(null);
-  const [filtersOpen, setFiltersOpen] = useState(false);
-  const [dragging, setDragging] = useState(null);
-  const [dropTarget, setDropTarget] = useState(null);
 
   const boards = boardsQ.data || [];
   const schema = schemaQ.data;
@@ -78,37 +71,45 @@ export default function Explore() {
   }, [boardId, loadBoard]);
 
   const rerun = useCallback(async (filters) => {
-    if (!board) return;
+    if (!boardId) return;
     setRunning(true);
     try {
-      const { results: ran } = await api.runBoard(board.id, filters);
+      const { results: ran } = await api.runBoard(boardId, filters);
       setResults(ran);
     } catch (e) {
       toast.fail('Query execution failed', e.message);
     } finally {
       setRunning(false);
     }
-  }, [board, toast]);
+  }, [boardId, toast]);
 
-  const saveBoard = async (updated) => {
-    try {
-      const saved = await api.saveBoard(updated);
-      setBoard(saved);
-      boardsQ.refetch();
-      toast.ok('Dashboard layout saved');
-    } catch (e) {
-      toast.fail('Could not save dashboard', e.message);
-    }
-  };
+  const reload = useCallback(async () => {
+    if (!boardId) return null;
+    const fresh = await api.board(boardId);
+    setBoard(fresh);
+    return fresh;
+  }, [boardId]);
 
   const handleCreateBoard = async () => {
     try {
-      const created = await api.createBoard({ title: 'New Custom Dashboard', widgets: [] });
+      const created = await api.createBoard({ name: 'New dashboard', widgets: [] });
       boardsQ.refetch();
       setBoardId(created.id);
       toast.ok('Created new dashboard');
     } catch (e) {
       toast.fail('Creation failed', e.message);
+    }
+  };
+
+  const handleRenameBoard = async (name) => {
+    if (!board || !name.trim()) return;
+    try {
+      await api.updateBoard(board.id, { ...board, name: name.trim() });
+      await reload();
+      boardsQ.refetch();
+      toast.ok('Dashboard renamed');
+    } catch (e) {
+      toast.fail('Rename failed', e.message);
     }
   };
 
@@ -126,39 +127,54 @@ export default function Explore() {
 
   const handleSaveWidget = async (widgetData) => {
     if (!board) return;
-    let nextWidgets = [...(board.widgets || [])];
-    if (widgetData.id) {
-      nextWidgets = nextWidgets.map((w) => (w.id === widgetData.id ? widgetData : w));
-    } else {
-      nextWidgets.push({ ...widgetData, id: `w_${Date.now()}` });
+    try {
+      if (widgetData.id) await api.updateWidget(board.id, widgetData.id, widgetData);
+      else await api.createWidget(board.id, widgetData);
+      const fresh = await reload();
+      setEditing(null);
+      await rerun(fresh?.filters || board.filters);
+      toast.ok(widgetData.id ? 'Widget updated' : 'Widget added');
+    } catch (e) {
+      toast.fail('Could not save widget', e.message);
     }
-    await saveBoard({ ...board, widgets: nextWidgets });
-    setEditing(null);
-    rerun(board.filters);
   };
 
   const handleDeleteWidget = async (widget) => {
-    if (!board) return;
-    const nextWidgets = (board.widgets || []).filter((w) => w.id !== widget.id);
-    await saveBoard({ ...board, widgets: nextWidgets });
-    setEditing(null);
+    if (!board || !widget?.id) { setEditing(null); return; }
+    try {
+      await api.deleteWidget(board.id, widget.id);
+      await reload();
+      setEditing(null);
+      toast.ok('Widget removed');
+    } catch (e) {
+      toast.fail('Could not remove widget', e.message);
+    }
   };
 
   const updateWidgetSize = async (widget, widthDelta, heightDelta) => {
     if (!board) return;
-    const updated = (board.widgets || []).map((w) => {
-      if (w.id !== widget.id) return w;
-      return {
-        ...w,
-        width: widthDelta !== 0 ? stepWidth(w.width || 6, widthDelta) : (w.width || 6),
-        height: heightDelta !== 0 ? Math.max(1, Math.min(4, (w.height || 2) + heightDelta)) : (w.height || 2),
-      };
-    });
-    saveBoard({ ...board, widgets: updated });
+    const next = {
+      ...widget,
+      width: widthDelta !== 0 ? stepWidth(widget.width || 6, widthDelta) : (widget.width || 6),
+      height: heightDelta !== 0
+        ? Math.max(1, Math.min(4, (widget.height || 2) + heightDelta))
+        : (widget.height || 2),
+    };
+    /* Paint the new size straight away; the request only confirms it. */
+    setBoard((prev) => (prev ? {
+      ...prev,
+      widgets: (prev.widgets || []).map((w) => (w.id === widget.id ? next : w)),
+    } : prev));
+    try {
+      await api.updateWidget(board.id, widget.id, next);
+    } catch (e) {
+      await reload();
+      toast.fail('Could not resize widget', e.message);
+    }
   };
 
   if (schemaQ.loading || boardsQ.loading) {
-    return <Loading label="Loading custom analytics engine…" />;
+    return <Loading message="Loading custom analytics engine…" />;
   }
 
   return (
@@ -176,18 +192,36 @@ export default function Explore() {
         </div>
 
         {/* Dashboard Actions */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 'var(--space-2)',
+          flexWrap: 'wrap', maxWidth: '100%',
+        }}>
           {boards.length > 0 && (
             <select
               className="select"
+              aria-label="Dashboard"
               value={boardId}
               onChange={(e) => setBoardId(e.target.value)}
               style={{ minWidth: 200 }}
             >
               {boards.map((b) => (
-                <option key={b.id} value={b.id}>{b.title}</option>
+                <option key={b.id} value={b.id}>
+                  {b.name || 'Untitled dashboard'}{b.is_default ? ' (default)' : ''}
+                </option>
               ))}
             </select>
+          )}
+
+          {board && (
+            <PromptButton
+              size="sm"
+              initial={board.name || ''}
+              placeholder="Dashboard name"
+              submitLabel="Rename"
+              onSubmit={handleRenameBoard}
+            >
+              Rename
+            </PromptButton>
           )}
 
           <Button size="sm" onClick={handleCreateBoard}>
@@ -241,14 +275,17 @@ export default function Explore() {
             (board.widgets || []).map((w) => {
               const res = results[w.id];
               const colSpan = Math.min(12, Math.max(3, w.width || 6));
-              const rowHeight = (w.height || 2) * 120;
+              /* A one-row stat tile is shorter than its own label + figure, so
+                 those grow to fit; charts and tables need a definite height. */
+              const flexible = w.type === 'stat' || w.type === 'text';
+              const rowHeight = Math.max(flexible ? 132 : 0, (w.height || 2) * 120);
 
               return (
                 <GlassCard
                   key={w.id}
                   style={{
                     gridColumn: `span ${colSpan}`,
-                    height: rowHeight,
+                    ...(flexible ? { minHeight: rowHeight } : { height: rowHeight }),
                     display: 'flex',
                     flexDirection: 'column',
                     padding: 0,

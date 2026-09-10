@@ -7,9 +7,8 @@ import { useToast } from '../core/toast';
 import { useCategories } from '../core/ledger';
 import { count, dateLabel, money, titleCase } from '../core/format';
 import {
-  Button, Callout, Card, GlassCard, Chip, Empty, Loading, Search, Segmented, Select, Stat, Table, Badge,
+  Button, Callout, Card, GlassCard, Chip, Empty, Loading, Search, Segmented, Select, Stat, Badge,
 } from '../ui';
-import { Icon } from '../ui/icons';
 
 const MODES = [
   ['queue', 'One At A Time', 'Line item decision triage: evaluate individual context, flow role, and ambiguity.'],
@@ -93,7 +92,11 @@ function Queue() {
   async function resolve(txn, fields) {
     setBusy(txn.id);
     try {
-      await api.updateTransaction(txn.id, { flow_role: txn.flow_role, ...fields });
+      /* Confirming has to clear `needs_review`, otherwise the row is re-saved
+         with the same values and stays in the queue forever. */
+      await api.updateTransaction(txn.id, {
+        flow_role: txn.flow_role, ...fields, needs_review: false,
+      });
       invalidate('review', 'workflow', 'analysis', 'dashboard', 'txns');
       await refetch();
       toast.ok('Transaction classified', 'Rule learned for future statements.');
@@ -104,7 +107,7 @@ function Queue() {
     }
   }
 
-  if (loading) return <Loading label="Loading unconfirmed transactions for review triage…" />;
+  if (loading) return <Loading message="Loading unconfirmed transactions for review triage…" />;
   if (error) return <Callout tone="neg">{error.message}</Callout>;
 
   return (
@@ -157,8 +160,10 @@ function QueueGroup({ reason, rows, busy, resolve }) {
             {paged.slice.map((t) => (
               <tr key={t.id} className="terminal-row" style={{ opacity: busy === t.id ? 0.4 : 1 }}>
                 <td className="nowrap muted tiny">{dateLabel(t.date)}</td>
-                <td>
-                  <div className="font-medium" style={{ overflowWrap: 'anywhere' }}>{t.description}</div>
+                <td style={{ maxWidth: 460, minWidth: 200 }}>
+                  <div className="font-medium" style={{ overflowWrap: 'anywhere', whiteSpace: 'normal' }}>
+                    {t.description}
+                  </div>
                   <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
                     <Chip size="sm">{titleCase(t.category)}</Chip>
                     {t.flow_role && (
@@ -175,14 +180,14 @@ function QueueGroup({ reason, rows, busy, resolve }) {
                   {t.direction === 'credit' ? '+' : '−'}{money(Math.abs(t.amount))}
                 </td>
                 <td>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
                     <Select
                       value={t.flow_role || ''}
                       placeholder="Assign Role…"
                       disabled={busy === t.id}
                       onChange={(v) => resolve(t, { flow_role: v })}
                       options={ROLES}
-                      style={{ minWidth: 220, maxWidth: 360, fontSize: 12, height: 30 }}
+                      style={{ minWidth: 170, maxWidth: 300, fontSize: 12, height: 30 }}
                     />
                     <Button
                       size="sm"
@@ -319,7 +324,7 @@ function ByMerchant() {
         />
       </div>
 
-      {loading && <Loading label="Aggregating merchant clusters…" />}
+      {loading && <Loading message="Aggregating merchant clusters…" />}
 
       {!loading && !groups.length && (
         <Empty
@@ -336,7 +341,7 @@ function ByMerchant() {
           <GlassCard key={g.key} style={{ padding: 'var(--space-4)', opacity: busy === g.key ? 0.5 : 1 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 'var(--space-3)' }}>
               <div>
-                <div style={{ fontSize: 'var(--text-md)', fontWeight: 600 }}>{g.key}</div>
+                <div style={{ fontSize: 'var(--text-base)', fontWeight: 600 }}>{g.key}</div>
                 <div className="tiny muted" style={{ marginTop: 2 }}>
                   {g.items.length} transaction{g.items.length === 1 ? '' : 's'} · {money(g.total)} ·{' '}
                   <button

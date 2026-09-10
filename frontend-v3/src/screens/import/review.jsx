@@ -316,7 +316,7 @@ export function ReviewStep({ onChanged }) {
                           alignItems: 'flex-start',
                           gap: 12,
                           padding: '10px 16px 10px 44px',
-                          borderTop: '1px solid var(--line-subtle)',
+                          borderTop: '1px solid var(--line)',
                           opacity: file.selected && !dead ? 1 : 0.5,
                           background: dead ? 'rgba(0,0,0,0.1)' : 'transparent',
                         }}

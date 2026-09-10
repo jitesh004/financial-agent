@@ -55,6 +55,14 @@ function DrillSheet({ request, onClose }) {
   const key = `drill:${JSON.stringify(query)}`;
   const { data, error, loading, refetch } = useQuery(key, () => api.transactions(query));
   const { data: categories = [] } = useQuery('categories', () => api.categories());
+  const { data: accounts = [] } = useQuery('accounts', () => api.accounts());
+
+  /* Rows reference an account by id only; resolve it so the sheet does not
+     print the literal word "Account" against every line. */
+  const accountName = useMemo(() => {
+    const byId = new Map((accounts || []).map((a) => [a.id, a.display_name || a.institution]));
+    return (row) => byId.get(row.account_id) || 'Unknown account';
+  }, [accounts]);
 
   const rows = data?.transactions || [];
   const total = data?.total ?? rows.length;
@@ -92,7 +100,7 @@ function DrillSheet({ request, onClose }) {
   function exportRows() {
     downloadCsv(`${slug(request.title || 'transactions')}.csv`, toCsv(rows, [
       ['date', 'Date'],
-      ['account_name', 'Account'],
+      [(r) => accountName(r), 'Account'],
       ['description', 'Description'],
       ['category', 'Category'],
       [(r) => (r.direction === 'credit' ? r.amount : -r.amount), 'Amount'],
@@ -155,6 +163,7 @@ function DrillSheet({ request, onClose }) {
       {!loading && rows.length > 0 && (
         <div className="drill-table-container" ref={scrollRef}>
           <VirtualBody
+            as="div"
             items={rows}
             rowHeight={ROW_H}
             containerRef={scrollRef}
@@ -162,7 +171,7 @@ function DrillSheet({ request, onClose }) {
               <div key={r.id} className={`drill-row ${r.excluded ? 'excluded' : ''}`}>
                 <div className="drill-col-date">
                   <span className="drill-date-val">{dateLabel(r.date)}</span>
-                  <span className="drill-acc-name">{r.account_name || 'Account'}</span>
+                  <span className="drill-acc-name" title={accountName(r)}>{accountName(r)}</span>
                 </div>
                 <div className="drill-col-desc">
                   <div className="drill-desc-text" title={r.description}>{r.description}</div>

@@ -161,6 +161,13 @@ export const api = {
   /* Settings & Demo */
   settings: () => get('/api/settings'),
   saveSettings: (body) => put('/api/settings', body),
+
+  /* Language model provider, key, models and agent step budget.
+     The API key is write-only: reads return a masked hint, never the key. */
+  llmConfig: () => get('/api/settings/llm'),
+  saveLlmConfig: (body) => put('/api/settings/llm', body),
+  resetLlmConfig: () => del('/api/settings/llm'),
+  testLlmConfig: () => post('/api/settings/llm/test'),
   runCategorize: () => post('/api/settings/categorize'),
   demo: () => get('/api/settings/demo'),
   setDemo: (enabled) => post('/api/settings/demo', { enabled }),

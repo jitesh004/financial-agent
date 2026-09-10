@@ -48,7 +48,7 @@ export default function Position() {
     notes: 'Adopted directly from credit bureau file.',
   }));
 
-  if (position.loading) return <Loading label="Compiling certified position telemetry…" />;
+  if (position.loading) return <Loading message="Compiling certified position telemetry…" />;
   if (position.error) return <Callout tone="neg">{position.error.message}</Callout>;
 
   const items = data?.items || [];
@@ -289,18 +289,24 @@ function BlindSpots({ bureau, onAdopt }) {
         <Icon name="alert" size={18} />
         <strong>{bureau.length} Unmapped Credit Bureau Account{bureau.length > 1 ? 's' : ''} Detected</strong>
       </div>
-      <p style={{ margin: '6px 0 12px 0' }} className="small">
+      <p style={{ margin: '6px 0 12px 0', overflowWrap: 'anywhere' }} className="small">
         Credit bureaus report active liabilities that do not yet exist in your position telemetry.
         Adopt them below to eliminate reporting blind spots:
       </p>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         {bureau.map((b) => (
-          <div key={b.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', background: 'var(--surface-2)', borderRadius: 'var(--radius-md)' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div key={b.id} style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            flexWrap: 'wrap', gap: 8,
+            padding: '6px 12px', background: 'var(--surface-2)', borderRadius: 'var(--radius-md)',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 }}>
               <strong className="small">{b.lender}</strong>
               <Chip size="sm">{String(b.type || '').replace(/_/g, ' ')}</Chip>
               {b.masked && <span className="tiny num">{b.masked}</span>}
-              {b.balance && <span className="tiny num font-semibold neg">{money(Number(b.balance))}</span>}
+              {b.balance != null && b.balance !== '' && (
+              <span className="tiny num font-semibold neg">{money(Number(b.balance))}</span>
+            )}
             </div>
             <Button size="xs" variant="primary" onClick={() => onAdopt(b)}>
               Adopt into Position
@@ -528,7 +534,9 @@ function LoanTable({ items, mappable, onPatch, onReview, onRemove }) {
                   <InlineEdit
                     value={item.attested_outstanding}
                     type="money"
-                    width={100}
+                    width={110}
+                    label="Attested outstanding"
+                    placeholder="Set attested balance"
                     onSave={(v) => onPatch(item.id, { outstanding: v })}
                   />
                 </td>

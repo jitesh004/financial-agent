@@ -78,7 +78,7 @@ export default function Recurring() {
     }
   }
 
-  if (loading) return <Loading label="Discovering recurring series and cadences…" />;
+  if (loading) return <Loading message="Discovering recurring series and cadences…" />;
   if (error) return <Callout tone="neg">{error.message}</Callout>;
 
   const active = visible.filter((s) => s.is_active);
@@ -176,7 +176,10 @@ export default function Recurring() {
                       </div>
                     ) : (
                       <div
-                        style={{ fontSize: 'var(--text-lg)', fontWeight: 600, cursor: 'pointer' }}
+                        style={{
+                          fontSize: 'var(--text-lg)', fontWeight: 600, cursor: 'pointer',
+                          overflowWrap: 'anywhere',
+                        }}
                         onClick={() => setOpen(isOpen ? null : s.id)}
                       >
                         {s.label}
@@ -255,7 +258,7 @@ export default function Recurring() {
                     </div>
                   )}
 
-                  {!rows && <Loading label="Loading constituent transaction evidence…" />}
+                  {!rows && <Loading message="Loading constituent transaction evidence…" />}
 
                   {rows && !rows.length && (
                     <div className="tiny muted" style={{ padding: 'var(--space-3)' }}>

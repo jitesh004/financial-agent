@@ -22,9 +22,11 @@ const SECTIONS = [
 
 const STATUS_MAP = {
   ok: ['pos', 'Reconciled'],
+  parsed: ['pos', 'Parsed'],
   unreconciled: ['warn', 'Unbalanced'],
-  failed: ['neg', 'Parse Failed'],
-  needs_password: ['warn', 'Password Protected'],
+  failed: ['neg', 'Parse failed'],
+  needs_password: ['warn', 'Password protected'],
+  pending: ['', 'Pending'],
 };
 
 export default function Data({ onImport }) {
@@ -104,22 +106,23 @@ function Coverage({ onImport }) {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
         <Section title="Mathematical Reconciliation Telemetry" subtitle="Audited statement balance movement" />
         <div className="stats-grid">
-          <Stat label="Total Processed Statements" value={String(quality.files_processed ?? statements.length)} />
+          <Stat label="Total Processed Statements" value={count(quality.files_processed ?? statements.length)} />
           <Stat
             label="Reconciled (100% Tie-out)"
-            value={String(quality.files_reconciled ?? 0)}
+            value={count(quality.files_reconciled ?? 0)}
             tone="pos"
             sub="Transactions equal net balance shift"
           />
           <Stat
             label="Unreconciled Discrepancies"
-            value={String(quality.files_unreconciled ?? 0)}
+            value={count(quality.files_unreconciled ?? 0)}
             tone={quality.files_unreconciled ? 'warn' : 'pos'}
           />
           <Stat
-            label="Duplicate Overlaps Removed"
-            value={String(quality.duplicates_removed ?? 0)}
-            sub="Overlapping statement date ranges"
+            label="Rows Needing Review"
+            value={count(quality.needs_review ?? 0)}
+            tone={quality.needs_review ? 'warn' : 'pos'}
+            sub={`${count(quality.uncategorized ?? 0)} still uncategorised`}
           />
         </div>
 
@@ -210,11 +213,11 @@ function CoverageGrid() {
 
   const allMonths = useMemo(() => {
     const set = new Set();
-    rows.forEach((r) => r.months.forEach((m) => set.add(m.month)));
+    rows.forEach((r) => (r.months || []).forEach((m) => set.add(m.month)));
     return [...set].sort((a, b) => b.localeCompare(a));
   }, [rows]);
 
-  if (loading) return <Loading label="Calculating account coverage heatmap…" />;
+  if (loading) return <Loading message="Calculating account coverage heatmap…" />;
   if (!rows.length) return null;
 
   return (
@@ -286,62 +289,74 @@ function CoverageGrid() {
 
 function Files({ onImport }) {
   const toast = useToast();
-  const { data: filesData, loading, refetch } = useQuery('files-registry', () => api.files());
+  /* GET /api/files answers with a bare array; reading `.files` off it left the
+     registry permanently empty even with hundreds of documents on record. */
+  const { data: files = [], loading, refetch } = useQuery('files-registry', () => api.files());
   const [filterStatus, setFilterStatus] = useState('all');
   const [search, setSearch] = useState('');
   const [passwords, setPasswords] = useState({});
+  const [busy, setBusy] = useState(null);
 
-  const files = filesData?.files || [];
+  const counts = useMemo(() => {
+    const out = { all: files.length, needs_password: 0, failed: 0, parsed: 0 };
+    for (const f of files) {
+      if (out[f.parse_status] != null) out[f.parse_status] += 1;
+    }
+    return out;
+  }, [files]);
 
   const filtered = useMemo(() => {
-    let out = [...files];
-    if (filterStatus !== 'all') out = out.filter((f) => f.status === filterStatus);
+    let out = files;
+    if (filterStatus !== 'all') out = out.filter((f) => f.parse_status === filterStatus);
     if (search.trim()) {
-      const q = search.toLowerCase();
-      out = out.filter((f) => (f.filename || '').toLowerCase().includes(q));
+      const q = search.trim().toLowerCase();
+      out = out.filter((f) => (f.filename || '').toLowerCase().includes(q)
+        || (f.institution_guess || '').toLowerCase().includes(q));
     }
     return out;
   }, [files, filterStatus, search]);
 
-  const handleUnlock = async (fileId) => {
-    const pwd = passwords[fileId];
-    if (!pwd) return;
+  /* Re-parsing is the only server-side action a file supports; there is no
+     delete endpoint, so no delete button is offered. */
+  const retry = async (file) => {
+    setBusy(file.id);
     try {
-      await api.unlockFile(fileId, pwd);
-      refetch();
-      invalidate('dashboard', 'coverage');
-      toast.ok('File unlocked & parsed successfully');
+      const result = await api.retryFile(file.id, passwords[file.id] || '');
+      await refetch();
+      invalidate('dashboard', 'coverage', 'analysis', 'txns', 'workflow');
+      setPasswords((prev) => ({ ...prev, [file.id]: '' }));
+      toast.ok(
+        result?.status === 'needs_password' ? 'Still locked' : 'File re-parsed',
+        result?.message || file.filename,
+      );
     } catch (e) {
-      toast.fail('Decryption failed', e.message);
+      toast.fail('Could not re-parse', e.message);
+    } finally {
+      setBusy(null);
     }
   };
 
-  const handleDelete = async (fileId) => {
-    try {
-      await api.deleteFile(fileId);
-      refetch();
-      invalidate('dashboard', 'coverage');
-      toast.ok('File and derived records deleted');
-    } catch (e) {
-      toast.fail('Delete failed', e.message);
-    }
-  };
-
-  if (loading) return <Loading label="Loading document registry…" />;
+  if (loading) return <Loading message="Loading document registry…" />;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 'var(--space-3)' }}>
-        <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
-          <Button size="sm" variant={filterStatus === 'all' ? 'primary' : 'ghost'} onClick={() => setFilterStatus('all')}>
-            All Files ({files.length})
-          </Button>
-          <Button size="sm" variant={filterStatus === 'needs_password' ? 'primary' : 'ghost'} onClick={() => setFilterStatus('needs_password')}>
-            Password Locked
-          </Button>
-          <Button size="sm" variant={filterStatus === 'failed' ? 'primary' : 'ghost'} onClick={() => setFilterStatus('failed')}>
-            Failed
-          </Button>
+        <div style={{ display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
+          {[
+            ['all', `All files (${counts.all})`],
+            ['needs_password', `Password locked (${counts.needs_password})`],
+            ['failed', `Failed (${counts.failed})`],
+            ['parsed', `Parsed (${counts.parsed})`],
+          ].map(([key, label]) => (
+            <Button
+              key={key}
+              size="sm"
+              variant={filterStatus === key ? 'primary' : 'ghost'}
+              onClick={() => setFilterStatus(key)}
+            >
+              {label}
+            </Button>
+          ))}
         </div>
 
         <div style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }}>
@@ -355,70 +370,83 @@ function Files({ onImport }) {
       </div>
 
       <Card pad={false}>
-        <div style={{ maxHeight: 540, overflowY: 'auto' }}>
+        <div className="table-wrapper" style={{ maxHeight: 540, overflowY: 'auto' }}>
           <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr>
-                <th>Document File</th>
-                <th>File Size</th>
-                <th>Import Timestamp</th>
-                <th>Processing Status</th>
-                <th style={{ textAlign: 'right' }}>Actions</th>
+                <th>Document file</th>
+                <th>Detected account</th>
+                <th style={{ textAlign: 'right' }}>Rows</th>
+                <th style={{ textAlign: 'right' }}>Size</th>
+                <th>First seen</th>
+                <th>Status</th>
+                <th style={{ textAlign: 'right' }}>Action</th>
               </tr>
             </thead>
             <tbody>
-              {filtered.map((f) => (
-                <tr key={f.id} className="terminal-row">
-                  <td>
-                    <div className="font-semibold truncate" style={{ maxWidth: 300 }}>{f.filename}</div>
-                    {f.error_message && <div className="tiny neg">{f.error_message}</div>}
-                  </td>
-                  <td className="num tiny muted">{bytes(f.size_bytes || 0)}</td>
-                  <td className="muted tiny nowrap">{stampLabel(f.uploaded_at)}</td>
-                  <td>
-                    {f.status === 'needs_password' ? (
-                      <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                        <input
-                          type="password"
-                          className="input"
-                          placeholder="Decryption password"
-                          value={passwords[f.id] || ''}
-                          onChange={(e) => setPasswords({ ...passwords, [f.id]: e.target.value })}
-                          style={{ height: 26, fontSize: 11, width: 140 }}
-                        />
-                        <Button size="xs" variant="primary" onClick={() => handleUnlock(f.id)}>
-                          Unlock
+              {filtered.slice(0, 400).map((f) => {
+                const locked = f.parse_status === 'needs_password';
+                const [tone, label] = STATUS_MAP[f.parse_status] || ['', f.parse_status || 'pending'];
+                return (
+                  <tr key={f.id} className="terminal-row">
+                    <td>
+                      <div className="font-semibold truncate" style={{ maxWidth: 300 }} title={f.filename}>
+                        {f.filename}
+                      </div>
+                      <div className="tiny muted truncate" style={{ maxWidth: 300 }}>
+                        {f.source === 'gmail' ? f.sender || 'Gmail' : titleCase(f.source || 'upload')}
+                      </div>
+                      {f.error_message && <div className="tiny neg">{f.error_message}</div>}
+                    </td>
+                    <td className="tiny muted truncate" style={{ maxWidth: 190 }}>
+                      {f.institution_guess || '—'}
+                    </td>
+                    <td className="num nowrap" style={{ textAlign: 'right' }}>
+                      {f.transaction_count ?? 0}
+                    </td>
+                    <td className="num tiny muted nowrap" style={{ textAlign: 'right' }}>{bytes(f.size_bytes || 0)}</td>
+                    <td className="muted tiny nowrap">{stampLabel(f.first_seen_at)}</td>
+                    <td><Badge tone={tone || 'brand'} size="sm">{label}</Badge></td>
+                    <td style={{ textAlign: 'right' }}>
+                      <div style={{ display: 'flex', gap: 6, alignItems: 'center', justifyContent: 'flex-end' }}>
+                        {locked && (
+                          <input
+                            type="password"
+                            className="input"
+                            placeholder="PDF password"
+                            value={passwords[f.id] || ''}
+                            onChange={(e) => setPasswords((prev) => ({ ...prev, [f.id]: e.target.value }))}
+                            style={{ height: 26, fontSize: 11, width: 130 }}
+                          />
+                        )}
+                        <Button
+                          size="xs"
+                          variant={locked ? 'primary' : 'secondary'}
+                          busy={busy === f.id}
+                          onClick={() => retry(f)}
+                        >
+                          {locked ? 'Unlock' : 'Re-parse'}
                         </Button>
                       </div>
-                    ) : (
-                      <Badge tone={f.status === 'ok' ? 'pos' : f.status === 'failed' ? 'neg' : 'warn'} size="sm">
-                        {f.status}
-                      </Badge>
-                    )}
-                  </td>
-                  <td style={{ textAlign: 'right' }}>
-                    <ConfirmButton
-                      size="xs"
-                      variant="danger"
-                      question="Permanently delete this file and remove its transactions?"
-                      confirmLabel="Delete"
-                      onConfirm={() => handleDelete(f.id)}
-                    >
-                      Delete
-                    </ConfirmButton>
-                  </td>
-                </tr>
-              ))}
+                    </td>
+                  </tr>
+                );
+              })}
               {!filtered.length && (
                 <tr>
-                  <td colSpan={5} className="muted tiny" style={{ padding: 'var(--space-6)', textAlign: 'center' }}>
-                    Zero files match filter.
+                  <td colSpan={7} className="muted tiny" style={{ padding: 'var(--space-6)', textAlign: 'center' }}>
+                    No files match this filter.
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
         </div>
+        {filtered.length > 400 && (
+          <div className="tiny muted" style={{ padding: '10px 16px', borderTop: '1px solid var(--line)' }}>
+            Showing the first 400 of {count(filtered.length)} matching files.
+          </div>
+        )}
       </Card>
     </div>
   );
@@ -428,117 +456,212 @@ function Files({ onImport }) {
 
 function Manage() {
   const toast = useToast();
-  const { data: snapshotsData, refetch } = useQuery('db-snapshots', () => api.snapshots());
-  const [busy, setBusy] = useState(false);
-  const [snapshotLabel, setSnapshotLabel] = useState('');
+  /* The server owns the list of clearing actions, the snapshot each one takes
+     first, and the confirmation phrase the destructive ones require. */
+  const { data: inventory, loading, refetch } = useQuery('data-inventory', () => api.inventory());
+  const [busy, setBusy] = useState(null);
+  const [typed, setTyped] = useState({});
 
-  const snapshots = snapshotsData?.snapshots || [];
+  const counts = inventory?.counts || {};
+  const actions = inventory?.actions || [];
+  const snapshots = inventory?.snapshots || [];
+  const fileStats = inventory?.files || {};
 
-  const handleCreateSnapshot = async () => {
-    setBusy(true);
+  const refreshAll = () => {
+    invalidate('dashboard', 'coverage', 'analysis', 'txns', 'workflow',
+      'files-registry', 'data-inventory', 'recurring', 'position');
+    return refetch();
+  };
+
+  const run = async (work, okTitle, okDetail) => {
     try {
-      await api.createSnapshot(snapshotLabel.trim() || 'Manual Snapshot');
-      setSnapshotLabel('');
-      refetch();
-      toast.ok('Snapshot sealed and persisted');
+      const result = await work();
+      await refreshAll();
+      toast.ok(okTitle, okDetail || result?.message);
+      return result;
     } catch (e) {
-      toast.fail('Snapshot failed', e.message);
+      toast.fail(okTitle.replace(/ed$/, ' failed'), e.message);
+      return null;
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   };
 
-  const handleRestoreSnapshot = async (id) => {
-    setBusy(true);
-    try {
-      await api.restoreSnapshot(id);
-      invalidate('dashboard', 'coverage', 'txns', 'analysis');
-      toast.ok('Database restored to historical snapshot');
-    } catch (e) {
-      toast.fail('Restore failed', e.message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const handleRebuildLedger = async () => {
-    setBusy(true);
-    try {
-      await api.rebuildLedger();
-      invalidate('dashboard', 'coverage', 'txns', 'analysis');
-      toast.ok('Ledger re-indexed and all heuristics re-applied');
-    } catch (e) {
-      toast.fail('Rebuild failed', e.message);
-    } finally {
-      setBusy(false);
-    }
-  };
+  if (loading) return <Loading message="Reading ledger inventory…" />;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-6)' }}>
-      {/* Snapshots Engine */}
-      <GlassCard glowing style={{ padding: 'var(--space-5)' }}>
-        <h3 className="h3" style={{ margin: 0 }}>Database Snapshots</h3>
-        <p className="tiny muted" style={{ margin: '4px 0 var(--space-4) 0' }}>
-          Create complete immutable restore points of all parsed transactions, accounts, rules, and reviews.
-        </p>
+      {/* What is currently stored */}
+      <div className="stats-grid">
+        <Stat label="Transactions" value={count(counts.transactions ?? 0)} sub="Rows in the ledger" />
+        <Stat label="Accounts" value={count(counts.accounts ?? 0)} sub="Distinct account identities" />
+        <Stat label="Statements" value={count(counts.statements ?? 0)} sub="Reconciled statement periods" />
+        <Stat
+          label="Stored Documents"
+          value={count(fileStats.count ?? counts.source_files ?? 0)}
+          sub={bytes(fileStats.bytes || 0)}
+        />
+      </div>
 
-        <div style={{ display: 'flex', gap: 'var(--space-2)', maxWidth: 460 }}>
-          <input
-            className="input"
-            placeholder="Snapshot descriptor (e.g. Pre-tax season)"
-            value={snapshotLabel}
-            onChange={(e) => setSnapshotLabel(e.target.value)}
-          />
-          <Button variant="primary" busy={busy} onClick={handleCreateSnapshot}>
-            Create Snapshot
+      {/* Re-run the analysis pipeline */}
+      <Card
+        title="Ledger Recalculation & Re-indexing"
+        subtitle="Re-runs transfer matching, recurring detection and category rules over the stored statements."
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 'var(--space-3)' }}>
+          <div>
+            <div className="font-medium">Re-analyse the whole ledger</div>
+            <div className="tiny muted">Nothing is deleted — totals, series IDs and accounting months are recomputed.</div>
+          </div>
+          <Button
+            variant="primary"
+            busy={busy === 'reanalyze'}
+            onClick={() => { setBusy('reanalyze'); run(() => api.reanalyze(), 'Ledger re-analysed'); }}
+          >
+            Re-analyse Ledger
           </Button>
         </div>
+      </Card>
 
-        {snapshots.length > 0 && (
-          <div style={{ marginTop: 'var(--space-4)' }}>
-            <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
-              <thead>
-                <tr>
-                  <th>Descriptor</th>
-                  <th>Timestamp</th>
-                  <th style={{ textAlign: 'right' }}>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {snapshots.map((s) => (
-                  <tr key={s.id} className="terminal-row">
-                    <td className="font-semibold">{s.label || s.id}</td>
-                    <td className="muted tiny">{stampLabel(s.created_at)}</td>
-                    <td style={{ textAlign: 'right' }}>
+      {/* Scoped clearing actions, straight from the server's own catalogue */}
+      <Card
+        title="Clear Stored Data"
+        subtitle="Each action snapshots the database first, so anything cleared here can be rolled back below."
+        pad={false}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column' }}>
+          {actions.map((action) => {
+            const needsPhrase = Boolean(action.confirm_phrase);
+            const phraseOk = !needsPhrase
+              || (typed[action.scope] || '').trim() === action.confirm_phrase;
+            return (
+              <div
+                key={action.scope}
+                style={{
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start',
+                  gap: 'var(--space-4)', flexWrap: 'wrap',
+                  padding: 'var(--space-4)', borderTop: '1px solid var(--line)',
+                }}
+              >
+                <div style={{ flex: 1, minWidth: 240 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span className="font-semibold">{action.label}</span>
+                    {action.destructive && <Badge tone="neg" size="sm">Destructive</Badge>}
+                  </div>
+                  <div className="tiny muted" style={{ marginTop: 4 }}>{action.description}</div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+                    {(action.clears || []).map((c) => (
+                      <Chip key={c} tone="neg" size="sm">clears {c}</Chip>
+                    ))}
+                    {(action.preserves || []).map((c) => (
+                      <Chip key={c} tone="pos" size="sm">keeps {c}</Chip>
+                    ))}
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  {needsPhrase && (
+                    <input
+                      className="input"
+                      placeholder={action.confirm_phrase}
+                      value={typed[action.scope] || ''}
+                      onChange={(e) => setTyped((prev) => ({ ...prev, [action.scope]: e.target.value }))}
+                      style={{ width: 190, height: 30, fontSize: 12 }}
+                    />
+                  )}
+                  <ConfirmButton
+                    size="sm"
+                    variant={action.destructive ? 'danger' : 'secondary'}
+                    disabled={!phraseOk || busy === action.scope}
+                    question={`Run "${action.label}" now?`}
+                    confirmLabel="Run"
+                    onConfirm={() => {
+                      setBusy(action.scope);
+                      return run(
+                        () => api.clearData(action.scope, action.confirm_phrase || undefined),
+                        `${action.label} completed`,
+                      );
+                    }}
+                  >
+                    {action.label}
+                  </ConfirmButton>
+                </div>
+              </div>
+            );
+          })}
+          {!actions.length && (
+            <div className="muted tiny" style={{ padding: 'var(--space-5)', textAlign: 'center' }}>
+              No clearing actions are available.
+            </div>
+          )}
+        </div>
+      </Card>
+
+      {/* Restore points */}
+      <Card
+        title="Restore Points"
+        subtitle="Automatic snapshots taken immediately before each clearing action."
+        pad={false}
+      >
+        <div className="table-wrapper" style={{ maxHeight: 320, overflowY: 'auto' }}>
+          <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr>
+                <th>Snapshot</th>
+                <th>Taken</th>
+                <th style={{ textAlign: 'right' }}>Size</th>
+                <th style={{ textAlign: 'right' }}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {snapshots.map((snap) => (
+                <tr key={snap.name} className="terminal-row">
+                  <td className="font-medium truncate" style={{ maxWidth: 340 }} title={snap.name}>
+                    {snap.name}
+                  </td>
+                  <td className="muted tiny nowrap">{stampLabel(snap.created_at)}</td>
+                  <td className="num tiny muted nowrap" style={{ textAlign: 'right' }}>{bytes(snap.size_bytes)}</td>
+                  <td style={{ textAlign: 'right' }}>
+                    <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
                       <ConfirmButton
                         size="xs"
                         variant="primary"
-                        question="Roll back current database to this snapshot?"
+                        question="Roll the database back to this snapshot?"
                         confirmLabel="Restore"
-                        onConfirm={() => handleRestoreSnapshot(s.id)}
+                        disabled={busy === snap.name}
+                        onConfirm={() => {
+                          setBusy(snap.name);
+                          return run(() => api.restoreSnapshot(snap.name), 'Database restored');
+                        }}
                       >
-                        Restore Point
+                        Restore
                       </ConfirmButton>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </GlassCard>
-
-      {/* Global Maintenance */}
-      <Card title="Ledger Recalculation & Re-indexing" subtitle="Re-executes transfer matching, recurring series detection, and category rules across all raw statements.">
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div>
-            <div className="font-medium">Rebuild Entire Ledger</div>
-            <div className="tiny muted">Re-stamps all series IDs, accounting months, and double-count mitigations.</div>
-          </div>
-          <Button variant="primary" busy={busy} onClick={handleRebuildLedger}>
-            Rebuild Ledger
-          </Button>
+                      <ConfirmButton
+                        size="xs"
+                        variant="danger"
+                        question="Delete this restore point permanently?"
+                        confirmLabel="Delete"
+                        disabled={busy === snap.name}
+                        onConfirm={() => {
+                          setBusy(snap.name);
+                          return run(() => api.deleteSnapshot(snap.name), 'Snapshot deleted');
+                        }}
+                      >
+                        Delete
+                      </ConfirmButton>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {!snapshots.length && (
+                <tr>
+                  <td colSpan={4} className="muted tiny" style={{ padding: 'var(--space-5)', textAlign: 'center' }}>
+                    No restore points yet — one is created automatically the first time you clear anything.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
         </div>
       </Card>
     </div>

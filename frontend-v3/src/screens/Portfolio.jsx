@@ -30,7 +30,7 @@ export default function Portfolio({ onImport }) {
   })), [data]);
 
   if (error) return <Callout tone="warn">{error.message}</Callout>;
-  if (loading) return <Loading label="Reconciling holdings statements and printed NAVs…" />;
+  if (loading) return <Loading message="Reconciling holdings statements and printed NAVs…" />;
 
   if (!holdings.length) {
     return (
@@ -113,7 +113,7 @@ export default function Portfolio({ onImport }) {
             <DonutChart
               data={byKind}
               size={220}
-              strokeWidth={30}
+              thickness={30}
               centerLabel="Net Assets"
               centerValue={compact(portfolioVal)}
             />
@@ -129,6 +129,7 @@ export default function Portfolio({ onImport }) {
               color: colorFor(i),
             }))}
             total={portfolioVal}
+            max={10}
           />
         </Card>
       </div>

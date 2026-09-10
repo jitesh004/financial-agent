@@ -30,7 +30,7 @@ export default function Owed() {
   const [settling, setSettling] = useState(null);
   const [form, setForm] = useState({ method: 'cash', amount: '', note: '' });
 
-  if (loading) return <Loading label="Retrieving counterparty claims and receivables…" />;
+  if (loading) return <Loading message="Retrieving counterparty claims and receivables…" />;
   if (error) return <Callout tone="neg">{error.message}</Callout>;
 
   const openClaims = (dir) => claims.filter((c) => c.direction === dir && c.status !== 'settled' && c.status !== 'written_off');
@@ -79,7 +79,7 @@ export default function Owed() {
       >
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 'var(--space-2)' }}>
           <div>
-            <div style={{ fontSize: 'var(--text-md)', fontWeight: 600 }}>{claim.counterparty || 'Unnamed Counterparty'}</div>
+            <div style={{ fontSize: 'var(--text-base)', fontWeight: 600 }}>{claim.counterparty || 'Unnamed Counterparty'}</div>
             <div className="tiny muted" style={{ marginTop: 2 }}>
               Opened {dateLabel(claim.opened_on)}
               {age !== null && ` · ${age} day${age === 1 ? '' : 's'} ago`}

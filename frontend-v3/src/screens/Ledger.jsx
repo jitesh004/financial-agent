@@ -15,7 +15,7 @@ import {
   count, dateLabel, downloadCsv, money, monthLabel, titleCase, toCsv, today,
 } from '../core/format';
 import {
-  Button, Callout, Card, Chip, Empty, Icon, IconButton, Loading, PromptButton, Search,
+  Button, Callout, Card, Empty, Field, IconButton, Loading, Search,
   Segmented, Select, Sheet, Modal,
 } from '../ui';
 import { VirtualBody } from '../ui/virtual';
@@ -52,6 +52,11 @@ export default function Ledger() {
   const [ruleExplanation, setRuleExplanation] = useState(null);
   const [splitOpen, setSplitOpen] = useState(false);
   const [splitParts, setSplitParts] = useState([{ amount: '', category: '' }]);
+
+  const splitTotal = splitParts.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+  const splitBalanced = inspectingTxn
+    ? Math.abs(splitTotal - Number(inspectingTxn.amount || 0)) < 0.01
+    : false;
 
   const scrollRef = useRef(null);
   const activeView = VIEWS.find((v) => v.key === view) || VIEWS[0];
@@ -151,12 +156,12 @@ export default function Ledger() {
   const exportCurrent = () => {
     downloadCsv(`transactions-${today()}.csv`, toCsv(visibleRows, [
       ['date', 'Date'],
-      ['account_name', 'Account'],
+      [(r) => accountName(r), 'Account'],
       ['description', 'Description'],
       ['category', 'Category'],
       [(r) => (r.direction === 'credit' ? r.amount : -r.amount), 'Amount'],
       ['flow_role', 'Role'],
-      ['running_balance', 'Balance'],
+      [(r) => r.balance_after ?? '', 'Balance'],
       ['excluded', 'Excluded'],
     ]));
   };
@@ -165,6 +170,11 @@ export default function Ledger() {
     () => (categories || []).map((c) => [c.name || c, c.name || c]),
     [categories],
   );
+
+  const accountName = useMemo(() => {
+    const byId = new Map(accounts.map((a) => [a.id, a.display_name || a.institution]));
+    return (row) => byId.get(row.account_id) || 'Unknown account';
+  }, [accounts]);
 
   return (
     <div className="flex-col gap-4 animate-fade-in">
@@ -221,7 +231,7 @@ export default function Ledger() {
         }}>
           <div className="flex items-center gap-2">
             <span className="badge badge-accent font-bold tabular-nums">{picked.size}</span>
-            <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--accent)' }}>
+            <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--accent-text)' }}>
               transactions selected
             </span>
           </div>
@@ -310,8 +320,12 @@ export default function Ledger() {
                         {dateLabel(r.date)}
                       </td>
                       <td>
-                        <span className="truncate block" style={{ maxWidth: 130, fontWeight: 500 }} title={r.account_name}>
-                          {r.account_name || 'Account'}
+                        <span
+                          className="truncate block"
+                          style={{ maxWidth: 130, fontWeight: 500 }}
+                          title={accountName(r)}
+                        >
+                          {accountName(r)}
                         </span>
                       </td>
                       <td>
@@ -339,7 +353,7 @@ export default function Ledger() {
                       </td>
                       {prefs.showBalance && (
                         <td className="tabular-nums text-right text-3 text-xs">
-                          {r.running_balance != null ? money(r.running_balance) : '—'}
+                          {r.balance_after != null ? money(r.balance_after) : '—'}
                         </td>
                       )}
                       <td style={{ textAlign: 'center' }}>
@@ -419,11 +433,11 @@ export default function Ledger() {
                 <div className="grid-2" style={{ marginTop: 6 }}>
                   <div>
                     <span className="text-3">Account:</span>
-                    <strong className="block text-1">{inspectingTxn.account_name}</strong>
+                    <strong className="block text-1">{accountName(inspectingTxn)}</strong>
                   </div>
                   <div>
                     <span className="text-3">Running Balance:</span>
-                    <strong className="block tabular-nums">{money(inspectingTxn.running_balance)}</strong>
+                    <strong className="block tabular-nums">{money(inspectingTxn.balance_after)}</strong>
                   </div>
                 </div>
               </div>
@@ -483,6 +497,10 @@ export default function Ledger() {
           <p style={{ fontSize: 13, color: 'var(--text-2)' }}>
             Total amount to allocate: <strong>{money(inspectingTxn?.amount)}</strong>
           </p>
+          <div className={`tiny ${splitBalanced ? 'pos' : 'warn'}`}>
+            Allocated {money(splitTotal)} of {money(inspectingTxn?.amount ?? 0)}
+            {splitBalanced ? ' — balanced' : ` — ${money(Math.abs((inspectingTxn?.amount || 0) - splitTotal))} unallocated`}
+          </div>
           {splitParts.map((part, idx) => (
             <div key={idx} className="grid-2 gap-2">
               <input
@@ -516,11 +534,16 @@ export default function Ledger() {
             <Button
               size="sm"
               variant="primary"
+              disabled={!splitBalanced}
               onClick={async () => {
                 try {
-                  await api.splitTransaction(inspectingTxn.id, splitParts);
+                  await api.splitTransaction(
+                    inspectingTxn.id,
+                    splitParts.map((p) => ({ amount: Number(p.amount), category: p.category })),
+                  );
                   setSplitOpen(false);
                   setInspectingTxn(null);
+                  invalidate('txns', 'analysis', 'dashboard', 'workflow');
                   refetch();
                   toast.ok('Transaction split saved');
                 } catch (e) {
