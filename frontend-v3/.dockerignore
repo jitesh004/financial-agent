@@ -1,0 +1,27 @@
+# What never needs to reach the build context.
+#
+# `node_modules` is the one that matters: the build stage runs `npm ci`, so
+# shipping the host's copy is ~94MB of upload for files that get installed
+# anyway. It is not merely wasted time - the host tree carries its own
+# platform's esbuild and rollup binaries, which then sit in the image
+# alongside the Linux ones for no reason.
+#
+# Deliberately NOT listed: nginx.conf. The runtime stage copies it from the
+# build context, not from the builder, so excluding it breaks the image.
+
+node_modules
+dist
+
+# Local browser-driving scratch (puppeteer Chrome profiles, audit output).
+temp-profile
+screenshots
+*.log
+npm-debug.log*
+
+# Nothing inside the image reads these.
+Dockerfile
+Dockerfile.dev
+.dockerignore
+.git
+.gitignore
+.DS_Store
