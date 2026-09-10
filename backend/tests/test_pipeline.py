@@ -310,10 +310,23 @@ def test_income_excludes_transfer_mirror_legs(full_run):
 
 
 def test_no_transaction_is_both_income_and_spend(full_run):
+    """Spending is money leaving, counted exactly once.
+
+    "Not an internal transfer" was the old proxy for that, and it is too
+    broad: a loan repayment IS an internal transfer and IS the cash
+    leaving - `reconcile.transfers` says so itself, and counting only the
+    far leg is what let one EMI be spending and another not, purely on
+    whether that lender happens to send statements.
+
+    The two rules that actually prevent a double count are asserted
+    instead: never the RECEIVING leg, and never a card bill - whose
+    purchases are already counted one by one.
+    """
     for txn in full_run["transactions"]:
         if txn.is_spend:
             assert txn.direction == Direction.DEBIT
-            assert not txn.is_internal_transfer
+            assert not txn.is_mirror_leg
+            assert txn.category != Category.CC_PAYMENT
 
 
 def test_rules_categorize_nearly_everything(full_run):

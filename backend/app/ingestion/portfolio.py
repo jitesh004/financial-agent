@@ -676,6 +676,18 @@ def epf_holdings(text: str) -> tuple[list[Holding], date | None]:
     if not match:
         return [], None
     as_of = parsers.parse_date(match.group(1))
+
+    # A passbook closes on the FINANCIAL YEAR, and EPFO prints that year's
+    # end date - so a book issued today for FY 2026-27 reads "closing balance
+    # as on 31/03/2027". Taken literally it dates the corpus in the future,
+    # and because the portfolio stamps its total with the newest holding's
+    # date, one passbook had the whole 19.88 lakh reading "Valued as of
+    # 31 Mar 27" six months before that date arrived.
+    #
+    # The MONEY is right and current; only the label is a year-end. Clamp it
+    # to today: a balance cannot be as-of a date that has not happened.
+    if as_of and as_of > date.today():
+        as_of = date.today()
     figures = [to_decimal(tok) for tok in match.group(2).split()]
     figures = [f for f in figures if f is not None]
 

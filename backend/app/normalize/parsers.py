@@ -455,6 +455,17 @@ def parse_indian_shorthand(text: str) -> Decimal | None:
 #: modules strip or match on them and each used to spell its own list.
 _RAIL_PREFIXES = formats.PREFIX_RAIL_PATTERN
 _REF_NUMBERS = re.compile(r"\b\d{8,}\b")
+#: A masked account or card number - "XXXX5134", "XX4757833". Identifies the
+#: instrument, never the merchant, and changes between rows of one series.
+_MASKED_ACCOUNT = re.compile(r"\bX{2,}\w*\d+\b", re.IGNORECASE)
+#: A per-transaction reference: a long run mixing letters and digits, like
+#: "ICI99A1D3B" or "YCDBC1C4F734E6F". Requires both a letter and a digit so
+#: real names ("VODAFONE") and short codes survive.
+_REF_BLOB = re.compile(r"\b(?=\w*\d)(?=\w*[A-Za-z])\w{8,}\b")
+#: One stray letter left at the end of an otherwise finished name.
+_TRAILING_INITIAL = re.compile(r"\s+[A-Z]$")
+#: A label left pointing at a reference that has just been removed.
+_DANGLING_LABEL = re.compile(r"\s*\b(?:REF(?:ERENCE)?\s*(?:NO|NUM|NUMBER)?|TXN\s*ID|UTR)\s*[:.#-]*\s*$", re.IGNORECASE)
 _MULTISPACE = re.compile(r"\s+")
 #: Payment aggregators that prefix the merchant they collected for. The "X6098Z"
 #: form is HDFC's per-terminal code on UPI-routed card rows.
@@ -533,6 +544,22 @@ def normalize_description(raw: str) -> str:
     text = _MULTISPACE.sub(" ", text).strip()
     text = text.upper()
     text = _TRAILING_CITY.sub("", text).strip()
+
+    # Per-transaction noise, removed so the SAME merchant produces the same
+    # string twice. Without this every row looks like a new merchant: 96% of
+    # descriptions on the audited ledger were unique, the learned
+    # merchant->category cache never hit once in 234 entries, one broker
+    # appeared under nine keys, and a single home-loan EMI was ranked as
+    # five separate "merchants" because its reference digits changed monthly.
+    text = _MASKED_ACCOUNT.sub(" ", text)
+    text = _REF_BLOB.sub(" ", text)
+    text = _MULTISPACE.sub(" ", text).strip()
+
+    # A lone letter at the end is a column marker the parser could not
+    # place, not part of the name: HDFC card rows arrive as
+    # "ZEPTOGURGAON C" and "PRADEEP SWEETS PRIVATE C".
+    text = _TRAILING_INITIAL.sub("", text).strip()
+    text = _DANGLING_LABEL.sub("", text).strip()
     return _MULTISPACE.sub(" ", text)
 
 

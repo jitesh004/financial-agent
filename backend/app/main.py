@@ -14,6 +14,7 @@ than by this file - see auth/session.py and db/engine.py.
 
 from __future__ import annotations
 
+import re
 import logging
 import shutil
 import threading
@@ -318,10 +319,15 @@ CLEAR_ACTIONS: tuple[ClearAction, ...] = (
     ClearAction(
         scope="decisions",
         label="Clear my decisions",
-        description="Discard every correction, note and exclusion you have "
-                    "made. Nothing can regenerate these.",
-        clears=("category corrections", "notes", "exclusions"),
-        preserves=("transactions", "statement files", "AI inference", "your profile"),
+        description="Discard everything you have told this app by hand - "
+                    "corrections, notes, exclusions, claims, splits, your "
+                    "attested balance sheet and your saved dashboards. "
+                    "Nothing can regenerate these.",
+        clears=("category corrections", "notes", "exclusions",
+                "claims and splits", "custom categories",
+                "your attested position", "saved dashboards"),
+        preserves=("transactions", "statement files", "AI inference",
+                   "your profile", "your settings"),
         destructive=True,
     ),
     ClearAction(
@@ -761,7 +767,7 @@ def _build_payload(state: dict[str, Any]) -> dict[str, Any]:
         "loans": [ser.loan_json(p) for p in state.get("loan_projections") or []],
         "forecast": ser.forecast_json(state.get("forecast")),
         "recurring": [ser.recurring_json(s) for s in state.get("recurring") or []],
-        "transfers": ser.transfer_json(state.get("transfer_report")),
+        "transfers": _transfers_block(state),
         "narrative": ser.jsonable(state.get("narrative") or {}),
         "statements": [
             {
@@ -796,7 +802,20 @@ def _data_quality(state: dict[str, Any], statements: list) -> dict[str, Any]:
     # rebuild carries the registry rows the Files tab renders. Both say
     # whether the file reconciled, so both are read rather than one being
     # declared the real one.
-    reconciled = unreconciled = 0
+    # The database is the authority on what reconciled, because the balance
+    # gate is what writes `recon_status` and only some of the shapes that
+    # reach this function carry it. Counting from whatever the in-memory
+    # state happened to include is how this card reported 186 reconciled and
+    # 0 unreconciled while fourteen statements had failed.
+    try:
+        _counts = repo.reconciliation_counts(get_db())
+        reconciled = _counts["passed"]
+        unreconciled = _counts["failed"]
+        not_checked = _counts["not_applicable"]
+    except Exception:                       # pragma: no cover - defensive
+        reconciled = unreconciled = not_checked = 0
+
+    _legacy_reconciled = _legacy_unreconciled = 0
     for entry in statements:
         status = None
         if isinstance(entry, dict):
@@ -808,10 +827,19 @@ def _data_quality(state: dict[str, Any], statements: list) -> dict[str, Any]:
         if status is None:
             continue
         name = getattr(status, "value", status)
+        # Only the gate's own verdicts count here. "parsed" and "ok" answer a
+        # different question - whether the file could be READ - and treating
+        # them as "reconciled" is what let a statement that declared no
+        # balances, and so was never checked at all, be reported as checked.
         if name in {"failed", "unreconciled"}:
-            unreconciled += 1
-        elif name in {"passed", "reconciled", "ok", "parsed"}:
-            reconciled += 1
+            _legacy_unreconciled += 1
+        elif name in {"passed", "reconciled"}:
+            _legacy_reconciled += 1
+
+    # Only if the database told us nothing at all - an empty ledger, or a
+    # caller with no tenant bound - fall back to what the state carried.
+    if not (reconciled or unreconciled or not_checked):
+        reconciled, unreconciled = _legacy_reconciled, _legacy_unreconciled
 
     transactions = state.get("transactions") or []
     uncategorized = sum(1 for t in transactions
@@ -824,6 +852,7 @@ def _data_quality(state: dict[str, Any], statements: list) -> dict[str, Any]:
         "files_processed": len(statements),
         "files_reconciled": reconciled,
         "files_unreconciled": unreconciled,
+        "files_not_checked": not_checked,
         "transactions": len(transactions),
         "uncategorized": uncategorized,
         # `rules_settled` is the name the Overview reads. Emitting only
@@ -849,12 +878,77 @@ def get_run(run_id: str) -> dict[str, Any]:
     return run
 
 
+def _transfers_block(state: dict[str, Any]) -> dict[str, Any]:
+    """The transfer-netting figures, from the run if present, else the ledger.
+
+    The in-memory report only exists on a full graph run. Falling back to the
+    persisted pairs is what keeps the Overview's "double-counting prevented"
+    line honest on a rebuilt dashboard instead of silently reading zero and
+    hiding the panel altogether.
+    """
+    report = state.get("transfer_report")
+    if report is not None and getattr(report, "pairs", None):
+        return ser.transfer_json(report)
+    try:
+        stored = repo.transfer_pairs_summary(get_db())
+    except Exception:                       # pragma: no cover - defensive
+        return ser.transfer_json(None)
+    missing = int(stored.get("evidence_missing") or 0)
+    notes = []
+    if missing:
+        # The netting stands - the transactions say it happened - but the
+        # match behind it cannot be produced. Said in the same place the
+        # figure is, because "7.58 lakh of double-counting prevented" with
+        # no way to check 45 of the groups is a claim, not a result.
+        notes.append(
+            f"{missing} of these groups have no recorded match behind them: "
+            f"the rows are netted, but the amount, day gap and confidence "
+            f"that paired them were not kept. Re-import or rebuild to "
+            f"restore the evidence."
+        )
+    return {
+        "total": float(stored["total"]),
+        "double_count_avoided": float(stored["double_count_avoided"]),
+        "notes": notes,
+        "evidence_missing": missing,
+        "pairs": [
+            {"pair_id": p.get("pair_id"), "amount": float(p.get("amount") or 0),
+             "kind": p.get("kind"), "from": None, "to": None,
+             "legs": p.get("legs"),
+             "evidence_missing": bool(p.get("evidence_missing")),
+             "day_gap": p.get("day_gap"), "confidence": p.get("confidence")}
+            for p in stored["pairs"]
+        ],
+    }
+
+
+def _with_live_transfers(payload: dict[str, Any]) -> dict[str, Any]:
+    """Re-read the netting figures from the ledger before serving a payload.
+
+    The rest of a stored run is a snapshot and should stay one, but these
+    two numbers are a claim about the CURRENT ledger - "7.58 lakh of
+    double-counting prevented across 70 pairs" - and the ledger is where
+    the answer lives. Served from the snapshot they simply stop being true:
+    after the matcher was tightened and the multi-leg groups were recorded,
+    the live answer was 10.92 lakh across 81 groups while the Overview went
+    on quoting a figure computed by an older version of the code, with no
+    event that would ever refresh it.
+    """
+    try:
+        payload = dict(payload)
+        payload["transfers"] = _transfers_block({})
+    except Exception as exc:        # pragma: no cover - never break the page
+        log.warning("Could not refresh transfer figures: %s", exc)
+    return payload
+
+
 @app.get("/api/dashboard")
 def dashboard() -> dict[str, Any]:
     """The most recent completed analysis."""
     run = runs.latest()
     if run and run.get("result"):
-        return {"status": "ok", "run_id": run["run_id"], **run["result"]}
+        return {"status": "ok", "run_id": run["run_id"],
+                **_with_live_transfers(run["result"])}
 
     db = get_db()
     if repo.count_transactions(db) == 0:
@@ -869,7 +963,8 @@ def dashboard() -> dict[str, Any]:
     if stored:
         run_id, payload = stored
         runs.create_from_payload(run_id, payload)
-        return {"status": "ok", "run_id": run_id, **payload}
+        return {"status": "ok", "run_id": run_id,
+                **_with_live_transfers(payload)}
 
     # No stored run either (an older workspace, or the run table was
     # cleared). Every transaction still carries its computed category and
@@ -979,8 +1074,13 @@ def scoped_analysis(
 
     from .analytics.engine import analyze
 
+    from .api.position_routes import resolved_for_net_worth
+
+    resolved, adopted = resolved_for_net_worth(db)
     result = analyze(transactions, accounts, period=period,
-                     bureau_accounts=repo.get_latest_bureau_accounts(db))
+                     bureau_accounts=repo.get_latest_bureau_accounts(db),
+                     resolved_balances=resolved, adopted_bureau=adopted,
+                     custom_groups=repo.custom_category_groups(db))
     return {
         "status": "ok",
         "range": period.as_json(),
@@ -1088,8 +1188,13 @@ def _rebuild_from_persisted_data(db) -> str:
     # every loan-statement row as though the holder had spent it.
     mark_lender_ledgers(transactions, accounts)
 
+    from .api.position_routes import resolved_for_net_worth
+
+    resolved, adopted = resolved_for_net_worth(db)
     analysis = analyze(transactions, accounts,
-                       bureau_accounts=repo.get_latest_bureau_accounts(db))
+                       bureau_accounts=repo.get_latest_bureau_accounts(db),
+                       resolved_balances=resolved, adopted_bureau=adopted,
+                       custom_groups=repo.custom_category_groups(db))
     recurring = detect_recurring(transactions)
     loan_projections = []
     for account_id, account in accounts.items():
@@ -1279,10 +1384,38 @@ def list_transactions(
         db, **filters, sort_by=sort_by, sort_dir=sort_dir,
         limit=min(limit, 1000), offset=offset,
     )
+    total = repo.count_transactions(db, **filters)
+
+    # How many rows the lender-ledger exclusion above took OUT of this
+    # particular query. Withholding them is right; withholding them in
+    # silence is not.
+    #
+    # Filter the Ledger to the ICICI personal loan and every one of its 114
+    # rows is suppressed, so the screen says "no transactions" about an
+    # account that plainly has some - indistinguishable from a broken filter
+    # or a failed import. Naming the count and the reason turns an empty
+    # table into an explanation, and the role filter is right there to look
+    # at them with.
+    withheld = 0
+    if not roles:
+        unfiltered = dict(filters, exclude_flow_role=None)
+        withheld = repo.count_transactions(db, **unfiltered) - total
+
     return {
         "transactions": [ser.transaction_json(t) for t in txns],
         "limit": limit,
         "offset": offset,
+        "withheld": {
+            "count": withheld,
+            "flow_role": FlowRole.LENDER_LEDGER.value,
+            "reason": (
+                "These are rows from a lender's own statement - the loan's "
+                "internal record of instalments falling due and being "
+                "received. They are not money you moved, so no total counts "
+                "them and the list leaves them out. Filter by the "
+                "'lender ledger' role to see them."
+            ),
+        } if withheld > 0 else None,
         # What the server understood the period to be. A screen that shows
         # figures for a window should be able to print the window it got
         # rather than the one it asked for.
@@ -1290,7 +1423,7 @@ def list_transactions(
         # Filtered to match what was actually returned - previously this
         # always reported the WHOLE table's row count regardless of any
         # filter, so a filtered view claimed far more pages than it had.
-        "total": repo.count_transactions(db, **filters),
+        "total": total,
     }
 
 
@@ -1429,16 +1562,41 @@ class CustomCategoryReq(BaseModel):
     name: str
     color: str = "#6b7280"
     icon: str = "Tag"
+    group: str = "Other"
+
 
 @app.post("/api/categories")
 def create_category(payload: CustomCategoryReq) -> dict[str, str]:
-    repo.add_custom_category(get_db(), payload.name, payload.color, payload.icon)
+    from .models.schemas import CATEGORY_GROUPS
+    group = (payload.group or "Other").strip() or "Other"
+    if group not in CATEGORY_GROUPS:
+        raise HTTPException(
+            400, f"'{group}' is not a group. Valid: "
+                 f"{', '.join(CATEGORY_GROUPS)}")
+    repo.add_custom_category(get_db(), payload.name, payload.color,
+                             payload.icon, group)
     return {"status": "ok"}
 
+
 @app.delete("/api/categories/{name}")
-def delete_category(name: str) -> dict[str, str]:
-    repo.delete_custom_category(get_db(), name)
-    return {"status": "ok"}
+def delete_category(name: str, reassign_to: str = "") -> dict[str, Any]:
+    """Remove a custom category, moving whatever is filed under it.
+
+    Refused rather than silently orphaning: a deleted category the picker no
+    longer offers, and validation no longer accepts, still renders on the
+    Spending screen against rows nobody can re-file.
+    """
+    db = get_db()
+    in_use = repo.count_transactions_in_category(db, name)
+    if in_use and not reassign_to:
+        raise HTTPException(
+            409, f"{in_use} transaction(s) are still filed under '{name}'. "
+                 f"Pass reassign_to=<category> to move them first - deleting "
+                 f"it now would leave them under a category you can no "
+                 f"longer select.")
+    moved = repo.delete_custom_category(db, name, reassign_to or None)
+    runs.clear()
+    return {"status": "ok", "reassigned": moved}
 
 
 @app.get("/api/data/inventory")
@@ -1669,9 +1827,44 @@ def get_profile() -> dict[str, Any]:
         "date_of_birth": profile.date_of_birth.isoformat() if profile.date_of_birth else "",
         "pan": profile.pan,
         "mobile": profile.mobile,
-        "custom_passwords": profile.custom_passwords,
+        # The passwords themselves are never echoed back. They are the most
+        # sensitive thing this app stores - and on this profile they encode
+        # the date of birth, so returning them hands over two secrets at
+        # once. The form needs to know how many are set and whether it can
+        # unlock anything; it does not need to read them, and anything that
+        # captures a response body would.
+        "custom_password_count": len(profile.custom_passwords or []),
         "has_password_material": profile.has_password_material(),
     }
+
+
+#: A PAN is five letters, four digits, one letter - fixed, and checkable.
+_PAN_RE = re.compile(r"^[A-Z]{5}[0-9]{4}[A-Z]$", re.IGNORECASE)
+#: An Indian mobile number, with or without the country code.
+_MOBILE_RE = re.compile(r"^(?:\+?91[- ]?)?[6-9][0-9]{9}$")
+
+
+def _reject_bad_identity(payload: dict[str, Any]) -> None:
+    """Check the two fields that generate statement passwords.
+
+    These are not filing details. `has_password_material` builds PDF
+    password candidates out of the PAN, the date of birth and the mobile
+    number, so garbage in either produces garbage candidates - and this
+    workspace has 33 statements sitting unopened at `needs_password`. The
+    date was already validated; these two were accepted as typed, so
+    "NOTAPAN123" and a two-digit mobile went straight in.
+    """
+    pan = (payload.get("pan") or "").strip()
+    if pan and not _PAN_RE.match(pan):
+        raise HTTPException(
+            400, "That does not look like a PAN. The format is five "
+                 "letters, four digits, then one letter - like ABCDE1234F.")
+
+    mobile = (payload.get("mobile") or "").strip().replace(" ", "")
+    if mobile and not _MOBILE_RE.match(mobile):
+        raise HTTPException(
+            400, "That does not look like a mobile number. Ten digits "
+                 "starting 6-9, optionally with +91.")
 
 
 @app.put("/api/profile")
@@ -1680,6 +1873,7 @@ def put_profile(payload: dict[str, Any]) -> dict[str, Any]:
     from .models.profile import UserProfile
 
     dob = (payload.get("date_of_birth") or "").strip()
+    _reject_bad_identity(payload)
     # excluded_senders is managed separately (PUT /api/gmail/ignored) and this
     # form never sends it - building a fresh UserProfile without carrying it
     # forward would silently wipe every family/firm account the user had
@@ -1691,7 +1885,14 @@ def put_profile(payload: dict[str, Any]) -> dict[str, Any]:
             date_of_birth=date.fromisoformat(dob) if dob else None,
             pan=(payload.get("pan") or "").strip(),
             mobile=(payload.get("mobile") or "").strip(),
-            custom_passwords=[p for p in (payload.get("custom_passwords") or []) if p],
+            # Absent or empty means LEAVE ALONE, not "delete them". The
+            # GET no longer echoes these back, so a form that round-trips
+            # what it was given would otherwise wipe every stored password
+            # the first time somebody corrected their own name.
+            custom_passwords=(
+                [p for p in payload["custom_passwords"] if p]
+                if payload.get("custom_passwords")
+                else existing.custom_passwords),
             excluded_senders=existing.excluded_senders,
         )
     except ValueError as exc:
@@ -1948,7 +2149,8 @@ def create_claim(txn_id: str, payload: ClaimReq) -> dict[str, Any]:
         counterparty=payload.counterparty,
         origin_fingerprint=txn.fingerprint,
         amount=payload.amount,
-        opened_on=txn.txn_date.isoformat()
+        opened_on=txn.txn_date.isoformat(),
+        note=payload.note or "",
     )
     repo.update_transaction_categories(db, [txn])
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Callable
 
 from ..models.schemas import AccountType, Category, ConfidenceSource, Direction
@@ -37,6 +38,18 @@ from .fingerprint import stamp_fingerprints
 from .overrides import OverrideReport, apply_overrides
 
 log = logging.getLogger(__name__)
+
+#: When a language model's category choice is worth a human glance,
+#: regardless of how sure the model said it was.
+#:
+#: A share rather than an amount, so it means the same thing at any income:
+#: one row being a third of everything filed under a category is what makes
+#: a wrong label move the chart, not the number of rupees on it.
+LLM_REVIEW_SHARE = Decimal("0.20")
+
+#: ...but only above a floor. In a category with two small rows, one being
+#: most of the total is arithmetic, not a finding.
+LLM_REVIEW_FLOOR = Decimal("10000")
 
 
 @dataclass
@@ -210,7 +223,7 @@ def enrich_ledger(
     # three real transactions, and neither the failed debit nor its refund
     # should count as spending, income, or a candidate leg for anything else.
     phase("Cancelling reversed charges")
-    reversed_count = detect_reversals(transactions)
+    reversed_count = detect_reversals(transactions, accounts)
     if reversed_count:
         result.warnings.append(
             f"{reversed_count} failed charge(s) were matched against their own "
@@ -245,6 +258,59 @@ def enrich_ledger(
     )
     if result.settlement_report is not None:
         result.warnings.extend(result.settlement_report.notes)
+        # Keep WHY these rows were netted, not only THAT they were.
+        #
+        # A settlement group is the multi-leg case `transfer_pairs` cannot
+        # represent - one bank debit against three card bills - so the
+        # matcher stamped `transfer_pair_id` on the rows and dropped its
+        # own reasoning on the floor. `repo.save_settlement_groups` was
+        # written for exactly this and never once called, which is why
+        # eleven groups on this ledger are netted out of spending with no
+        # total, no residual and no confidence recorded anywhere.
+        try:
+            groups = list(result.settlement_report.groups or [])
+            legs = [
+                {"group_id": g.group_id, "fingerprint": leg.fingerprint,
+                 "side": side}
+                for g in groups
+                for side, side_legs in (("outflow", g.outflow_legs),
+                                        ("inflow", g.inflow_legs))
+                for leg in side_legs
+                if getattr(leg, "fingerprint", "")
+            ]
+            from ..db import repository as _repo
+            _repo.save_settlement_groups(db, groups, legs)
+        except Exception as exc:  # pragma: no cover - never block a run on this
+            log.warning("Could not record settlement groups: %s", exc)
+
+    # 4b. Release a category that only a WITHDRAWN pairing was holding up.
+    #
+    # Pairing rewrites the category of both legs: a UPI debit to a broker
+    # became "cc_payment" because the row it was matched with sat on a card.
+    # When a later pass refuses that match - a tighter matcher, a user
+    # unlinking it, a re-derive - the pairing goes and the label it wrote
+    # stays, because `ConfidenceSource.RULE` cannot say which rule wrote it.
+    # A 64,000 transfer to Zerodha went on being filed as a card payment,
+    # and therefore netted out of both spending and investment, with
+    # nothing left anywhere in the ledger to pair it with.
+    #
+    # Reset to undecided rather than guessed at, so step 5 below reads the
+    # narration and answers from scratch - which is what would have
+    # happened if the bad match had never been made.
+    from ..reconcile.transfers import PAIRING_RULE
+    released = 0
+    for txn in transactions:
+        if (txn.category_rule == PAIRING_RULE
+                and not txn.is_internal_transfer
+                and not txn.transfer_pair_id):
+            txn.category = Category.UNCATEGORIZED
+            txn.category_source = ConfidenceSource.DEFAULT
+            txn.category_confidence = 0.0
+            txn.category_rule = ""
+            released += 1
+    if released:
+        log.info("Released %d categories left behind by withdrawn pairings.",
+                 released)
 
     # 5. Deterministic rules. Skips anything already decided.
     phase("Categorizing")
@@ -300,10 +366,44 @@ def enrich_ledger(
     #    value in the DB makes queries and debugging far simpler.
     from ..models.schemas import FlowRole, derive_flow_role
     from ..categorize.rules import looks_like_person_payment
+    from .overrides import rederive_role
+
+    pinned = result.override_report.role_pinned
+
+    # How much of each category's spending one row is answerable for.
+    #
+    # A language model's confidence is about the LABEL, never about the
+    # CONSEQUENCE, and nothing here was combining the two. "COWTOWN INFOTECH
+    # SERVI Pune IND" - an IT services firm - was read as entertainment at
+    # 0.85 confidence, twice, for 1.88 lakh, which is 97% of everything this
+    # ledger calls entertainment. Every other guess in that category was
+    # worth a few hundred rupees and every one of them was equally
+    # unreviewed, because 0.85 is a perfectly ordinary score.
+    #
+    # Share of its own category is the test rather than a rupee threshold:
+    # it is self-calibrating, so it means the same thing to someone who
+    # spends thousands and someone who spends lakhs, and it asks the
+    # question that matters - would being wrong about this one row change
+    # what the chart says?
+    from collections import defaultdict
+    category_totals: dict[Any, Decimal] = defaultdict(lambda: Decimal("0"))
+    for txn in transactions:
+        if txn.direction == Direction.DEBIT and not txn.excluded:
+            category_totals[txn.category] += txn.amount
 
     for txn in transactions:
-        if not txn.flow_role:
-            txn.flow_role = derive_flow_role(txn).value
+        # Re-derived every pass, not just when empty. The role depends on
+        # `category`, `excluded` and the transfer flags, and all three change
+        # during a run - categorization, transfer matching and the user's own
+        # decisions all move them. Deriving only into an empty field froze the
+        # role at whatever the FIRST pass concluded, so a category corrected
+        # afterwards changed the label and left the money where it was.
+        #
+        # Two exceptions, both handled inside `rederive_role`/here: a role the
+        # user pinned by hand outranks anything inferred, and LENDER_LEDGER is
+        # a property of the account that derivation cannot see.
+        if txn.id not in pinned:
+            rederive_role(txn)
 
         # A credit carrying a spending category nets against that spending -
         # a returned purchase, a reversed fee. That is unambiguous when the
@@ -325,6 +425,61 @@ def enrich_ledger(
                 "as money back rather than income. Confirm or flip."
             )
 
+        # A credit nothing could explain, counted as income because the
+        # alternative silently erases real money. `models.schemas` documents
+        # that trade-off and says "the review queue is what narrows these
+        # down" - but nothing ever put them there, so 8.17 lakh across 80
+        # rows was counted as earnings and never questioned. That is 37% of
+        # reported income on this ledger, against a reported surplus of 3.49
+        # lakh: the guess is bigger than the answer it feeds.
+        if (txn.flow_role == FlowRole.INCOME.value
+                and not txn.needs_review
+                and txn.category_source == ConfidenceSource.DEFAULT):
+            txn.needs_review = True
+            txn.review_reason = (
+                "Nothing identified this credit, so it is counted as income. "
+                "If it was a refund, a transfer from your own account or "
+                "money someone owed you, say so - it is inflating both your "
+                "income and your savings rate until you do."
+            )
+
+        # A guess by a language model that one row alone could rewrite.
+        #
+        # Deliberately independent of confidence: the model was 85% sure
+        # about Cowtown and it was wrong, and no score it could have
+        # returned would have made a 1 lakh row not worth a glance. The
+        # floor keeps this off small categories, where one row being most
+        # of the total is normal and means nothing.
+        if (txn.category_source == ConfidenceSource.LLM
+                and txn.direction == Direction.DEBIT
+                and not txn.excluded
+                and not txn.needs_review
+                and txn.amount >= LLM_REVIEW_FLOOR):
+            total = category_totals.get(txn.category) or Decimal("0")
+            if total > 0 and (txn.amount / total) >= LLM_REVIEW_SHARE:
+                share = int((txn.amount / total) * 100)
+                txn.needs_review = True
+                txn.review_reason = (
+                    f"A language model chose this category, and this single "
+                    f"row is {share}% of everything filed under it. Nothing "
+                    f"but the narration was used to decide. Confirm it or "
+                    f"recategorise it - the chart is mostly this one row."
+                )
+
+        # Nothing in this app converts currency, so a row denominated in
+        # anything else cannot be added to a rupee total - and silently
+        # adding it is exactly what happened for as long as the detector
+        # mis-stamped an Indian travel card as USD. Flag rather than convert:
+        # inventing an exchange rate would be a worse answer than saying the
+        # figure needs a human.
+        if (txn.currency and txn.currency != "INR" and not txn.needs_review):
+            txn.needs_review = True
+            txn.review_reason = (
+                f"This row is recorded in {txn.currency}, and totals here are "
+                f"in rupees. Nothing converts between them, so it is being "
+                f"added at face value. Check the amount and the currency."
+            )
+
         # A card-bill row that never found its far leg is a silent default,
         # not a confirmed fact - detect_transfers only found candidates
         # within its own day-gap and account set, and a missing statement,
@@ -332,11 +487,19 @@ def enrich_ledger(
         # payment all look identical from here. Surfacing it is what turns
         # "assumed" into "confirmed or corrected" instead of a number the
         # user never gets a chance to check.
-        if (txn.category == Category.CC_PAYMENT and not txn.is_internal_transfer
-                and not txn.needs_review):
-            txn.needs_review = True
+        #
+        # The ROLE is decided unconditionally; only the review COPY is
+        # withheld from a row that already carries a reason. Those are two
+        # different questions and they were one `if`: because the whole
+        # block hung off `not txn.needs_review`, a card payment that had
+        # already been flagged for something else - an unconverted currency,
+        # a credit from a person - skipped the settlement correction with it
+        # and stayed booked as spending. An accounting decision must not
+        # depend on whether a UI flag happens to be free.
+        if txn.category == Category.CC_PAYMENT and not txn.is_internal_transfer:
+            unflagged = not txn.needs_review
             if txn.direction == Direction.CREDIT:
-                txn.review_reason = (
+                reason = (
                     "This card's payment-received entry has no matching bank "
                     "debit - either that statement is missing, or someone "
                     "else paid this bill. Counted as settling the card, not "
@@ -344,6 +507,7 @@ def enrich_ledger(
                 )
             elif card_purchases_already_counted(
                     txn.txn_date, accounts, statements_by_account):
+                # -- accounting, not presentation: runs however the row is flagged --
                 # The bill this settles has already been imported, so the
                 # purchases on it are already counted as spending. Counting
                 # the payment as well charges the holder twice for the same
@@ -357,8 +521,9 @@ def enrich_ledger(
                 # bank account to settle a liability the app already tracks.
                 # Still flagged, because the far leg has not been seen and
                 # the holder may know something the ledger does not.
-                txn.flow_role = FlowRole.TRANSFER_OUT.value
-                txn.review_reason = (
+                if txn.id not in pinned:
+                    txn.flow_role = FlowRole.TRANSFER_OUT.value
+                reason = (
                     "Counted as settling your card, not as spending: a "
                     "statement for one of your cards closed shortly before "
                     "this, so the purchases this bill pays for are already "
@@ -366,7 +531,7 @@ def enrich_ledger(
                     "will arrive on its next statement."
                 )
             else:
-                txn.review_reason = (
+                reason = (
                     "This card-bill payment has no matching entry on the "
                     "card's own statement, and no card statement has closed "
                     "recently either - so the purchases behind it were never "
@@ -374,6 +539,9 @@ def enrich_ledger(
                     "spent. Counted as spending. Import that card's "
                     "statement and this becomes a transfer instead."
                 )
+            if unflagged:
+                txn.needs_review = True
+                txn.review_reason = reason
 
     if not run_analysis:
         return result

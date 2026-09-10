@@ -217,11 +217,65 @@ function CoverageGrid() {
     return [...set].sort((a, b) => b.localeCompare(a));
   }, [rows]);
 
+  /* What the grid is actually saying, counted rather than left to be read
+     off 200-odd 20px squares. A screen whose entire content is a heatmap
+     has no headline, so "how complete am I?" - the one question it exists
+     to answer - was the one thing it never said. */
+  const tally = useMemo(() => {
+    let parsed = 0; let failed = 0; let missing = 0;
+    rows.forEach((r) => (r.months || []).forEach((m) => {
+      const st = m.status || 'missing';
+      if (st === 'parsed' || st === 'ok') parsed += 1;
+      else if (st === 'failed' || st === 'unreconciled') failed += 1;
+      else missing += 1;
+    }));
+    return { parsed, failed, missing, total: parsed + failed + missing };
+  }, [rows]);
+
+  const locked = data?.locked || [];
+
   if (loading) return <Loading message="Calculating account coverage heatmap…" />;
   if (!rows.length) return null;
 
   return (
     <Card title="Statement Coverage Grid" subtitle="Month-by-month historical completeness per account.">
+      <div className="flex items-center gap-4 flex-wrap" style={{ marginBottom: 12, fontSize: 13 }}>
+        <span>
+          <strong className="tabular-nums">{tally.parsed}</strong>
+          <span className="text-3"> of {tally.total} account-months imported</span>
+        </span>
+        {tally.failed > 0 && (
+          <span style={{ color: 'var(--warn)' }}>
+            <strong className="tabular-nums">{tally.failed}</strong> did not reconcile
+          </span>
+        )}
+        {tally.missing > 0 && (
+          <span style={{ color: 'var(--neg)' }}>
+            <strong className="tabular-nums">{tally.missing}</strong> missing
+          </span>
+        )}
+      </div>
+
+      {/* A locked file produces no account and no month, so it appears in
+          none of the rows below and the month it covers is drawn as
+          "missing" - the same cell a month you never uploaded gets. Those
+          are different facts, and conflating them sends someone hunting for
+          statements they have already handed over. */}
+      {locked.length > 0 && (
+        <Callout tone="warn">
+          <strong className="tabular-nums">{locked.length}</strong>
+          {' '}uploaded {locked.length === 1 ? 'file is' : 'files are'} password-protected
+          and could not be opened, so {locked.length === 1 ? 'it does' : 'they do'} not
+          appear in this grid. Some of the {tally.missing} months shown as missing may
+          already be covered by {locked.length === 1 ? 'it' : 'them'} &mdash; add the
+          passwords under Files to find out.
+          <div className="text-xs text-3" style={{ marginTop: 6 }}>
+            {locked.slice(0, 6).map((f) => f.filename).join(', ')}
+            {locked.length > 6 ? ` and ${locked.length - 6} more` : ''}
+          </div>
+        </Callout>
+      )}
+
       <div style={{ overflowX: 'auto', paddingBottom: 8 }}>
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>

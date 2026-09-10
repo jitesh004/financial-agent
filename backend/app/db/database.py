@@ -114,10 +114,22 @@ _TIER_DECISIONS = ("user_overrides", "claim_settlements", "transaction_splits",
                    "custom_categories", "recurring_series_overrides",
                    "claims", "split_rules", "settlement_group_legs",
                    "settlement_groups", "dashboard_widgets", "dashboards",
-                   "position_snapshots", "position_items",
-                   "app_settings")
+                   "position_snapshots", "position_items")
 
-_TIER_IDENTITY = ("user_profile",)
+#: `app_settings` is NOT in the tier above, though it used to be. It holds
+#: configuration - the LLM provider, both model names, the agent profile -
+#: and none of that is a "decision" in the sense the action describes. The
+#: button says it preserves your setup and then wiped it: clearing
+#: corrections left this workspace with no model configured, which silently
+#: disables categorisation and every agent until somebody notices and types
+#: it all back in.
+
+#: Who this workspace belongs to and how it is set up. Cleared only by a
+#: factory reset. `app_settings` lives here rather than in the decisions
+#: tier because it holds CONFIGURATION - the LLM provider, both model names,
+#: the agent profile - and "clear my corrections" has no business disabling
+#: categorisation and every agent on the way past.
+_TIER_IDENTITY = ("user_profile", "app_settings")
 
 #: Each scope is cumulative over the cheaper tiers below it: re-parsing has to
 #: drop the derived data built on top of the rows it is replacing, and clearing

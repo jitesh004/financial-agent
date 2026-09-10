@@ -316,11 +316,14 @@ def merge_extracted_file_into_ledger(
     # the same way the Gmail import job builds it, from the FULL registry
     # rather than just this one file, so it reflects every statement ever
     # attempted rather than resetting to "1 processed".
+    _recon = repo.reconciliation_counts(db)
     payload["data_quality"] = {
         "files_processed": len(statement_rows),
-        "files_reconciled": sum(1 for s in statement_rows if s["status"] == "ok"),
-        "files_unreconciled": sum(1 for s in statement_rows
-                                  if s["status"] == "unreconciled"),
+        # From `recon_status`, the gate's own verdict - not from
+        # `parse_status`, which only says whether the file could be read.
+        "files_reconciled": _recon["passed"],
+        "files_unreconciled": _recon["failed"],
+        "files_not_checked": _recon["not_applicable"],
         "files_failed": sum(1 for s in statement_rows
                             if s["status"] in {"failed", "needs_password"}),
         "duplicates_removed": enriched.duplicate_count,
@@ -454,7 +457,38 @@ def get_coverage() -> dict[str, Any]:
     accounts = repo.get_accounts(db)
     statements_by_account = _load_statements_by_account(db)
     files_by_account = _attribute_and_group_files(db, accounts)
-    return {"accounts": build_coverage(accounts, statements_by_account, files_by_account)}
+
+    # Files that were uploaded and could not be opened, reported alongside
+    # the grid rather than left out of it.
+    #
+    # A locked statement is invisible here today: nothing parsed it, so it
+    # produced no account and no month, so it appears in none of the rows -
+    # and the month it covers is rendered "missing", which is the same cell
+    # a month you never uploaded gets. Those are different facts. On this
+    # ledger 33 files are password-protected against 52 months shown as
+    # missing, so the screen is telling someone to go and find statements
+    # they have already given it.
+    #
+    # Not attributed to an account or a month on purpose: extraction is what
+    # discovers those, and extraction is the step that failed. A filename
+    # hint is recorded where one was parsed, and that is as far as an honest
+    # guess goes.
+    locked = [
+        {
+            "file_id": rec.id,
+            "filename": rec.filename,
+            "period_hint": rec.period_hint or "",
+            "institution_guess": rec.institution_guess or "",
+        }
+        for rec in repo.list_source_files(db)
+        if (rec.password_status or "") == "locked"
+    ]
+    locked.sort(key=lambda f: (f["period_hint"] or "9999", f["filename"]))
+
+    return {
+        "accounts": build_coverage(accounts, statements_by_account, files_by_account),
+        "locked": locked,
+    }
 
 
 # --------------------------------------------------------------------------

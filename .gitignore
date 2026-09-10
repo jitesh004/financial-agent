@@ -12,3 +12,6 @@ data
 
 # Local browser-driving scratch (audit scripts, Chrome profiles)
 frontend-v3/temp-profile/
+
+# Vite dependency-optimizer cache - regenerated on every dev server start.
+.vite/

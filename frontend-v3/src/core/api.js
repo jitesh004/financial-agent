@@ -127,7 +127,7 @@ export const api = {
     api.transactions({ needs_review: true, limit: api.PAGE_MAX, ...params }),
   updateTransaction: (id, fields) => patch(`/api/transactions/${id}`, fields),
   bulkUpdate: (txnIds, fields) => patch('/api/transactions/bulk', { txn_ids: txnIds, ...fields }),
-  splitTransaction: (id, parts) => post(`/api/transactions/${id}/split`, { parts }),
+  splitTransaction: (id, splits) => post(`/api/transactions/${id}/split`, { splits }),
   claimTransaction: (id, body) => post(`/api/transactions/${id}/claim`, body),
   recategorize: (id, category) => patch(`/api/transactions/${id}`, { category }),
 

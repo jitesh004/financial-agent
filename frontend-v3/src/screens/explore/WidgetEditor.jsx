@@ -20,10 +20,20 @@ const EMPTY = {
     limit: 200,
     exclude_mirror_legs: true,
     exclude_excluded: true,
+    exclude_lender_ledger: true,
     compare: false,
   },
   viz: {},
 };
+
+const COUNTING_RULES = [
+  ['exclude_mirror_legs', 'Skip the far leg of a transfer',
+   'Both legs of a transfer between your own accounts describe one movement. Counting both doubles it.'],
+  ['exclude_excluded', 'Skip rows you excluded',
+   'Rows you marked as not yours, or not spending.'],
+  ['exclude_lender_ledger', 'Skip the lender’s own ledger',
+   'A loan statement books each instalment against the loan, and your bank statement books the same instalment leaving your account. They are one payment.'],
+];
 
 export default function WidgetEditor({ schema, widget, board, onSave, onCancel, onDelete }) {
   /* The query endpoint overlays a board's *filters* object ({date_range,
@@ -274,6 +284,33 @@ export default function WidgetEditor({ schema, widget, board, onSave, onCancel, 
                   >
                     + Add Filter
                   </Button>
+                </div>
+              </div>
+              {/* What the query leaves out. Shown, not applied silently:
+                  each of these drops rows from the total, and a figure that
+                  quietly excludes things is the kind this app exists not to
+                  produce. */}
+              <div>
+                <div className="small font-medium muted" style={{ marginBottom: 6 }}>
+                  Counting rules
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  {COUNTING_RULES.map(([key, label, why]) => (
+                    <label
+                      key={key}
+                      className="tiny"
+                      title={why}
+                      style={{ display: 'flex', alignItems: 'flex-start', gap: 6, cursor: 'pointer' }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={query[key] !== false}
+                        onChange={(e) => setQuery({ [key]: e.target.checked })}
+                        style={{ marginTop: 2 }}
+                      />
+                      <span>{label}</span>
+                    </label>
+                  ))}
                 </div>
               </div>
             </>

@@ -42,8 +42,17 @@ export default function Forecast() {
     expected: m.closing_expected,
   }));
 
+  /* The projection does not count every active series: one that is too
+     irregular to trust, or a credit nothing could identify as income, is
+     shown here but not in the totals above. Listing them all without
+     saying which is which had this page showing 14 commitments beside a
+     figure built from 5 of them. */
+  const counted = new Set(forecast?.counted_series || []);
+  const isCounted = (r) => counted.size === 0 || counted.has(r.id);
   const outflows = recurring.filter((r) => r.direction === 'debit' && r.is_active);
   const inflows = recurring.filter((r) => r.direction === 'credit' && r.is_active);
+  const countedOut = outflows.filter(isCounted).length;
+  const countedIn = inflows.filter(isCounted).length;
   const first = months[0];
 
   return (
@@ -155,7 +164,7 @@ export default function Forecast() {
         />
 
         <div className="grid-2">
-          <Card title="Scheduled Outflow Commitments" subtitle={`${outflows.length} active outflows detected`}>
+          <Card title="Scheduled Outflow Commitments" subtitle={`${countedOut} of ${outflows.length} counted in the projection`}>
             <div style={{ maxHeight: 300, overflow: 'auto' }}>
               <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
                 <thead>
@@ -196,7 +205,7 @@ export default function Forecast() {
             )}
           </Card>
 
-          <Card title="Expected Inbound Cashflows" subtitle={`${inflows.length} active inflows detected`}>
+          <Card title="Expected Inbound Cashflows" subtitle={`${countedIn} of ${inflows.length} counted in the projection`}>
             <div style={{ maxHeight: 300, overflow: 'auto' }}>
               <table className="terminal-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
                 <thead>

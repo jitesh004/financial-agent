@@ -281,9 +281,15 @@ export default function Debt({ onImport }) {
       {/* Individual Loans Detailed Breakdown */}
       {loans.map((loan) => {
         const emi = Number(loan.emi) || 0;
+        /* The exact split is the first row of the schedule the backend
+           already sent. Multiplying the EMI by a percentage it had rounded
+           to one decimal put 386 on screen where the schedule said 365.42 -
+           and left the same card claiming 365 of total remaining interest
+           on a loan with one payment left. */
+        const first = loan.schedule?.[0];
         const sharePct = Number(loan.next_interest_share_pct) || 0;
-        const interestAmt = emi * (sharePct / 100);
-        const principalAmt = emi * (1 - sharePct / 100);
+        const interestAmt = first ? Number(first.interest) : emi * (sharePct / 100);
+        const principalAmt = first ? Number(first.principal) : emi * (1 - sharePct / 100);
 
         const scheduleData = (loan.schedule || []).map((p) => ({
           label: String(p.date).slice(0, 4),

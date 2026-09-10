@@ -3,7 +3,7 @@ import { api } from '../core/api';
 import { invalidate, useQuery } from '../core/store';
 import { useToast } from '../core/toast';
 import { dateLabel, money, today } from '../core/format';
-import { Button, Callout, Card, GlassCard, Chip, Empty, Loading, Select, Stat, Badge } from '../ui';
+import { Button, Callout, Card, GlassCard, Chip, Empty, Loading, Select, Stat, Table, Badge } from '../ui';
 import { Icon } from '../ui/icons';
 
 const SETTLEMENT_METHODS = [
@@ -22,11 +22,34 @@ const STATUS_TONE_MAP = {
   written_off: 'neg',
 };
 
+/* `Table` takes tuple columns - [key, label, width, align] - where a
+   FUNCTION in the key slot is called with the row. Declared out here so the
+   array is not rebuilt on every render. */
+const P2P_COLUMNS = [
+  ['counterparty', 'Counterparty', 200],
+  [(r) => <span className="num">{money(r.sent)}</span>, 'You sent', 120, 'right'],
+  [(r) => <span className="num">{money(r.received)}</span>, 'You received', 120, 'right'],
+  [(r) => (
+    <span
+      className="num"
+      style={{
+        color: Number(r.net_owed_to_me) > 0 ? 'var(--pos)'
+          : Number(r.net_owed_to_me) < 0 ? 'var(--neg)' : 'inherit',
+      }}
+    >
+      {money(r.net_owed_to_me)}
+    </span>
+  ), 'Net', 130, 'right'],
+  ['count', 'Rows', 70, 'right'],
+  [(r) => dateLabel(r.last_activity), 'Last seen', 110],
+];
+
 const ageInDays = (iso) => (iso ? Math.floor((Date.now() - new Date(iso).getTime()) / 86400000) : null);
 
 export default function Owed() {
   const toast = useToast();
   const { data: claims = [], loading, error, refetch } = useQuery('claims', () => api.claims());
+  const { data: analysisData } = useQuery('analysis', () => api.analysis());
   const [settling, setSettling] = useState(null);
   const [form, setForm] = useState({ method: 'cash', amount: '', note: '' });
 
@@ -39,6 +62,9 @@ export default function Owed() {
   const closed = claims.filter((c) => c.status === 'settled' || c.status === 'written_off');
 
   const totalOutstanding = (rows) => rows.reduce((s, c) => s + (Number(c.amount) - Number(c.settled_amount || 0)), 0);
+
+  const p2p = (analysisData?.analysis?.p2p_balances || [])
+    .filter((b) => Math.abs(Number(b.net_owed_to_me)) >= 1);
 
   async function handleSettle(claim) {
     try {
@@ -206,6 +232,41 @@ export default function Owed() {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
             {owedByMe.map(renderClaimCard)}
           </div>
+        </Card>
+      )}
+
+      {/* Observed person-to-person flow, as distinct from the claims above.
+          A claim is something you declared; this is what the statements
+          show, and it is the only thing that makes the P2P credits
+          readable. 5.41 lakh arriving from named individuals is counted as
+          income because nothing can prove otherwise - the debits to those
+          same people are the evidence that some of it was a repayment. */}
+      {p2p.length > 0 && (
+        <Card
+          title="Observed Person-to-Person Flow"
+          subtitle="Netted from your statements, not declared. Nothing here is counted as a claim."
+        >
+          <Callout>
+            These are UPI and bank transfers to and from named individuals. Money
+            received from a person is counted as <strong>income</strong> unless you
+            say otherwise, because the alternative silently erases real money &mdash;
+            so a name with more received than sent may be inflating your income.
+            Open it in the Ledger and mark it a transfer or a repayment if it was one.
+            <div style={{ marginTop: 6 }}>
+              <strong>Net</strong> is what you sent minus what you received:
+              positive means they have had more from you than you from them.
+            </div>
+          </Callout>
+          <Table
+            keyField="counterparty"
+            columns={P2P_COLUMNS}
+            rows={p2p.slice(0, 25)}
+          />
+          {p2p.length > 25 && (
+            <div className="tiny muted" style={{ marginTop: 8 }}>
+              Showing the 25 largest of {p2p.length} counterparties.
+            </div>
+          )}
         </Card>
       )}
 

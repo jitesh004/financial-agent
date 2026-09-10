@@ -133,7 +133,11 @@ RULES: list[Rule] = [
        r"\bPARAG\s+PARIKH\b|\bNIFTY\b|\bINDEX\s+FUND\b|\bFLEXI\s*CAP\b|"
        r"\bELSS\b|\bBSE\s+LTD\b|\bNSE\s+CLEARING\b|\bINDMONEY\b",
        Category.INVESTMENT, 0.93),
-    _r(r"\bZERODHA\b|\bGROWW\b|\bUPSTOX\b|\bICICI\s*DIRECT\b|\bANGEL\s*ONE\b|"
+    # Leading word boundary only on the broker names. A UPI handle welds
+    # the brand to a suffix - "zerodhabroking", and a 64,000 transfer to
+    # one was left uncategorised because `\bZERODHA\b` requires a
+    # non-word character after it and gets a "b".
+    _r(r"\bZERODHA|\bGROWW|\bUPSTOX|\bICICI\s*DIRECT\b|\bANGEL\s*ONE\b|"
        r"\bKUVERA\b|\bCOIN\b|\bDEMAT\b|\bNPS\b|\bPPF\b|\bEPF\b|\bSUKANYA\b|"
        r"\bRECURRING\s+DEPOSIT\b|\bFIXED\s+DEPOSIT\b|\bRD\s+INSTAL?MENT\b|"
        r"\bINDMONEY\b",

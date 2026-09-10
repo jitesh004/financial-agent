@@ -1266,10 +1266,12 @@ def _run_process(job_id: str, files: list[dict[str, Any]], use_llm: bool) -> Non
         repo.backfill_source_file_account_ids(db)
         payload = _build_payload(state)
         payload["statements"] = statement_rows
+        _recon = repo.reconciliation_counts(db)
         payload["data_quality"] = {
             "files_processed": len(statement_rows),
-            "files_reconciled": sum(1 for s in statement_rows if s["status"] == "ok"),
-            "files_unreconciled": sum(1 for s in statement_rows if s["status"] == "unreconciled"),
+            "files_reconciled": _recon["passed"],
+            "files_unreconciled": _recon["failed"],
+            "files_not_checked": _recon["not_applicable"],
             "files_failed": sum(1 for s in statement_rows
                                 if s["status"] in {"failed", "needs_password"}),
             "duplicates_removed": enriched.duplicate_count,

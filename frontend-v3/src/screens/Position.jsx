@@ -247,7 +247,9 @@ function Totals({ totals = {} }) {
           label="Total Liabilities Outstanding"
           value={totals.total_owed == null ? '—' : money(totals.total_owed)}
           tone={totals.total_owed ? 'neg' : undefined}
-          sub={`${totals.loan_count || 0} Loans · ${totals.card_count || 0} Cards`}
+          sub={totals.unconfirmed_bureau_debt
+            ? `${totals.loan_count || 0} Loans · ${totals.card_count || 0} Cards · plus ${money(totals.unconfirmed_bureau_debt)} unconfirmed`
+            : `${totals.loan_count || 0} Loans · ${totals.card_count || 0} Cards`}
         />
         <Stat
           label="Monthly Debt Outflow"
@@ -271,6 +273,30 @@ function Totals({ totals = {} }) {
             : 'Requires active balance, EMI & rate'}
         />
       </div>
+
+      {/* Net worth, stated on the screen that owns the balances - and stated
+          on the SAME basis the Overview uses, which includes debt the bureau
+          reports but nothing here has adopted. Publishing only the exclusive
+          figure is what left the two screens 27,659 apart with neither of
+          them saying so. */}
+      {totals.net_including_unconfirmed != null && (
+        <Callout>
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div>
+              <strong>Net worth {money(totals.net_including_unconfirmed)}</strong>
+              {' — '}{money(totals.assets)} tracked against{' '}
+              {money(totals.total_owed_including_unconfirmed)} owed.
+            </div>
+            {totals.unconfirmed_bureau_debt > 0 && (
+              <span className="tiny muted">
+                Includes {money(totals.unconfirmed_bureau_debt)} the credit
+                bureau reports that no account here has adopted. Excluding it,
+                net worth is {money(totals.net)}.
+              </span>
+            )}
+          </div>
+        </Callout>
+      )}
 
       {blanks > 0 && (
         <Callout tone="warn">

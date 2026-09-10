@@ -6,6 +6,8 @@ attribution with salary drift, and the coverage gate.
 
 import sys
 import uuid
+
+import pytest
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -42,7 +44,7 @@ def _txn(
     amount, direction=Direction.DEBIT, category=Category.UNCATEGORIZED,
     account_id="savings_1", txn_date=None, description="",
     is_internal_transfer=False, is_mirror_leg=False, flow_role="",
-    fingerprint=None, excluded=False,
+    fingerprint=None, excluded=False, transfer_pair_id=None,
 ):
     txn_date = txn_date or date(2025, 8, 15)
     return Transaction(
@@ -57,6 +59,7 @@ def _txn(
         category_source=ConfidenceSource.DEFAULT,
         is_internal_transfer=is_internal_transfer,
         is_mirror_leg=is_mirror_leg,
+        transfer_pair_id=transfer_pair_id,
         flow_role=flow_role,
         fingerprint=fingerprint or str(uuid.uuid4()),
         excluded=excluded,
@@ -122,7 +125,13 @@ def test_matched_transfer_pair_excludes_from_spend():
                   is_internal_transfer=True, is_mirror_leg=True)
 
     assert debit.role == FlowRole.TRANSFER_OUT
-    assert credit.role == FlowRole.TRANSFER_IN
+    # The far leg is the card's own record of the bill being settled, which is
+    # what `reconcile.settlement` stamps on it and what the unmatched case
+    # above already derives. What this test is about is that BOTH legs are
+    # neutral, so assert that rather than one particular neutral role.
+    assert credit.role == FlowRole.CARD_SETTLEMENT
+    assert debit.role in NEUTRAL_ROLES
+    assert credit.role in NEUTRAL_ROLES
     assert not debit.is_spend
     assert not credit.is_spend
 
@@ -627,3 +636,95 @@ def test_payment_rail_patterns():
     assert PAYMENT_RAIL_PATTERNS.search("NEFT TO HDFC CREDIT CARD")
     assert PAYMENT_RAIL_PATTERNS.search("BILLPAY CC PAYMENT XXXX5678")
     assert not PAYMENT_RAIL_PATTERNS.search("NEFT TO JOHN DOE SAVINGS ACCOUNT")
+
+
+# ==========================================================================
+# Netting evidence - the record of WHY rows were netted
+# ==========================================================================
+
+def test_an_empty_pair_set_never_clears_pairs_the_ledger_still_uses():
+    """save_transfer_pairs must refuse to wipe a table rows still point at.
+
+    `detect_transfers` builds its candidates from rows where
+    `is_internal_transfer` is false, so running it again over rows it
+    already flagged finds nothing. That empty report is not a statement
+    that there are no transfers - but replacing the table from it deleted
+    every pair row while the transactions went on being netted against
+    them, destroying the whole audit trail without a word.
+    """
+    db = _db()
+    for acc in (Account(id="savings_1", institution="HDFC",
+                        account_type=AccountType.SAVINGS,
+                        account_number_masked="1234"),
+                Account(id="cc_axis", institution="Axis",
+                        account_type=AccountType.CREDIT_CARD,
+                        account_number_masked="5207")):
+        repo.upsert_account(db, acc)
+    debit = _txn(5000, Direction.DEBIT, Category.CC_PAYMENT,
+                 is_internal_transfer=True, transfer_pair_id="pair-1")
+    credit = _txn(5000, Direction.CREDIT, Category.CC_PAYMENT,
+                  account_id="cc_axis", is_internal_transfer=True,
+                  is_mirror_leg=True, transfer_pair_id="pair-1")
+    repo.save_transactions(db, [debit, credit])
+
+    class _Pair:
+        pair_id = "pair-1"
+        debit_txn_id = debit.id
+        credit_txn_id = credit.id
+        amount = Decimal("5000")
+        day_gap = 1
+        kind = "card_settlement"
+        confidence = 0.9
+
+    assert repo.save_transfer_pairs(db, [_Pair()]) == 1
+    assert len(repo.transfer_pairs_summary(db)["pairs"]) == 1
+
+    # The destructive call. It must be refused, not obeyed.
+    assert repo.save_transfer_pairs(db, []) == 0
+    summary = repo.transfer_pairs_summary(db)
+    assert summary["evidence_missing"] == 0
+    assert summary["pairs"][0]["kind"] == "card_settlement"
+
+
+def test_a_multi_leg_settlement_records_why_it_was_netted():
+    """One debit against several card credits leaves an inspectable group.
+
+    `transfer_pairs` holds one debit and one credit, so a settlement of one
+    bank debit against three card bills never fitted it. The group table
+    exists for that case and nothing ever wrote to it, which left those
+    rows netted out of spending with no total, no residual and no
+    confidence recorded anywhere.
+    """
+    db = _db()
+    accounts = {
+        "savings_1": Account(id="savings_1", institution="HDFC",
+                             account_type=AccountType.SAVINGS,
+                             account_number_masked="1234"),
+        "cc_axis": Account(id="cc_axis", institution="Axis",
+                           account_type=AccountType.CREDIT_CARD,
+                           account_number_masked="5207"),
+    }
+    when = date(2025, 8, 20)
+    txns = [
+        _txn(9000, Direction.DEBIT, Category.CC_PAYMENT, txn_date=when,
+             description="CRED DREAMPLUG"),
+        _txn(4000, Direction.CREDIT, Category.CC_PAYMENT, account_id="cc_axis",
+             txn_date=when, description="PAYMENT RECEIVED"),
+        _txn(3000, Direction.CREDIT, Category.CC_PAYMENT, account_id="cc_axis",
+             txn_date=when, description="PAYMENT RECEIVED"),
+        _txn(2000, Direction.CREDIT, Category.CC_PAYMENT, account_id="cc_axis",
+             txn_date=when, description="PAYMENT RECEIVED"),
+    ]
+    for acc in accounts.values():
+        repo.upsert_account(db, acc)
+    repo.save_transactions(db, txns)
+    enrich_ledger(db, txns, accounts, run_analysis=False)
+
+    netted = [t for t in txns if t.transfer_pair_id]
+    if not netted:
+        pytest.skip("matcher did not group these legs; nothing to record")
+
+    summary = repo.transfer_pairs_summary(db)
+    assert summary["evidence_missing"] == 0, (
+        "rows were netted with no recorded reason")
+    assert summary["settlement_groups"] >= 1

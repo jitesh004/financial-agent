@@ -291,9 +291,19 @@ class Account(BaseModel):
 
     @property
     def balance(self) -> Decimal | None:
-        """Signed balance: positive is owned, negative is owed."""
+        """Signed balance: positive is owned, negative is owed.
+
+        A card issuer's closing balance can land in either column depending
+        on the extractor, so a zero `principal_outstanding` beside a real
+        `current_balance` is a parse default, not a settled card. Reading
+        only the first put an IDFC card at 0 in Net Worth while the Debt
+        screen showed the 1,025 the statement actually closed on.
+        """
         if self.is_liability:
-            return None if self.principal_outstanding is None else -self.principal_outstanding
+            owed = self.principal_outstanding
+            if not owed and self.current_balance:
+                owed = self.current_balance
+            return None if owed is None else -owed
         return self.current_balance
 
     def display_name(self) -> str:
@@ -468,8 +478,40 @@ def derive_flow_role(txn: "Transaction") -> FlowRole:
     if txn.excluded:
         return FlowRole.EXCLUDED
 
+    # An instalment is an instalment whichever loan it services.
+    #
+    # A repayment IS an internal transfer, and `reconcile.transfers` pairs it
+    # as one - but its own comment says what should happen next: "the debit
+    # is the cash actually leaving; the credit is the receiving account's
+    # record of the same money. Cashflow must count the FIRST and ignore the
+    # second." Flattening both legs to a neutral role ignored both.
+    #
+    # It only pairs at all when the loan's OWN statement was imported, which
+    # is a fact about which PDFs a person happens to have, not about their
+    # money - so two identical obligations landed on opposite sides of the
+    # spend total: 3,84,192 of home-loan EMI counted because that lender
+    # sends no statements, 3,42,800 of personal-loan EMI netted away because
+    # that one does.
+    #
+    # No double count: the far leg is a mirror leg, and the loan account's
+    # own rows are dropped wholesale by `_without_lender_ledgers`.
+    if (txn.category == Category.EMI
+            and txn.direction == Direction.DEBIT
+            and not txn.is_mirror_leg):
+        return FlowRole.EXPENSE
+
     if txn.is_internal_transfer:
-        return FlowRole.TRANSFER_IN if txn.is_mirror_leg else FlowRole.TRANSFER_OUT
+        if not txn.is_mirror_leg:
+            return FlowRole.TRANSFER_OUT
+        # The far leg of a matched card-bill payment is the card's own record
+        # of being settled, which `reconcile.settlement` stamps as such. Say
+        # the same thing here: derivation has to be able to reproduce every
+        # role a subsystem sets, or re-deriving a row silently downgrades it.
+        # Both are neutral, so no total moves either way - but the Ledger
+        # would start calling a settled bill an ordinary transfer.
+        if txn.category == Category.CC_PAYMENT:
+            return FlowRole.CARD_SETTLEMENT
+        return FlowRole.TRANSFER_IN
 
     if txn.direction == Direction.CREDIT:
         if txn.category == Category.CC_PAYMENT:

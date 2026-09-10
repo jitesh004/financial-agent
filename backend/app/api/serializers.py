@@ -180,6 +180,23 @@ def analysis_json(analysis: Any) -> dict[str, Any]:
              "last_seen": m.last_seen.isoformat()}
             for m in analysis.top_merchants
         ],
+        # Who the person-to-person money actually moved between, netted.
+        #
+        # `analyze` has always computed this and nothing ever sent it: 222
+        # counterparties recomputed on every request and dropped before the
+        # response was built. It is also the only thing that makes the P2P
+        # figures readable - 5.41 lakh of credits from named individuals is
+        # counted as income because nothing can prove otherwise, and the
+        # offsetting debits to the SAME people are what tell you it was a
+        # repayment rather than earnings. One name here sent 43,000 and
+        # received 73,864; those two numbers belong on the same line.
+        "p2p_balances": [
+            {"counterparty": b.counterparty, "sent": num(b.sent),
+             "received": num(b.received), "net_owed_to_me": num(b.net_owed_to_me),
+             "count": b.transaction_count,
+             "last_activity": b.last_activity.isoformat()}
+            for b in analysis.p2p_balances
+        ],
         "income_sources": [
             {"source": s, "total": num(t), "count": n}
             for s, t, n in analysis.income_sources
@@ -311,6 +328,9 @@ def forecast_json(forecast: Any) -> dict[str, Any]:
         "confidence": forecast.confidence,
         "assumptions": forecast.assumptions,
         "warnings": forecast.warnings,
+        # Which recurring series the projection actually counted, so the
+        # screen can stop listing commitments the total does not include.
+        "counted_series": list(getattr(forecast, "counted_series", []) or []),
         "months": [
             {"month": m.month,
              "committed_income": num(m.committed_income),
@@ -325,6 +345,20 @@ def forecast_json(forecast: Any) -> dict[str, Any]:
             for m in forecast.months
         ],
     }
+
+
+def _is_committed(is_active: Any, confidence: Any) -> bool:
+    """Is this series committed money, or a pattern the detector noticed?
+
+    Decided by the constant the FORECAST uses, so that the two screens which
+    report a commitment total report the same one.
+    """
+    from ..analytics.forecast import COMMITTED_SERIES_CONFIDENCE
+
+    try:
+        return bool(is_active) and float(confidence or 0) >= COMMITTED_SERIES_CONFIDENCE
+    except (TypeError, ValueError):
+        return False
 
 
 def recurring_json(series: Any) -> dict[str, Any]:
@@ -344,6 +378,20 @@ def recurring_json(series: Any) -> dict[str, Any]:
         "next_expected": series.next_expected.isoformat() if series.next_expected else None,
         "is_active": series.is_active,
         "confidence": series.confidence,
+        # Whether this series is committed money or merely a pattern the
+        # detector noticed, decided by the SAME constant the forecast uses.
+        #
+        # The Recurring screen was summing every active debit series into
+        # "Total Monthly Commitment" while the Forecast counted only those
+        # above the threshold, so the two screens reported different
+        # commitments off identical data - and the screen's total was
+        # padded with a 26 scan-and-pay, a 30.50 UPI and a 20 transfer to
+        # a person, none of which anybody is committed to.
+        #
+        # Sent rather than re-derived in the client: a threshold that lives
+        # in two languages is a threshold that will disagree with itself
+        # again.
+        "is_committed": _is_committed(series.is_active, series.confidence),
         "transaction_ids": series.transaction_ids,
         # How the detector reached its verdict. A series is an inference, and
         # the tab that shows it already lets the user open the rows behind
@@ -381,6 +429,10 @@ def stored_recurring_json(row: dict[str, Any]) -> dict[str, Any]:
     from ..analytics.recurring import to_monthly
 
     amount = row.get("median_amount")
+    # Same verdict, same constant, both shapes - see `recurring_json`. The
+    # docstring above already says these two functions must agree; a field
+    # added to one and not the other is how they stopped agreeing last time.
+    committed = _is_committed(row.get("is_active"), row.get("confidence"))
     cadence_name = row.get("cadence_name") or ""
     cadence_days = int(row.get("cadence_days") or 30)
     monthly = (to_monthly(Decimal(str(amount)), cadence_name, cadence_days)
@@ -393,6 +445,7 @@ def stored_recurring_json(row: dict[str, Any]) -> dict[str, Any]:
         "last_amount": num(row.get("last_amount")),
         "cadence": cadence_name,
         "monthly_equivalent": num(monthly),
+        "is_committed": committed,
     }
 
 

@@ -27,10 +27,35 @@ export function AgentAnswerView({ answer, compact = false }) {
     );
   }
 
-  const { headline, summary, metrics = [], findings = [], actions = [], caveats = [] } = answer;
+  const { headline, summary, metrics = [], findings = [], actions = [],
+          caveats = [], unverified_figures: unverified = [] } = answer;
 
   return (
     <div className="flex-col gap-4">
+      {/* Above the headline, deliberately. The figure check already catches
+          numbers the model produced rather than read - it named all three
+          on a run that reported a debt this holder does not have - but it
+          said so in muted text at the bottom while the invented figure led
+          in large type at the top. A correction nobody reads first is not
+          a correction. */}
+      {unverified.length > 0 && (
+        <div style={{
+          border: '1px solid var(--danger)', borderLeft: '3px solid var(--danger)',
+          borderRadius: 4, padding: '8px 12px', background: 'var(--danger-soft, transparent)',
+        }}>
+          <div className="small font-semibold" style={{ color: 'var(--danger)' }}>
+            {unverified.length} figure{unverified.length > 1 ? 's' : ''} in this
+            answer did not come from your ledger
+          </div>
+          <div className="tiny muted" style={{ marginTop: 2 }}>
+            {unverified.slice(0, 6).join(', ')} — the model produced
+            {unverified.length > 1 ? ' these' : ' this'} rather than reading
+            {unverified.length > 1 ? ' them' : ' it'}. Check against the
+            working before relying on anything here.
+          </div>
+        </div>
+      )}
+
       {headline && (
         <h3 style={{
           fontSize: compact ? 15 : 19, fontWeight: 800, lineHeight: 1.35, margin: 0,

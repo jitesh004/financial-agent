@@ -23,7 +23,9 @@ from pydantic import BaseModel
 from ..analytics import position as position_mod
 from ..db import repository as repo
 from ..db.database import get_db
-from ..models.schemas import LOAN_TYPES, AccountType
+from decimal import Decimal
+
+from ..models.schemas import Direction
 
 log = logging.getLogger(__name__)
 
@@ -87,16 +89,95 @@ def _bureau_context(db) -> tuple[list[dict[str, Any]], date | None]:
     return repo.get_bureau_accounts(db, latest["id"]), as_of
 
 
-@router.get("")
-def read_position(include_archived: bool = False) -> dict[str, Any]:
-    db = get_db()
+def _emi_payments(db, items: list[dict[str, Any]]) -> dict[str, list[date]]:
+    """EMI debits the ledger recorded, per attested loan.
+
+    Decision: the attested balance is the root fact and the bank-side debits
+    are the CHECK. Aging by the calendar is only ever a model of when money
+    moved; these are the money moving, so where they exist they are what the
+    roll-forward counts.
+
+    Matched on amount rather than on category, deliberately. Category is the
+    field this ledger is least able to trust - one of the seven home-loan
+    EMIs is filed as `cc_payment` because the settlement matcher absorbed it -
+    so keying the check on it would find six payments where seven were made.
+    An EMI is a distinctive round figure on a named account; the amount is
+    the stabler handle until a loan carries a stored link to the mandate that
+    services it.
+    """
+    loans = [i for i in items
+             if (i.get("kind") == "loan") and i.get("emi") and i.get("id")]
+    if not loans:
+        return {}
+
+    # Read the ledger ONCE, not once per loan.
+    debits = [t for t in repo.get_transactions(db)
+              if t.direction == Direction.DEBIT]
+
+    found: dict[str, list[date]] = {}
+    for item in loans:
+        try:
+            emi = Decimal(str(item["emi"]))
+        except (ArithmeticError, ValueError):
+            continue
+        reviewed = item.get("reviewed_on") or ""
+        found[item["id"]] = sorted(
+            t.txn_date for t in debits
+            if t.amount == emi
+            and not (reviewed and t.txn_date.isoformat() <= reviewed))
+    return found
+
+
+def build_for(db, *, include_archived: bool = False) -> dict[str, Any]:
+    """The resolved position, loaded and built in one place.
+
+    Everything that needs a resolved balance goes through here rather than
+    assembling the same five reads itself - the whole point of the exercise
+    is that there is one answer, so there should be one place that produces
+    it.
+    """
     bureau_accounts, _pulled = _bureau_context(db)
+    accounts = repo.get_accounts(db)
+    # Heal the stored link on the way past, so the label fallback inside
+    # `build` is doing the work once rather than on every read forever. See
+    # `repo.repair_position_account_keys`: migration 0006 added the column
+    # to be the durable reference and its backfill could not see a single
+    # row, because migrations run with no tenant bound.
+    try:
+        repo.repair_position_account_keys(db, accounts)
+    except Exception as exc:        # pragma: no cover - never block a read
+        log.warning("Could not repair position account links: %s", exc)
+
+    items = repo.get_position_items(db, include_archived=include_archived)
     return position_mod.build(
-        repo.get_position_items(db, include_archived=include_archived),
-        repo.get_accounts(db),
+        items,
+        accounts,
         bureau_accounts,
         include_archived=include_archived,
+        holdings=repo.get_holdings(db, latest_only=True),
+        holdings_any=repo.get_holdings(db, latest_only=False),
+        emi_payments=_emi_payments(db, items),
     )
+
+
+def resolved_for_net_worth(db) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Both answers net worth needs, from ONE build.
+
+    Returned together because they come from the same resolution and asking
+    for them separately built the whole position twice per request.
+    """
+    try:
+        built = build_for(db)
+        return (position_mod.balances_by_account(built),
+                position_mod.adopted_bureau(built))
+    except Exception:                       # pragma: no cover - defensive
+        log.exception("could not resolve position balances")
+        return {}, {}
+
+
+@router.get("")
+def read_position(include_archived: bool = False) -> dict[str, Any]:
+    return build_for(get_db(), include_archived=include_archived)
 
 
 @router.get("/mappable")
@@ -185,6 +266,49 @@ def seed_position() -> dict[str, Any]:
             "already_present": len(existing)}
 
 
+#: Fields that describe an amount of money or a rate, and cannot be negative
+#: on any real instrument. A negative one is a typo or a paste error.
+_NON_NEGATIVE = {
+    "outstanding": "an outstanding balance",
+    "original_amount": "an original loan amount",
+    "emi": "an instalment",
+    "interest_rate": "an interest rate",
+    "credit_limit": "a credit limit",
+    "min_due": "a minimum due",
+}
+
+
+def _reject_impossible(body: dict[str, Any]) -> None:
+    """Refuse figures that cannot describe a real account.
+
+    Unvalidated, a single typed minus sign rewrote the whole balance sheet:
+    one item with `outstanding: -999999` produced total debt of -9,89,999
+    and a POSITIVE net worth of 9,89,999 invented out of nothing, with
+    `assets`, `credit_limit` and `interest_remaining` all coming back null -
+    and `is_complete: true` alongside, with no warning anywhere.
+
+    A balance sheet is arithmetic on numbers a person typed. It can only be
+    as good as the numbers, so the numbers are checked at the door.
+    """
+    for field, described in _NON_NEGATIVE.items():
+        raw = body.get(field)
+        if raw in (None, ""):
+            continue
+        try:
+            value = Decimal(str(raw))
+        except (ArithmeticError, ValueError):
+            raise HTTPException(
+                400, f"{described.capitalize()} has to be a number.")
+        if value < 0:
+            raise HTTPException(
+                400, f"{described.capitalize()} cannot be negative "
+                     f"(got {value}).")
+
+    months = body.get("months_remaining")
+    if months is not None and months != "" and int(months) < 0:
+        raise HTTPException(400, "Months remaining cannot be negative.")
+
+
 @router.post("/items")
 def create_item(payload: ItemPayload) -> dict[str, Any]:
     body = payload.model_dump(exclude_unset=True)
@@ -194,6 +318,7 @@ def create_item(payload: ItemPayload) -> dict[str, Any]:
             400, f"'{kind}' is not a kind. Valid: "
                  f"{', '.join(position_mod.KINDS)}")
     body["kind"] = kind
+    _reject_impossible(body)
     item_id = repo.save_position_item(get_db(), body)
     return {"status": "ok", "id": item_id}
 
@@ -201,6 +326,7 @@ def create_item(payload: ItemPayload) -> dict[str, Any]:
 @router.patch("/items/{item_id}")
 def patch_item(item_id: str, payload: ItemPayload) -> dict[str, Any]:
     body = payload.model_dump(exclude_unset=True)
+    _reject_impossible(body)
     if body.get("kind") and body["kind"] not in position_mod.KINDS:
         raise HTTPException(
             400, f"'{body['kind']}' is not a kind. Valid: "
@@ -254,7 +380,9 @@ def review_position(payload: ReviewPayload | None = None) -> dict[str, Any]:
 
     bureau_accounts, _pulled = _bureau_context(db)
     built = position_mod.build(repo.get_position_items(db),
-                               repo.get_accounts(db), bureau_accounts)
+                               repo.get_accounts(db), bureau_accounts,
+                               holdings=repo.get_holdings(db, latest_only=True),
+                               holdings_any=repo.get_holdings(db, latest_only=False))
     snapshot_id = repo.save_position_snapshot(
         db, when, payload.note, built["items"], built["totals"])
     return {"status": "ok", "snapshot_id": snapshot_id,

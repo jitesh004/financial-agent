@@ -180,6 +180,17 @@ class AnalysisResult:
 # --------------------------------------------------------------------------
 
 
+#: Tokens the payee regex pulls out that are not people. UPI narrations
+#: carry scheme markers in the same slot a name occupies, so "P2A" (person
+#: to account) was ranked as a counterparty owed 18,000, and a stray "A" as
+#: another owed 4,500. A balance sheet of who owes whom is worthless if two
+#: of its rows are protocol keywords.
+_NOT_A_PAYEE = {
+    "P2A", "P2M", "P2P", "UPI", "VPA", "NEFT", "IMPS", "RTGS", "NA", "N/A",
+    "SELF", "ATM", "POS", "CASH", "PAYMENT", "TRANSFER", "COLLECT",
+}
+
+
 def _p2p_balances(txns: list[Transaction]) -> list[P2PBalance]:
     from ..categorize.rules import _payee_field
     from collections import defaultdict
@@ -195,7 +206,7 @@ def _p2p_balances(txns: list[Transaction]) -> list[P2PBalance]:
             # Clean up UPI string prefixes if present
             name = re.sub(r'^(UPI[/_]|VPA[/_])', '', name, flags=re.IGNORECASE)
             name = name.split('/')[0].split('@')[0].strip().title()
-            if name:
+            if name and name.upper() not in _NOT_A_PAYEE and len(name) > 2:
                 buckets[name].append(t)
                 
     out = []
@@ -225,6 +236,9 @@ def analyze(
     end: date | None = None,
     period: "periods.Period | None" = None,
     bureau_accounts: list[dict[str, Any]] | None = None,
+    resolved_balances: dict[str, Decimal] | None = None,
+    custom_groups: dict[str, str] | None = None,
+    adopted_bureau: dict[str, Decimal] | None = None,
 ) -> AnalysisResult:
     """Compute the full picture from a categorized, reconciled ledger.
 
@@ -298,8 +312,14 @@ def analyze(
                 f"No transactions counted in {period.label()}.")
             result.period_start, result.period_end = period.bounds()
             return result
-        result.period_start = min(t.txn_date for t in txns)
-        result.period_end = max(t.txn_date for t in txns)
+        # Measured over rows that COUNT. An excluded row is not in any
+        # total, so letting it set the window's edges describes a period the
+        # figures do not cover: one excluded April refund, carrying an
+        # August accounting month, reported "Last month" as
+        # 27 Apr - 31 Aug.
+        dated = [t for t in txns if not t.excluded] or txns
+        result.period_start = min(t.txn_date for t in dated)
+        result.period_end = max(t.txn_date for t in dated)
     elif start or end:
         s = start or txns[0].txn_date
         e = end or txns[-1].txn_date
@@ -368,7 +388,9 @@ def analyze(
 
     result.monthly = _monthly_flows(txns)
     result.monthly_by_category = _monthly_by_category(spend_txns + offset_txns)
-    result.by_category = _category_breakdown(spend_txns + offset_txns, result.months_covered)
+    result.by_category = _category_breakdown(
+        spend_txns + offset_txns, result.months_covered,
+        custom_groups=custom_groups)
     result.by_group = _group_totals(result.by_category)
     result.top_merchants = _merchant_spend(spend_txns + offset_txns)
     result.income_sources = _income_sources(income_txns)
@@ -400,7 +422,8 @@ def analyze(
         # a ledger of card statements, which mostly do not carry one. The
         # honest answer there is the latest figure there is, labelled as such.
         # Reporting zero would be a claim that the accounts are empty.
-        result.net_worth = _net_worth(accounts, bureau_accounts)
+        result.net_worth = _net_worth(accounts, bureau_accounts,
+                                      resolved_balances, adopted_bureau)
         result.net_worth_as_of = max(
             (a.balance_as_of for a in accounts.values() if a.balance_as_of),
             default=None)
@@ -499,11 +522,23 @@ def _monthly_by_category(txns: list[Transaction]) -> dict[str, dict[str, Decimal
     return {month: {c: q(v) for c, v in cats.items()} for month, cats in out.items()}
 
 
+#: Categories whose rows REDUCE spending rather than add to it. Kept beside
+#: `_category_breakdown` because that is the only place the distinction
+#: matters: everywhere else a refund is grouped with income quite correctly.
+_CONTRA_CATEGORIES = {Category.REFUND}
+
+
 def _category_breakdown(
-    txns: list[Transaction], months: int
+    txns: list[Transaction], months: int,
+    custom_groups: dict[str, str] | None = None,
 ) -> list[CategoryBreakdown]:
     total = sum((_spend_val(t) for t in txns), ZERO)
+    # Built-ins first, then whatever the user chose for their own
+    # categories. Without the second half every custom category fell to
+    # "Other" regardless of the group it was created with, so a category
+    # deliberately made an Essential never appeared as one on the chart.
     groups = {c: g for g, cats in CATEGORY_GROUPS.items() for c in cats}
+    groups.update(custom_groups or {})
     buckets: dict[Category, list[Transaction]] = defaultdict(list)
     for t in txns:
         buckets[t.category].append(t)
@@ -511,10 +546,28 @@ def _category_breakdown(
     out: list[CategoryBreakdown] = []
     for category, members in buckets.items():
         subtotal = sum((_spend_val(t) for t in members), ZERO)
+        # This is a breakdown of SPENDING, and only spending and its offsets
+        # reach it - `analyze` passes `spend_txns + offset_txns`, never an
+        # income row. So `CATEGORY_GROUPS["Income"]` can be populated here by
+        # exactly one thing: a refund, whose `_spend_val` is negative because
+        # it nets against the purchase it reverses.
+        #
+        # The map is right for what it is mostly used for - filtering the
+        # ledger, where "Income" genuinely means salary and interest - but
+        # read as a spending group it says a 50,000 credit-balance refund was
+        # 50,000 of "Income", and then `_group_totals` renders the group at
+        # MINUS 50,000. Both halves are wrong: it is not income, and a
+        # negative bar in a spending chart has nothing to be a share of.
+        #
+        # Grouped by what the row does to the total instead of by the label
+        # its category carries elsewhere. Money that comes back is its own
+        # group, and it is the only group whose total is meant to be negative.
+        group = ("Money back" if category in _CONTRA_CATEGORIES
+                 else groups.get(category, "Other"))
         largest = max(members, key=lambda t: t.amount)
         out.append(CategoryBreakdown(
             category=category,
-            group=groups.get(category, "Other"),
+            group=group,
             total=q(subtotal),
             share_pct=_pct(subtotal, total),
             transaction_count=len(members),
@@ -535,11 +588,26 @@ def _group_totals(breakdown: list[CategoryBreakdown]) -> dict[str, Decimal]:
 
 
 def _merchant_spend(txns: list[Transaction], limit: int = 25) -> list[MerchantSpend]:
+    #: A description the parser could not turn into a name. Grouped under one
+    #: honest label instead of being ranked as though it were a merchant: the
+    #: HDFC card extractor drops the payee on some rows and leaves "+ C", and
+    #: that string was appearing as this holder's second-largest merchant at
+    #: 1,31,981. It is not a merchant; it is a parse failure, and saying so
+    #: is the only way it gets fixed.
+    UNREADABLE = "(no merchant on the statement)"
+
     buckets: dict[str, list[Transaction]] = defaultdict(list)
     for t in txns:
-        key = (t.merchant or t.normalized_description or t.raw_description)[:40].strip()
-        if key:
-            buckets[key].append(t)
+        # `merchant` first: it is the normalised identity, so the same payee
+        # lands in one bucket even when the reference digits differ row to
+        # row. Falling straight to the raw description is what split one
+        # home-loan EMI across five "merchants".
+        key = (t.merchant or "").strip()
+        if not key:
+            key = (t.normalized_description or "").strip()
+            if not any(ch.isalpha() for ch in key):
+                key = UNREADABLE
+        buckets[key[:40].strip() or UNREADABLE].append(t)
 
     out = []
     for merchant, members in buckets.items():
@@ -639,7 +707,17 @@ def _salary_flows(txns: list[Transaction]) -> list[SalaryFlow]:
         )
 
         flows.append(SalaryFlow(
-            month=_month_key(salary.txn_date),
+            # The accounting month, not the calendar month the credit landed
+            # in. A salary paid on the last working day lands on the 31st one
+            # month and the 1st two months later, which is the exact case
+            # `assign_accounting_months` exists to absorb - and reading the
+            # calendar month here bypassed it. On this ledger the eight
+            # salaries dated Feb 1 ... Aug 31 came back labelled
+            # 02,03,04,05,05,06,08,08: May and August each appeared twice,
+            # July and September not at all. Two rows sharing a month key is
+            # not a cosmetic duplicate either; it is the key the Months
+            # screen joins on.
+            month=salary.accounting_month or _month_key(salary.txn_date),
             salary_date=salary.txn_date,
             salary_amount=q(salary.amount),
             allocations=allocations,
@@ -672,7 +750,8 @@ def _days_to_half(salary: Transaction, outflows: list[Transaction]) -> int | Non
 _BUREAU_ATTRIBUTED = frozenset({"auto", "confirmed", "suggested"})
 
 
-def _unaccounted_debt(bureau_accounts, detail: dict) -> Decimal:
+def _unaccounted_debt(bureau_accounts, detail: dict,
+                      adopted: dict[str, Decimal] | None = None) -> Decimal:
     """Debt a lender reports that no tracked account covers.
 
     Net worth read the ledger alone, and the ledger only knows about accounts
@@ -691,6 +770,10 @@ def _unaccounted_debt(bureau_accounts, detail: dict) -> Decimal:
     total = ZERO
     for line in bureau_accounts or []:
         if (line.get("status") or "open") != "open":
+            continue
+        # Adopted onto the balance sheet, so the Position tab already counts
+        # it. Counting it here as well is the same card twice.
+        if adopted and line.get("id") in adopted:
             continue
         if line.get("account_id") or \
                 (line.get("match_status") or "") in _BUREAU_ATTRIBUTED:
@@ -771,12 +854,27 @@ def _without_lender_ledgers(
 
 
 def _net_worth(accounts: dict[str, Account],
-               bureau_accounts=None) -> dict[str, Decimal]:
+               bureau_accounts=None,
+               resolved: dict[str, Decimal] | None = None,
+               adopted_bureau: dict[str, Decimal] | None = None,
+               ) -> dict[str, Decimal]:
+    """Assets, liabilities and the net of them.
+
+    `resolved` is the Position tab's answer for the accounts it covers, and
+    it WINS where it exists. `Account.balance` reads the attested columns
+    straight off the row; Position is the layer that ages a loan forward
+    through its amortization, prefers holdings over a stale summary column,
+    and sets aside a broker statement a CAS already contains. Reading the raw
+    columns here is what had this screen and the Position tab quoting net
+    worth 3.49 lakh apart.
+    """
     assets, liabilities = ZERO, ZERO
     detail: dict[str, Decimal] = {}
 
     for account in accounts.values():
         signed = account.balance
+        if resolved and account.id in resolved:
+            signed = resolved[account.id]
         if signed is None:
             continue
         label = account.display_name()
@@ -786,7 +884,22 @@ def _net_worth(accounts: dict[str, Account],
             assets += signed
         detail[label] = q(signed)
 
-    liabilities += _unaccounted_debt(bureau_accounts, detail)
+    # Bureau-only debt the Position tab has adopted. It has no ledger
+    # account, so `resolved` cannot carry it and the sweep below skips it as
+    # already-counted - without this it falls between the two and vanishes.
+    for line in (bureau_accounts or []):
+        signed = (adopted_bureau or {}).get(line.get("id"))
+        if signed is None:
+            continue
+        lender = str(line.get("lender") or "a lender").title()
+        kind = str(line.get("account_type") or "account").replace("_", " ")
+        detail[f"{lender} {kind} (reported by the bureau)"] = q(signed)
+        if signed < 0:
+            liabilities += -signed
+        else:
+            assets += signed
+
+    liabilities += _unaccounted_debt(bureau_accounts, detail, adopted_bureau)
 
     detail["_assets"] = q(assets)
     detail["_liabilities"] = q(liabilities)
@@ -887,12 +1000,22 @@ def _find_unusual(
         threshold = median + 6 * mad
 
         for t in members:
-            if float(t.amount) > threshold:
-                flagged.append((
-                    t,
-                    f"{t.amount:,.0f} is well above the typical "
-                    f"{category.replace('_', ' ')} spend of ~{median:,.0f}.",
-                ))
+            if float(t.amount) <= threshold:
+                continue
+            # A charge the app itself predicted is not an anomaly. Every one
+            # of six identical monthly home-loan EMIs was being flagged as
+            # "well above the typical emi spend of ~650" - the 650 being a
+            # small insurance instalment that happened to share the
+            # category. The most predictable payment in the ledger was the
+            # loudest thing on the screen, six times over, which is how a
+            # detector trains its reader to ignore it.
+            if t.recurring_series_id:
+                continue
+            flagged.append((
+                t,
+                f"{t.amount:,.0f} is well above the typical "
+                f"{category.replace('_', ' ')} spend of ~{median:,.0f}.",
+            ))
 
     flagged.sort(key=lambda pair: -pair[0].amount)
     return flagged[:12]

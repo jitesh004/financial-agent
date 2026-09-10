@@ -66,13 +66,23 @@ def synthesize(state: AnalysisState) -> dict:
     # the reconciliation/parse-failure notes below counted and named a
     # retried file two or three times over.
     statements = nodes.latest_attempt_per_file(state.get("statements") or [])
-    unreconciled = [s for s in statements if s.get("status") == "unreconciled"]
+    # `status` is the PARSE outcome; the balance gate records its verdict in
+    # `recon_status`. Reading the wrong one is why "files unreconciled" was
+    # always zero - nothing ever writes the string "unreconciled" into
+    # `status`.
+    def _recon_of(row):
+        return str(row.get("recon_status") or "")
+
+    unreconciled = [s for s in statements if _recon_of(s) == "failed"]
+    not_checked = [s for s in statements if _recon_of(s) == "not_applicable"]
     failed = [s for s in statements if s.get("status") == "failed"]
 
     data_quality: dict[str, Any] = {
         "files_processed": len(statements),
-        "files_reconciled": sum(1 for s in statements if s.get("status") == "ok"),
+        "files_reconciled": sum(1 for s in statements
+                                if _recon_of(s) == "passed"),
         "files_unreconciled": len(unreconciled),
+        "files_not_checked": len(not_checked),
         "files_failed": len(failed),
         "duplicates_removed": state.get("duplicate_count", 0),
         "uncategorized_count": analysis.uncategorized_count,

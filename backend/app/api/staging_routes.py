@@ -479,7 +479,17 @@ def _run_process(job_id: str) -> None:
                             "is untouched and the selection is still staged.")
             return
 
+        # What the ledger held BEFORE. `materialise` does not append - it
+        # rebuilds from the current selection, so anything whose source file
+        # is not ticked disappears. On a workspace of 256 transactions,
+        # processing one newly-uploaded statement left 5, and the finished
+        # job reported "5 transaction(s) now count" with no warnings and no
+        # mention of the 251 it had just removed. Silence is the wrong
+        # answer when the number goes DOWN.
+        before_txns = repo.count_transactions(db)
+
         built = pipeline.materialise(db, progress=progress.phase)
+        removed = max(0, before_txns - int(built.get("transactions") or 0))
         # Registered here rather than after the analysis: when nothing parses
         # there is no ledger to publish, and those are exactly the runs whose
         # documents someone needs to see on the Files screen.
@@ -605,6 +615,7 @@ def _run_process(job_id: str) -> None:
                             if getattr(t, "category", "") == "uncategorized")
         result = {**built,
                   "uncategorized": uncategorized,
+                  "removed": removed,
                   "recurring": len(enriched.recurring or []) if transactions else 0,
                   **{f"decisions_{k}": v for k, v in report.items()
                      if k != "notes"}}
@@ -612,7 +623,10 @@ def _run_process(job_id: str) -> None:
         progress.complete(
             result=result,
             message=(
-                f"{built['transactions']} transaction(s) across "
+                (f"{removed} transaction(s) were removed: the ledger is "
+                 f"rebuilt from what is selected, and their documents are "
+                 f"not. " if removed else "")
+                + f"{built['transactions']} transaction(s) across "
                 f"{built['accounts']} account(s) now count. "
                 + (f"{report.get('applied', 0)} of your decisions were put back"
                    + (f"; {lost} could not be matched to a row and are kept "
@@ -767,10 +781,12 @@ def _publish(db, enriched, job_id: str, statement_entries: list) -> dict:
         "detail": e["parse_message"],
     } for e, state in zip(statement_entries, states)]
     analysis = enriched.analysis
+    _recon = repo.reconciliation_counts(db)
     payload["data_quality"] = {
         "files_processed": len(statement_entries),
-        "files_reconciled": sum(1 for st in states if st == "ok"),
-        "files_unreconciled": sum(1 for st in states if st == "unreconciled"),
+        "files_reconciled": _recon["passed"],
+        "files_unreconciled": _recon["failed"],
+        "files_not_checked": _recon["not_applicable"],
         "files_failed": sum(1 for st in states if st == "failed"),
         "files_locked": sum(1 for st in states if st == "needs_password"),
         "duplicates_removed": enriched.duplicate_count,

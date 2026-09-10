@@ -9,6 +9,7 @@ export default function Profile() {
   const { data, loading, refetch } = useQuery('profile', () => api.profile());
   const [form, setForm] = useState(null);
   const [customText, setCustomText] = useState('');
+  const [savedPasswordCount, setSavedPasswordCount] = useState(0);
   const [saving, setSaving] = useState(false);
   const [candidates, setCandidates] = useState(null);
   const [error, setError] = useState(null);
@@ -21,7 +22,10 @@ export default function Profile() {
       pan: data.pan || '',
       mobile: data.mobile || '',
     });
-    setCustomText((data.custom_passwords || []).join(', '));
+    // Never prefilled: the API no longer returns the passwords themselves.
+    // Left blank means "keep what is stored"; typing replaces them.
+    setCustomText('');
+    setSavedPasswordCount(data.custom_password_count || 0);
   }, [data, form]);
 
   if (loading || !form) return <Loading message="Reading identity parameters…" />;

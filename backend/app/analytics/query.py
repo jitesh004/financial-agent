@@ -212,6 +212,21 @@ MEASURES: dict[str, Measure] = {m.key: m for m in [
             hint="Every credit, added up - which includes refunds and money "
                  "moved in from your own accounts, not just income. Filter by "
                  "flow role for income alone."),
+    Measure("spending", "Spending (as the Overview counts it)", "Money",
+            "CASE WHEN t.flow_role = 'expense' AND t.direction = 'debit' "
+            f"THEN {_paise('t.amount')} "
+            "WHEN t.flow_role = 'refund' AND t.direction = 'credit' "
+            f"THEN -{_paise('t.amount')} ELSE 0 END",
+            hint="Spending on the app's own definition: money that actually "
+                 "left, with refunds netted off and transfers between your "
+                 "own accounts ignored. Use this to agree with the Overview; "
+                 "use “Money out” for every debit regardless."),
+    Measure("income", "Income (as the Overview counts it)", "Money",
+            "CASE WHEN t.flow_role = 'income' AND t.direction = 'credit' "
+            f"THEN {_paise('t.amount')} ELSE 0 END",
+            hint="Credits the app judged to be earnings - not refunds, not "
+                 "card settlements, not money moved in from your own "
+                 "accounts. Use “Money in” for every credit."),
     Measure("gross_amount", "Amount (unsigned)", "Money", _paise("t.amount"),
             hint="Size of the transaction regardless of direction."),
     Measure("txn_count", "Transactions", "Counts", "*",
@@ -520,14 +535,24 @@ def compile_query(spec: dict[str, Any], today: date | None = None) -> Compiled:
             clauses.append(clause)
             params.extend(values)
 
-    # Two defaults that are on unless explicitly turned off. Both appear as
-    # checkboxes in the widget editor rather than being applied invisibly: a
-    # total that quietly drops rows is exactly the kind of number this project
+    # Three defaults, on unless explicitly turned off, and each surfaced as a
+    # checkbox in the widget editor rather than applied invisibly: a total
+    # that quietly drops rows is exactly the kind of number this project
     # exists not to produce.
     if spec.get("exclude_mirror_legs", True):
         clauses.append("t.is_mirror_leg = 0")
     if spec.get("exclude_excluded", True):
         clauses.append("t.excluded = 0")
+    if spec.get("exclude_lender_ledger", True):
+        # A loan's own statement books every instalment against the loan
+        # account, and the bank statement books the same instalment leaving
+        # the funding account. They are one payment. `analytics.engine` drops
+        # the lender's copy before it totals anything
+        # (`_without_lender_ledgers`); without the same rule here, "money out
+        # by category" reported 31,73,777 of EMI on this ledger where
+        # 7,31,327 of it was the holder's cash and 24,42,450 was the lender's
+        # bookkeeping of that same cash.
+        clauses.append("t.flow_role <> 'lender_ledger'")
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     group = f"GROUP BY {', '.join(group_by)}" if group_by else ""

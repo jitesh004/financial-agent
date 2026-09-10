@@ -321,9 +321,25 @@ def analyse_budget(
         per_category[txn.category][periods.effective_month(txn)] += value
         counts[txn.category] += 1
 
+    from ..models.schemas import INCOME_CATEGORIES
+
     for category, per_month in per_category.items():
         seen = [per_month[m] for m in sorted(per_month)]
         if not seen:
+            continue
+        # A budget is a list of things that COST money. An income category
+        # reaching this list can only be a credit that netted against a
+        # category with no spending behind it, and it renders as a negative
+        # budget line - "refund: -50,000 a month" - which is not a thing
+        # anyone can plan around. The money is not lost: it is already in
+        # `offsets`, netted off the totals above.
+        if category in INCOME_CATEGORIES:
+            continue
+        # Same reasoning for a SPENDING category that nets negative over the
+        # window - more came back than went out, so there is nothing to
+        # budget for. "insurance: -13,736 a month" is not a plan; the refund
+        # behind it is already netted into the totals above.
+        if _median(seen) <= 0:
             continue
         # The median of the months this category appeared in - "what it costs
         # when it happens", which is what the row is read as next to the

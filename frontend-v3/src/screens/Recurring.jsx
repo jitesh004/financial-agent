@@ -83,7 +83,16 @@ export default function Recurring() {
 
   const active = visible.filter((s) => s.is_active);
   const amountOf = (s) => Number(s.amount ?? s.median_amount) || 0;
-  const monthlyTotal = active.reduce(
+
+  /* Committed money is what the SERVER says it is - `is_committed`, decided
+     by the same constant the Forecast counts with. Summing every active
+     debit series instead meant this screen and the Forecast published
+     different commitment totals off identical data, and this one was padded
+     with a 26 scan-and-pay, a 30.50 UPI and a 20 transfer to a person. Those
+     are repeating patterns; nobody is committed to them. */
+  const committed = active.filter((s) => s.is_committed);
+  const watching = active.filter((s) => !s.is_committed);
+  const monthlyTotal = committed.reduce(
     (sum, s) => (s.direction === 'debit' ? sum + (Number(s.monthly_equivalent) || 0) : sum),
     0
   );
@@ -105,12 +114,18 @@ export default function Recurring() {
 
       {/* Top Headline Stats */}
       <div className="stats-grid">
-        <Stat label="Active Tracked Series" value={String(active.length)} sub="Systematic repeating commitments" />
+        <Stat
+          label="Confirmed Commitments"
+          value={String(committed.length)}
+          sub={watching.length
+            ? `${watching.length} more repeat too loosely to count`
+            : 'Systematic repeating commitments'}
+        />
         <Stat
           label="Total Monthly Commitment"
           value={money(monthlyTotal)}
           tone="neg"
-          sub="Normalized 30-day monthly outflow"
+          sub="Normalized 30-day outflow, confirmed series only"
         />
         <Stat
           label="Muted / Ignored Series"
@@ -208,6 +223,19 @@ export default function Recurring() {
                       {s.status === 'overdue' && <Badge tone="warn" size="sm">Overdue</Badge>}
                       {s.status === 'ended' && <Badge size="sm">Concluded</Badge>}
                       {!s.is_active && <Badge tone="warn" size="sm">Muted</Badge>}
+                      {/* Said on the row, not only in the header count: a
+                          series that repeats too loosely to be counted still
+                          appears in this list, and without the label it is
+                          indistinguishable from the home-loan EMI above it. */}
+                      {s.is_active && !s.is_committed && (
+                        <Badge
+                          size="sm"
+                          title={`Repeats, but not consistently enough to count as a commitment (confidence ${
+                            (Number(s.confidence) * 100).toFixed(0)}%). Not in the monthly commitment total or the forecast.`}
+                        >
+                          Pattern only
+                        </Badge>
+                      )}
                     </div>
                   </div>
                 </div>

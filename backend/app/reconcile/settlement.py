@@ -36,6 +36,7 @@ from ..models.schemas import (
     Account, AccountType, Category, ConfidenceSource,
     Direction, FlowRole, Transaction,
 )
+from ..reconcile.transfers import PAIRING_RULE, _names_another_destination
 from ..rules import formats, institutions
 
 log = logging.getLogger(__name__)
@@ -206,6 +207,29 @@ def _load_confirmed_fingerprints(db) -> set[str]:
         return set()
 
 
+def _residual_too_big(residual: Decimal, total: Decimal) -> bool:
+    """Reject a candidate group whose legs do not add up.
+
+    BOTH bounds have to hold, not either. Written as `and` this read "reject
+    only when the gap is over 500 AND over 2%", which accepts everything
+    inside 500 no matter how small the transaction: a 30 debit was matched
+    against 499 of credits - 1,563% out - and a 349 debit against 2. Every
+    one of those turned a real expense into an internal transfer and removed
+    it from spending.
+
+    The absolute bound is there to forgive rounding on a large amount; the
+    proportional one is there to stop it forgiving everything on a small one.
+    A group has to pass both to be believed.
+    """
+    if residual <= 0:
+        return False
+    if residual > RESIDUAL_ABS_MAX:
+        return True
+    if total <= 0:
+        return True
+    return residual / total > RESIDUAL_PCT_MAX
+
+
 def _apply_group(group: SettlementGroup) -> None:
     """Stamp flags on every leg of a matched group."""
     for leg in group.outflow_legs:
@@ -215,6 +239,7 @@ def _apply_group(group: SettlementGroup) -> None:
         leg.flow_role = FlowRole.TRANSFER_OUT.value
         leg.category = Category.CC_PAYMENT
         leg.category_source = ConfidenceSource.RULE
+        leg.category_rule = PAIRING_RULE
         leg.category_confidence = group.confidence
 
     for leg in group.inflow_legs:
@@ -224,6 +249,7 @@ def _apply_group(group: SettlementGroup) -> None:
         leg.flow_role = FlowRole.CARD_SETTLEMENT.value
         leg.category = Category.CC_PAYMENT
         leg.category_source = ConfidenceSource.RULE
+        leg.category_rule = PAIRING_RULE
         leg.category_confidence = group.confidence
 
 
@@ -283,6 +309,8 @@ def match_settlements(
         if txn.account_id in card_ids and txn.direction == Direction.CREDIT:
             card_credits.append(txn)
         elif txn.account_id in cash_ids and txn.direction == Direction.DEBIT:
+            if _names_another_destination(txn):
+                continue
             bank_debits.append(txn)
 
     # Track which transactions have been claimed by a group.
@@ -366,10 +394,7 @@ def match_settlements(
                 credit_sum = sum(c.amount for c in subset)
                 residual = abs(debit.amount - credit_sum)
 
-                if residual > RESIDUAL_ABS_MAX and (
-                    debit.amount == 0
-                    or residual / debit.amount > RESIDUAL_PCT_MAX
-                ):
+                if _residual_too_big(residual, debit.amount):
                     continue
 
                 # NOT clamped to the floor. Clamping made the floor
@@ -440,10 +465,7 @@ def match_settlements(
                 debit_sum = sum(d.amount for d in subset)
                 residual = abs(debit_sum - credit.amount)
 
-                if residual > RESIDUAL_ABS_MAX and (
-                    credit.amount == 0
-                    or residual / credit.amount > RESIDUAL_PCT_MAX
-                ):
+                if _residual_too_big(residual, credit.amount):
                     continue
 
                 # NOT clamped to the floor. Clamping made the floor

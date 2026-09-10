@@ -305,8 +305,13 @@ def test_a_model_that_never_answers_is_stopped(ledger):
     reading, rather than as a failure with nothing behind it.
     """
     agent = catalogue.get("cashflow-sentinel")
-    forever = {"thought": "One more look.", "calls": [{"tool": "accounts"}]}
-    model = ScriptedModel(*[forever] * agent.max_steps)
+    # A DIFFERENT tool each turn. Repeating one would trip the loop guard
+    # (see test_a_model_that_repeats_itself_is_stopped_early), and what this
+    # test is about is the budget running out, not the guard firing.
+    tools = list(agent.tools)
+    model = ScriptedModel(*[
+        {"thought": "One more look.", "calls": [{"tool": tools[i % len(tools)]}]}
+        for i in range(agent.max_steps)])
 
     result = runner.run(agent, ledger, client=model)
     assert result.status == "exhausted"
@@ -315,10 +320,34 @@ def test_a_model_that_never_answers_is_stopped(ledger):
     assert "all" in result.error and "steps" in result.error
 
 
+
+def test_a_model_that_repeats_itself_is_stopped_early(ledger):
+    """Asking for the same data three times is not progress.
+
+    Half the runs on the audited workspace ended this way: steps four
+    through eight issuing an identical tool set with identical reasoning,
+    then a silent give-up when the budget ran out - eight minutes to
+    produce nothing. The run is stopped at the third repeat instead, and
+    says why.
+    """
+    agent = catalogue.get("cashflow-sentinel")
+    same = {"thought": "One more look.", "calls": [{"tool": "accounts"}]}
+    model = ScriptedModel(*[same] * agent.max_steps)
+
+    result = runner.run(agent, ledger, client=model)
+    assert result.status == "looping"
+    assert result.answer is None
+    # Stopped well inside the budget rather than burning all of it.
+    assert len(result.steps) < agent.max_steps + 1
+    assert "same data three times" in result.error
+
+
 def test_the_last_turn_says_so(ledger):
     agent = catalogue.get("cashflow-sentinel")
-    forever = {"thought": "Again.", "calls": [{"tool": "accounts"}]}
-    model = ScriptedModel(*[forever] * agent.max_steps)
+    tools = list(agent.tools)
+    model = ScriptedModel(*[
+        {"thought": "Again.", "calls": [{"tool": tools[i % len(tools)]}]}
+        for i in range(agent.max_steps)])
     runner.run(agent, ledger, client=model)
     assert "LAST turn" in model.prompts[-1]
 
@@ -688,11 +717,16 @@ def test_a_run_that_never_answers_is_still_saved_and_readable(ledger, monkeypatc
                          json={}).json()["job_id"]
     job = client.get(f"/api/jobs/{job_id}").json()
     assert job["status"] == "complete"
-    assert job["result"]["status"] == "exhausted"
+    # Either way of not answering counts. This model repeats one tool, so
+    # the loop guard stops it before the budget does and reports "looping" -
+    # a more specific diagnosis of the same outcome. What the test is about
+    # is that the run is SAVED and its working is readable.
+    no_answer = {"exhausted", "looping"}
+    assert job["result"]["status"] in no_answer
 
     run = client.get(f"/api/agents/runs/{job['result']['run_id']}"
                      f"?transcript=true").json()
-    assert run["status"] == "exhausted"
+    assert run["status"] in no_answer
     assert run["transcript"], "the working survives a run that gave no answer"
 
 
@@ -878,8 +912,10 @@ def test_the_budget_caps_the_steps_an_agent_may_take(ledger):
 
     agent = catalogue.get("debt-strategist")
     assert agent.max_steps > runner_mod.COMPACT.max_steps
-    forever = {"thought": "again", "calls": [{"tool": "loans"}]}
-    model = ScriptedModel(*[forever] * runner_mod.COMPACT.max_steps)
+    tools = list(agent.tools)
+    model = ScriptedModel(*[
+        {"thought": "again", "calls": [{"tool": tools[i % len(tools)]}]}
+        for i in range(runner_mod.COMPACT.max_steps)])
 
     result = runner.run(agent, ledger, client=model,
                         budget=runner_mod.COMPACT)

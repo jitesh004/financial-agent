@@ -34,6 +34,10 @@ class OverrideReport:
         #: benign - the statement it came from has not been re-parsed yet -
         #: so they are kept, never deleted.
         self.orphaned = 0
+        #: Ids of rows where the USER set `flow_role` by hand. Nothing may
+        #: re-derive over the top of those: an explicit decision outranks
+        #: anything inferred from the category.
+        self.role_pinned: set[str] = set()
         self.notes: list[str] = []
 
     def as_dict(self) -> dict[str, object]:
@@ -94,6 +98,8 @@ def apply_overrides(db, transactions, accounts) -> OverrideReport:
             continue
 
         _apply_one(record, txn)
+        if record.flow_role is not None and txn.id:
+            report.role_pinned.add(txn.id)
         report.applied += 1
 
         if repaired:
@@ -109,6 +115,27 @@ def apply_overrides(db, transactions, accounts) -> OverrideReport:
     return report
 
 
+def rederive_role(txn) -> None:
+    """Recompute `flow_role` from the row as it now stands.
+
+    `flow_role` - not `category` - decides whether a rupee counts as income,
+    as spending, or as neither. `category` and `excluded` are two of its
+    inputs, so a decision that changes either has to change the role too.
+    Without this, a correction moves the label and leaves the money where the
+    original derivation put it: a payment relabelled `investment` keeps
+    counting as spending, and a row marked excluded keeps counting at all.
+
+    LENDER_LEDGER is the one role left alone. It is a property of the ACCOUNT
+    - every row on a loan's own statement is the lender's bookkeeping, not the
+    user's cash - and `derive_flow_role` cannot see account types, so
+    re-deriving would silently drop those rows back into income and spending.
+    """
+    from ..models.schemas import FlowRole, derive_flow_role
+    if txn.flow_role == FlowRole.LENDER_LEDGER.value:
+        return
+    txn.flow_role = derive_flow_role(txn).value
+
+
 def _apply_one(record, txn) -> None:
     """Copy one stored decision onto one transaction."""
     if record.category is not None:
@@ -116,14 +143,20 @@ def _apply_one(record, txn) -> None:
         txn.category_source = ConfidenceSource.USER
         txn.category_confidence = 1.0
 
-    if record.flow_role is not None:
-        txn.flow_role = record.flow_role
     if record.accounting_month is not None:
         txn.accounting_month = record.accounting_month
     if record.note is not None:
         txn.note = record.note
     if record.excluded is not None:
         txn.excluded = bool(record.excluded)
+
+    # LAST, and after every input above has landed: `excluded` and `category`
+    # are both inputs to the role, so deriving before they are applied reads
+    # the old row.
+    if record.flow_role is not None:
+        txn.flow_role = record.flow_role
+    elif record.category is not None or record.excluded is not None:
+        rederive_role(txn)
 
     # A row the user has ruled on is, by definition, no longer awaiting their
     # ruling - leaving it in the review queue would ask the same question

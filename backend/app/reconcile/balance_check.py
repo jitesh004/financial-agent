@@ -49,6 +49,18 @@ def reconcile(statement: Statement, account_type: AccountType) -> Reconciliation
         transaction_count=len(txns),
     )
 
+    # A statement that declared neither balance had both invented from its
+    # own rows, so `opening + credits - debits == closing` holds by
+    # construction. Saying "passed" there claims a verification nobody
+    # performed - and this is what let a loan statement recording 0.00 in
+    # and 0.00 out be reported as reconciled.
+    if getattr(statement, "extra", {}).get("reconciliation_vacuous") == "1":
+        result.message = (
+            "Neither an opening nor a closing balance was stated, so both "
+            "were taken from the transaction rows. There is nothing "
+            "independent left to check them against.")
+        return result
+
     if not txns:
         result.message = "No transactions to reconcile."
         return result

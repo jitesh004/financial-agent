@@ -241,6 +241,9 @@ class AgedItem:
     bureau_outstanding: Decimal | None = None
     drift: Decimal | None = None
     drift_pct: float | None = None
+    #: The documents cover this holding, but under a statement that already
+    #: contains it. Counting the attestation as well would double it.
+    superseded: bool = False
 
     # ---- how to read all of the above ----
     #: One sentence saying where `outstanding` came from.
@@ -257,7 +260,8 @@ class AgedItem:
 
 def age_item(item: dict[str, Any], *, as_of: date,
              observed: dict[str, Any] | None = None,
-             bureau: dict[str, Any] | None = None) -> AgedItem:
+             bureau: dict[str, Any] | None = None,
+             payments: list[date] | None = None) -> AgedItem:
     """Roll one attested item forward to `as_of` and check it.
 
     `observed` is what the ledger currently says about the mapped account, and
@@ -289,17 +293,31 @@ def age_item(item: dict[str, Any], *, as_of: date,
     )
 
     if aged.kind == "loan":
-        _age_loan(aged, as_of)
+        _age_loan(aged, as_of, payments)
     elif aged.kind == "card":
         _age_card(aged, as_of)
     else:
         _age_holding(aged, as_of)
 
     _attach_observed(aged, observed, bureau)
+
+    # Attestation is an OVERRIDE, not a parallel store. Where nothing has
+    # been asserted, the document answers - which is what lets an item stop
+    # carrying a second copy of a figure a statement already provides, and
+    # lets that copy stop going stale on its own. A loan is the exception
+    # handled above: its attested balance IS the root fact, because a loan
+    # serviced from an account nobody uploaded has no document to fall back
+    # on.
+    if aged.outstanding is None and aged.observed_outstanding is not None:
+        aged.outstanding = aged.observed_outstanding
+        aged.basis = ("from your statement"
+                      + (f" of {aged.observed_as_of.isoformat()}"
+                         if aged.observed_as_of else ""))
     return aged
 
 
-def _age_loan(aged: AgedItem, as_of: date) -> None:
+def _age_loan(aged: AgedItem, as_of: date,
+              payments: list[date] | None = None) -> None:
     """Walk the amortization forward from the review to today."""
     terms = complete_loan_terms(aged.attested_outstanding, aged.emi,
                                 aged.interest_rate,
@@ -328,8 +346,18 @@ def _age_loan(aged: AgedItem, as_of: date) -> None:
     # known. Counting whole calendar months instead is wrong by one for half
     # of every month - which on a 20-year loan is the difference between the
     # right payoff date and one a month out.
-    emi_day = aged.due_day or aged.reviewed_on.day
-    paid = cycles_between(emi_day, aged.reviewed_on, as_of)
+    #
+    # Better still: count the payments the LEDGER actually recorded. The
+    # calendar can only ever be a model of when money moved; the debits are
+    # the money moving. This loan is why - `due_day` was never captured, so
+    # the fallback used the review date's own day (the 30th) while every EMI
+    # actually left on the 5th. Two cycles were counted where three payments
+    # had been made, and the balance read 24,262 too high.
+    if payments:
+        paid = sum(1 for when in payments if when > aged.reviewed_on)
+    else:
+        emi_day = aged.due_day or aged.reviewed_on.day
+        paid = cycles_between(emi_day, aged.reviewed_on, as_of)
     aged.emis_since_review = paid
     aged.outstanding = outstanding
     aged.months_remaining = aged.attested_months_remaining
@@ -462,6 +490,17 @@ def _attach_observed(aged: AgedItem, observed: dict[str, Any] | None,
         aged.bureau_outstanding = _dec(bureau.get("current_balance"))
     if not observed:
         return
+    if observed.get("superseded"):
+        # Not drift, and not a missing figure either: a consolidated
+        # statement already reports these holdings, so the attested copy is
+        # the SAME money a second time. Say so, and leave it out of the
+        # totals rather than reporting the whole balance as a discrepancy.
+        aged.superseded = True
+        aged.warnings.append(
+            "Already counted: a consolidated statement reports these "
+            "holdings, so this attested figure is the same money twice. "
+            "It is shown here but left out of the totals.")
+        return
     aged.observed_outstanding = _dec(observed.get("outstanding"))
     aged.observed_as_of = _as_date(observed.get("as_of"))
     if observed.get("credit_limit") and aged.credit_limit is None:
@@ -493,30 +532,59 @@ def _attach_observed(aged: AgedItem, observed: dict[str, Any] | None,
 def build(items: list[dict[str, Any]], accounts: list[Any],
           bureau_accounts: list[dict[str, Any]], *,
           as_of: date | None = None,
-          include_archived: bool = False) -> dict[str, Any]:
+          include_archived: bool = False,
+          holdings: list[dict[str, Any]] | None = None,
+          holdings_any: list[dict[str, Any]] | None = None,
+          emi_payments: dict[str, list[date]] | None = None) -> dict[str, Any]:
     """Every attested item aged to today, plus what nothing accounts for."""
     as_of = as_of or date.today()
     accounts_by_id = {a.id: a for a in accounts if getattr(a, "id", None)}
-    bureau_by_id = {b["id"]: b for b in bureau_accounts if b.get("id")}
+    resolve = _account_resolver(accounts)
+    resolve_bureau = _bureau_resolver(bureau_accounts)
+    held = _holdings_by_account(holdings)
+    superseded = _superseded_accounts(accounts, held, holdings_any)
 
     aged: list[AgedItem] = []
     for item in items:
         if item.get("archived") and not include_archived:
             continue
+        account = resolve(item)
+        line = resolve_bureau(item)
+        if line is not None and line.get("id") != item.get("bureau_account_id"):
+            item = {**item, "bureau_account_id": line["id"]}
+        if account is not None and getattr(account, "id", None):
+            # Report the account this item RESOLVED to, not the uuid stored
+            # on it. They differ whenever a rebuild renumbered the ledger,
+            # and anything downstream keying on the stored one would file
+            # this balance against whatever now holds that uuid - which is
+            # how both loans came to be filed against a credit card.
+            item = {**item, "account_id": account.id}
         aged.append(age_item(
             item, as_of=as_of,
-            observed=_observed_for(accounts_by_id.get(item.get("account_id"))),
-            bureau=bureau_by_id.get(item.get("bureau_account_id")),
+            observed=_observed_for(account, held, superseded),
+            bureau=line,
+            payments=_payments_for(item, emi_payments),
         ))
     aged.sort(key=lambda a: (a.sort_order, a.label.lower()))
 
     claimed_accounts = {a.account_id for a in aged if a.account_id}
     claimed_bureau = {a.bureau_account_id for a in aged if a.bureau_account_id}
 
+    unconfirmed = ZERO
+    for line in bureau_accounts:
+        if line["id"] in claimed_bureau or _is_attributed(line):
+            continue
+        if (line.get("status") or "open") != "open":
+            continue
+        try:
+            unconfirmed += Decimal(str(line.get("current_balance") or 0))
+        except (ArithmeticError, ValueError):
+            continue
+
     return {
         "as_of": as_of.isoformat(),
         "items": [_item_json(a) for a in aged],
-        "totals": _totals(aged),
+        "totals": _totals(aged, unconfirmed),
         # The three ways this picture can be incomplete, each named rather
         # than folded into a confidence score. Only the first is alarming.
         "unaccounted": {
@@ -545,15 +613,260 @@ def build(items: list[dict[str, Any]], accounts: list[Any],
     }
 
 
-def _observed_for(account: Any) -> dict[str, Any] | None:
+def _account_resolver(accounts: list[Any]):
+    """Find the account an attested item is about, by IDENTITY not by uuid.
+
+    Account uuids do not survive a ledger rebuild - `staging/process` mints
+    new ones - so an item created before a rebuild holds an id that now names
+    nothing, or worse, names a different account entirely. Both happened on
+    the ledger this was written against: 25 of 28 links dangled, and the two
+    loans had both come to point at the same credit card. A card carries a
+    zero balance, so a 66.7 lakh home loan was compared against 0 and the
+    entire balance was reported as "drift".
+
+    So identity is tried before the uuid, in the order it can be trusted:
+
+      1. `account_key` - INSTITUTION|TYPE|MASKED|PRODUCT, the same key
+         `user_overrides` has always used, which is why a correction survives
+         a reprocess when an attestation did not.
+      2. The label, which was rendered from the account's own fields when the
+         item was created and still names the real-world account.
+      3. The stored uuid, last, because it is the thing that goes stale.
+
+    Returning None is a real answer and a different one from "balance zero":
+    it means no ledger account covers this item, which is the whole reason
+    the item was typed in by hand.
+    """
+    from ..pipeline.fingerprint import account_key
+
+    by_id: dict[str, Any] = {}
+    by_key: dict[str, Any] = {}
+    by_label: dict[str, Any] = {}
+    for account in accounts:
+        if getattr(account, "id", None):
+            by_id[account.id] = account
+        key = account_key(account)
+        if key:
+            by_key.setdefault(key, account)
+        try:
+            by_label.setdefault(account.display_name(), account)
+        except Exception:            # pragma: no cover - defensive
+            pass
+
+    def resolve(item: dict[str, Any]) -> Any:
+        key = (item.get("account_key") or "").strip()
+        if key and key in by_key:
+            return by_key[key]
+        labelled = by_label.get(item.get("label") or "")
+        if labelled is not None:
+            return labelled
+        return by_id.get(item.get("account_id"))
+
+    return resolve
+
+
+def _holdings_by_account(
+    holdings: list[dict[str, Any]] | None,
+) -> dict[str, tuple[Decimal, str]]:
+    """Latest valued holdings, summed per account.
+
+    For an investment account this - not `accounts.current_balance` - is what
+    the documents actually say. That column is a summary written alongside the
+    holdings, and it can go stale on its own: on the ledger this was written
+    against, the Broker account carried `current_balance = 0` with a
+    2026-07-31 as-of stamp while its own holdings for that same date summed to
+    301,409.33. Reading the copy reported the whole balance as drift.
+    """
+    index: dict[str, tuple[Decimal, str]] = {}
+    for row in holdings or []:
+        account_id = row.get("account_id")
+        if not account_id:
+            continue
+        try:
+            value = Decimal(str(row.get("value") or "0"))
+        except (ArithmeticError, ValueError):
+            continue
+        total, seen = index.get(account_id, (Decimal("0"), ""))
+        index[account_id] = (total + value,
+                             max(seen, str(row.get("as_of") or "")))
+    return index
+
+
+def balances_by_account(built: dict[str, Any]) -> dict[str, Decimal]:
+    """Signed resolved balance per linked account, from a built position.
+
+    This is the hand-off that makes the Position tab the reader-of-record.
+    Every other screen used to read `accounts.principal_outstanding` and
+    `accounts.current_balance` directly, which is why four screens quoted
+    four different figures for one home loan: those columns hold the balance
+    as ATTESTED, and only this module ages it forward, checks it against the
+    ledger and drops what a consolidated statement already counted.
+
+    Liabilities come back negative and assets positive, matching
+    `Account.balance`, so a caller can substitute one for the other.
+    Superseded items are omitted rather than zeroed: the caller must not
+    count them, and must not read a zero as "this is empty" either.
+    """
+    out: dict[str, Decimal] = {}
+    for item in built.get("items", []):
+        account_id = item.get("account_id")
+        if not account_id or item.get("superseded"):
+            continue
+        kind = item.get("kind")
+        if kind == "investment":
+            value = item.get("observed_outstanding")
+            if value is None:
+                value = item.get("outstanding")
+        else:
+            value = item.get("outstanding")
+        if value is None:
+            continue
+        amount = Decimal(str(value))
+        out[account_id] = -amount if kind in {"loan", "card"} else amount
+    return out
+
+
+def adopted_bureau(built: dict[str, Any]) -> dict[str, Decimal]:
+    """Bureau-only debt this position has taken responsibility for.
+
+    A bureau line adopted onto the balance sheet is counted HERE, so whoever
+    also totals "debt the bureau reports that nothing covers" has to skip it
+    or the same card is counted twice. Keyed by bureau id for exactly that
+    hand-off. Signed like `balances_by_account`: liabilities negative.
+    """
+    out: dict[str, Decimal] = {}
+    for item in built.get("items", []):
+        bureau_id = item.get("bureau_account_id")
+        if not bureau_id or item.get("superseded"):
+            continue
+        # Only items the bureau is the SOLE source for. One that also maps to
+        # a ledger account is already counted through that account, and
+        # returning it here would add the same debt a second time.
+        if item.get("account_id"):
+            continue
+        value = item.get("outstanding")
+        if value is None:
+            continue
+        amount = Decimal(str(value))
+        out[bureau_id] = (-amount if item.get("kind") in {"loan", "card"}
+                          else amount)
+    return out
+
+
+def _payments_for(item: dict[str, Any],
+                  emi_payments: dict[str, list[date]] | None) -> list[date]:
+    """The EMI debits the ledger recorded for this item's loan.
+
+    Keyed by the item id, because the caller is the only layer that can see
+    both the attestation and the transactions and decide which debits belong
+    to which loan.
+    """
+    if not emi_payments:
+        return []
+    return emi_payments.get(item.get("id") or "", [])
+
+
+def _bureau_resolver(bureau_accounts: list[dict[str, Any]]):
+    """Find the bureau line an item is about, by identity not by uuid.
+
+    Exactly the same failure as `_account_resolver` guards against, one table
+    over: `bureau_accounts` rows are replaced wholesale each time a report is
+    ingested, so a `bureau_account_id` captured against an older pull names a
+    row that no longer exists - or, once the uuids are reused, somebody
+    else's. On this ledger three unrelated items - a credit card, the home
+    loan and the personal loan - had all come to share one bureau id.
+
+    Identity here is the lender plus the masked number, which is what the
+    label was built from when the item was adopted.
+    """
+    by_id = {b["id"]: b for b in bureau_accounts if b.get("id")}
+    by_identity: dict[str, dict[str, Any]] = {}
+    for line in bureau_accounts:
+        ident = " ".join(x for x in (
+            str(line.get("lender") or "").strip(),
+            str(line.get("account_number_masked") or "").strip(),
+        ) if x)
+        if ident:
+            by_identity.setdefault(ident.upper(), line)
+
+    def resolve(item: dict[str, Any]) -> dict[str, Any] | None:
+        label = str(item.get("label") or "").strip().upper()
+        if label and label in by_identity:
+            return by_identity[label]
+        return by_id.get(item.get("bureau_account_id"))
+
+    return resolve
+
+
+def _superseded_accounts(accounts: list[Any],
+                         held: dict[str, tuple[Decimal, str]],
+                         holdings_any: list[dict[str, Any]] | None) -> set[str]:
+    """Investment accounts a consolidated statement has already absorbed.
+
+    `repository.get_holdings(latest_only=True)` deliberately drops a broker's
+    own holdings when a CAS covers the same securities - "consolidated" means
+    the CAS is a superset, and adding the broker's copy counts those shares
+    twice.
+
+    So an investment account that HAS holdings on file yet contributes none
+    of them is not empty: it has been superseded. An account with no holdings
+    at all is a different thing again - simply unknown - and must not be
+    confused with either. The three states are why this returns a set rather
+    than a boolean per account.
+    """
+    with_any = {row.get("account_id") for row in (holdings_any or [])
+                if row.get("account_id")}
+    return {a.id for a in accounts
+            if getattr(a, "id", None)
+            and a.account_type == AccountType.INVESTMENT
+            and a.id in with_any
+            and a.id not in held}
+
+
+def _observed_for(account: Any,
+                  held: dict[str, tuple[Decimal, str]] | None = None,
+                  superseded: set[str] | None = None,
+                  ) -> dict[str, Any] | None:
+    """What the DOCUMENTS say about this account, or None for "nothing does".
+
+    Returning None is a real answer and a different one from zero. An account
+    nobody has uploaded a statement for has an UNKNOWN balance; reporting it
+    as 0 turns "I do not know" into "you owe nothing", and then measures the
+    user's own attested figure against that invented zero. That is how a 66.7
+    lakh home loan came to be reported as 66.7 lakh of drift.
+    """
     if account is None:
         return None
-    if account.account_type in LOAN_TYPES or \
-            account.account_type == AccountType.CREDIT_CARD:
+
+    if account.account_type in LOAN_TYPES or             account.account_type == AccountType.CREDIT_CARD:
+        # Same fallback as `Account.balance`: a zero principal beside a real
+        # current balance is which column the extractor happened to fill,
+        # not a settled account.
         outstanding = account.principal_outstanding
-    else:
-        outstanding = account.current_balance
-    return {"outstanding": outstanding, "as_of": account.balance_as_of,
+        if not outstanding and account.current_balance:
+            outstanding = account.current_balance
+        return {"outstanding": outstanding, "as_of": account.balance_as_of,
+                "credit_limit": account.credit_limit}
+
+    if account.account_type == AccountType.INVESTMENT:
+        # Holdings are canonical for an investment; `current_balance` is a
+        # summary written beside them that can go stale on its own.
+        if held and account.id in held:
+            total, as_of = held[account.id]
+            return {"outstanding": total,
+                    "as_of": as_of or account.balance_as_of,
+                    "credit_limit": account.credit_limit}
+        if superseded and account.id in superseded:
+            return {"superseded": True}
+        return None
+
+    # A balance nobody ever read is unknown, not zero. `balance_as_of` is the
+    # marker for "a document stated this", so its absence is the marker for
+    # "no document did".
+    if not account.balance_as_of:
+        return None
+    return {"outstanding": account.current_balance,
+            "as_of": account.balance_as_of,
             "credit_limit": account.credit_limit}
 
 
@@ -574,15 +887,26 @@ def _sum_known(values: list[Decimal | None]) -> tuple[Decimal | None, int]:
     return (sum(known, ZERO) if known else None, len(values) - len(known))
 
 
-def _totals(aged: list[AgedItem]) -> dict[str, Any]:
+def _totals(aged: list[AgedItem],
+            unconfirmed: Decimal | None = None) -> dict[str, Any]:
     loans = [a for a in aged if a.kind == "loan"]
     cards = [a for a in aged if a.kind == "card"]
-    assets = [a for a in aged if a.kind in {"account", "investment"}]
+    # An investment the documents already report under a consolidated
+    # statement is the same money twice, so it is named and set aside rather
+    # than added. And where holdings DO cover an investment, they are the
+    # canonical figure - the attestation is a copy that can go stale.
+    assets = [a for a in aged
+              if a.kind in {"account", "investment"} and not a.superseded]
+    superseded = [a for a in aged if a.superseded]
 
     loan_outstanding, loans_unknown = _sum_known([a.outstanding for a in loans])
     card_outstanding, cards_unknown = _sum_known([a.outstanding for a in cards])
     limit, _ = _sum_known([a.credit_limit for a in cards])
-    asset_total, assets_unknown = _sum_known([a.outstanding for a in assets])
+    asset_total, assets_unknown = _sum_known([
+        a.observed_outstanding
+        if (a.kind == "investment" and a.observed_outstanding is not None)
+        else a.outstanding
+        for a in assets])
     monthly_emi, _ = _sum_known([a.emi for a in loans])
     interest_left, _ = _sum_known(
         [a.total_interest_remaining for a in loans])
@@ -599,6 +923,15 @@ def _totals(aged: list[AgedItem]) -> dict[str, Any]:
     return {
         "loan_count": len(loans),
         "card_count": len(cards),
+        "superseded_count": len(superseded),
+        # Debt the bureau reports that nothing here has adopted. Named
+        # rather than folded into `total_owed`, because it is a different
+        # KIND of claim - a third party's word, unconfirmed - and because
+        # the Overview adds exactly this figure on top of the accounts it
+        # knows. Both screens can now quote the same composition instead of
+        # silently disagreeing about scope.
+        "unconfirmed_bureau_debt": _money(unconfirmed),
+        "total_owed_including_unconfirmed": _money(_add(owed, unconfirmed)),
         "loan_outstanding": _money(loan_outstanding),
         "card_outstanding": _money(card_outstanding),
         "total_owed": _money(owed),
@@ -611,6 +944,22 @@ def _totals(aged: list[AgedItem]) -> dict[str, Any]:
         "assets": _money(asset_total),
         "net": (None if asset_total is None and owed is None
                 else _money((asset_total or ZERO) - (owed or ZERO))),
+        # The same subtraction over the INCLUSIVE debt, because that is what
+        # the Overview's net worth uses.
+        #
+        # `total_owed_including_unconfirmed` was added above so the two
+        # screens could "quote the same composition instead of silently
+        # disagreeing about scope" - but `net` was left over the exclusive
+        # figure, so the disagreement moved from the debt line to the
+        # headline: Position said -48,63,484 and Net Worth -48,91,143, a
+        # 27,659 gap that is exactly the unconfirmed bureau debt and that
+        # neither screen accounted for. Publishing both makes the
+        # composition legible instead of leaving a reader to find the
+        # difference by subtraction.
+        "net_including_unconfirmed": (
+            None if asset_total is None and owed is None
+            else _money((asset_total or ZERO)
+                        - (_add(owed, unconfirmed) or ZERO))),
         # Every figure above is only as complete as what has been filled in,
         # and a blank is not a zero. Counted here so the screen can say which
         # totals are short rather than presenting them as final.

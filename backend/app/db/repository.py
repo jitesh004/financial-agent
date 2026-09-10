@@ -410,6 +410,15 @@ def update_transaction_categories(db: Database, transactions: Iterable[Transacti
     dashboard rebuilt after a restart disagree with the one computed at
     ingestion: analytics counts exactly one leg of a transfer as real cash,
     and every reloaded row claimed to be the leg that counts.
+
+    Returns how many rows were actually UPDATED, which is not the same as
+    how many were handed in. This is an UPDATE keyed on `id`, so a
+    transaction the caller holds that no longer exists in the table matches
+    nothing and is silently skipped - and the count reported it as written.
+    A caller passing enrichment output hits this every time: the pipeline
+    drops duplicate rows from its result, so 1,307 rows in came back as
+    "wrote 1,279" with no hint that 28 were neither updated nor deleted.
+    Saying what happened is what makes that visible.
     """
     rows = [
         (t.category, t.category_source.value, t.category_confidence,
@@ -418,6 +427,9 @@ def update_transaction_categories(db: Database, transactions: Iterable[Transacti
          t.review_reason, t.flow_role, int(t.excluded), t.note, t.id)
         for t in transactions if t.id
     ]
+    if not rows:
+        return 0
+    ids = [r[-1] for r in rows]
     with db.connection() as conn:
         conn.executemany(
             """UPDATE transactions
@@ -429,7 +441,15 @@ def update_transaction_categories(db: Database, transactions: Iterable[Transacti
                 WHERE id = ?""",
             rows,
         )
-    return len(rows)
+        placeholders = ",".join("?" for _ in ids)
+        written = conn.execute(
+            f"SELECT COUNT(*) c FROM transactions WHERE id IN ({placeholders})",
+            ids).fetchone()["c"]
+    if written != len(rows):
+        log.warning(
+            "update_transaction_categories: %d of %d rows do not exist and "
+            "were not written.", len(rows) - written, len(rows))
+    return written
 
 
 #: Columns a caller may sort transactions by, as the SQL fragment to order on.
@@ -903,6 +923,34 @@ def save_transfer_pairs(db: Database, pairs: Sequence[Any]) -> int:
     """
     rows = [(p.pair_id, p.debit_txn_id, p.credit_txn_id, _txt(p.amount),
              p.day_gap, p.kind, p.confidence) for p in pairs]
+
+    # An EMPTY set never clears a table the transactions still point at.
+    #
+    # `detect_transfers` builds its candidate list from rows where
+    # `is_internal_transfer` is false, so running the pipeline a second time
+    # over rows it already flagged finds nothing and returns no pairs - the
+    # detection is not idempotent, and the report is not a statement that
+    # there are no transfers. Replacing the table from that report deletes
+    # every pair row while 180 transactions go on being netted out of
+    # spending on the strength of them. That is the whole audit trail for
+    # 9.78 lakh of movement, and it goes without a word.
+    #
+    # "Replace with nothing" has no legitimate caller: clearing the ledger
+    # deletes these rows by cascade, and a real re-detection always produces
+    # pairs when paired rows exist. So it is refused rather than obeyed.
+    if not rows:
+        with db.connection() as conn:
+            referenced = conn.execute(
+                "SELECT COUNT(*) c FROM transactions "
+                "WHERE COALESCE(transfer_pair_id, '') != ''").fetchone()["c"]
+        if referenced:
+            log.warning(
+                "Refusing to clear transfer_pairs: no pairs were supplied but "
+                "%d transactions still reference one. Detection is not "
+                "idempotent - re-run it on unflagged rows, or clear the "
+                "ledger.", referenced)
+            return 0
+
     with db.connection() as conn:
         conn.execute("DELETE FROM transfer_pairs")
         conn.executemany(
@@ -1390,6 +1438,15 @@ def repoint_override(db: Database, old_fingerprint: str, new_fingerprint: str,
 
 def save_analysis_run(db: Database, run_id: str, status: str, file_count: int,
                       payload: dict | None = None, error: str = "") -> None:
+    # Stamped with the ledger it describes, so `get_latest_analysis_run` can
+    # tell a snapshot that is still true from one that has been overtaken.
+    if payload is not None:
+        try:
+            payload = dict(payload)
+            payload["_ledger_signature"] = ledger_signature(db)
+        except Exception as exc:    # pragma: no cover - never block a save
+            log.warning("could not stamp analysis run %s: %s", run_id, exc)
+
     with db.connection() as conn:
         conn.execute(
             """INSERT INTO analysis_runs (id, status, file_count, summary_json, error)
@@ -1416,12 +1473,56 @@ def get_latest_analysis_run(db: Database) -> tuple[str, dict] | None:
     if not row:
         return None
     try:
-        return row["id"], json.loads(row["summary_json"])
+        payload = json.loads(row["summary_json"])
+        # Only if it still describes THIS ledger. See `ledger_signature`:
+        # a payload written before a correction is a set of figures for
+        # rows that have since changed, and serving it verbatim is how the
+        # Overview came to publish a spend total 60,000 out of date.
+        # An UNSTAMPED payload is rejected too. It was written before this
+        # check existed, so nothing can say which ledger it describes - and
+        # "I cannot tell whether these figures are current" is not a good
+        # enough reason to publish them as the Overview's headline. The
+        # rebuild costs a second and produces the right answer; the next
+        # save stamps it and the fast path resumes.
+        stamped = (payload or {}).get("_ledger_signature")
+        if stamped != ledger_signature(db):
+            log.info("stored analysis run %s does not describe the current "
+                     "ledger; recomputing", row["id"])
+            return None
+        return row["id"], payload
     except (ValueError, TypeError):
         # A payload we cannot read is not worth crashing the dashboard over;
         # the caller falls back to recomputing from the stored rows.
         log.warning("stored analysis run %s has an unreadable payload", row["id"])
         return None
+
+
+def ledger_signature(db: Database) -> str:
+    """A cheap fingerprint of the ledger's analysable state.
+
+    Stored beside a dashboard payload so the payload can be revalidated
+    instead of trusted. `/api/dashboard` prefers the stored snapshot over
+    recomputing - which is right, the rebuild loses the narrative - but
+    nothing invalidated it except an explicit clear. Correct a category,
+    re-derive the roles, tighten a matcher: the ledger moves and the
+    Overview goes on publishing figures from before it did. On this ledger
+    that meant a headline spend of 21.80 lakh and a net of -16,390 while
+    the live answer was 21.20 lakh and +43,527.
+
+    Every field the analytics layer reads is in here, and nothing else, so
+    a change that cannot move a total does not throw the snapshot away.
+    """
+    with db.connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n,"
+            "       COALESCE(SUM(CAST(amount AS NUMERIC)), 0) AS total,"
+            "       COALESCE(SUM(CASE WHEN excluded = 1 THEN 1 ELSE 0 END), 0) AS ex,"
+            "       COALESCE(SUM(CASE WHEN is_mirror_leg = 1 THEN 1 ELSE 0 END), 0) AS mir,"
+            "       COALESCE(MD5(STRING_AGG("
+            "           COALESCE(flow_role, '') || COALESCE(category, ''),"
+            "           '|' ORDER BY id)), '') AS roles"
+            "  FROM transactions").fetchone()
+    return f"{row['n']}:{row['total']}:{row['ex']}:{row['mir']}:{row['roles']}"
 
 
 def clear_analysis_runs(db: Database) -> int:
@@ -1455,30 +1556,107 @@ def confirm_group(db, group_id: str) -> None:
         conn.execute("UPDATE settlement_groups SET confirmed = 1 WHERE id = ?", (group_id,))
 
 def save_settlement_groups(db, groups: list, legs: list) -> None:
+    """Record WHY a set of rows was netted into one settlement.
+
+    A settlement group is the multi-leg case `transfer_pairs` cannot hold -
+    one bank debit covering three card bills - and its reasoning is the
+    total, the residual left over and how much the matcher believed itself.
+    Without those, eleven groups on this ledger were netted out of spending
+    with nothing behind them that anyone could inspect or argue with.
+
+    Confirmed groups are left alone: those carry a human decision, and a
+    re-run of the matcher is not entitled to overwrite one.
+    """
+    # Named columns, not positional. `settlement_groups` has nine columns -
+    # `user_id`, `note` and `created_at` all carry defaults - so a bare
+    # `VALUES (?,?,?,?,?,?)` bound `kind` to `user_id` and every insert died
+    # on the uuid cast. Nothing noticed, because nothing called this.
+    g_rows = [(g.group_id, g.kind, _txt(g.total_amount), _txt(g.residual),
+               float(g.confidence), int(g.confirmed))
+              for g in groups if not g.confirmed]
+    keep = {g[0] for g in g_rows}
+    l_rows = [(l["group_id"], l["fingerprint"], l["side"])
+              for l in legs if l["group_id"] in keep]
+
+    # Same refusal as `save_transfer_pairs`, for the same reason: the
+    # matcher skips rows already flagged internal, so a second pass over a
+    # settled ledger reports no groups, and clearing the table from that
+    # report throws away the only record of why eleven groups were netted.
+    if not g_rows:
+        with db.connection() as conn:
+            referenced = conn.execute(
+                "SELECT COUNT(*) c FROM transactions "
+                "WHERE COALESCE(transfer_pair_id, '') != ''").fetchone()["c"]
+        if referenced:
+            log.warning(
+                "Refusing to clear settlement_groups: no groups were supplied "
+                "but %d transactions still reference a netting group.",
+                referenced)
+            return
+
     with db.connection() as conn:
-        conn.execute("DELETE FROM settlement_group_legs WHERE group_id IN (SELECT id FROM settlement_groups WHERE confirmed = 0)")
+        conn.execute(
+            "DELETE FROM settlement_group_legs WHERE group_id IN "
+            "(SELECT id FROM settlement_groups WHERE confirmed = 0)")
         conn.execute("DELETE FROM settlement_groups WHERE confirmed = 0")
-        g_rows = [(g.group_id, g.kind, _txt(g.total_amount), _txt(g.residual), g.confidence, int(g.confirmed)) for g in groups if not g.confirmed]
         if g_rows:
-            conn.executemany("INSERT INTO settlement_groups VALUES (?,?,?,?,?,?)", g_rows)
-        l_rows = [(l["group_id"], l["fingerprint"], l["side"]) for l in legs]
+            conn.executemany(
+                "INSERT INTO settlement_groups "
+                "(id, kind, total_amount, residual, confidence, confirmed) "
+                "VALUES (?,?,?,?,?,?)", g_rows)
         if l_rows:
-            conn.executemany("INSERT INTO settlement_group_legs VALUES (?,?,?)", l_rows)
+            conn.executemany(
+                "INSERT INTO settlement_group_legs (group_id, fingerprint, side) "
+                "VALUES (?,?,?)", l_rows)
 
 def get_custom_categories(db) -> list[dict]:
     with db.connection() as conn:
         rows = conn.execute("SELECT * FROM custom_categories ORDER BY name ASC").fetchall()
     return [_row_dict(r) for r in rows]
 
-def add_custom_category(db, name: str, color: str = "#6b7280", icon: str = "Tag") -> None:
+def add_custom_category(db, name: str, color: str = "#6b7280",
+                        icon: str = "Tag", group_name: str = "Other") -> None:
     with db.connection() as conn:
-        conn.execute("INSERT INTO custom_categories (name, color, icon)"
-                     " VALUES (?, ?, ?) ON CONFLICT (user_id, name) DO NOTHING",
-                     (name.strip().lower(), color, icon))
+        conn.execute("INSERT INTO custom_categories (name, color, icon, group_name)"
+                     " VALUES (?, ?, ?, ?) ON CONFLICT (user_id, name) DO UPDATE"
+                     " SET color = EXCLUDED.color, icon = EXCLUDED.icon,"
+                     "     group_name = EXCLUDED.group_name",
+                     (name.strip().lower(), color, icon, group_name))
 
-def delete_custom_category(db, name: str) -> None:
+
+def custom_category_groups(db) -> dict[str, str]:
+    """Which group each user-defined category belongs to."""
     with db.connection() as conn:
-        conn.execute("DELETE FROM custom_categories WHERE name = ?", (name.strip().lower(),))
+        return {r["name"]: r["group_name"] for r in conn.execute(
+            "SELECT name, group_name FROM custom_categories")}
+
+
+def count_transactions_in_category(db, name: str) -> int:
+    with db.connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM transactions WHERE category = ?",
+            (name.strip().lower(),)).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def delete_custom_category(db, name: str, reassign_to: str | None = None) -> int:
+    """Remove a category, moving anything filed under it somewhere real.
+
+    Deleting the row alone stranded every transaction using it: the picker
+    stopped offering the name, validation then refused to accept it, and the
+    rows kept rendering under a category that no longer existed and could
+    not be re-selected. Whatever is filed under it moves first.
+    """
+    name = name.strip().lower()
+    moved = 0
+    with db.connection() as conn:
+        if reassign_to:
+            cur = conn.execute(
+                "UPDATE transactions SET category = ? WHERE category = ?",
+                (reassign_to.strip().lower(), name))
+            moved = cur.rowcount or 0
+        conn.execute("DELETE FROM custom_categories WHERE name = ?", (name,))
+    return moved
 
 def update_recurring_series_override(db, series_id: str, payload: dict) -> None:
     with db.connection() as conn:
@@ -1496,11 +1674,19 @@ def update_recurring_series_override(db, series_id: str, payload: dict) -> None:
 
 import uuid
 
-def save_claim(db, direction: str, counterparty: str, origin_fingerprint: str, amount, opened_on: str) -> str:
+def save_claim(db, direction: str, counterparty: str, origin_fingerprint: str,
+               amount, opened_on: str, note: str = "") -> str:
+    """Open a claim.
+
+    `note` is stored. It used to be accepted by the endpoint, validated by
+    the request model, and then dropped on the floor here - the column was
+    written as "" regardless - so the one field explaining WHY an expense
+    was disowned never survived the request that set it.
+    """
     claim_id = str(uuid.uuid4())
     with db.connection() as conn:
         conn.execute("INSERT INTO claims (id, direction, counterparty, origin_fingerprint, amount, settled_amount, status, basis, opened_on, closed_on, note) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
-            claim_id, direction, counterparty, origin_fingerprint, _txt(amount), "0", "open", "accrual", opened_on, None, ""
+            claim_id, direction, counterparty, origin_fingerprint, _txt(amount), "0", "open", "accrual", opened_on, None, note or ""
         ))
     return claim_id
 
@@ -2491,6 +2677,116 @@ def save_portfolio_statement(db: Database, statement: Any, account_id: str | Non
     return statement_id
 
 
+def transfer_pairs_summary(db: Database) -> dict[str, Any]:
+    """The netted transfers, read back from the ledger.
+
+    The dashboard used to render this only from a `transfer_report` the
+    pipeline leaves in memory, so any rebuild that did not re-run the full
+    graph showed "0 pairs, 0 double-counting prevented" while the ledger
+    held 70 pairs and 9.78 lakh of netted movement. The pairs are persisted;
+    nothing was reading them.
+    """
+    with db.connection() as conn:
+        stored = {r["pair_id"]: dict(r) for r in conn.execute(
+            "SELECT pair_id, debit_txn_id, credit_txn_id, amount, day_gap,"
+            "       kind, confidence FROM transfer_pairs")}
+        # Grouped from the TRANSACTIONS, which are the source of truth for
+        # what was actually netted. The pairs table is the detail record and
+        # it drifts: `transfer_pair_id` is bare TEXT with no foreign key, and
+        # the two sides are written by different code paths, so on this
+        # ledger 108 rows across 45 groups were netted out of spending
+        # against pair rows that no longer existed, while 34 pair rows
+        # pointed at nothing. Counting the table reported 70 pairs and 7.58
+        # lakh; the ledger had 81 groups and more money in them.
+        #
+        # Reading the transactions also fixes what the table never
+        # represented: it stores one debit and one credit, so a multi-leg
+        # settlement - one bank debit covering three cards - was a group of
+        # four counted as a pair of two.
+        # The multi-leg groups live in their own table, because a settlement
+        # of one debit against three cards is not a pair and never fitted
+        # `transfer_pairs`. Both are evidence; asking only one of them
+        # reported eleven fully-recorded groups as unexplained.
+        settled = {r["id"]: dict(r) for r in conn.execute(
+            "SELECT id, kind, total_amount, residual, confidence, confirmed"
+            "  FROM settlement_groups")}
+        grouped = [dict(r) for r in conn.execute(
+            "SELECT transfer_pair_id AS pair_id,"
+            "       COUNT(*) AS legs,"
+            "       SUM(CASE WHEN direction = 'debit'"
+            "                THEN CAST(amount AS NUMERIC) ELSE 0 END) AS amount"
+            "  FROM transactions"
+            " WHERE COALESCE(transfer_pair_id, '') != ''"
+            " GROUP BY transfer_pair_id")]
+
+    pairs = []
+    total = Decimal("0")
+    unbacked = 0
+    for row in grouped:
+        detail = stored.get(row["pair_id"]) or {}
+        group = settled.get(row["pair_id"]) or {}
+        if not detail and not group:
+            unbacked += 1
+        try:
+            amount = Decimal(str(row.get("amount") or 0))
+        except Exception:
+            amount = Decimal("0")
+        total += amount
+        pairs.append({
+            "pair_id": row["pair_id"],
+            "debit_txn_id": detail.get("debit_txn_id"),
+            "credit_txn_id": detail.get("credit_txn_id"),
+            "amount": str(amount),
+            "legs": int(row.get("legs") or 0),
+            "day_gap": detail.get("day_gap"),
+            "kind": detail.get("kind") or group.get("kind") or "",
+            "confidence": detail.get("confidence", group.get("confidence")),
+            "residual": group.get("residual"),
+            # Netted, but with nothing recorded about WHY. Reported rather
+            # than hidden: a row removed from spending on evidence that
+            # cannot be produced is exactly the thing this app exists not
+            # to do.
+            "evidence_missing": not detail and not group,
+        })
+
+    return {
+        "pairs": pairs,
+        "total": total,
+        "double_count_avoided": total,
+        "evidence_missing": unbacked,
+        # Pair rows nothing points at any more. Harmless to totals, but they
+        # are what makes the two counts disagree, so they are said out loud.
+        "orphan_pair_rows": len([p for p in stored if p not in
+                                 {row["pair_id"] for row in grouped}]),
+        "settlement_groups": len(settled),
+    }
+
+
+def reconciliation_counts(db: Database) -> dict[str, int]:
+    """How many statements actually passed the balance check.
+
+    Read from `recon_status`, which is where the gate records its verdict -
+    not from `source_files.parse_status`, which answers a different question
+    ("could this file be read at all"). The dashboard used to count
+    `parse_status == 'unreconciled'`, a value nothing ever writes, so the
+    "files unreconciled" figure was structurally zero while fourteen
+    statements were failing - one of them by a lakh.
+
+    `not_applicable` is reported separately and never folded into `passed`: a
+    statement that declared no opening or closing balance was not checked,
+    and saying it reconciled is a claim nobody made.
+    """
+    counts = {"passed": 0, "failed": 0, "not_applicable": 0}
+    with db.connection() as conn:
+        for table in ("statements", "portfolio_statements"):
+            for row in conn.execute(
+                    f"SELECT recon_status, COUNT(*) AS n FROM {table} "
+                    f"GROUP BY recon_status"):
+                key = str(row["recon_status"] or "not_applicable")
+                counts[key] = counts.get(key, 0) + int(row["n"])
+    return counts
+
+
 def get_holdings(db: Database, latest_only: bool = True) -> list[dict[str, Any]]:
     """Current positions.
 
@@ -2984,6 +3280,53 @@ def _position_value(field: str, value: Any) -> Any:
         parsed = _d(value)
         return parsed.isoformat() if parsed else None
     return str(value)
+
+
+def repair_position_account_keys(db: Database, accounts: Sequence[Any]) -> int:
+    """Write back the account key for items that only resolve by label.
+
+    `position_items.account_key` was added by migration 0006 to be the
+    durable link - `account_id` holds a raw uuid, and `staging/process`
+    mints fresh uuids on every rebuild, so every stored reference rots. The
+    migration's own backfill could not run: migrations execute with no
+    tenant bound, so RLS returned no rows and every key stayed empty.
+
+    So the column exists, is documented as the fix, and is blank on all 35
+    rows - the resolution happens at read time through the display label
+    instead, which works until somebody renames an account. Writing the key
+    back the first time a row resolves is what turns that fallback into the
+    repair it was meant to be.
+
+    Returns how many rows were healed.
+    """
+    from ..pipeline.fingerprint import account_key
+
+    by_label: dict[str, Any] = {}
+    for account in accounts:
+        try:
+            by_label.setdefault(account.display_name(), account)
+        except Exception:            # pragma: no cover - defensive
+            continue
+
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT id, label FROM position_items "
+            "WHERE COALESCE(account_key, '') = ''").fetchall()
+        healed = []
+        for row in rows:
+            account = by_label.get(row["label"] or "")
+            if account is None:
+                continue        # bureau-only, or genuinely unlinkable
+            key = account_key(account)
+            if key:
+                healed.append((key, account.id, row["id"]))
+        if healed:
+            conn.executemany(
+                "UPDATE position_items SET account_key = ?, account_id = ? "
+                "WHERE id = ?", healed)
+    if healed:
+        log.info("Repaired %d position item account links.", len(healed))
+    return len(healed)
 
 
 def save_position_item(db: Database, item: dict[str, Any]) -> str:

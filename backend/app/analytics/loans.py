@@ -245,7 +245,14 @@ def project_loan(
     # instalment does not acquire a phantom month behind it.
     schedule = schedule[:months] if months else schedule
     total_interest = sum((r.interest for r in schedule), Decimal("0"))
-    total_payable = sum((r.emi for r in schedule), Decimal("0"))
+    # What is left to pay is the debt plus the interest on it - NOT
+    # instalments x EMI. Those differ whenever the last instalment is a stub,
+    # which is most loans and always one whose term the lender has stated:
+    # truncating the schedule to a lender-stated term left the final row
+    # short, so the screen showed outstanding 67,22,779 + interest 38,65,530
+    # beside a "total payable" of 1,05,65,280 - three figures that cannot all
+    # be true, 23,029 apart.
+    total_payable = outstanding + total_interest
     next_interest = schedule[0].interest if schedule else Decimal("0")
 
     return LoanProjection(

@@ -17,14 +17,17 @@ tie out against the original statement.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import Decimal
 
+from ..rules import formats
 from ..models.schemas import (Account, AccountType, Category, ConfidenceSource,
-                              Direction, LIABILITY_TYPES, Transaction)
+                              Direction, LIABILITY_TYPES, LOAN_TYPES,
+                              Transaction)
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +38,17 @@ MAX_DAY_GAP = 4
 #: Amounts must match this closely. Transfers move an exact figure; anything
 #: looser starts pairing unrelated transactions of similar size.
 AMOUNT_TOLERANCE = Decimal("0.01")
+
+
+#: What `category_rule` says on a category a MATCHER assigned rather than a
+#: narration rule. Pairing rewrites the category of both legs - a debit to a
+#: broker becomes "cc_payment" because the row it was paired with was a card
+#: - and `ConfidenceSource.RULE` cannot tell that apart from a rule that
+#: actually read the narration. So when the pairing is later withdrawn the
+#: label it wrote survives it, and the row goes on being counted as a card
+#: settlement with nothing left to settle. Naming the source is what lets
+#: `enrich` release the label along with the pairing.
+PAIRING_RULE = "transfer-pairing"
 
 
 @dataclass
@@ -127,6 +141,7 @@ def detect_transfers(
             leg.transfer_pair_id = pair_id
             leg.category = cat
             leg.category_source = ConfidenceSource.RULE
+            leg.category_rule = PAIRING_RULE
             leg.category_confidence = 0.95
 
         # The debit is the cash actually leaving; the credit is the receiving
@@ -160,6 +175,61 @@ def detect_transfers(
             f"spending totals - without this, that amount would be counted twice."
         )
     return report
+
+
+#: A narration that identifies a counterparty the holder paid: a UPI
+#: handle, a VPA, or a person/merchant name in the payee slot. Present on a
+#: purchase, absent from a bill payment - which names a rail ("BBPS-PAYMENT
+#: INR"), an issuer, or nothing readable at all.
+_NAMES_A_PAYEE = re.compile(
+    r"\bUPI[_/]|@[a-z]{2,}|\bVPA\b|\bP2[AMP]\b",
+    re.IGNORECASE,
+)
+
+
+def _names_a_payee(txn: Transaction) -> bool:
+    """Does this card row name who was paid, rather than what settled it?"""
+    text = txn.normalized_description or txn.raw_description or ""
+    if formats.BILL_PAYMENT.search(text):
+        return False        # says "payment" outright; that wins.
+    return bool(_NAMES_A_PAYEE.search(text))
+
+
+#: A payee that identifies the money's real destination, where that
+#: destination is not a credit card. Kept in step with the INVESTMENT rules
+#: in `categorize.rules`, which is where these names are already known.
+#:
+#: Leading word boundary only. A UPI handle welds the brand to a suffix -
+#: the row that started this reads "BR/zerodhabroking/XXXX9584/..." - so a
+#: trailing boundary refuses the exact strings this exists to catch. The
+#: leading one is what keeps a brand from matching inside another word.
+_NAMED_ELSEWHERE = re.compile(
+    r"\bZERODHA|\bGROWW|\bUPSTOX|\bANGEL\s*ONE|\bKUVERA|"
+    r"\bSMALLCASE|\bINDMONEY|\bBSE\s*STAR\s*MF|\bBSESTARMF|"
+    r"\bKFINTECH|\bCAMSONLINE|\bMF\s*CENTRAL|\bDEMAT|"
+    r"\bNSE\s*CLEARING|\bINDIANCLEA",
+    re.IGNORECASE,
+)
+
+
+def _names_another_destination(txn: Transaction) -> bool:
+    """Does this debit say where it went, and say somewhere that is not a card?
+
+    A settlement is inferred from amount and timing, and on a large ledger
+    those coincide often. The narration is the one piece of direct evidence
+    about where the money actually went, and it was not being read: a 64,000
+    UPI transfer to "zerodhabroking" was adopted as the funding leg of a
+    group whose other members were an HSBC and an ICICI card bill summing to
+    63,820 - close enough on the numbers, and wrong. It took 64,000 out of
+    "invested" and attributed two real card payments to a transfer that had
+    nothing to do with them.
+
+    A row that names its payee is not available to be guessed about. It can
+    still be a card payment when the narration says nothing either way,
+    which is the ordinary case this matcher is for.
+    """
+    text = f"{txn.merchant or ''} {txn.raw_description or ''}"
+    return bool(_NAMED_ELSEWHERE.search(text))
 
 
 def _pair_card_payment_mirrors(
@@ -203,11 +273,37 @@ def _pair_card_payment_mirrors(
         if txn.account_id not in card_ids or txn.is_internal_transfer:
             continue
 
+        # A card row that plainly names a MERCHANT is a purchase, and a
+        # purchase is not a bill being settled.
+        #
+        # This loop took every row on a credit-card account as a candidate,
+        # because the docstring above explains that a payment is often
+        # parsed as a debit and so direction cannot be the test. That is
+        # right, but nothing was put in its place - so an ordinary card
+        # purchase was eligible, and a 90 paan-shop charge on a Yes Bank
+        # card got paired against a same-day 90 UPI transfer to a broker.
+        # Both were then relabelled "credit card payment".
+        #
+        # Stated as a refusal rather than a requirement, deliberately. The
+        # rows this function exists for are the ones whose narration did NOT
+        # survive extraction - the HDFC card writes a 1.13 lakh payment as
+        # "+ C" - so demanding positive evidence of a payment would throw
+        # away exactly the case it was written to catch. What can be said
+        # with confidence is the other direction: a row that names a UPI
+        # payee is that payee's purchase, whatever else is true.
+        if txn.direction == Direction.DEBIT and _names_a_payee(txn):
+            continue
+
         candidates = [
             c for c in cash_debits.get(txn.amount, ())
             if id(c) not in claimed
             and not c.is_internal_transfer
             and abs((c.txn_date - txn.txn_date).days) <= MAX_DAY_GAP
+            # ...and the funding row must not name somewhere else it went.
+            # Amount and timing coincide constantly on a large ledger; a
+            # narration that names a broker is direct evidence that beats
+            # both. See settlement._names_another_destination.
+            and not _names_another_destination(c)
         ]
         if not candidates:
             continue
@@ -221,6 +317,7 @@ def _pair_card_payment_mirrors(
             leg.transfer_pair_id = pair_id
             leg.category = Category.CC_PAYMENT
             leg.category_source = ConfidenceSource.RULE
+            leg.category_rule = PAIRING_RULE
             leg.category_confidence = 0.85
         # The bank is where the money actually moved.
         cash_leg.is_mirror_leg = False
@@ -301,11 +398,13 @@ def _pair_investment_mirrors(
         txn.transfer_pair_id = pair_id
         txn.category = Category.INVESTMENT
         txn.category_source = ConfidenceSource.RULE
+        txn.category_rule = PAIRING_RULE
         txn.category_confidence = 0.9
 
         cash_leg.transfer_pair_id = pair_id
         cash_leg.category = Category.INVESTMENT
         cash_leg.category_source = ConfidenceSource.RULE
+        cash_leg.category_rule = PAIRING_RULE
         cash_leg.category_confidence = 0.9
 
         claimed.add(id(cash_leg))
@@ -386,7 +485,8 @@ def find_duplicate_transactions(transactions: list[Transaction]) -> list[Transac
 REVERSAL_MAX_DAY_GAP = 3
 
 
-def detect_reversals(transactions: list[Transaction]) -> int:
+def detect_reversals(transactions: list[Transaction],
+                     accounts: dict[str, Account] | None = None) -> int:
     """Cancel out a failed charge against its own same-account refund.
 
     A payment gateway that fails a charge often posts BOTH the debit and its
@@ -404,9 +504,27 @@ def detect_reversals(transactions: list[Transaction]) -> int:
     requiring the same merchant too is what keeps this from cancelling two
     genuinely unrelated transactions that happen to match on size and timing.
     """
+    # A loan account's own statement is out of scope entirely.
+    #
+    # Those rows are the LENDER's bookkeeping - "EMI due for Inst.43" on one
+    # line and "Receipt Chq No..." on the next - so every instalment is a
+    # same-day, same-amount, opposite-direction pair by construction. They
+    # are already excluded from every total as LENDER_LEDGER, so cancelling
+    # them changes nothing and flagging them buries the real ambiguous pairs
+    # under 114 rows of routine loan servicing.
+    #
+    # Taken from the ACCOUNT because this runs before roles are stamped -
+    # `flow_role` is not populated yet at step 2c of the pipeline.
+    lender_accounts = {
+        account_id for account_id, account in (accounts or {}).items()
+        if getattr(account, "account_type", None) in LOAN_TYPES
+    }
+
     by_account: dict[str, list[Transaction]] = defaultdict(list)
     for txn in transactions:
         if txn.is_internal_transfer or txn.excluded:
+            continue
+        if txn.account_id in lender_accounts:
             continue
         by_account[txn.account_id or ""].append(txn)
 
@@ -417,27 +535,104 @@ def detect_reversals(transactions: list[Transaction]) -> int:
         claimed: set[int] = set()
 
         for credit in credits:
-            candidates = [
+            near = [
                 d for d in debits
                 if id(d) not in claimed
                 and d.amount == credit.amount
                 and abs((d.txn_date - credit.txn_date).days) <= REVERSAL_MAX_DAY_GAP
-                and _same_merchant(d, credit)
             ]
-            if not candidates:
+            if not near:
                 continue
-            best = min(candidates,
-                      key=lambda d: abs((d.txn_date - credit.txn_date).days))
-            claimed.add(id(best))
 
-            best.excluded = True
-            credit.excluded = True
-            note = "Reversed: a failed charge refunded the same day, not real spending."
-            best.note = f"{best.note} {note}".strip()
-            credit.note = f"{credit.note} {note}".strip()
-            reversed_count += 1
+            # Either kind of evidence will do, and the marker is the
+            # stronger of the two.
+            #
+            # Requiring the merchant to match missed the case the rails
+            # actually produce: a UPI reversal does not repeat the payee, it
+            # PREFIXES a marker to it - "UPI/Parviom Te/parkplus.payu@"
+            # reversed by "UPI/RFNDPARKPL/parkplusio.pay", and
+            # "UPI/DUMMY NAME/XXXX0004" by "UPI/RVSLDUMMY /XXXX0004". The
+            # merchant tokens differ, so `_same_merchant` said no, and both
+            # halves stood: the debit counted as spending and the credit as
+            # income, for money that never moved.
+            candidates = [d for d in near
+                          if _same_merchant(d, credit) or _reversal_of(credit, d)]
+            if candidates:
+                best = min(candidates,
+                          key=lambda d: abs((d.txn_date - credit.txn_date).days))
+                claimed.add(id(best))
+
+                best.excluded = True
+                credit.excluded = True
+                note = ("Reversed: a failed charge refunded the same day, "
+                        "not real spending.")
+                best.note = f"{best.note} {note}".strip()
+                credit.note = f"{credit.note} {note}".strip()
+                reversed_count += 1
+                continue
+
+            # Same account, same amount, same day, opposite directions - and
+            # nothing to say whether it is one cancelled transaction or two
+            # real ones. Left counted as BOTH an expense and income, which is
+            # the one reading that is wrong either way: a 55,604 debit at
+            # Vijay Sales against a same-day credit from the same store put
+            # 55,604 on each side of this ledger for a purchase that was
+            # probably returned at the till.
+            #
+            # Not cancelled, because the evidence is not there - flagged, so
+            # the guess belongs to the person who can actually check it.
+            best = min(near, key=lambda d: abs((d.txn_date - credit.txn_date).days))
+            claimed.add(id(best))
+            reason = (
+                "This is the same amount, the same day and the same account "
+                "as its opposite - it looks like a cancelled transaction, but "
+                "nothing on either row says so. Counted as real spending AND "
+                "real money in until you confirm."
+            )
+            for leg in (best, credit):
+                if not leg.needs_review:
+                    leg.needs_review = True
+                    leg.review_reason = reason
 
     return reversed_count
+
+
+#: Markers a rail glues onto the payee when it sends money back. Matched as
+#: a prefix on a description TOKEN, never anywhere in the string: "RETURN"
+#: inside "RETURNS PVT LTD" is a company name, not a reversal.
+_REVERSAL_MARKERS = ("RVSL", "RFND", "REVERSAL", "REFUND", "RETURN", "REV")
+
+
+def _reversal_of(credit: Transaction, debit: Transaction) -> bool:
+    """Does this credit's narration announce itself as undoing that debit?
+
+    True when the credit carries a reversal marker AND enough of the debit's
+    payee survives alongside it to tie the two together. Both halves are
+    needed: the marker alone would cancel any refund against any same-sized
+    debit that happened to land the same day.
+    """
+    text = (credit.raw_description or "").upper()
+    tokens = re.split(r"[^A-Z0-9]+", text)
+    if not any(tok.startswith(m) for tok in tokens for m in _REVERSAL_MARKERS):
+        return False
+
+    # The payee, as the rail writes it: alphabetic runs of 4+ characters,
+    # which skips the masked digits and the two-letter rail codes that every
+    # UPI narration carries and that would otherwise match anything.
+    def _words(txn: Transaction) -> set[str]:
+        raw = f"{txn.merchant or ''} {txn.raw_description or ''}".upper()
+        return {w for w in re.findall(r"[A-Z]{4,}", raw)
+                if w not in {"UPI", "BANK", "NEFT", "IMPS", "RTGS"}}
+
+    debit_words = _words(debit)
+    if not debit_words:
+        return False
+    credit_words = _words(credit)
+    # A marker is often welded to the payee ("RVSLDUMMY"), so a plain
+    # intersection misses it - test containment both ways.
+    return any(w in c or c in w
+               for w in debit_words for c in credit_words
+               if len(w) >= 4 and len(c) >= 4)
 
 
 def _same_merchant(a: Transaction, b: Transaction) -> bool:
@@ -520,6 +715,33 @@ def _is_same_row(a: Transaction, b: Transaction) -> bool:
     """
     if not _balances_agree(a, b):
         return False
+
+    # With no running balance on either row, the RAW narration is the only
+    # evidence there is - and it is the field that still carries the bank
+    # reference.
+    #
+    # This function's own reasoning says "two real transactions would carry
+    # different bank references", and that is true; but it was reading
+    # `normalized_description`, which is precisely where normalisation
+    # strips the reference out. Three 26 payments to one pan shop on one day
+    # all normalise to "UPI VIJAY BHOJA SHETTY IND" while their raw rows read
+    # "...Ref No: RT260490388000420000075" and "...RT260490388000770000358" -
+    # different payments, deduplicated down to one. 28 real rows on this
+    # ledger, and the shape is routine: any card statement with no running
+    # balance and a habit of small repeat payments hits it.
+    #
+    # A prefix still counts as one row: that is the truncation case, where
+    # two extractions cut the same narration at different lengths. Anything
+    # else, with no balance to appeal to, is two transactions.
+    raw_a = (a.raw_description or "").strip()
+    raw_b = (b.raw_description or "").strip()
+    no_balance = a.balance_after is None and b.balance_after is None
+    if no_balance and raw_a and raw_b and raw_a != raw_b:
+        short_raw, long_raw = ((raw_a, raw_b) if len(raw_a) <= len(raw_b)
+                               else (raw_b, raw_a))
+        if not long_raw.startswith(short_raw):
+            return False
+
     da = (a.normalized_description or "").strip()
     db = (b.normalized_description or "").strip()
     if da[:60] == db[:60]:

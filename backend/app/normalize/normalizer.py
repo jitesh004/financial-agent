@@ -1491,12 +1491,22 @@ def _infer_balances_from_rows(statement: Statement, account_type: AccountType) -
         if is_liability:
             effect = -effect
         statement.opening_balance = first.balance_after - effect
+        statement.extra["derived_opening_balance"] = "1"
         statement.parse_warnings.append(
             "Opening balance was not stated; derived from the first row's "
             "running balance."
         )
 
+    derived_opening = statement.extra.get("derived_opening_balance") == "1"
+
     if statement.closing_balance is None:
+        if derived_opening:
+            # BOTH ends derived from the same rows the gate is about to
+            # check. That comparison cannot fail - it is the rows against
+            # themselves - so the gate must report that it could not run,
+            # not that everything balanced. Nine statements here were
+            # recorded as "passed" on exactly this tautology.
+            statement.extra["reconciliation_vacuous"] = "1"
         statement.closing_balance = with_balance[-1].balance_after
         if not is_liability:
             statement.extra["derived_current_balance"] = str(statement.closing_balance)

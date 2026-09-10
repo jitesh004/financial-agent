@@ -82,6 +82,13 @@ class ForecastResult:
     first_shortfall_month: str | None = None
     confidence: str = "low"
     assumptions: list[str] = field(default_factory=list)
+    #: Ids of the recurring series the projection actually counted. The
+    #: Forecast screen lists every active series it can find, which is a
+    #: longer list - a sub-0.5 series and a credit the app could not
+    #: identify as income are both shown and neither is projected. Naming
+    #: the ones that count is what stops the page listing 14 commitments
+    #: beside a total built from 5 of them.
+    counted_series: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -110,14 +117,23 @@ def forecast(
     # down and make the forecast quietly optimistic about spending.
     history = monthly[:-1] if len(monthly) > 2 else monthly
 
-    committed_income, committed_outflow = _committed_flows(series)
+    committed_income, committed_outflow, counted = _committed_flows(series)
+    result.counted_series = counted
     discretionary = _discretionary_history(history, series)
 
     expected, low, high = _distribution(discretionary)
 
+    # Against TYPICAL income, the same denominator the Budget uses. Dividing
+    # by contracted income alone made this 64.2% where the Budget said 43.4%
+    # - one figure, one name, twenty-one points apart, because one screen
+    # counted only the salary and the other counted everything that arrives.
+    # Over every month, not `history` - the Budget's median covers all of
+    # them, and dropping the partial last one here would leave the two
+    # figures a few points apart for no reason a reader could discover.
+    typical_income = _typical_monthly_income(monthly) or committed_income
     result.commitment_ratio = (
-        round(float(committed_outflow / committed_income), 3)
-        if committed_income else 0.0
+        round(float(committed_outflow / typical_income), 3)
+        if typical_income else 0.0
     )
     if committed_outflow > 0:
         result.runway_months = round(float(opening_balance / committed_outflow), 1)
@@ -160,7 +176,24 @@ def forecast(
     return result
 
 
-def _committed_flows(series: list[RecurringSeries]) -> tuple[Decimal, Decimal]:
+def _typical_monthly_income(history: list[MonthlyFlow]) -> Decimal:
+    """The middle month's income, matching `analytics.budget`.
+
+    Median rather than mean for the reason it always is here: one bonus
+    month should not redefine what a normal month brings in.
+    """
+    values = sorted(m.income for m in history if m.income)
+    if not values:
+        return ZERO
+    mid = len(values) // 2
+    if len(values) % 2:
+        return values[mid]
+    return q((values[mid - 1] + values[mid]) / 2)
+
+
+def _committed_flows(
+    series: list[RecurringSeries],
+) -> tuple[Decimal, Decimal, list[str]]:
     """Monthly-equivalent totals of active recurring income and outflow.
 
     Two exclusions matter:
@@ -175,15 +208,23 @@ def _committed_flows(series: list[RecurringSeries]) -> tuple[Decimal, Decimal]:
     """
     income = ZERO
     outflow = ZERO
+    counted: list[str] = []
     for s in series:
-        if not s.is_active or s.confidence < 0.5:
+        # The constant, not a second literal. This test read `< 0.5` while
+        # `_confidence` counted series at `>= COMMITTED_SERIES_CONFIDENCE`
+        # (0.6), so the forecast added up one set of commitments and then
+        # graded its own trustworthiness against a different one. Two
+        # answers to "is this committed money?" inside one module.
+        if not s.is_active or s.confidence < COMMITTED_SERIES_CONFIDENCE:
             continue
         if s.direction == Direction.CREDIT:
             if s.category in INCOME_CATEGORIES:
                 income += s.monthly_equivalent
+                counted.append(s.id)
         elif s.category != Category.CC_PAYMENT:
             outflow += s.monthly_equivalent
-    return q(income), q(outflow)
+            counted.append(s.id)
+    return q(income), q(outflow), counted
 
 
 def _discretionary_history(
@@ -195,7 +236,7 @@ def _discretionary_history(
     What's left is the variable part - the only part worth modelling as a
     distribution, since the committed part doesn't vary.
     """
-    _, committed_outflow = _committed_flows(series)
+    _, committed_outflow, _counted = _committed_flows(series)
     out = []
     for m in history:
         # total_outflow, not spend: spend excludes EMIs and SIPs, while
@@ -264,7 +305,11 @@ def _assumptions(
     return [
         f"Based on {len(history)} complete month(s) of history.",
         f"Assumes {len(active)} recurring item(s) continue unchanged: "
-        f"{committed_income:,.0f} in and {committed_outflow:,.0f} out per month.",
+        f"{committed_income:,.0f} in and {committed_outflow:,.0f} out per "
+        f"month."
+        + (f" {len(series) - len(active)} other series were left out - too "
+           f"irregular to project, or a credit nothing could identify as "
+           f"income." if len(series) > len(active) else ""),
         "Discretionary spending is projected from your own observed range, not "
         "from a target or a budget.",
         "Does not account for inflation, salary changes, job changes, tax events, "

@@ -383,6 +383,10 @@ def run(
                 for c, r in zip(opening.calls, opening.results)))
 
     task = (question.strip() or agent.question)
+    #: The tools the previous step asked for, and how many times running
+    #: the model has repeated them. See the loop guard below.
+    previous_signature: tuple[str, ...] = ()
+    repeats = 0
 
     for index in range(1, steps_allowed + 1):
         last_turn = index == steps_allowed
@@ -458,6 +462,34 @@ def run(
 
         step.seconds = round(time.monotonic() - turn_started, 2)
         run_record.steps.append(step)
+
+        # A model that asks for the same tools it just asked for is not
+        # making progress; it is stuck, and the only thing left to spend
+        # is the budget. Half of all runs on this workspace ended that
+        # way - steps 4 through 8 issuing the identical set with the
+        # identical reasoning, then a silent give-up at step 10. Say so
+        # the first time and stop the second: an agent that has re-read
+        # the same data three times learns nothing from a fourth.
+        signature = tuple(sorted(c["tool"] for c in step.calls))
+        if signature and signature == previous_signature:
+            repeats += 1
+            if repeats >= 2:
+                run_record.status = "looping"
+                run_record.error = (
+                    "Asked for the same data three times without reaching "
+                    "a conclusion, so the run was stopped rather than left "
+                    "to use up its remaining steps.")
+                log.warning("agent %s looping on %s; stopped at step %d",
+                            agent.key, signature, index)
+                break
+            transcript.append(
+                "You have just requested the same tools as the previous "
+                "step, and the results have not changed. Do not call them "
+                "again - answer with what you already have, or say what "
+                "is missing.")
+        else:
+            repeats = 0
+        previous_signature = signature
         transcript.append(
             f"Step {index}. You said: {step.thought}\n" + "\n".join(lines))
         transcript = _trim(transcript, budget.max_transcript_chars)
@@ -465,7 +497,12 @@ def run(
         # The loop finished without breaking, so the budget ran out.
         run_record.status = "exhausted"
 
-    if run_record.answer is None and run_record.status != "failed":
+    # "looping" is a diagnosis, not a synonym for running out - it says the
+    # run was CUT SHORT because it had stopped making progress, and burying
+    # that under "exhausted" would hide the one detail that explains why
+    # there is no answer.
+    if run_record.answer is None and run_record.status not in {"failed",
+                                                               "looping"}:
         run_record.status = "exhausted"
         run_record.error = run_record.error or (
             f"The agent used all {steps_allowed} of its steps without "
@@ -481,6 +518,13 @@ def run(
         caveat = verify.caveat_for(report)
         if caveat:
             run_record.answer.setdefault("caveats", []).append(caveat)
+            # Also as structured data, so the screen can put it ABOVE the
+            # headline instead of in a muted list underneath it. The check
+            # worked on the run that reported a 14,34,500 debt this holder
+            # does not have - it named all three invented figures - but the
+            # invention was the first thing on screen in large type and the
+            # correction was the last thing in small grey text.
+            run_record.answer["unverified_figures"] = list(report.unverified)
 
     run_record.seconds = round(time.monotonic() - started, 2)
     run_record.finished_at = _now()

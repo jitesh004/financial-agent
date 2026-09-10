@@ -43,6 +43,11 @@ export default function Ledger() {
   const [search, setSearch] = useRouteParam('q', '');
   const settledSearch = useDebounced(search);
 
+  // Rows belonging to a lender's own statement are held back by the API
+  // unless a role is asked for by name. Off by default, exactly as the
+  // server intends; the notice below the table is what turns it on.
+  const [lenderLedger, setLenderLedger] = useState(false);
+
   const [sortBy, setSortBy] = useState('date');
   const [sortDir, setSortDir] = useState('desc');
   const [page, setPage] = useState(0);
@@ -63,7 +68,7 @@ export default function Ledger() {
   const inScope = useMemo(() => activeView.accounts(accounts), [activeView, accounts]);
   const scopeIds = useMemo(() => inScope.map((a) => a.id), [inScope]);
 
-  useEffect(() => { setPage(0); }, [view, category, rail, sortBy, sortDir, paramsKey, settledSearch]);
+  useEffect(() => { setPage(0); }, [view, category, rail, sortBy, sortDir, paramsKey, settledSearch, lenderLedger]);
 
   const accountParam = scopeIds.length ? scopeIds.join(',') : '__none__';
   const pageSize = Number(prefs.pageSize) || 250;
@@ -77,8 +82,9 @@ export default function Ledger() {
     sort_dir: sortDir,
     offset: page * pageSize,
     limit: pageSize,
+    flow_role: lenderLedger ? 'lender_ledger' : undefined,
     ...periodParams,
-  }), [accountParam, activeView, category, rail, settledSearch, sortBy, sortDir, page, pageSize, periodParams]);
+  }), [accountParam, activeView, category, rail, settledSearch, sortBy, sortDir, page, pageSize, periodParams, lenderLedger]);
 
   const ready = !loadingAccounts;
   const key = ready ? `txns:${JSON.stringify(query)}` : null;
@@ -87,6 +93,7 @@ export default function Ledger() {
 
   const rows = data?.transactions || [];
   const total = data?.total ?? 0;
+  const withheld = data?.withheld || null;
   const pages = Math.ceil(total / pageSize) || 1;
 
   const visibleRows = useMemo(
@@ -261,10 +268,51 @@ export default function Ledger() {
         {loading && <Loading message="Querying transactions..." />}
         {error && <Callout tone="neg">{error.message}</Callout>}
 
-        {!loading && visibleRows.length === 0 && (
+        {!loading && visibleRows.length === 0 && !withheld && (
           <Empty title="No transactions match" icon="rows">
             Try adjusting your search query, filters, or selected date period.
           </Empty>
+        )}
+
+        {/* An empty table is indistinguishable from a broken filter, and
+            filtering to the ICICI personal loan produced exactly that: all
+            114 of its rows are held back, so the screen said "no
+            transactions" about an account that plainly has some. Say what
+            was withheld and why, and offer to show it. */}
+        {!loading && withheld && (
+          <div style={{ padding: '16px 20px' }}>
+            <Callout>
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div>
+                  <strong className="tabular-nums">{count(withheld.count)}</strong>
+                  {visibleRows.length === 0
+                    ? ' rows here are not shown. '
+                    : ' further rows are not shown. '}
+                  {withheld.reason}
+                </div>
+                <Button size="xs" onClick={() => setLenderLedger(true)}>
+                  Show them
+                </Button>
+              </div>
+            </Callout>
+          </div>
+        )}
+
+        {!loading && lenderLedger && (
+          <div style={{ padding: '16px 20px 0' }}>
+            <Callout tone="warn">
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div>
+                  Showing the lender&rsquo;s own ledger only. These rows are
+                  the loan&rsquo;s internal record, not money you moved, and
+                  no total on any screen counts them.
+                </div>
+                <Button size="xs" onClick={() => setLenderLedger(false)}>
+                  Back to your activity
+                </Button>
+              </div>
+            </Callout>
+          </div>
         )}
 
         {!loading && visibleRows.length > 0 && (

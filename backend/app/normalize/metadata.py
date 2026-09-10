@@ -1041,6 +1041,44 @@ _CARD_SUMMARY_LIMIT = (r"total\s*credit\s*limit", r"credit\s*limit")
 _CARD_SUMMARY_MIN_DUE = (r"minimum\s*amount\s*due", r"minimum\s*payment\s*due")
 
 
+def _apply_currency(meta, text: str) -> None:
+    """Set a non-rupee statement currency, but only on real evidence.
+
+    The old test was "mentions USD or a dollar sign, and does not mention
+    INR" - which a travel card fails every month. An HSBC TravelOne prints
+    a foreign-currency column for the trips on it while being billed
+    entirely in rupees, and its extracted text carries no "INR" token, so
+    25 plainly Indian charges - "National Highways A Delhi IND" at 3,103,
+    a Pune electronics shop at 55,604 - were stamped USD and then summed
+    straight into rupee totals, because nothing here converts currency.
+
+    So: an explicit declaration, or nothing. And any India marker settles
+    it the other way - a statement naming an IFSC or a GSTIN is not
+    denominated in dollars.
+    """
+    if _INDIA_MARKER.search(text or ""):
+        return
+    declared = _DECLARED_CURRENCY.search(text or "")
+    if declared:
+        meta.currency = declared.group(1).upper()
+
+
+#: An explicit statement-level declaration - the only thing trusted to
+#: change the currency of every row on the document.
+_DECLARED_CURRENCY = re.compile(
+    r"(?:statement|account|billing|base)\s+currency\s*[:\-]?\s*"
+    r"(\b(?:USD|EUR|GBP|AED|SGD)\b)",
+    re.IGNORECASE,
+)
+#: Anything that places the document in India. One of these outweighs any
+#: number of foreign-currency mentions in a transactions table.
+_INDIA_MARKER = re.compile(
+    r"\bINR\b|\u20b9|\bRs\.?\b|\bIFSC\b|\bGSTIN\b"
+    r"|\bUPI\b|\bIndia\b|\bNEFT\b|\bIMPS\b|\bRTGS\b",
+    re.IGNORECASE,
+)
+
+
 def extract_metadata(text: str, filename: str = "", sender: str = "",
                      full_text: str = "") -> StatementMetadata:
     """Pull everything we can from the statement letterhead.
@@ -1287,8 +1325,7 @@ def extract_metadata(text: str, filename: str = "", sender: str = "",
             except Exception:
                 pass
 
-    if re.search(r"\bUSD\b|\$", text) and not re.search(r"\bINR\b|₹|\bRs\.?\b", text):
-        meta.currency = "USD"
+    _apply_currency(meta, text)
 
 
     # LLM Fallback for identity fields

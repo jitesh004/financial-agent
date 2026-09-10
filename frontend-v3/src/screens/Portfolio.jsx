@@ -95,9 +95,18 @@ export default function Portfolio({ onImport }) {
           label="Unrealized Return"
           value={gain == null ? '—' : money(gain)}
           tone={gain == null ? undefined : gain >= 0 ? 'pos' : 'neg'}
+          /* The coverage belongs NEXT TO the percentage, not implied by the
+             words "documented cost". A 99.9% return sitting beside a 19.88
+             lakh valuation reads as "my portfolio doubled" when it is a
+             gain on ten instruments out of fifty - 5% of the value. The
+             number is right; on its own it says the wrong thing. */
           sub={gain == null || !(invested > 0)
             ? 'No cost basis declared on demat statements'
-            : `${((gain / invested) * 100).toFixed(1)}% return on documented cost`}
+            : `${((gain / invested) * 100).toFixed(1)}% on ${money(invested)} of cost basis`
+              + ` — ${totals.costed_instruments ?? 0} of ${totals.instruments ?? 0}`
+              + ` holdings${portfolioVal > 0
+                  ? `, ${((Number(totals.gain_basis_value || 0) / portfolioVal) * 100).toFixed(0)}% of value`
+                  : ''}`}
         />
         <Stat
           label="Securities Tracked"
