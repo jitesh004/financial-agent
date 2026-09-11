@@ -341,15 +341,40 @@ def _post_with_retries(client: Any, url: str, *, json: Any,
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             last_error = exc
             _record("failed", error=f"{type(exc).__name__}: {exc}")
+
+            # Rotate before backing off, exactly as the 429 path does. This
+            # branch used to go straight to sleeping, and because a timeout
+            # never marked the key as tried, the next attempt picked the
+            # SAME key and slept again: 2s, then 4s, then 8s, fourteen
+            # seconds of nothing while three other keys sat idle.
+            #
+            # The key is NOT rested. A timeout is the provider being slow,
+            # not the credential being bad, and standing a good key down
+            # over it would shrink the ring for every later call. It is
+            # only set aside for the rest of THIS call.
+            if key is not None:
+                exhausted_keys.add(key.secret)
+                if len(exhausted_keys) < len(ring):
+                    logging.info(
+                        "%s call failed (%s); trying another API key "
+                        "(%d of %d tried)", provider, type(exc).__name__,
+                        len(exhausted_keys), len(ring))
+                    continue        # a different key is not a retry
+
             attempt += 1
             if attempt > RATE_LIMIT_RETRIES:
                 raise
             delay = _clamp_wait(2.0 ** attempt)
             logging.warning(
-                "%s call failed (%s); retrying in %.0fs (attempt %d of %d)",
+                "%s call failed (%s); every key tried, retrying in %.0fs "
+                "(attempt %d of %d)",
                 provider, type(exc).__name__, delay, attempt,
                 RATE_LIMIT_RETRIES)
             time.sleep(delay)
+            # Every key has now failed this call, so the next pass falls
+            # back to the whole ring. Cleared so it starts from the top
+            # rather than immediately exhausting again on the same set.
+            exhausted_keys.clear()
             continue
 
         last_resp = resp

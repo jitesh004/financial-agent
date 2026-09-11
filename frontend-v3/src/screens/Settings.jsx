@@ -108,7 +108,10 @@ function ModelSettings() {
         />
       </div>
 
-      <div style={{ display: 'flex', gap: 'var(--space-3)', alignItems: 'center', marginTop: 'var(--space-3)' }}>
+      <div style={{
+        display: 'flex', gap: 'var(--space-3)', alignItems: 'center',
+        flexWrap: 'wrap', marginTop: 'var(--space-3)',
+      }}>
         <Badge tone={pending ? 'warn' : 'pos'} size="md">
           {pending} uncategorized row{pending === 1 ? '' : 's'}
         </Badge>
@@ -119,7 +122,9 @@ function ModelSettings() {
           disabled={!settings.use_llm || !pending}
           onClick={run}
         >
-          Run AI Categorizer on {pending} Rows
+          <span style={{ whiteSpace: 'normal', textAlign: 'left' }}>
+            Run AI Categorizer on {count(pending)} Rows
+          </span>
         </Button>
       </div>
 

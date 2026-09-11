@@ -256,6 +256,11 @@ export default function useImport({ open, onImported }) {
 
   const mailboxReady = Boolean(status?.connected);
   const mailboxAvailable = Boolean(status?.available);
+  /* A grant on record that the server will no longer accept. Distinct from
+     never having connected: the fix is the same button, but telling someone
+     to "connect" a mailbox they already connected reads like the app lost
+     track of itself. */
+  const mailboxNeedsReconnect = Boolean(status?.needs_reconnect);
 
   const persistSelection = useCallback((next) => {
     setSelection((prev) => {
@@ -399,7 +404,7 @@ export default function useImport({ open, onImported }) {
 
   return {
     status, periods, intents, error, setError, stage, job, scanJob, busy, activeCount,
-    mailboxReady, mailboxAvailable,
+    mailboxReady, mailboxAvailable, mailboxNeedsReconnect,
     rows, excluded, ignoredCount, summary, alerts, importableAlerts,
     intent, chosenIntents, toggleIntent, scanIntent,
     selection, setSelection: persistSelection,

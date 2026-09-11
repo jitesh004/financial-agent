@@ -80,13 +80,36 @@ _NUMBER = re.compile(
     re.IGNORECASE,
 )
 
+#: Month names as prose writes them, long and short, so a year sitting next
+#: to one can be recognised as a year.
+_MONTH = (r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+          r"jul(?:y)?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|"
+          r"nov(?:ember)?|dec(?:ember)?")
+
 #: Text that is an identifier rather than a quantity. A run id, a masked card
 #: number and an ISO date all contain digits and none of them is money.
+#:
+#: A BARE YEAR belongs here too, and its absence was a real bug. "You spent
+#: 5,500 on fuel in August 2026" had 2026 read out as a money figure, matched
+#: against everything the tools returned, found nowhere - and a correct
+#: answer was handed to the reader under a warning that one of its figures
+#: was unsourced. Every dated answer carries a year, so every dated answer
+#: was flagged. That is worse than not checking: a warning that fires on
+#: correct answers is one people learn to scroll past, and then it is not
+#: there on the day it is right.
+#:
+#: Only a year in DATE CONTEXT is skipped - following a month name, or a word
+#: that can introduce nothing else. A bare "2026" standing alone stays a
+#: quantity, because at that point it is as plausibly rupees.
 _NOT_A_QUANTITY = re.compile(
     r"\b\d{4}-\d{2}(?:-\d{2})?\b"          # 2026-04 or 2026-04-10
     r"|\bXXXX\d+\b"                        # a masked account number
     r"|\b[0-9a-f]{8,}\b"                   # an id
-    r"|\(\s*\d+\s*/\s*\d+\s*\)",           # an instalment counter
+    r"|\(\s*\d+\s*/\s*\d+\s*\)"            # an instalment counter
+    rf"|\b(?:{_MONTH})\.?,?\s+(?:19|20|21)\d{{2}}\b"      # August 2026
+    r"|\b(?:fy|cy)\s?(?:19|20|21)?\d{2}\s*[-/]\s*\d{2,4}\b"   # FY 2026-27
+    r"|\b(?:in|during|since|until|till|through|year|fy|cy|q[1-4]|"
+    r"calendar|financial|fiscal)\s+(?:19|20|21)\d{2}\b",  # in 2026
     re.IGNORECASE,
 )
 
@@ -193,6 +216,31 @@ def _matches(value: Decimal, figures: set[Decimal]) -> bool:
     return False
 
 
+def _is_a_year(written: str, value: Decimal) -> bool:
+    """A plain four-digit number in the years, written the way years are.
+
+    The date-context rules above catch "August 2026" and "in 2026", which is
+    most of it, but a model writes years in places no keyword precedes:
+    "Spending 2026", "Period 2026", a metric note reading "fuel, 2026". Each
+    one was reported as an unsourced money figure on an answer that was
+    correct, and a warning that fires on correct answers is one people learn
+    to ignore.
+
+    The distinguishing mark is the formatting, not the surroundings. Money in
+    this app is written with separators or paise - 5,500 and 7,110 and
+    42,781 - by the formatters, by the tools, and by the model copying them.
+    A bare 2026 with no comma and no decimal, inside the two centuries a year
+    can plausibly fall in, is a year.
+
+    What this gives up: an invented figure that happens to land between 1900
+    and 2100 AND is written without a separator escapes the check. That is a
+    narrow hole and it is the right way round - the alternative was flagging
+    every dated answer the agent produces.
+    """
+    return ("," not in written and "." not in written
+            and Decimal(1900) <= value <= Decimal(2100))
+
+
 def check(answer: dict[str, Any], figures: set[Decimal]) -> Report:
     """Every money figure in this answer, against everything the tools said."""
     report = Report(available=len(figures))
@@ -203,6 +251,11 @@ def check(answer: dict[str, Any], figures: set[Decimal]) -> Report:
     for text in _texts(answer):
         for written, value in figures_in(text):
             if value < ONE_RUPEE_SCALE:
+                continue
+            if _is_a_year(written, value) and not _matches(value, figures):
+                # Not counted as checked either: it was never a claim about
+                # money, so counting it would inflate "12 figures checked"
+                # with things that are not figures.
                 continue
             report.checked += 1
             if _matches(value, figures):

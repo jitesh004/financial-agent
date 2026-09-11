@@ -32,6 +32,23 @@ from app.models.schemas import (Account, AccountType, Category,  # noqa: E402
                                 Direction, Transaction)
 
 
+#: A stored Gmail grant shaped the way google-auth requires, so it parses and
+#: reads as usable without any network call. Tests about isolation want a
+#: grant that works; tests about an unusable grant say so explicitly.
+GRANT = json.dumps({
+    "token": "mine",
+    "refresh_token": "renew-me",
+    "client_id": "client",
+    "client_secret": "secret",
+    "token_uri": "https://oauth2.googleapis.com/token",
+})
+
+#: Parses, but carries nothing to renew itself with once expired - the shape
+#: a real grant degrades into, and the one that used to be reported as
+#: connected forever.
+UNUSABLE_GRANT = json.dumps({"token": "stale", "client_id": "client"})
+
+
 @pytest.fixture()
 def client():
     from fastapi.testclient import TestClient
@@ -414,7 +431,7 @@ def test_a_re_grant_without_a_refresh_token_keeps_the_one_already_held(
 
 def test_one_users_gmail_grant_is_invisible_to_another(client):
     db = get_db()
-    store.save_google_token(db, TENANT.get(), '{"token": "mine"}', "gmail.readonly")
+    store.save_google_token(db, TENANT.get(), GRANT, "gmail.readonly")
     assert client.get("/api/gmail/status").json()["connected"] is True
 
     fresh_ledger()
@@ -433,13 +450,66 @@ def test_the_gmail_client_reads_the_signed_in_users_stored_grant():
     db = get_db()
     assert _client().is_authorized() is False       # nothing granted yet
 
-    store.save_google_token(db, TENANT.get(), '{"token": "mine"}',
+    store.save_google_token(db, TENANT.get(), GRANT,
                             " ".join(google.GMAIL_SCOPES))
     assert _client().is_authorized() is True
 
     # And it is genuinely per user, not a shared file.
     fresh_ledger()
     assert _client().is_authorized() is False
+
+
+def test_an_unusable_grant_is_not_reported_as_connected(client):
+    """A grant on record is not the same as a grant that works.
+
+    `is_authorized` used to be `bool(token_row_exists)`, so a grant that
+    google-auth cannot even parse - one whose refresh token is gone - was
+    reported as connected for good. The import screen said "Mailbox
+    connected" while every scan answered "Gmail is not connected. Connect it
+    from the import screen", which is the screen that was already claiming it
+    was. Status now reports it as needing a reconnect instead.
+    """
+    from app.api.gmail_routes import _client
+
+    store.save_google_token(get_db(), TENANT.get(), UNUSABLE_GRANT,
+                            " ".join(google.GMAIL_SCOPES))
+
+    body = client.get("/api/gmail/status").json()
+    assert body["connected"] is False
+    assert body["needs_reconnect"] is True
+    assert _client().is_authorized() is False
+
+
+def test_a_grant_that_cannot_be_parsed_is_discarded_on_use(client):
+    """Permanent failures clear themselves rather than lingering.
+
+    Transient refresh failures must keep the grant - throwing away a working
+    token because the network blipped costs a re-consent for nothing. A grant
+    that cannot be parsed at all is the opposite: it will never become
+    readable, so the first call that tries it drops it and the screen falls
+    back to a plain "not connected" with a working Connect button.
+    """
+    from app.api.gmail_routes import _client
+
+    db = get_db()
+    store.save_google_token(db, TENANT.get(), UNUSABLE_GRANT,
+                            " ".join(google.GMAIL_SCOPES))
+
+    gmail = _client()
+    assert gmail.authorize() is False
+    assert gmail.auth_error == "unreadable"
+    assert store.get_google_token(db, TENANT.get()) is None
+
+    body = client.get("/api/gmail/status").json()
+    assert body["connected"] is False
+    assert body["needs_reconnect"] is False
+
+
+def test_a_scan_without_a_grant_says_how_to_fix_it(client):
+    """The refusal has to name the remedy, and the code has to match it."""
+    response = client.post("/api/gmail/scan")
+    assert response.status_code == 400
+    assert "import screen" in response.json()["detail"]
 
 
 def test_the_gmail_client_refuses_to_run_a_consent_flow():

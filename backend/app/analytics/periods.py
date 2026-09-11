@@ -291,6 +291,27 @@ def resolve_period(spec: dict[str, Any] | None, today: date | None = None) -> Pe
     today = today or date.today()
     preset = (spec.get("preset") or "all").strip() or "all"
 
+    # Bounds without a preset ARE a custom window.
+    #
+    # The default of "all" used to be applied first and returned
+    # immediately, so `{"start": "2026-07-01", "end": "2026-07-31"}` - with
+    # no `preset` alongside it - was answered with the whole ledger. No
+    # error, no empty result: the caller asked for July and got every
+    # month there has ever been, and the only sign was a `range` object in
+    # the reply saying "All time" that nothing reads.
+    #
+    # The agent toolbelt documents this exact shape - `date_range: {preset}
+    # or {start, end}` - so every dated query an agent has ever run was
+    # silently undated. A model asked "how much on fuel in August" and one
+    # asked "in July" received the identical all-time figure and reported
+    # it, confidently, as the answer to two different questions.
+    #
+    # This function's own docstring already promises to be "lenient about
+    # which fields a caller sends". It now is.
+    if preset == "all" and any(spec.get(field) for field in
+                               ("start", "end", "start_month", "end_month")):
+        preset = "custom"
+
     if preset in {"custom", "custom_months", "inherit"}:
         return _resolve_custom(spec, preset)
     if preset == "all":

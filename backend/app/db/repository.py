@@ -2128,6 +2128,125 @@ def get_ai_call_log(db, job_id: str = "", limit: int = 200) -> list[dict]:
 
 
 
+
+# --------------------------------------------------------------------------
+# Conversations
+# --------------------------------------------------------------------------
+
+def create_conversation(db: Database, title: str = "") -> str:
+    """Start a conversation. Returns its id."""
+    conversation_id = _new_id()
+    with db.connection() as conn:
+        conn.execute(
+            "INSERT INTO conversations (id, title) VALUES (?, ?)",
+            (conversation_id, (title or "")[:200]))
+    return conversation_id
+
+
+def list_conversations(db: Database, *, include_archived: bool = False,
+                       limit: int = 50) -> list[dict]:
+    """Recent conversations, newest activity first."""
+    sql = ("SELECT c.id, c.title, c.created_at, c.updated_at, c.archived,"
+           "       COUNT(t.id) AS turns"
+           "  FROM conversations c"
+           "  LEFT JOIN conversation_turns t"
+           "    ON t.conversation_id = c.id AND t.user_id = c.user_id")
+    if not include_archived:
+        sql += " WHERE c.archived = 0"
+    sql += (" GROUP BY c.id, c.title, c.created_at, c.updated_at, c.archived"
+            " ORDER BY c.updated_at DESC LIMIT ?")
+    with db.connection() as conn:
+        rows = conn.execute(sql, (limit,)).fetchall()
+    out = []
+    for row in rows:
+        entry = dict(row)
+        entry["archived"] = bool(entry.get("archived"))
+        out.append(entry)
+    return out
+
+
+def get_conversation(db: Database, conversation_id: str) -> dict | None:
+    with db.connection() as conn:
+        row = conn.execute(
+            "SELECT id, title, created_at, updated_at, archived"
+            "  FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+    if not row:
+        return None
+    found = dict(row)
+    found["archived"] = bool(found.get("archived"))
+    return found
+
+
+def get_turns(db: Database, conversation_id: str,
+              limit: int = 100) -> list[dict]:
+    """Every turn in order, oldest first - which is reading order."""
+    with db.connection() as conn:
+        rows = conn.execute(
+            "SELECT id, conversation_id, seq, question, answer_json, run_id,"
+            "       status, error, created_at"
+            "  FROM conversation_turns WHERE conversation_id = ?"
+            "  ORDER BY seq ASC LIMIT ?", (conversation_id, limit)).fetchall()
+    out = []
+    for row in rows:
+        turn = dict(row)
+        try:
+            turn["answer"] = json.loads(turn.pop("answer_json") or "{}")
+        except (ValueError, TypeError):
+            turn.pop("answer_json", None)
+            turn["answer"] = {}
+        out.append(turn)
+    return out
+
+
+def append_turn(db: Database, conversation_id: str, *, question: str,
+                answer: dict | None = None, run_id: str = "",
+                status: str = "ok", error: str = "") -> str:
+    """Record one exchange, and mark the conversation as active.
+
+    `seq` is assigned here rather than by the caller: two turns landing in
+    the same second order arbitrarily by timestamp, which a cached answer
+    reaches easily.
+    """
+    turn_id = _new_id()
+    with db.connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS top FROM conversation_turns"
+            "  WHERE conversation_id = ?", (conversation_id,)).fetchone()
+        conn.execute(
+            "INSERT INTO conversation_turns"
+            " (id, conversation_id, seq, question, answer_json, run_id,"
+            "  status, error) VALUES (?,?,?,?,?,?,?,?)",
+            (turn_id, conversation_id, int(row["top"]) + 1, question[:4000],
+             json.dumps(answer or {}, default=str), run_id, status,
+             (error or "")[:1000]))
+        conn.execute(
+            "UPDATE conversations SET updated_at = fa_now() WHERE id = ?",
+            (conversation_id,))
+        # The first question names the conversation. A list of "Conversation
+        # 1..9" is a list nobody can search.
+        conn.execute(
+            "UPDATE conversations SET title = ?"
+            "  WHERE id = ? AND COALESCE(title, '') = ''",
+            (question.strip()[:120], conversation_id))
+    return turn_id
+
+
+def rename_conversation(db: Database, conversation_id: str,
+                        title: str) -> bool:
+    with db.connection() as conn:
+        return conn.execute(
+            "UPDATE conversations SET title = ? WHERE id = ?",
+            ((title or "")[:200], conversation_id)).rowcount > 0
+
+
+def delete_conversation(db: Database, conversation_id: str) -> bool:
+    with db.connection() as conn:
+        conn.execute("DELETE FROM conversation_turns WHERE conversation_id = ?",
+                     (conversation_id,))
+        return conn.execute("DELETE FROM conversations WHERE id = ?",
+                            (conversation_id,)).rowcount > 0
+
+
 # --------------------------------------------------------------------------
 # Model-call telemetry
 # --------------------------------------------------------------------------

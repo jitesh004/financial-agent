@@ -157,6 +157,11 @@ export const api = {
   /* Profile */
   profile: () => get('/api/profile'),
   saveProfile: (profile) => put('/api/profile', profile),
+  /* Known PDF passwords are managed one at a time. The list is never sent to
+     the browser, so adding one cannot be spelled as "send the whole list
+     back" - that would need values nobody here has. */
+  addProfilePassword: (password) => post('/api/profile/passwords', { password }),
+  deleteProfilePassword: (index) => del(`/api/profile/passwords/${index}`),
 
   /* Settings & Demo */
   settings: () => get('/api/settings'),
@@ -218,6 +223,15 @@ export const api = {
   agentRun: (id, { transcript = false } = {}) =>
     get(`/api/agents/runs/${id}?transcript=${transcript ? 'true' : 'false'}`),
   deleteAgentRun: (id) => del(`/api/agents/runs/${id}`),
+
+  /* Ask - the conversational layer over the same read-only tools */
+  conversations: () => get('/api/chat/conversations'),
+  conversation: (id) => get(`/api/chat/conversations/${id}`),
+  renameConversation: (id, title) =>
+    patch(`/api/chat/conversations/${id}`, { title }),
+  deleteConversation: (id) => del(`/api/chat/conversations/${id}`),
+  askChat: (question, conversationId) =>
+    post('/api/chat/ask', { question, conversation_id: conversationId || null }),
 
   /* Explore & Custom Dashboards */
   querySchema: () => get('/api/query/schema'),

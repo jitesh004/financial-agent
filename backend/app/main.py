@@ -33,7 +33,8 @@ from fastapi.responses import JSONResponse
 
 from . import storage
 from .analytics import periods
-from .api import (admin_routes, agent_routes, auth_routes, files_routes,
+from .api import (admin_routes, agent_routes, auth_routes, chat_routes,
+                  files_routes,
                   gmail_routes, job_routes, llm_routes, position_routes,
                   query_routes, rules_routes, settings_routes,
                   staging_routes, wealth_routes)
@@ -130,6 +131,7 @@ app.include_router(files_routes.coverage_router)
 app.include_router(query_routes.router)
 app.include_router(job_routes.router)
 app.include_router(llm_routes.router)
+app.include_router(chat_routes.router)
 app.include_router(wealth_routes.router)
 app.include_router(settings_routes.router)
 app.include_router(staging_routes.router)
@@ -1668,6 +1670,8 @@ PREVIEW_COLUMNS: dict[str, str] = {
     "ai_inference_log": "kind, source_label, cached, model, created_at",
     "llm_calls": "created_at, purpose, subject, model, key_label, status, "
                  "total_tokens, latency_ms",
+    "conversations": "title, created_at, updated_at, archived",
+    "conversation_turns": "conversation_id, seq, question, status, created_at",
     # Downloaded, and irreplaceable if the mail is gone.
     "source_files": "filename, size_bytes, parse_status, transaction_count",
     "staged_files": ("filename, kind, account_label, parse_status, row_count,"
@@ -1840,8 +1844,77 @@ def get_profile() -> dict[str, Any]:
         # unlock anything; it does not need to read them, and anything that
         # captures a response body would.
         "custom_password_count": len(profile.custom_passwords or []),
+        # Enough to list and delete a specific one, and nothing more. A
+        # length is not a disclosure; the value would be, and on this profile
+        # several of them encode the date of birth.
+        "custom_password_hints": [
+            {"index": i, "length": len(p)}
+            for i, p in enumerate(profile.custom_passwords or [])
+        ],
         "has_password_material": profile.has_password_material(),
     }
+
+
+# --------------------------------------------------------------------------
+# Known PDF passwords, one at a time
+#
+# `PUT /api/profile` takes the whole list, which makes adding one to a set you
+# cannot see a destructive edit: send the new password and the others are
+# gone. These two exist so the common operations - add one, drop one - are
+# not spelled as "replace everything".
+# --------------------------------------------------------------------------
+
+def _password_payload(profile) -> dict[str, Any]:
+    from .ingestion.passwords import derive_passwords
+
+    return {
+        "custom_password_count": len(profile.custom_passwords),
+        "custom_password_hints": [
+            {"index": i, "length": len(p)}
+            for i, p in enumerate(profile.custom_passwords)
+        ],
+        "password_candidates": len(derive_passwords(profile)),
+    }
+
+
+@app.post("/api/profile/passwords")
+def add_profile_password(payload: dict[str, Any]) -> dict[str, Any]:
+    """Add one known password, keeping the ones already stored."""
+    password = str(payload.get("password") or "").strip()
+    if not password:
+        raise HTTPException(400, "Send the password to add.")
+
+    db = get_db()
+    profile = repo.get_profile(db)
+    if password in profile.custom_passwords:
+        # Not an error: the end state the caller asked for is the state it is
+        # already in, and duplicates would only be tried twice per file.
+        return {**_password_payload(profile), "status": "already_stored"}
+
+    updated = profile.model_copy(
+        update={"custom_passwords": [*profile.custom_passwords, password]})
+    repo.save_profile(db, updated)
+    return {**_password_payload(updated), "status": "added"}
+
+
+@app.delete("/api/profile/passwords/{index}")
+def delete_profile_password(index: int) -> dict[str, Any]:
+    """Drop one stored password by position.
+
+    By position because the caller has never been told the values - the whole
+    point of the hints is that a password can be managed without being read
+    back out of the database.
+    """
+    db = get_db()
+    profile = repo.get_profile(db)
+    if index < 0 or index >= len(profile.custom_passwords):
+        raise HTTPException(
+            404, f"There is no stored password at position {index}.")
+
+    remaining = [p for i, p in enumerate(profile.custom_passwords) if i != index]
+    updated = profile.model_copy(update={"custom_passwords": remaining})
+    repo.save_profile(db, updated)
+    return {**_password_payload(updated), "status": "removed"}
 
 
 #: A PAN is five letters, four digits, one letter - fixed, and checkable.

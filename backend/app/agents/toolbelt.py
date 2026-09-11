@@ -112,11 +112,108 @@ def ledger_schema(db, **_: Any) -> dict[str, Any]:
     }
 
 
+#: Every key the query compiler actually reads. Anything else in a spec is
+#: dead weight, and - before this list existed - silently dead: the compiler
+#: took what it recognised and dropped the rest without a word.
+_SPEC_KEYS = frozenset({
+    "dimensions", "measures", "filters", "date_range", "limit", "sort",
+    "compare", "exclude_excluded", "exclude_lender_ledger",
+    "exclude_mirror_legs",
+})
+
+#: Flat date arguments, and where each belongs inside `date_range`.
+_DATE_KEYS = frozenset({"start", "end", "preset", "start_month", "end_month",
+                        "months"})
+
+#: Flat spellings of the two structural keys, as a model tends to write them.
+_DIMENSION_ALIASES = frozenset({"group_by", "groupby", "dimension"})
+_MEASURE_ALIASES = frozenset({"measure", "metric", "aggregate"})
+
+#: Every field the query engine will accept a filter on. Static - it is a
+#: property of the field registry, not of the ledger - so it is read once.
+_FILTERABLE: frozenset[str] = frozenset(
+    key for key, field in q.FIELDS.items() if field.filterable)
+
+
+def _normalise_spec(spec: dict[str, Any], filterable: set[str]
+                    ) -> tuple[dict[str, Any], list[str]]:
+    """Turn what the model wrote into a spec, or name what could not be.
+
+    Models do not reliably nest. Asked for fuel in August they write
+    `{category: "fuel", start: "2026-08-01", end: "2026-08-31"}` rather than
+    the filters-and-date_range shape, and every one of those keys used to be
+    dropped on the floor: the query ran with no filter and no window at all
+    and returned the net total of the entire ledger, labelled "All time",
+    with no error. The agent then reported that figure as the answer to a
+    question about one category in one month.
+
+    That is the worst way for this to fail. A refused call costs a turn and
+    the agent fixes it; a wrong number costs nothing visible and is believed.
+
+    So flat arguments are TRANSLATED where their meaning is unambiguous - a
+    filterable field name is a filter on that field, a date bound is a date
+    bound - and anything still unrecognised is REFUSED by name. What is never
+    an option is running a query that quietly means something else.
+    """
+    out: dict[str, Any] = {}
+    filters = list(spec.get("filters") or [])
+    date_range = dict(spec.get("date_range") or {})
+    unknown: list[str] = []
+
+    for key, value in spec.items():
+        if key in ("filters", "date_range"):
+            continue
+        if key in _SPEC_KEYS:
+            out[key] = value
+        elif key in _DATE_KEYS:
+            date_range[key] = value
+        elif key in filterable:
+            # A list means several acceptable values; a scalar means one.
+            filters.append({"field": key,
+                            "op": "in" if isinstance(value, list) else "eq",
+                            "value": value})
+        elif key in _DIMENSION_ALIASES:
+            out["dimensions"] = ([value] if isinstance(value, str)
+                                 else list(value or []))
+        elif key in _MEASURE_ALIASES:
+            out["measures"] = ([{"field": value, "agg": "sum"}]
+                               if isinstance(value, str)
+                               else list(value or []))
+        else:
+            unknown.append(key)
+
+    if filters:
+        out["filters"] = filters
+    if date_range:
+        out["date_range"] = date_range
+    return out, unknown
+
+
 def ledger_query(db, spec: dict[str, Any] | None = None,
                  **kwargs: Any) -> dict[str, Any]:
     """Group and aggregate the ledger any way the registry allows."""
-    spec = dict(spec or kwargs or {})
-    spec.pop("_period_override", None)
+    # Merged rather than either/or: a model that sends a nested `spec` AND a
+    # stray flat argument meant both, and dropping one half of that is the
+    # behaviour this function exists to stop.
+    merged = {**dict(spec or {}), **kwargs}
+    merged.pop("_period_override", None)
+
+    # Read from the field registry, NOT from `q.schema(db)`. Which fields
+    # are filterable is a static fact about the registry; `schema` is the
+    # picker payload and runs three queries to build it, one of them a
+    # DISTINCT over every transaction. `ledger_query` is the most-called
+    # tool there is, several times a run, and putting that behind it would
+    # have paid for a constant with a table scan.
+    spec, unknown = _normalise_spec(merged, _FILTERABLE)
+    if unknown:
+        return {
+            "error": f"ledger_query does not understand: {', '.join(sorted(unknown))}.",
+            "hint": "Filter with filters:[{field, op, value}] and set the "
+                    "window with date_range:{preset} or {start, end}. Call "
+                    "ledger_schema for the fields that exist.",
+            "ignored_nothing": "This query was NOT run - no figure here.",
+        }
+
     spec["limit"] = min(int(spec.get("limit") or MAX_ROWS), MAX_ROWS)
     try:
         result = q.run_query(db, spec)
@@ -187,10 +284,31 @@ def search_transactions(db, text: str = "", category: str | None = None,
 # Positions
 # ---------------------------------------------------------------------------
 
-def accounts(db, **_: Any) -> dict[str, Any]:
-    """Every account, with what it holds or what is owed on it."""
+def accounts(db, account_type: Any = None, institution: str = "",
+             **_: Any) -> dict[str, Any]:
+    """Every account, with what it holds or what is owed on it.
+
+    Filterable, which it was not: the whole list is 22 accounts and around
+    six kilobytes, and a small model on a compact budget gets roughly a
+    quarter of that before the result is cut off. Asked how many credit
+    cards this holder has, it read a truncated list and answered that the
+    account records were inaccessible; told to try again, it counted the
+    three it could see and reported three.
+
+    `count` and `by_type` are the fix that does not depend on the model
+    doing anything clever. Both are scalars, both survive any trimming of
+    the list beside them, and between them they answer every "how many"
+    question about accounts without a single row being read.
+    """
+    wanted = ({account_type} if isinstance(account_type, str) and account_type
+              else set(account_type or ()))
     out = []
     for account in repo.get_accounts(db):
+        if wanted and account.account_type.value not in wanted:
+            continue
+        if institution and institution.lower() not in (
+                account.institution or "").lower():
+            continue
         out.append({
             "id": account.id,
             "name": account.display_name(),
@@ -204,7 +322,10 @@ def accounts(db, **_: Any) -> dict[str, Any]:
             "is_liability": account.account_type.value in {
                 t.value for t in (AccountType.CREDIT_CARD, *LOAN_TYPES)},
         })
-    return {"accounts": out, "count": len(out)}
+    by_type: dict[str, int] = {}
+    for row in out:
+        by_type[row["type"]] = by_type.get(row["type"], 0) + 1
+    return {"accounts": out, "count": len(out), "by_type": by_type}
 
 
 def _ledger(db) -> tuple[list[Transaction], dict[str, Any]]:
@@ -1016,6 +1137,17 @@ def data_quality(db, **_: Any) -> dict[str, Any]:
 # The catalogue
 # ---------------------------------------------------------------------------
 
+
+#: Tools that CHANGE something. Empty, and the emptiness is load-bearing:
+#: it is what lets an arbitrary question pick its own tools safely, since
+#: no phrasing can make a query destructive.
+#:
+#: Anything added here must also be kept out of the copilot's tool list -
+#: `api.chat_routes._refuse_write_tools` fails the request rather than
+#: trusting that, so the day someone adds a write tool the error names the
+#: seam instead of a conversation quietly editing the ledger.
+WRITE_TOOLS: frozenset[str] = frozenset()
+
 TOOLS: dict[str, Tool] = {t.name: t for t in [
     Tool("ledger_schema",
          "Every dimension, measure, filter and date preset ledger_query "
@@ -1043,8 +1175,14 @@ TOOLS: dict[str, Tool] = {t.name: t for t in [
           "min_amount": "number", "start": "YYYY-MM-DD", "end": "YYYY-MM-DD"},
          search_transactions,
          example={"text": "insurance", "direction": "debit"}),
-    Tool("accounts", "Every account with its balance, limit, rate and EMI.",
-         {}, accounts),
+    Tool("accounts",
+         "Accounts with their balance, limit, rate and EMI. To COUNT a kind "
+         "of account read `by_type` in the result - never tally the list, "
+         "which may be shortened to fit.",
+         {"account_type": "optional: savings|current|credit_card|home_loan|"
+                          "personal_loan|auto_loan|... (one, or a list)",
+          "institution": "optional: substring of the bank name"},
+         accounts, example={"account_type": "credit_card"}),
     Tool("analysis",
          "Income, spending, savings rate, category breakdown and top "
          "merchants for a window.",

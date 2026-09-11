@@ -445,6 +445,10 @@ class GoogleGmailClient:
         self._service = None
         self._creds = None
         self._local = None
+        #: Why the last `authorize()` said no, for the caller that has to tell
+        #: a person what to do about it. One of the keys in
+        #: `api.gmail_routes._AUTH_FAILURE`; empty when authorised.
+        self.auth_error = ""
 
     def authorize(self, interactive: bool = False) -> bool:
         """Load the stored grant, refreshing it if it has expired.
@@ -457,13 +461,26 @@ class GoogleGmailClient:
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
 
+        self.auth_error = ""
+
         raw = self.tokens.load()
         if not raw:
+            self.auth_error = "no_grant"
             return False
         try:
             creds = Credentials.from_authorized_user_info(json.loads(raw), SCOPES)
         except (TypeError, ValueError) as exc:
-            log.warning("stored Gmail token is unreadable: %s", exc)
+            # Discarded rather than kept, because this failure is permanent:
+            # google-auth refuses to build credentials without refresh_token,
+            # client_id and client_secret, and no amount of retrying supplies
+            # them. Keeping the row only let /status go on reporting a
+            # connection whose every use answered "Gmail is not connected".
+            log.warning("stored Gmail token is unreadable, discarding it: %s", exc)
+            try:
+                self.tokens.forget()
+            except Exception:      # never let cleanup mask the cause
+                log.exception("could not discard the unreadable Gmail grant")
+            self.auth_error = "unreadable"
             return False
 
         if creds.valid:
@@ -493,6 +510,7 @@ class GoogleGmailClient:
                         self.tokens.forget()
                     except Exception:      # never let cleanup mask the cause
                         log.exception("could not discard the dead Gmail grant")
+                    self.auth_error = "grant_revoked"
                 else:
                     # Transient - Google unreachable, a 5xx, a timeout. The
                     # grant is probably fine, so it is emphatically NOT
@@ -500,13 +518,17 @@ class GoogleGmailClient:
                     # network blipped would make the user re-consent for
                     # nothing.
                     log.warning("could not refresh the Gmail grant: %s", exc)
+                    self.auth_error = "transient"
                 return False
             self._save(creds)
             self._build(creds)
             return True
 
-        # Expired with nothing to refresh from. The user has to grant again;
-        # saying so beats a confusing 401 from the first API call.
+        # Expired with nothing to refresh from - reachable when the stored
+        # grant carries an empty refresh_token, which passes google-auth's
+        # key check and then cannot renew anything. The user has to grant
+        # again; saying so beats a confusing 401 from the first API call.
+        self.auth_error = "expired_no_refresh"
         return False
 
     def _build(self, creds) -> None:
@@ -541,6 +563,39 @@ class GoogleGmailClient:
         self.tokens.save(creds.to_json())
 
     def is_authorized(self) -> bool:
+        """Whether the stored grant is still usable, decided without a call.
+
+        Deliberately not `bool(self.tokens.load())`. A row exists for a grant
+        that can never be used again too - one missing its refresh_token, say
+        - and counting that as connected is what let the import screen show
+        "Mailbox connected" while every scan answered "Gmail is not
+        connected. Connect it from the import screen", pointing the user at
+        the screen that was already claiming it was.
+
+        No network here on purpose: /status is polled, and refreshing inside
+        it would spend a token round trip per poll. This answers the part
+        that is knowable locally - the grant parses, and is either still
+        valid or carries something to renew itself with. A grant that passes
+        this and then fails to refresh is reported by the failing call.
+        """
+        from google.oauth2.credentials import Credentials
+
+        raw = self.tokens.load()
+        if not raw:
+            return False
+        try:
+            creds = Credentials.from_authorized_user_info(json.loads(raw), SCOPES)
+        except (TypeError, ValueError):
+            return False
+        return bool(creds.valid or creds.refresh_token)
+
+    def has_stored_grant(self) -> bool:
+        """Whether any grant is on record, usable or not.
+
+        Lets the status endpoint separate "never connected" from "connected
+        once, now needs reconnecting" - which are the same thing to
+        `is_authorized` and very different things to read on screen.
+        """
         return bool(self.tokens.load())
 
     #: Gmail's hard per-page ceiling. Asking for more silently returns 500.

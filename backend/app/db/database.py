@@ -92,7 +92,8 @@ _TIER_STAGING = ("staged_files",)
 #: statement should not throw away an analysis somebody paid a model to
 #: produce - and unlike a recurring series, no amount of CPU brings it back.
 _TIER_AI = ("agent_runs", "ai_inferences", "ai_inference_log",
-            "llm_calls", "merchant_categories")
+            "llm_calls", "merchant_categories",
+            "conversation_turns", "conversations")
 
 #: Authored by a human. Cannot be regenerated from any input at any price.
 #: `claims` is listed before `claim_settlements` and `transaction_splits`
@@ -176,6 +177,8 @@ TENANT_TABLES: tuple[str, ...] = (
     "ai_inferences",
     "ai_inference_log",
     "llm_calls",
+    "conversations",
+    "conversation_turns",
     "claims",
     "claim_settlements",
     "transaction_splits",

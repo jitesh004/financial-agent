@@ -38,12 +38,17 @@ export function AgentAnswerView({ answer, compact = false }) {
           said so in muted text at the bottom while the invented figure led
           in large type at the top. A correction nobody reads first is not
           a correction. */}
+      {/* `--neg`, not `--danger`. There is no `--danger` in this design
+          system and there never was, so every rule above resolved to
+          nothing: the border fell back to currentColor and the heading kept
+          body text colour. The one banner in the app whose entire job is to
+          look alarming was rendering as ordinary prose in a faint box. */}
       {unverified.length > 0 && (
         <div style={{
-          border: '1px solid var(--danger)', borderLeft: '3px solid var(--danger)',
-          borderRadius: 4, padding: '8px 12px', background: 'var(--danger-soft, transparent)',
+          border: '1px solid var(--neg-border)', borderLeft: '3px solid var(--neg)',
+          borderRadius: 4, padding: '8px 12px', background: 'var(--neg-soft)',
         }}>
-          <div className="small font-semibold" style={{ color: 'var(--danger)' }}>
+          <div className="small font-semibold" style={{ color: 'var(--neg)' }}>
             {unverified.length} figure{unverified.length > 1 ? 's' : ''} in this
             answer did not come from your ledger
           </div>

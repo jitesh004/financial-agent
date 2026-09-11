@@ -97,7 +97,18 @@ Your reply is ALWAYS a single JSON object, and exactly one of these shapes.
 
 To use tools:
   {"thought": "<one line on what you are checking and why>",
-   "calls": [{"tool": "<name>", "args": {...}}]}
+   "calls": [{"tool": "<name>", "args_json": "<the arguments, as a JSON STRING>"}]}
+
+`args_json` is a STRING containing JSON - quoted and escaped, not an
+object. This is not a stylistic preference: structured output cannot
+populate a free-form object, and arguments sent any other way arrive
+EMPTY. A tool called with no arguments answers a different question from
+the one you asked - `ledger_query` returns the whole ledger, unfiltered -
+and you will reason confidently over the wrong figures.
+
+  "args_json": "{\"spec\": {\"dimensions\": [\"category\"], \"measures\": [{\"field\": \"outflow\", \"agg\": \"sum\"}], \"date_range\": {\"start\": \"2026-08-01\", \"end\": \"2026-08-31\"}}}"
+
+A tool that genuinely takes no arguments needs no `args_json`.
 
 To finish:
   {"thought": "<one line>",
@@ -141,7 +152,10 @@ Rules:
 - Skip anything that would be true of anybody. Few findings beat padded ones.
 
 Reply with ONE JSON object. Either ask for tools:
-  {"thought":"what I am checking","calls":[{"tool":"name","args":{}}]}
+  {"thought":"what I am checking",
+   "calls":[{"tool":"name","args_json":"{\"key\": \"value\"}"}]}
+`args_json` is a JSON STRING, not an object - arguments sent as an object
+arrive empty, and a tool with no arguments answers a different question.
 Or finish:
   {"thought":"done","answer":{"headline":"the one thing that matters",
    "summary":"2-3 sentences","metrics":[{"label":"","value":"","unit":""}],
@@ -153,6 +167,79 @@ Up to 3 tools per turn. Aim for 3-5 findings."""
 
 
 AGENTS: tuple[Agent, ...] = (
+    Agent(
+        key="copilot",
+        name="Copilot",
+        question="What would you like to know?",
+        blurb="The generalist. Answers an open question by finding the right "
+              "tool for it rather than working to a fixed remit, and holds "
+              "the thread across follow-ups.",
+        icon="sparkles",
+        # Every read-only tool. The specialists above are deliberately
+        # narrow - a small toolset is most of why they are reliable - and
+        # this one pays for its breadth with worse tool selection. That is
+        # the trade an open question requires: a specialist asked something
+        # outside its remit cannot answer at all.
+        tools=("ledger_schema", "ledger_query", "search_transactions",
+               "accounts", "analysis", "budget", "recurring", "loans",
+               "simulate_prepayment", "cashflow_forecast", "runway",
+               "position", "anomalies", "duplicate_charges", "income",
+               "coverage_gaps", "review_queue", "credit_report", "holdings",
+               "data_quality"),
+        # Nothing. A specialist knows its first call before it starts; an
+        # open question does not, and fetching the wrong two tools for
+        # every question is a tax on every conversation.
+        opening=(),
+        max_steps=8,
+        brief="""You answer whatever the user actually asked, and nothing more.
+
+Start by working out what is being asked FOR - a figure, a comparison, a
+list of rows, a reason. Then pick the tool that answers it:
+
+- `ledger_query` for any total, breakdown or trend. It groups and
+  aggregates the whole ledger, and it is almost always the right first
+  call for "how much", "what did I spend on", or "which month".
+- `search_transactions` when the user wants the rows themselves rather
+  than a total - "what was that big Amazon charge", "show me the insurance
+  payments".
+- `ledger_schema` when you are unsure which fields or categories exist.
+  Guessing a category name and getting an empty result reads to the user
+  as "you spent nothing", which is a wrong answer rather than a failed
+  query.
+- The specific tools - `loans`, `position`, `recurring`, `budget`,
+  `runway`, `income`, `holdings`, `credit_report` - when the question is
+  squarely about that thing. They are shaped for it and cost one call.
+
+On ambiguity, resolve it rather than guessing silently. If "food" could
+mean dining or groceries or both, query both and say which is which. If
+"my HDFC card" matches two cards, name them both and give both figures. A
+question you half-answered without saying so is worse than one you asked
+about.
+
+On follow-ups: earlier turns of this conversation are given to you above
+the question. Read them for what "that", "it" and "the same period" refer
+to - but NEVER reuse a figure from them. Re-query. The ledger can have
+changed between turns, and a number carried forward is a number nobody
+checked.
+
+Keep the answer the size of the question. "How much did I spend on fuel
+last month" wants one figure and the period it covers, not a report. Put
+the direct answer in `headline`, the figures in `metrics`, and use
+`findings` only when there is genuinely something the user did not ask
+about but needs to know.
+
+Say what you could not determine. An empty result is a real answer -
+"nothing matched that in the period" - but only when you have checked that
+the category and the date range exist. Put it in `caveats` when the ledger
+is too incomplete for the question to be answerable.""",
+        focus="""Answer exactly what was asked, using the tool that fits.
+`ledger_query` for totals and breakdowns, `search_transactions` for rows,
+`ledger_schema` when unsure what exists. Resolve ambiguity out loud rather
+than picking one reading. Earlier turns tell you what "that" refers to -
+re-query for the figures, never reuse them. Keep the answer the size of
+the question.""",
+    ),
+
     Agent(
         key="debt-strategist",
         name="Debt Strategist",
@@ -896,6 +983,9 @@ reports less believable.""",
 #: about debt, balances or completeness gets it", checked by a test rather
 #: than left to whoever adds the next agent.
 POSITION_SUBJECTS = frozenset({
+    # The generalist carries everything readable; an open question can be
+    # about what is owed as easily as about anything else.
+    "copilot",
     "debt-strategist", "subscription-auditor", "cashflow-sentinel",
     "tax-utilisation", "resilience", "bill-shock", "credit-health",
     "fee-auditor", "ledger-trust",

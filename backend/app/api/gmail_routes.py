@@ -75,11 +75,37 @@ def _client() -> GoogleGmailClient | None:
     return GoogleGmailClient(_DatabaseTokenStore(tenant))
 
 
+#: What to tell a person for each way `authorize()` can say no, and the status
+#: code that matches. 503 for the transient case because the correct action is
+#: to try again, and a 400 tells the caller the opposite - that the request was
+#: wrong and retrying it is pointless.
+_AUTH_FAILURE: dict[str, tuple[int, str]] = {
+    "no_grant": (
+        400, "Gmail is not connected. Connect it from the import screen."),
+    "unreadable": (
+        400, "The stored Gmail grant could not be read and has been "
+             "discarded. Reconnect Gmail from the import screen."),
+    "expired_no_refresh": (
+        400, "The Gmail grant expired and carries nothing to renew it with. "
+             "Reconnect Gmail from the import screen."),
+    "grant_revoked": (
+        400, "Google has revoked this Gmail grant, so it has been discarded. "
+             "Reconnect Gmail from the import screen."),
+    "transient": (
+        503, "Google could not be reached to renew the Gmail grant. The "
+             "connection itself is fine - try again in a moment."),
+}
+
+
 def _require_client() -> GoogleGmailClient:
     client = _client()
-    if client is None or not client.authorize():
+    if client is None:
         raise HTTPException(
             400, "Gmail is not connected. Connect it from the import screen.")
+    if not client.authorize():
+        status_code, detail = _AUTH_FAILURE.get(
+            client.auth_error, _AUTH_FAILURE["no_grant"])
+        raise HTTPException(status_code, detail)
     return client
 
 
@@ -93,9 +119,16 @@ def status() -> dict[str, Any]:
     cached = len(list(cache.glob("*.pdf"))) if cache.exists() else 0
     profile = repo.get_profile(get_db())
     client = _client()
+    connected = bool(client and client.is_authorized())
     return {
         "available": config.google_configured,
-        "connected": bool(client and client.is_authorized()),
+        "connected": connected,
+        # A grant on record that is no longer usable. Reported separately so
+        # the screen can offer "Reconnect" rather than implying Gmail was
+        # never set up - and so it stops showing "connected" for a grant
+        # every scan would refuse.
+        "needs_reconnect": bool(
+            client and not connected and client.has_stored_grant()),
         "cached_files": cached,
         "profile_ready": profile.has_password_material(),
         # Where to send the browser to grant read access. A URL rather than a

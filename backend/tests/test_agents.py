@@ -313,17 +313,22 @@ def test_a_model_that_never_answers_is_stopped(ledger):
     reading, rather than as a failure with nothing behind it.
     """
     agent = catalogue.get("cashflow-sentinel")
-    # A DIFFERENT tool each turn. Repeating one would trip the loop guard
-    # (see test_a_model_that_repeats_itself_is_stopped_early), and what this
-    # test is about is the budget running out, not the guard firing.
-    tools = list(agent.tools)
+    # A GENUINELY NEW call every turn, which now means new ARGUMENTS rather
+    # than merely a different tool name. Cycling tool names does not do it:
+    # there are fewer tools than steps, so the cycle wraps and the repeats
+    # are - correctly - read as learning nothing. What this test is about is
+    # the budget running out, not the guard firing, so every step asks
+    # something it has not asked before.
     model = ScriptedModel(*[
-        {"thought": "One more look.", "calls": [{"tool": tools[i % len(tools)]}]}
+        {"thought": "One more look.",
+         "calls": [{"tool": "ledger_query",
+                    "args": {"spec": {"dimensions": ["category"],
+                                      "limit": i + 1}}}]}
         for i in range(agent.max_steps)])
 
     result = runner.run(agent, ledger, client=model)
     assert result.status == "exhausted"
-    assert result.answer is None
+    assert result.answer is None, "the scripted model has nothing left to conclude with"
     assert len(result.steps) == agent.max_steps + 1  # + the opening facts
     assert "all" in result.error and "steps" in result.error
 
@@ -435,12 +440,18 @@ def test_a_call_with_different_arguments_is_not_a_repeat(ledger):
 
 def test_the_last_turn_says_so(ledger):
     agent = catalogue.get("cashflow-sentinel")
-    tools = list(agent.tools)
     model = ScriptedModel(*[
-        {"thought": "Again.", "calls": [{"tool": tools[i % len(tools)]}]}
+        {"thought": "Again.",
+         "calls": [{"tool": "ledger_query",
+                    "args": {"spec": {"dimensions": ["category"],
+                                      "limit": i + 1}}}]}
         for i in range(agent.max_steps)])
     runner.run(agent, ledger, client=model)
-    assert "LAST turn" in model.prompts[-1]
+    # Searched rather than taken from the end: a run that goes the distance
+    # without answering gets one more turn after its last STEP, asking it to
+    # conclude from what it has (see `_last_chance`). That turn offers no
+    # tools, so it is not a last turn - it is the turn after one.
+    assert any("LAST turn" in p for p in model.prompts)
 
 
 def test_an_empty_reply_costs_a_step_rather_than_the_run(ledger):
@@ -763,7 +774,12 @@ def test_running_an_agent_through_the_job_system(ledger, monkeypatch):
     result = job["result"]
     assert result["status"] == "ok"
     assert result["headline"] == ANSWER["answer"]["headline"]
-    assert result["tool_calls"] == 4  # two opening facts + two asked for
+    # Two opening facts, and only ONE of the two tools asked for actually
+    # runs: `loans` is an opening fact, so the model asking for it again is
+    # served from that result. This read 4 while an argument-less call
+    # hashed as "null" and the opening facts seeded "{}" - the memo never
+    # matched them, and every repeat of a no-argument tool was re-executed.
+    assert result["tool_calls"] == 3
 
     run = client.get(f"/api/agents/runs/{result['run_id']}"
                      f"?transcript=true").json()
@@ -1003,16 +1019,23 @@ def test_the_budget_caps_the_steps_an_agent_may_take(ledger):
 
     agent = catalogue.get("debt-strategist")
     assert agent.max_steps > runner_mod.COMPACT.max_steps
-    tools = list(agent.tools)
     model = ScriptedModel(*[
-        {"thought": "again", "calls": [{"tool": tools[i % len(tools)]}]}
+        {"thought": "again",
+         "calls": [{"tool": "ledger_query",
+                    "args": {"spec": {"dimensions": ["category"],
+                                      "limit": i + 1}}}]}
         for i in range(runner_mod.COMPACT.max_steps)])
 
     result = runner.run(agent, ledger, client=model,
                         budget=runner_mod.COMPACT)
     assert result.status == "exhausted"
-    assert len(model.prompts) == runner_mod.COMPACT.max_steps
-    assert "LAST turn" in model.prompts[-1]
+    # Steps are what the budget caps, and it capped them: five, plus the
+    # opening facts. The model is asked once more after that - without tools
+    # - to conclude from what it gathered, which is a request but not a
+    # step, and is the difference between a dead run and a qualified answer.
+    assert len(result.steps) == runner_mod.COMPACT.max_steps + 1
+    assert len(model.prompts) == runner_mod.COMPACT.max_steps + 1
+    assert "LAST turn" in model.prompts[-2]
     assert result.profile == "compact"
 
 
@@ -1135,7 +1158,7 @@ def test_the_catalogue_is_complete_and_coherent():
     exist. Checked as a set because the failure of a twelfth agent is
     typically a copied block with one field not changed."""
     keys = [a.key for a in catalogue.AGENTS]
-    assert len(keys) == len(set(keys)) == 12
+    assert len(keys) == len(set(keys)) == 13
 
     for agent in catalogue.AGENTS:
         assert agent.name and agent.question and agent.blurb, agent.key
@@ -1285,4 +1308,7 @@ def test_the_catalogue_says_which_budget_is_in_force(ledger):
     assert payload["profile"]["name"] in {"compact", "full"}
     assert payload["profile"]["max_steps"] >= 5
     assert payload["profile"]["note"]
-    assert len(payload["agents"]) == 12
+    # Derived, not restated. A hardcoded count means adding an agent
+    # fails a test about the BUDGET, which sends the next person
+    # looking in the wrong place.
+    assert len(payload["agents"]) == len(catalogue.AGENTS)

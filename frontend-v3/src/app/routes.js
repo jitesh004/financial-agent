@@ -21,6 +21,12 @@ export const ROUTES = [
     load: () => import('../screens/Overview'),
   },
   {
+    path: '/ask', key: 'ask', group: 'money', label: 'Ask', icon: 'question',
+    title: 'Ask Your Ledger', needsLedger: true,
+    blurb: 'Ask anything about your money and read the queries behind the answer.',
+    load: () => import('../screens/Chat'),
+  },
+  {
     path: '/agents', key: 'agents', group: 'money', label: 'Copilot Agents', icon: 'sparkles',
     title: 'AI Financial Agents', needsLedger: true,
     blurb: 'Specialized LangGraph models auditing leaks, resilience, debt and taxes.',

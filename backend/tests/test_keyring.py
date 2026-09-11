@@ -313,3 +313,90 @@ def test_the_stash_is_never_served_over_http(signed_in_client):
     # Only masked hints reach the browser.
     for k in llm.get("api_keys") or []:
         assert "key" not in k
+
+
+# ---------------------------------------------------------------------------
+# A timeout is a reason to try another key, not only to wait
+# ---------------------------------------------------------------------------
+
+class _FlakyClient:
+    """Raises a transport error for the first `fail` attempts, then answers."""
+
+    def __init__(self, fail: int, exc=None):
+        import httpx
+        self.remaining = fail
+        self.exc = exc or httpx.ReadTimeout("too slow")
+        self.keys_seen: list[str] = []
+
+    def post(self, url, json=None, headers=None):
+        self.keys_seen.append(headers.get("x-goog-api-key"))
+        if self.remaining > 0:
+            self.remaining -= 1
+            raise self.exc
+        return _Resp(200)
+
+
+def test_a_timed_out_key_hands_off_to_the_next_one(monkeypatch):
+    """A timeout used to sleep on the same key instead of asking another.
+
+    The key was never marked as tried, so the next attempt picked the first
+    available key again - the same one - and backed off: two seconds, then
+    four, then eight. Fourteen seconds of waiting with three good keys
+    sitting idle, which is what a whole eval sweep was doing.
+    """
+    slept: list[float] = []
+    monkeypatch.setattr("time.sleep", lambda s: slept.append(s))
+
+    client = _FlakyClient(fail=1)
+    resp = _post_with_retries(client, "http://x", json={}, provider="Gemini",
+                              keys=_ring("a", "b"), headers_for=_headers_for)
+
+    assert resp.status_code == 200
+    assert client.keys_seen == ["secret-a", "secret-b"]
+    assert slept == [], "it waited when another key was available"
+
+
+def test_a_timeout_does_not_stand_a_good_key_down(monkeypatch):
+    """The key is set aside for THIS call only.
+
+    A timeout is the provider being slow, not the credential being bad.
+    Resting it - as a 429 does - would shrink the ring for every later
+    call over something that was never the key's fault.
+    """
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    client = _FlakyClient(fail=1)
+    _post_with_retries(client, "http://x", json={}, provider="Gemini",
+                       keys=_ring("a", "b"), headers_for=_headers_for)
+
+    ring = _ring("a", "b")
+    assert len(keyring.available(ring)) == 2, (
+        "a slow reply took a working key out of service")
+
+
+def test_only_when_every_key_has_timed_out_does_it_wait(monkeypatch):
+    """Backoff is still there - it is just the last resort rather than the
+    first, which is the same order the 429 path already used."""
+    slept: list[float] = []
+    monkeypatch.setattr("time.sleep", lambda s: slept.append(s))
+
+    client = _FlakyClient(fail=2)
+    resp = _post_with_retries(client, "http://x", json={}, provider="Gemini",
+                              keys=_ring("a", "b"), headers_for=_headers_for)
+
+    assert resp.status_code == 200
+    assert client.keys_seen[:2] == ["secret-a", "secret-b"]
+    assert slept, "both keys failed and it did not back off at all"
+
+
+def test_a_single_key_still_backs_off(monkeypatch):
+    """Nothing to rotate to, so the old behaviour is the right behaviour."""
+    slept: list[float] = []
+    monkeypatch.setattr("time.sleep", lambda s: slept.append(s))
+
+    client = _FlakyClient(fail=1)
+    resp = _post_with_retries(client, "http://x", json={}, provider="Gemini",
+                              keys=_ring("solo"), headers_for=_headers_for)
+
+    assert resp.status_code == 200
+    assert slept == [2.0]

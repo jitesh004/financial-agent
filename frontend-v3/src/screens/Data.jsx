@@ -306,7 +306,10 @@ function CoverageGrid() {
           appear in this grid. Some of the {tally.missing} months shown as missing may
           already be covered by {locked.length === 1 ? 'it' : 'them'} &mdash; add the
           passwords under Files to find out.
-          <div className="text-xs text-3" style={{ marginTop: 6 }}>
+          <div
+            className="text-xs text-3"
+            style={{ marginTop: 6, overflowWrap: 'anywhere' }}
+          >
             {locked.slice(0, 6).map((f) => f.filename).join(', ')}
             {locked.length > 6 ? ` and ${locked.length - 6} more` : ''}
           </div>

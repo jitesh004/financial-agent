@@ -299,7 +299,16 @@ function AgentAnswer({ run, onBack }) {
               {run.transcript.map((step, idx) => (
                 <div key={step.index ?? idx} className="card" style={{ padding: '10px 14px', fontSize: 12.5, background: 'var(--surface-2)' }}>
                   <div className="flex items-center justify-between gap-2 flex-wrap" style={{ marginBottom: 6 }}>
-                    <span className="font-mono font-bold brand">Step {(step.index ?? idx) + 1}</span>
+                    {/* `index` is already 1-based, and 0 means the opening
+                        facts - fetched for the agent before it was asked
+                        anything, not a step it took. Adding one to it
+                        numbered every row one too high AND broke the
+                        "from step N" badges below, which carry the real
+                        step number: a repeat of step 2 pointed at a row
+                        labelled Step 3. */}
+                    <span className="font-mono font-bold brand">
+                      {step.index ? `Step ${step.index}` : 'Opening facts'}
+                    </span>
                     <span className="text-3 text-xs">
                       {step.seconds != null ? `${step.seconds.toFixed(2)}s` : ''}
                     </span>

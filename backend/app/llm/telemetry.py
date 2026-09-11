@@ -51,6 +51,7 @@ PURPOSES: tuple[tuple[str, str], ...] = (
     ("agent", "Copilot agents"),
     ("narrative", "Written narrative"),
     ("probe", "Connection test"),
+    ("eval", "Eval sweep"),
 )
 
 PURPOSE_LABEL = dict(PURPOSES)

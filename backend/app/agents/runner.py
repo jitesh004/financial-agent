@@ -189,6 +189,11 @@ class AgentRun:
     #: agents.verify. Empty is the normal case and the one worth trusting.
     unverified: list[str] = field(default_factory=list)
     figures_checked: int = 0
+    #: True when the answer came from the last-chance turn rather than from
+    #: the agent deciding it was done. The figures in it were still produced
+    #: by tools and still checked, but the agent had stopped making progress
+    #: when it was asked to conclude - which the reader should know.
+    partial: bool = False
 
 
 class AgentUnavailable(RuntimeError):
@@ -215,6 +220,31 @@ REPLY_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "properties": {
                     "tool": {"type": "string"},
+                    # The arguments, as a JSON STRING.
+                    #
+                    # Not as an object, which is what this used to be and
+                    # is the obvious way to write it. Google's structured
+                    # output takes an OpenAPI subset where an OBJECT with
+                    # no declared properties has nothing it is PERMITTED
+                    # to emit - so it returns `{}`, every time, however
+                    # clearly the model said what it wanted. Verified
+                    # against the live API: the same request answered
+                    # `{"args": {}}` under an object schema and
+                    # `{"args_json": "{\"text\": \"fuel\", ...}"}`
+                    # under this one.
+                    #
+                    # That silently disarmed every tool that takes
+                    # arguments. `ledger_query` ran unfiltered over the
+                    # whole ledger on every call an agent ever made, and
+                    # `search_transactions` returned whatever came first -
+                    # so an agent asked about August fuel was reading the
+                    # same all-time totals as one asked about anything
+                    # else, and reasoning confidently over them.
+                    #
+                    # `args` is kept and still honoured: OpenRouter and
+                    # Azure handle a bare object correctly, and a model
+                    # that fills it is not wrong.
+                    "args_json": {"type": "string"},
                     "args": {"type": "object"},
                 },
                 "required": ["tool"],
@@ -289,13 +319,125 @@ def _json_default(obj: Any) -> Any:
     return str(obj)
 
 
+def _shrink(value: Any, limit: int) -> Any:
+    """Drop whole rows from the longest list until the result fits.
+
+    Character truncation is the wrong tool for a result shaped like
+    `{"accounts": [...22 of them...], "count": 22}`. Cut at 1,800 characters
+    it becomes JSON that stops mid-object, and a model handed that reads it
+    as a broken tool rather than a long one: asked how many credit cards
+    this holder has, one read a severed account list and reported that the
+    records were inaccessible. They were not - there were 22 of them.
+
+    Dropping rows keeps the structure intact and keeps the parts that are
+    not rows - `count`, `range`, `truncated` - which are frequently the
+    whole answer. What is lost is said in place, in the list, where a model
+    reading the list will see it.
+    """
+    if not isinstance(value, dict):
+        return None
+    lists = [(k, v) for k, v in value.items()
+             if isinstance(v, list) and len(v) > 1]
+    if not lists:
+        return None
+    key, rows = max(lists, key=lambda kv: len(_json(kv[1])))
+
+    def marker(kept: int) -> str:
+        return (f"[{len(rows) - kept} of {len(rows)} not shown - too long "
+                f"for one result. Filter the call to see the rest; any "
+                f"count or total alongside this list still covers all "
+                f"{len(rows)}.]")
+
+    def attempt(kept: int) -> dict:
+        out = dict(value)
+        out[key] = rows[:kept] + [marker(kept)]
+        return out
+
+    # Measured with the REAL marker, not a short stand-in. Measuring a
+    # placeholder and emitting a sentence is how this overflowed the limit
+    # on its first outing and fell straight back to cutting characters -
+    # which is the thing it exists to avoid.
+    low, high, best = 0, len(rows) - 1, -1
+    while low <= high:
+        mid = (low + high) // 2
+        if len(_json(attempt(mid))) <= limit:
+            best, low = mid, mid + 1
+        else:
+            high = mid - 1
+
+    # Even zero rows plus the marker does not fit; there is nothing useful
+    # to hand back and the caller should truncate instead.
+    return attempt(best) if best >= 0 else None
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, default=_json_default, separators=(",", ":"))
+
+
 def _dump(value: Any, limit: int) -> str:
-    text = json.dumps(value, default=_json_default, separators=(",", ":"))
+    text = _json(value)
     if len(text) <= limit:
         return text
+
+    shrunk = _shrink(value, limit)
+    if shrunk is not None:
+        trimmed = _json(shrunk)
+        if len(trimmed) <= limit:
+            return trimmed
+
     return (text[:limit]
             + f'… [truncated at {limit} characters of {len(text)}; narrow the '
               f'query or raise a filter to see the rest]')
+
+
+#: What the model is allowed to return when it is out of steps. Tools are
+#: not on the menu, so the only shape left is an answer.
+_FINAL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": dict(REPLY_SCHEMA["properties"]["answer"]["properties"]),
+    "required": ["headline"],
+}
+
+
+def _last_chance(client, system: str, task: str, transcript: list[str],
+                 run_record: "AgentRun", agent: Agent, event) -> dict | None:
+    """One turn to conclude, with the tools taken away.
+
+    Called only when a run stopped without answering. Everything the tools
+    returned is still in the transcript; what the agent failed at was
+    deciding it had enough, which is a different failure from not having
+    enough and should not be handed to the reader as the same blank page.
+
+    Given no `calls` key to fill, so there is nothing to do but answer or
+    say what is missing. Returns None on any failure - a last chance that
+    breaks is simply a run with no answer, which is where it already was.
+    """
+    event("model", "Out of steps - asking for a conclusion",
+          detail="no tools offered; answer from what the run already has")
+    prompt = (
+        f"The question: {task}\n\n"
+        f"What the tools returned:\n" + "\n".join(transcript) + "\n\n"
+        "You are out of steps and there are no more tool calls available. "
+        "Answer the question NOW using only the results above.\n"
+        "- Use only figures that appear above. Do not calculate new ones "
+        "and do not estimate.\n"
+        "- If the results do not answer the question, say exactly that in "
+        "the headline and put what is missing in `caveats`. That is a "
+        "useful answer; an invented figure is not."
+    )
+    try:
+        from ..llm import telemetry
+        with telemetry.purpose("agent", f"{agent.key} · conclude"):
+            reply = client.complete_json(prompt, system=system,
+                                         schema=_FINAL_SCHEMA, max_tokens=4000)
+    except Exception as exc:
+        log.warning("agent %s: last-chance turn failed: %s", agent.key, exc)
+        return None
+    if not isinstance(reply, dict) or not reply.get("headline"):
+        return None
+    event("answer", "Concluded from what the run already had",
+          detail=str(reply.get("headline"))[:200])
+    return _clean_answer(reply)
 
 
 def _system(agent: Agent, budget: Budget = FULL) -> str:
@@ -333,6 +475,7 @@ def run(
     *,
     client: LLMClient | None = None,
     question: str = "",
+    history: list[dict] | None = None,
     budget: Budget | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> AgentRun:
@@ -405,10 +548,16 @@ def run(
                 for c, r in zip(opening.calls, opening.results)))
 
     task = (question.strip() or agent.question)
-    #: The tools the previous step asked for, and how many times running
-    #: the model has repeated them. See the loop guard below.
-    previous_signature: tuple[str, ...] = ()
+    #: How many steps running have taught the model nothing new. See the
+    #: loop guard below for what "nothing new" means and why it is not the
+    #: same question as "the same tools again".
     repeats = 0
+    #: Calls the MODEL made that returned something the run did not already
+    #: have. Distinct from `run_record.tool_calls`, which also counts the
+    #: opening facts - those are fetched for the model, not by it, and a run
+    #: cannot be accused of going in circles on the strength of work it did
+    #: not do.
+    learned = 0
 
     def event(kind: str, text: str, *, detail: str = "", step: int = 0,
               ok: bool = True) -> None:
@@ -439,7 +588,8 @@ def run(
         step = Step(index=index)
         turn_started = time.monotonic()
 
-        prompt = _prompt(task, transcript, index, steps_allowed, last_turn)
+        prompt = _prompt(task, transcript, index, steps_allowed, last_turn,
+                         history=history)
         run_record.prompt_chars += len(system) + len(prompt)
         # Said before the call, not after. A model call is the slowest thing
         # in a run - ten to thirty seconds - and for all of it the screen
@@ -511,11 +661,14 @@ def run(
 
         progress(f"Checking the numbers (step {index})")
         lines: list[str] = []
+        #: Tool results this step that the run did not already have. The
+        #: loop guard reads this and nothing else.
+        new_results = 0
         for requested in calls[:MAX_CALLS_PER_STEP]:
             if not isinstance(requested, dict):
                 continue
             name = str(requested.get("tool") or "")
-            args = requested.get("args")
+            args = _arguments(requested)
             memo_key = (name, _dump(args, 400))
             repeat_of = answered.get(memo_key)
 
@@ -541,6 +694,8 @@ def run(
                 result = toolbelt.call(db, name, args)
                 verify.collect_figures(result, figures)
                 run_record.tool_calls += 1
+                new_results += 1
+                learned += 1
                 answered[memo_key] = (index - 1, result)
                 # Named individually, with what it was asked and how long it
                 # took. "23 tool calls" at the end of a run says nothing
@@ -572,39 +727,79 @@ def run(
         step.seconds = round(time.monotonic() - turn_started, 2)
         run_record.steps.append(step)
 
-        # A model that asks for the same tools it just asked for is not
-        # making progress; it is stuck, and the only thing left to spend
-        # is the budget. Half of all runs on this workspace ended that
-        # way - steps 4 through 8 issuing the identical set with the
-        # identical reasoning, then a silent give-up at step 10. Say so
-        # the first time and stop the second: an agent that has re-read
-        # the same data three times learns nothing from a fourth.
-        signature = tuple(sorted(c["tool"] for c in step.calls))
-        if signature and signature == previous_signature:
+        # A model that learns nothing from a step is stuck, and the only
+        # thing left to spend is the budget. Half of all runs on this
+        # workspace ended that way - steps 4 through 8 issuing the same
+        # request with the same reasoning, then a silent give-up at step 10.
+        # Say so the first time and stop the second.
+        #
+        # What counts as stuck is NEW INFORMATION, not a repeated tool name.
+        # This guard used to compare `sorted(tool names)` between steps,
+        # which was a fair proxy only for as long as arguments never
+        # arrived: with every call carrying empty arguments, the same tool
+        # twice really was the same call twice. The moment arguments started
+        # working it became wrong in the most damaging direction - asking
+        # `ledger_query` for dining and then for groceries is two different
+        # questions and exactly how "how much do I spend on food?" has to be
+        # answered, and the guard was killing those runs outright.
+        #
+        # The memo already knows the honest answer: a call whose result was
+        # served from an earlier step produced nothing new, and a step where
+        # every call was served that way is a step that went nowhere.
+        if step.calls and not new_results:
             repeats += 1
-            if repeats >= 2:
+            # A run has not STOPPED making progress until it has made some.
+            # The memo is seeded with the opening facts, and for most agents
+            # the opening tools are the first ones listed - so a model that
+            # politely starts by asking for exactly what it was already
+            # handed trips two no-progress steps before it has made a single
+            # call of its own, and the run died at step 2. That is a
+            # confused opening, not a loop, and the nudge below is the right
+            # response to it. Killing the run is reserved for a model that
+            # has been somewhere and stopped going anywhere.
+            if repeats >= 2 and learned:
                 run_record.status = "looping"
                 run_record.error = (
                     "Asked for the same data three times without reaching "
                     "a conclusion, so the run was stopped rather than left "
                     "to use up its remaining steps.")
-                log.warning("agent %s looping on %s; stopped at step %d",
-                            agent.key, signature, index)
+                log.warning("agent %s learned nothing new for two steps; "
+                            "stopped at step %d", agent.key, index)
                 break
             transcript.append(
-                "You have just requested the same tools as the previous "
-                "step, and the results have not changed. Do not call them "
-                "again - answer with what you already have, or say what "
-                "is missing.")
+                "Every tool you just called had already been answered this "
+                "run, so nothing has changed. Do not call them again - "
+                "answer with what you already have, or say what is missing.")
         else:
             repeats = 0
-        previous_signature = signature
         transcript.append(
             f"Step {index}. You said: {step.thought}\n" + "\n".join(lines))
         transcript = _trim(transcript, budget.max_transcript_chars)
     else:
         # The loop finished without breaking, so the budget ran out.
         run_record.status = "exhausted"
+
+    # A run that stopped without answering still gathered everything it
+    # gathered. Throwing that away and showing the reader "the agent used
+    # all of its steps" is the least useful thing to do with it: the tool
+    # results that would have answered the question are usually already
+    # sitting in the transcript, and what failed was the deciding, not the
+    # looking.
+    #
+    # So one last turn, with no tools on offer and no option to ask for
+    # any - answer from what is here, or say plainly what is missing. It
+    # costs a single request and it is the difference between a dead run
+    # and a qualified answer. It is deliberately NOT attempted when the
+    # model itself failed: if the call is erroring, another call is not a
+    # recovery, it is the same error again.
+    if (run_record.answer is None
+            and run_record.status in {"looping", "exhausted"}
+            and run_record.tool_calls):
+        run_record.answer = _last_chance(
+            client, system, task, transcript, run_record, agent, event)
+        if run_record.answer is not None:
+            run_record.status = "ok"
+            run_record.partial = True
 
     # "looping" is a diagnosis, not a synonym for running out - it says the
     # run was CUT SHORT because it had stopped making progress, and burying
@@ -640,9 +835,91 @@ def run(
     return run_record
 
 
+#: How many earlier exchanges a follow-up can see.
+#:
+#: Four, because a follow-up refers to the turn before it and occasionally
+#: the one before that - and because history is re-sent on EVERY step of
+#: EVERY turn. One run already grew its prompt from 18,000 characters to
+#: 46,000 across four steps; multiplying that by an unbounded conversation
+#: is how a chat feature becomes slow, expensive and finally too long to
+#: send at all.
+HISTORY_TURNS = 4
+
+#: How much of one earlier turn is worth carrying.
+HISTORY_ANSWER_CHARS = 400
+
+
+def _history_block(history: list[dict]) -> str:
+    """Earlier turns, compressed to what a follow-up actually needs.
+
+    The QUESTION and the HEADLINE, not the working. What "that" and "the
+    same period" refer to lives in those two lines; the tool results
+    behind them are large, already spent, and re-sending them would crowd
+    out the reasoning for the question actually being asked.
+
+    Figures are deliberately NOT carried as fact - see the brief. They are
+    here so the model can tell what is being referred to, and it is told
+    to re-query rather than reuse.
+    """
+    lines = []
+    for turn in history[-HISTORY_TURNS:]:
+        question = str(turn.get("question") or "").strip()
+        answer = turn.get("answer") or {}
+        headline = str(answer.get("headline") or "").strip()
+        if not question:
+            continue
+        entry = f"Q: {question[:300]}"
+        if headline:
+            entry += f"\nA: {headline[:HISTORY_ANSWER_CHARS]}"
+        elif turn.get("error"):
+            entry += "\nA: (that question could not be answered)"
+        lines.append(entry)
+    return "\n\n".join(lines)
+
+
+def _arguments(requested: dict) -> dict:
+    """The arguments for one call, from whichever field carries them.
+
+    `args_json` first, because that is the one Google's structured output
+    can actually populate; `args` second, for the providers that handle a
+    bare object. A model that fills both is taken at its word on the
+    richer of the two.
+    """
+    parsed: dict = {}
+    raw = requested.get("args_json")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                parsed = loaded
+        except (ValueError, TypeError):
+            # Not fatal: the tool runs with what is left, and the model
+            # sees the result and can correct itself next step. Saying so
+            # is what makes that possible.
+            log.warning("agent sent unparseable args_json: %.120s", raw)
+
+    direct = requested.get("args")
+    if isinstance(direct, dict) and direct:
+        # Merged rather than replaced, so a model that splits its
+        # arguments across both fields does not silently lose half.
+        return {**parsed, **direct} if parsed else direct
+    return parsed
+
+
 def _prompt(task: str, transcript: list[str], index: int, budget: int,
-            last_turn: bool) -> str:
-    parts = [f"THE QUESTION\n{task}\n"]
+            last_turn: bool, history: list[dict] | None = None) -> str:
+    parts = []
+    if history:
+        block = _history_block(history)
+        if block:
+            parts.append(
+                "EARLIER IN THIS CONVERSATION\n" + block
+                + "\n\nThese are for working out what the question REFERS "
+                  "to - what \"that\", \"it\" and \"the same period\" "
+                  "mean. Do not reuse a figure from them: query for it "
+                  "again. The ledger can have changed, and a number carried "
+                  "forward is a number nobody checked.")
+    parts.append(f"THE QUESTION\n{task}\n")
     if transcript:
         parts.append("WHAT YOU HAVE LOOKED AT SO FAR\n"
                      + "\n\n".join(transcript))

@@ -55,6 +55,7 @@ export default function ImportWizard({ mailbox, open, onClose, onImported }) {
     status, periods, intents, error, stage, job, busy,
     rows, selection, setSelection, chosenIntents, toggleIntent, scanIntent,
     importableAlerts, sections, sourceResults, mailboxReady, mailboxAvailable,
+    mailboxNeedsReconnect,
   } = mailbox;
 
   const [step, setStep] = useState(0);
@@ -123,7 +124,9 @@ export default function ImportWizard({ mailbox, open, onClose, onImported }) {
   const subtitle = status?.connected
     ? (status.cached_files > 0
       ? `Mailbox connected · ${status.cached_files} statements cached locally` : 'Mailbox connected')
-    : 'Local workspace import';
+    : mailboxNeedsReconnect
+      ? 'Mailbox grant expired — reconnect to scan'
+      : 'Local workspace import';
 
   return (
     <Modal
@@ -250,9 +253,11 @@ export default function ImportWizard({ mailbox, open, onClose, onImported }) {
 
       {!mailboxReady && (view === 'scanning' || view === 'choose') && (
         <Callout tone="warn" icon="warning">
-          {mailboxAvailable
-            ? 'No mailbox is currently linked. Connect Google Gmail on Step 1, or drop statement files directly from this machine.'
-            : 'Gmail OAuth is not configured on this server. Add local PDF/CSV statement files on Step 1 — they are verified through the exact same parsing and balance gates.'}
+          {!mailboxAvailable
+            ? 'Gmail OAuth is not configured on this server. Add local PDF/CSV statement files on Step 1 — they are verified through the exact same parsing and balance gates.'
+            : mailboxNeedsReconnect
+              ? 'Your Gmail grant is no longer accepted — Google expires read access periodically. Reconnect on Step 1, or drop statement files directly from this machine.'
+              : 'No mailbox is currently linked. Connect Google Gmail on Step 1, or drop statement files directly from this machine.'}
         </Callout>
       )}
 
@@ -262,13 +267,14 @@ export default function ImportWizard({ mailbox, open, onClose, onImported }) {
           {!mailboxReady && (
             mailboxAvailable ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                <Callout tone="acc" icon="info">
-                  Read-only statement access. Authentication occurs entirely on Google&apos;s verified consent screen.
-                  This agent never stores account passwords and requests zero send/delete scopes.
+                <Callout tone={mailboxNeedsReconnect ? 'warn' : 'acc'} icon="info">
+                  {mailboxNeedsReconnect
+                    ? 'Gmail read access was granted before but Google no longer accepts it — grants expire, and an app still in OAuth testing has them expire weekly. Granting again restores it; nothing already imported is affected.'
+                    : 'Read-only statement access. Authentication occurs entirely on Google’s verified consent screen. This agent never stores account passwords and requests zero send/delete scopes.'}
                 </Callout>
                 <div>
                   <Button variant="primary" icon="mail" onClick={mailbox.connect}>
-                    Connect Gmail Read-Only
+                    {mailboxNeedsReconnect ? 'Reconnect Gmail Read-Only' : 'Connect Gmail Read-Only'}
                   </Button>
                 </div>
               </div>

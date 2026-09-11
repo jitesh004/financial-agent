@@ -667,6 +667,121 @@ def test_full_address_exclusion_does_not_match_a_different_mailbox():
     assert not profile.is_excluded("")
 
 
+def test_a_password_can_be_added_without_replacing_the_others():
+    """Adding one known password must not cost you the ones already stored.
+
+    `PUT /api/profile` takes the whole list, and the API deliberately never
+    returns the passwords, so a caller wanting to add one cannot send the
+    others back - it does not have them. Spelled as a replace, "add a
+    password" quietly deleted every other password the user had.
+    """
+    from app.db import database as db_module
+    from app.db import repository as repo
+    from app.models.profile import UserProfile
+    from fastapi.testclient import TestClient
+    import app.main as main_module
+
+    original_db = db_module._db
+    db_module._db = fresh_ledger()
+    try:
+        repo.save_profile(db_module._db, UserProfile(
+            full_name="Holder", custom_passwords=["first", "second"]))
+
+        client = TestClient(main_module.app)
+        resp = client.post("/api/profile/passwords", json={"password": "third"})
+        assert resp.status_code == 200
+        assert resp.json()["custom_password_count"] == 3
+
+        assert repo.get_profile(db_module._db).custom_passwords == [
+            "first", "second", "third"]
+    finally:
+        db_module._db = original_db
+
+
+def test_adding_a_password_twice_changes_nothing():
+    """The end state asked for is the state it is already in."""
+    from app.db import database as db_module
+    from app.db import repository as repo
+    from app.models.profile import UserProfile
+    from fastapi.testclient import TestClient
+    import app.main as main_module
+
+    original_db = db_module._db
+    db_module._db = fresh_ledger()
+    try:
+        repo.save_profile(db_module._db, UserProfile(custom_passwords=["only"]))
+        client = TestClient(main_module.app)
+
+        body = client.post("/api/profile/passwords", json={"password": "only"}).json()
+        assert body["status"] == "already_stored"
+        assert repo.get_profile(db_module._db).custom_passwords == ["only"]
+    finally:
+        db_module._db = original_db
+
+
+def test_a_password_can_be_removed_by_position():
+    """Removal has to work without ever reading the value back.
+
+    The caller is told a length per entry and nothing else, so position is
+    the only handle it has.
+    """
+    from app.db import database as db_module
+    from app.db import repository as repo
+    from app.models.profile import UserProfile
+    from fastapi.testclient import TestClient
+    import app.main as main_module
+
+    original_db = db_module._db
+    db_module._db = fresh_ledger()
+    try:
+        repo.save_profile(db_module._db, UserProfile(
+            custom_passwords=["keep-me", "drop-me", "keep-me-too"]))
+        client = TestClient(main_module.app)
+
+        body = client.delete("/api/profile/passwords/1").json()
+        assert body["custom_password_count"] == 2
+        assert repo.get_profile(db_module._db).custom_passwords == [
+            "keep-me", "keep-me-too"]
+
+        assert client.delete("/api/profile/passwords/9").status_code == 404
+    finally:
+        db_module._db = original_db
+
+
+def test_the_profile_never_returns_the_passwords_themselves():
+    """Lengths are enough to manage the list; the values would be a leak.
+
+    On this profile several of them encode the date of birth, so echoing
+    them back hands over two secrets in one response.
+    """
+    from app.db import database as db_module
+    from app.db import repository as repo
+    from app.models.profile import UserProfile
+    from fastapi.testclient import TestClient
+    import app.main as main_module
+
+    original_db = db_module._db
+    db_module._db = fresh_ledger()
+    try:
+        repo.save_profile(db_module._db, UserProfile(
+            custom_passwords=["topsecret", "alsosecret"]))
+        client = TestClient(main_module.app)
+
+        body = client.get("/api/profile").json()
+        assert body["custom_password_count"] == 2
+        assert body["custom_password_hints"] == [
+            {"index": 0, "length": 9}, {"index": 1, "length": 10}]
+        assert "topsecret" not in resp_text(body)
+        assert "alsosecret" not in resp_text(body)
+    finally:
+        db_module._db = original_db
+
+
+def resp_text(body) -> str:
+    import json as _json
+    return _json.dumps(body)
+
+
 def test_saving_the_profile_form_does_not_wipe_excluded_senders(tmp_path):
     """PUT /api/profile must not silently delete the family/firm ignore list.
 
