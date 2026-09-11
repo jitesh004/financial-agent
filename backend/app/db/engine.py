@@ -92,6 +92,31 @@ def current_tenant() -> str | None:
     return TENANT.get()
 
 
+#: Which import job the work on this thread belongs to, when it belongs to
+#: one. Bound the same way and for the same reason as `TENANT`: a model
+#: inference happens six frames below the route that started the job, and
+#: threading an id through every one of those signatures to satisfy an
+#: audit log would be a worse trade than a context variable.
+#:
+#: Empty outside a job - a parse run from a script or a test logs its
+#: inferences with no job, which is accurate.
+JOB: ContextVar[str] = ContextVar("fa_job_id", default="")
+
+
+def current_job() -> str:
+    return JOB.get() or ""
+
+
+@contextmanager
+def job_scope(job_id: str):
+    """Run a block as part of `job_id`."""
+    token = JOB.set(str(job_id or ""))
+    try:
+        yield
+    finally:
+        JOB.reset(token)
+
+
 # ---------------------------------------------------------------------------
 # Dialect
 # ---------------------------------------------------------------------------

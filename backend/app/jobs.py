@@ -467,6 +467,28 @@ class JobProgress:
 
     def __init__(self, job: Job):
         self.job = job
+        # Bind the job for anything running underneath this worker.
+        #
+        # Model inferences are logged six frames below the route that
+        # started the job, and the import wizard has to be able to say
+        # which run they belong to. Threading an id through every
+        # intervening signature to satisfy an audit log would be the worse
+        # trade, so it travels the way the tenant already does. This
+        # constructor is the one place every job body passes through.
+        try:
+            from .db.engine import JOB
+            JOB.set(job.id)
+        except Exception:               # pragma: no cover - defensive
+            pass
+
+    @staticmethod
+    def _unbind() -> None:
+        """Stop attributing later work to a job that has ended."""
+        try:
+            from .db.engine import JOB
+            JOB.set("")
+        except Exception:               # pragma: no cover - defensive
+            pass
 
     def start(self, total: int, phase: str = "") -> None:
         with self.job.lock:
@@ -523,6 +545,7 @@ class JobProgress:
             self.job.dirty = True
 
     def complete(self, result: Any = None, message: str = "") -> None:
+        self._unbind()
         with self.job.lock:
             self.job.status = "complete"
             self.job.finished_at = time.time()
@@ -549,6 +572,7 @@ class JobProgress:
         self._persist_now()
 
     def fail(self, error: str) -> None:
+        self._unbind()
         with self.job.lock:
             self.job.status = "failed"
             self.job.finished_at = time.time()

@@ -25,16 +25,113 @@
         if (m) m.setAttribute('content', t === 'dark' ? '#090b10' : '#f8fafc');
       })();
     </script>
+
+    <!-- The boot screen's own styles, inline and in the head.
+
+         They cannot live in `src/styles/app.css`: that file is imported by
+         `main.jsx`, so it arrives only once the module graph has loaded -
+         which is precisely the interval the boot screen exists to cover.
+         Styling it there would mean it is unstyled for exactly as long as
+         it is visible, and styled only once it is gone.
+
+         That is what was happening here, in its worst form: the markup
+         below referenced four classes that were never defined anywhere at
+         all, so a reload painted the bare words "PRISM v3" in the top-left
+         corner in the browser's default font until React replaced them.
+
+         The background is the token value for each theme, copied rather
+         than referenced because the token stylesheet has not loaded yet
+         either. Keep these two in step with `tokens.css`. -->
+    <style>
+      .boot-screen {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        background: #f8fafc;
+        /* Hidden at first, and only faded up if the wait is long enough to
+           be worth explaining. A mount that finishes in 200ms shows a
+           plain background and nothing else - which is the whole point,
+           because a splash that flashes for a moment reads as a glitch
+           rather than as reassurance. */
+        opacity: 0;
+        animation: boot-appear .25s ease-out .35s forwards;
+        /* Never interactive, at any point in its life. It is decoration
+           over the top of the whole viewport, and a decoration that can
+           intercept a click is a trap - especially one that is invisible
+           for the first third of a second. */
+        pointer-events: none;
+      }
+
+      [data-theme="dark"] .boot-screen { background: #090b10; }
+
+      @keyframes boot-appear { to { opacity: 1; } }
+
+      /* Set by `main.jsx` once the app has painted. Animation is dropped
+         first, or the fade-in keyframe keeps winning over the fade-out. */
+      .boot-screen.done {
+        animation: none;
+        opacity: 0;
+        transition: opacity .2s ease-out;
+      }
+
+      .boot-logo {
+        width: 44px;
+        height: 44px;
+        border-radius: 12px;
+        background: linear-gradient(135deg, #4f46e5 0%, #38bdf8 100%);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .boot-prism {
+        width: 17px;
+        height: 17px;
+        border: 2px solid rgba(255, 255, 255, .92);
+        border-radius: 3px;
+        transform: rotate(45deg);
+        animation: boot-turn 1.6s ease-in-out infinite;
+      }
+
+      @keyframes boot-turn {
+        0%, 100% { transform: rotate(45deg)  scale(1);   opacity: 1; }
+        50%      { transform: rotate(135deg) scale(.82); opacity: .65; }
+      }
+
+      .boot-label {
+        font: 600 13px/1 ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+              sans-serif;
+        letter-spacing: .14em;
+        text-transform: uppercase;
+        color: #64748b;
+      }
+
+      /* Respecting the setting is not decoration here: a pulsing shape is
+         exactly the kind of motion someone turns this on to avoid. */
+      @media (prefers-reduced-motion: reduce) {
+        .boot-screen { animation-delay: .35s; animation-duration: .01s; }
+        .boot-prism  { animation: none; }
+      }
+    </style>
   </head>
   <body>
-    <div id="root">
-      <div class="boot-screen">
-        <div class="boot-logo">
-          <div class="boot-prism"></div>
-        </div>
-        <div class="boot-label">PRISM v3</div>
+    <!-- Outside #root, not inside it.
+
+         React clears its container on the first render, which does remove
+         this - but abruptly, on whichever frame the mount lands. Keeping
+         it as a sibling lets `main.jsx` fade it out deliberately once the
+         app has actually painted. -->
+    <div id="boot" class="boot-screen">
+      <div class="boot-logo">
+        <div class="boot-prism"></div>
       </div>
+      <div class="boot-label">PRISM v3</div>
     </div>
+    <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

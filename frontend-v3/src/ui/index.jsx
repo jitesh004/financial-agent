@@ -456,21 +456,60 @@ export function Toggle({ on, children, ...rest }) {
   );
 }
 
+/* Vertical padding and font per size. `xs` exists because six call sites
+   were each writing `style={{ fontSize: 11, height: 26 }}` by hand, and a
+   height set from outside cannot know what padding the component will add
+   underneath it - see the clamp below for what that cost. */
+const SELECT_SIZES = {
+  xs: { padY: 3, padX: 8, font: 11 },
+  sm: { padY: 4, padX: 8, font: 12 },
+  '': { padY: 7, padX: 12, font: 13.5 },
+};
+
 export function Select({ options = [], value, onChange, size = '', placeholder, disabled = false, style = {}, ...rest }) {
+  const scale = SELECT_SIZES[size] || SELECT_SIZES[''];
+  let { padY } = scale;
+  const font = style.fontSize ?? scale.font;
+
+  /* A caller-supplied height wins, but it cannot be allowed to crush the
+     text inside it. Everything here is `box-sizing: border-box`, so a fixed
+     26px against 7px of padding top and bottom plus 1px borders leaves a
+     10px content box for an 11px font - and the glyphs are clipped top and
+     bottom. That is exactly what the two dropdowns on the import wizard's
+     Source step were doing: measured, they needed 29.2px and were given 26.
+     Rather than ignore the height or let it clip, shrink the padding to
+     whatever actually fits and keep at least a hairline of it. */
+  if (style.height != null && style.padding == null) {
+    const box = parseFloat(style.height);
+    if (Number.isFinite(box)) {
+      const lineBox = Math.ceil(font * 1.2);
+      padY = Math.max(1, Math.floor((box - lineBox - 2) / 2));
+    }
+  }
+
   return (
     <select
       value={value}
       onChange={(e) => onChange?.(e.target.value)}
       disabled={disabled}
       style={{
-        padding: size === 'sm' ? '4px 8px' : '7px 12px',
-        fontSize: size === 'sm' ? 12 : 13.5,
+        padding: `${padY}px ${scale.padX}px`,
+        fontSize: font,
+        // Pinned, not inherited. `base.css` sets `font: inherit` on every
+        // select, and the `font` shorthand carries line-height with it - so
+        // a select dropped into a tight flex row inherited that row's
+        // leading instead of its own.
+        lineHeight: 1.2,
         borderRadius: 'var(--r-sm)',
         border: '1px solid var(--line-strong)',
         background: 'var(--surface)',
         color: 'var(--text)',
         cursor: 'pointer',
         ...style,
+        // After the spread: a caller's `height` is honoured, but the padding
+        // computed above must not be overwritten by the shorthand it came in
+        // with. Only an explicit `padding` from the caller replaces it.
+        padding: style.padding ?? `${padY}px ${scale.padX}px`,
       }}
       {...rest}
     >

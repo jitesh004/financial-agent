@@ -1,5 +1,7 @@
 from typing import Any
 from ..config import config
+from . import keyring
+from . import telemetry
 from . import settings as llm_settings
 import httpx
 import json
@@ -49,7 +51,52 @@ def _parse_json_loose(raw: str) -> Any:
             except json.JSONDecodeError:
                 continue
 
+    # Cut off mid-answer, or genuinely malformed? The two look identical
+    # from here and they are not the same problem: one is fixed by raising
+    # `max_tokens`, the other by fixing the prompt or the schema. Reported
+    # as one message, every failure with a budget too small read as "the
+    # model cannot follow instructions", which is the wrong thing to go and
+    # fix - and on the tier this app targets, tokens are the cheap resource
+    # (250,000 a minute against 500 requests a DAY), so a budget that
+    # truncates costs the only thing that actually runs out.
+    if _looks_truncated(text):
+        raise ValueError(
+            "The model's reply was cut off before it finished - the JSON "
+            "ends mid-structure. Raise max_tokens for this call; a "
+            "reasoning model spends its thinking against the same "
+            f"allowance. Got {len(text)} characters ending {text[-60:]!r}")
+
     raise ValueError(f"Model did not return parseable JSON: {raw[:200]!r}")
+
+
+def _looks_truncated(text: str) -> bool:
+    """Does this read as an answer that stopped, rather than a bad answer?
+
+    An unterminated string, or more openers than closers, means the reply
+    was still being written when the budget ran out. A model that simply
+    answered in prose has neither.
+    """
+    if not text:
+        return False
+    depth = 0
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == chr(92):
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+    return in_string or depth > 0
 
 class Provider:
     def complete(self, prompt: str, system: str = "", max_tokens: int = 4096, tier: str = "fast", temperature: float = 0.0) -> str:
@@ -176,51 +223,194 @@ def _token_budget_note(response: Any) -> str:
     )
 
 
-def _post_with_retries(client: Any, url: str, *, json: Any, headers: dict,
-                       provider: str) -> Any:
-    """POST once, retrying the two failures that are worth retrying.
+#: A refusal of the CREDENTIAL, however the provider chose to spell it.
+#:
+#: Google does not use 401 for this. A mistyped or revoked key comes back
+#: `400 INVALID_ARGUMENT` with "API key not valid" in the body - the same
+#: status a malformed request gets, which is why the status alone cannot
+#: decide. Checked against the body so a genuine payload error still reads
+#: as a payload error and does not stand a working key down.
+#:
+#: This is the commonest real failure there is - somebody pastes a key with
+#: a character missing - and until it was recognised the whole multi-key
+#: ring did nothing for it: the bad key was never retired, never rotated
+#: past, and failed every call for the life of the process.
+_BAD_CREDENTIAL = re.compile(
+    r"api[\s_-]?key not valid"
+    r"|api[\s_-]?key[\s_-]?invalid"
+    r"|invalid[\s_-]?api[\s_-]?key"
+    r"|invalid authentication"
+    r"|incorrect api key"
+    r"|unauthenticated",
+    re.IGNORECASE,
+)
 
-    A 429 is the provider saying "not yet"; a timeout or a dropped connection
-    is the network saying "ask again". Neither means the request was wrong,
-    and both were fatal here - the 429 because only its status was checked,
-    the timeout because `client.post` raised straight out of the loop.
+
+def _rejects_the_key(response: Any) -> bool:
+    """Is this response the provider refusing the credential?"""
+    status = getattr(response, "status_code", 0)
+    if status in (401, 403):
+        return True
+    if status != 400:
+        return False
+    return bool(_BAD_CREDENTIAL.search(_body_text(response)))
+
+
+def _body_text(response: Any) -> str:
+    """Whatever the provider said, as text, without raising."""
+    try:
+        return (getattr(response, "text", "") or "")[:600]
+    except Exception:                   # pragma: no cover - defensive
+        return ""
+
+
+def _post_with_retries(client: Any, url: str, *, json: Any,
+                       headers: dict | None = None, provider: str,
+                       keys: list | None = None,
+                       headers_for: Any = None) -> Any:
+    """POST, rotating API keys and then backing off, until something works.
+
+    A 429 is the provider saying "not yet"; a timeout or a dropped
+    connection is the network saying "ask again". Neither means the request
+    was wrong, and both were fatal here - the 429 because only its status
+    was checked, the timeout because `client.post` raised straight out of
+    the loop.
 
     That cost whole agent runs. One of these agents makes twenty-three tool
-    calls over ten steps; a single slow reply on call twenty-three threw away
-    the twenty-two before it and reported "ReadTimeout" as the answer to a
-    question about the holder's debt.
+    calls over ten steps; a single slow reply on call twenty-three threw
+    away the twenty-two before it and reported "ReadTimeout" as the answer
+    to a question about the holder's debt.
+
+    ROTATION COMES BEFORE BACKOFF, and the order is the substance. A free
+    tier meters requests per minute AND per day, and a 429 does not say
+    which ceiling was hit. Sleeping clears the first and never clears the
+    second, so an import that trips the daily cap used to stall for the
+    full backoff and then fail anyway. Asking a different key costs nothing
+    and is correct for both - it is only when every key is resting that
+    waiting is the right move.
+
+    `keys` and `headers_for` are how a caller offers more than one
+    credential: `headers_for(secret)` builds the request headers for a
+    given key, because each provider carries it differently (a bearer
+    token, an `x-goog-api-key`, an `api-key`). Callers with a single
+    credential pass `headers` and behave exactly as before.
 
     Raises the last error if every attempt fails, so a genuine outage still
     surfaces rather than being swallowed.
     """
+    ring = list(keys or [])
+    if ring and headers_for is None:        # pragma: no cover - programmer error
+        raise ValueError("keys= requires headers_for=")
+
     last_error: Exception | None = None
-    for attempt in range(RATE_LIMIT_RETRIES + 1):
+    last_resp: Any = None
+    attempt = 0
+    exhausted_keys: set[str] = set()
+
+    while attempt <= RATE_LIMIT_RETRIES:
+        key = None
+        if ring:
+            usable = [k for k in keyring.available(ring)
+                      if k.secret not in exhausted_keys]
+            # Every key has failed this call: fall back to the full ring and
+            # let the backoff below do the waiting.
+            key = (usable or keyring.available(ring))[0]
+            request_headers = headers_for(key.secret)
+        else:
+            request_headers = headers or {}
+
+        # Every attempt is recorded, whatever becomes of it. A request that
+        # was rate limited on one key and succeeded on the next is two
+        # facts, and folding them into one is how a quota problem stays
+        # invisible: the summary reads "1 request, ok" and the reason the
+        # import took four minutes is nowhere.
+        call = telemetry.CURRENT.get()
+        started = time.monotonic()
+
+        def _record(status: str, http_status: int = 0, error: str = "") -> None:
+            if call is None:
+                return
+            call.attempt(
+                key_label=key.label if key is not None else "",
+                key_hint=key.masked() if key is not None else "",
+                status=status, http_status=http_status, error=error[:500],
+                latency_ms=int((time.monotonic() - started) * 1000))
+
         try:
-            resp = client.post(url, json=json, headers=headers)
+            resp = client.post(url, json=json, headers=request_headers)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             last_error = exc
-            if attempt == RATE_LIMIT_RETRIES:
+            _record("failed", error=f"{type(exc).__name__}: {exc}")
+            attempt += 1
+            if attempt > RATE_LIMIT_RETRIES:
                 raise
             delay = _clamp_wait(2.0 ** attempt)
             logging.warning(
                 "%s call failed (%s); retrying in %.0fs (attempt %d of %d)",
-                provider, type(exc).__name__, delay, attempt + 1,
+                provider, type(exc).__name__, delay, attempt,
                 RATE_LIMIT_RETRIES)
             time.sleep(delay)
             continue
 
-        if resp.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
+        last_resp = resp
+
+        # A credential the provider refuses will not start working, so it is
+        # retired for the process rather than rested. One mistyped key
+        # otherwise costs a failed attempt on every request from here on.
+        if key is not None and _rejects_the_key(resp):
+            _record("rejected", resp.status_code,
+                    f"the provider refused this key: {_body_text(resp)}")
+            keyring.retire(key, f"HTTP {resp.status_code}")
+            exhausted_keys.add(key.secret)
+            if len(exhausted_keys) < len(ring):
+                continue            # another key, without spending a retry
+            return resp
+
+        if resp.status_code != 429:
+            # The body, not just the status. "HTTP 400" on the statistics
+            # page says nothing a reader can act on; "API key not valid"
+            # or "Unknown name 'type'" says exactly what to go and fix.
+            _record("ok" if resp.status_code < 400 else "failed",
+                    resp.status_code,
+                    "" if resp.status_code < 400
+                    else f"HTTP {resp.status_code}: {_body_text(resp)}")
+            if key is not None:
+                keyring.revive(key)
+            return resp
+
+        _record("rate_limited", 429, "rate limited by the provider")
+
+        # Rate limited. Stand this key down and try the next one FIRST;
+        # only sleep when there is nothing else to ask.
+        if key is not None:
+            keyring.rest(key, _retry_after_seconds(resp, attempt))
+            exhausted_keys.add(key.secret)
+            if len(exhausted_keys) < len(ring):
+                logging.info(
+                    "%s rate limited; switching to another API key "
+                    "(%d of %d tried)", provider, len(exhausted_keys),
+                    len(ring))
+                continue            # a different key is not a retry
+
+        attempt += 1
+        if attempt > RATE_LIMIT_RETRIES:
             return resp
 
         delay = _retry_after_seconds(resp, attempt)
         logging.warning(
-            "%s rate limited (429); retrying in %.0fs (attempt %d of %d)",
-            provider, delay, attempt + 1, RATE_LIMIT_RETRIES)
+            "%s rate limited (429) on every key; waiting %.0fs "
+            "(attempt %d of %d)", provider, delay, attempt,
+            RATE_LIMIT_RETRIES)
         time.sleep(delay)
+        # A wait may have cleared the per-minute window for keys already
+        # tried, so they are candidates again.
+        exhausted_keys.clear()
 
-    if last_error is not None:  # pragma: no cover - loop always returns first
+    if last_resp is not None:
+        return last_resp
+    if last_error is not None:  # pragma: no cover - loop returns first
         raise last_error
-    return resp
+    return last_resp
 
 
 def _message_text(data: Any) -> str:
@@ -342,21 +532,30 @@ class OpenRouterProvider(Provider):
             payload["reasoning_effort"] = config.OPENROUTER_REASONING_EFFORT
 
         live = llm_settings.for_provider("openrouter")
-        headers = {"Authorization": f"Bearer {live['api_key']}"}
-        # Attribution, so a shared key's traffic is identifiable on
-        # openrouter.ai. Neither header carries anything about the user.
-        if config.OPENROUTER_APP_URL:
-            headers["HTTP-Referer"] = config.OPENROUTER_APP_URL
-        if config.OPENROUTER_APP_TITLE:
-            headers["X-Title"] = config.OPENROUTER_APP_TITLE
+
+        def headers_for(secret: str) -> dict:
+            built = {"Authorization": f"Bearer {secret}"}
+            # Attribution, so a shared key's traffic is identifiable on
+            # openrouter.ai. Neither header carries anything about the user.
+            if config.OPENROUTER_APP_URL:
+                built["HTTP-Referer"] = config.OPENROUTER_APP_URL
+            if config.OPENROUTER_APP_TITLE:
+                built["X-Title"] = config.OPENROUTER_APP_TITLE
+            return built
 
         base_url = (live["base_url"] or "https://openrouter.ai/api/v1").rstrip("/")
         url = f"{base_url}/chat/completions"
-        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-            resp = _post_with_retries(client, url, json=payload,
-                                      headers=headers, provider="OpenRouter")
+        with telemetry.record(
+                "openrouter", self._model(tier), tier=tier,
+                reasoning=config.OPENROUTER_REASONING_EFFORT or "off",
+                prompt=f"{system}\n\n{prompt}" if system else prompt), \
+                httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+            resp = _post_with_retries(
+                client, url, json=payload, provider="OpenRouter",
+                keys=live.get("api_keys"), headers_for=headers_for)
             resp.raise_for_status()
             data = resp.json()
+            telemetry.note_usage(data, _message_text(data))
 
         # OpenRouter reports upstream failures in the body, with a 200 on the
         # envelope that carried them. Left unread, the error surfaces as an
@@ -408,6 +607,19 @@ def _gemini_schema(schema: Any) -> Any:
             continue
         if key == "type" and isinstance(value, str):
             out[key] = value.upper()
+        elif key == "type" and isinstance(value, list):
+            # `{"type": ["integer", "null"]}` is how JSON Schema spells an
+            # optional field, and Google's dialect has no union type at all
+            # - it rejects the list outright with `Proto field is not
+            # repeating, cannot start list` and the whole request 400s.
+            # Nullability lives in its own key there, so the two halves are
+            # separated rather than the schema being rewritten at each call
+            # site: a caller writes ordinary JSON Schema and every provider
+            # gets something it accepts, which is this function's whole job.
+            concrete = [v for v in value if str(v).lower() != "null"]
+            out[key] = str(concrete[0]).upper() if concrete else "STRING"
+            if len(concrete) < len(value):
+                out["nullable"] = True
         elif key == "properties" and isinstance(value, dict):
             out[key] = {k: _gemini_schema(v) for k, v in value.items()}
             out["propertyOrdering"] = list(value)
@@ -528,18 +740,32 @@ class GeminiProvider(Provider):
                        or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
         url = (f"{gemini_base}/models/"
                f"{self._model(tier)}:generateContent")
-        headers = {"x-goog-api-key": live["api_key"],
-                   "Content-Type": "application/json"}
+        def headers_for(secret: str) -> dict:
+            return {"x-goog-api-key": secret,
+                    "Content-Type": "application/json"}
 
-        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-            resp = _post_with_retries(client, url, json=body,
-                                      headers=headers, provider="Gemini")
+        with telemetry.record(
+                "gemini", self._model(tier), tier=tier,
+                # Google's own API has no reasoning switch on this path;
+                # the model thinks or it does not, by its own nature. Said
+                # as "model default" rather than left blank, because blank
+                # reads as "nobody knows" and this is a known state.
+                reasoning="model default",
+                prompt=f"{system}\n\n{prompt}" if system else prompt), \
+                httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+            resp = _post_with_retries(
+                client, url, json=body, provider="Gemini",
+                keys=live.get("api_keys"), headers_for=headers_for)
             if resp.status_code >= 400:
                 note = (_token_budget_note(resp)
                         if resp.status_code == 429 else "")
                 raise RuntimeError(f"Gemini returned {resp.status_code}: "
                                    f"{_gemini_error(resp)}{note}")
             data = resp.json()
+            telemetry.note_usage(
+                data[0] if isinstance(data, list) and data else data,
+                _gemini_text(data[0] if isinstance(data, list) and data
+                             else data) if isinstance(data, (dict, list)) else "")
 
         if isinstance(data, list):
             data = data[0] if data else {}
@@ -596,13 +822,23 @@ class AzureOpenAIProvider(Provider):
         if not config.AZURE_OPENAI_USE_CLASSIC:
             payload["model"] = deployment
 
-        headers = {"api-key": live["api_key"],
-                   "Authorization": f"Bearer {live['api_key']}"}
-        
-        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-            resp = client.post(url, json=payload, headers=headers)
+        def headers_for(secret: str) -> dict:
+            return {"api-key": secret, "Authorization": f"Bearer {secret}"}
+
+        with telemetry.record(
+                "azure", deployment, tier=tier, reasoning="off",
+                prompt=f"{system}\n\n{prompt}" if system else prompt), \
+                httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+            # Through the shared loop like the other two. This was a bare
+            # `client.post`, so Azure alone had no retry on a 429 and no
+            # retry on a dropped connection - the two failures the loop
+            # exists for, and the ones that cost whole agent runs.
+            resp = _post_with_retries(
+                client, url, json=payload, provider="Azure OpenAI",
+                keys=live.get("api_keys"), headers_for=headers_for)
             resp.raise_for_status()
             data = resp.json()
+            telemetry.note_usage(data, _message_text(data))
             try:
                 return data["choices"][0]["message"].get("content", "")
             except (KeyError, IndexError):

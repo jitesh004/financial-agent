@@ -205,7 +205,9 @@ def generate_narrative(
 
     payload = json.dumps(brief, default=_json_default, indent=1)
     try:
-        narrative = client.complete_json(
+        from . import telemetry
+        with telemetry.purpose("narrative", "dashboard narrative"):
+            narrative = client.complete_json(
             f"Here is the computed financial brief:\n\n{payload}\n\n"
             f"Write the analysis as specified.",
             system=SYSTEM,

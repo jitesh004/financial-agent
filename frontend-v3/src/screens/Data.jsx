@@ -207,9 +207,46 @@ function CoverageGrid() {
   const { data, loading, refetch } = useQuery('coverage', () => api.coverage());
   const { data: gmail } = useQuery('gmail-status', () => api.gmailStatus());
   const [busyCell, setBusyCell] = useState(null);
+  /* Which cell has its rows open, as "accountId:month". One at a time:
+     two open months push the grid off the screen and neither is readable. */
+  const [openMonth, setOpenMonth] = useState(null);
 
   const rows = data?.accounts || [];
   const canFetch = Boolean(gmail?.connected);
+
+  /* An amber cell has a file behind it that would not parse. Retrying is
+     worth offering because the commonest cause is a password that has
+     since been supplied. */
+  async function retryCell(fileId, cellKey) {
+    setBusyCell(cellKey);
+    try {
+      await api.retryFile(fileId);
+      invalidate('coverage', 'files-registry', 'dashboard');
+      await refetch();
+      toast.ok('Re-read that file', 'The grid has been refreshed.');
+    } catch (e) {
+      toast.fail('That file could not be re-read', e.message);
+    } finally {
+      setBusyCell(null);
+    }
+  }
+
+  /* A red cell is a month nothing was ever imported for. With a mailbox
+     connected, the app can go and look for exactly that one. */
+  async function fetchCell(accountId, month, cellKey, label) {
+    setBusyCell(cellKey);
+    try {
+      const { job_id: jobId } = await api.fetchMonth(accountId, month);
+      if (!jobId) throw new Error('Nothing was started.');
+      toast.ok('Searching your mailbox', `${label} · ${monthLabel(month)}`);
+      invalidate('coverage', 'files-registry');
+      await refetch();
+    } catch (e) {
+      toast.fail('That month could not be fetched', e.message);
+    } finally {
+      setBusyCell(null);
+    }
+  }
 
   const allMonths = useMemo(() => {
     const set = new Set();
@@ -313,18 +350,55 @@ function CoverageGrid() {
                       title += ' (Missing statement)';
                     }
 
+                    /* What this particular cell can DO, which is not the
+                       same as its colour. A failed cell with no file behind
+                       it has nothing to retry, and a missing one has
+                       nowhere to look without a mailbox - and a cell that
+                       cannot act must not look like it can, or clicking it
+                       reads as a dead button. */
+                    const action = status === 'parsed' || status === 'ok'
+                      ? 'rows'
+                      : (status === 'failed' || status === 'unreconciled') && cell?.file_id
+                        ? 'retry'
+                        : status === 'missing' && canFetch ? 'fetch' : null;
+                    const cellKey = `${r.account_id}:${m}`;
+                    const isOpen = openMonth === cellKey;
+
+                    if (action === 'rows') title += ' — click to see its rows';
+                    else if (action === 'retry') title += ' — click to retry the file';
+                    else if (action === 'fetch') title += ' — click to search your mailbox';
+
                     return (
                       <td key={m} style={{ padding: 4, textAlign: 'center' }}>
-                        <div
+                        <button
+                          type="button"
                           title={title}
+                          disabled={!action || busyCell === cellKey}
+                          aria-expanded={action === 'rows' ? isOpen : undefined}
+                          onClick={() => {
+                            if (action === 'rows') setOpenMonth(isOpen ? null : cellKey);
+                            else if (action === 'retry') retryCell(cell.file_id, cellKey);
+                            else if (action === 'fetch') fetchCell(r.account_id, m, cellKey, accountLabel);
+                          }}
                           style={{
                             width: 20,
                             height: 20,
+                            padding: 0,
                             borderRadius: 4,
                             background: bg,
+                            display: 'block',
                             margin: '0 auto',
-                            border: status === 'missing' ? '1px dashed var(--neg)' : 'none',
+                            border: isOpen
+                              ? '2px solid var(--text)'
+                              : status === 'missing' ? '1px dashed var(--neg)' : '1px solid transparent',
+                            cursor: action ? 'pointer' : 'default',
+                            opacity: busyCell === cellKey ? 0.4 : 1,
+                            transition: 'transform var(--t-fast) var(--e-out)',
                           }}
+                          onMouseEnter={(e) => {
+                            if (action) e.currentTarget.style.transform = 'scale(1.25)';
+                          }}
+                          onMouseLeave={(e) => { e.currentTarget.style.transform = ''; }}
                         />
                       </td>
                     );
@@ -335,7 +409,103 @@ function CoverageGrid() {
           </tbody>
         </table>
       </div>
+
+      {/* The rows a green cell stands for.
+
+          A heatmap that cannot be opened is a claim without evidence: it
+          says a month parsed and gives no way to see what it brought in.
+          Rendered under the grid rather than inside the table, because a
+          full-width drawer inside a horizontally scrolling table scrolls
+          away from the cell that opened it. */}
+      {openMonth && (
+        <MonthRows
+          accountId={openMonth.slice(0, openMonth.lastIndexOf(':'))}
+          month={openMonth.slice(openMonth.lastIndexOf(':') + 1)}
+          label={(rows.find((r) => r.account_id === openMonth.slice(0, openMonth.lastIndexOf(':')))
+            || {}).display_name || 'Account'}
+          onClose={() => setOpenMonth(null)}
+        />
+      )}
     </Card>
+  );
+}
+
+
+/* Every transaction the app counted for one account in one month.
+
+   Asked by accounting_month, not by statement, because that is the month
+   the rest of the app files those rows under - a statement spanning a
+   cycle boundary contributes to two, and showing "the statement's rows"
+   would disagree with every total elsewhere. */
+function MonthRows({ accountId, month, label, onClose }) {
+  const { data, loading, error } = useQuery(
+    `cov-rows:${accountId}:${month}`,
+    () => api.transactions({
+      account_id: accountId, accounting_month: month,
+      limit: 500, sort_by: 'date', sort_dir: 'asc',
+    }),
+  );
+  const rows = data?.transactions || [];
+
+  return (
+    <div style={{
+      marginTop: 12,
+      border: '1px solid var(--border-subtle)',
+      borderRadius: 'var(--radius-md)',
+      background: 'var(--surface-2)',
+      overflow: 'hidden',
+    }}>
+      <div className="flex items-center gap-2 flex-wrap"
+        style={{ padding: '10px 14px', borderBottom: '1px solid var(--border-subtle)' }}>
+        <strong style={{ fontSize: 13 }}>{label}</strong>
+        <span className="text-3">·</span>
+        <span style={{ fontSize: 13 }}>{monthLabel(month)}</span>
+        {data && <Chip size="sm">{count(data.total)} row{data.total === 1 ? '' : 's'}</Chip>}
+        <span style={{ flex: 1 }} />
+        <Button size="xs" variant="ghost" onClick={onClose}>Hide</Button>
+      </div>
+
+      {loading && <Loading message="Reading that month…" />}
+      {error && <div style={{ padding: 12 }}><Callout tone="neg">{error.message}</Callout></div>}
+
+      {data && !rows.length && (
+        <div className="tiny text-3" style={{ padding: '12px 14px' }}>
+          A statement covering this month parsed, but no transaction is
+          counted in it. That is a real answer, not a missing one &mdash; a
+          card with no spending in a cycle looks exactly like this.
+        </div>
+      )}
+
+      {rows.length > 0 && (
+        <div className="table-wrapper" style={{ maxHeight: 320, overflow: 'auto' }}>
+          <table className="terminal-table compact">
+            <thead>
+              <tr>
+                <th style={{ width: 95 }}>Date</th>
+                <th>Description</th>
+                <th style={{ width: 150 }}>Category</th>
+                <th style={{ width: 120, textAlign: 'right' }}>Amount</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((t) => (
+                <tr key={t.id}>
+                  <td className="nowrap">{dateLabel(t.date)}</td>
+                  <td style={{ overflowWrap: 'anywhere' }}>{t.description}</td>
+                  <td><Chip size="sm">{titleCase(t.category)}</Chip></td>
+                  <td className="num nowrap" style={{
+                    textAlign: 'right',
+                    color: t.direction === 'credit' ? 'var(--pos)' : 'inherit',
+                  }}>
+                    {t.direction === 'credit' ? '+' : '\u2212'}{money(t.amount)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -470,7 +640,7 @@ function Files({ onImport }) {
                             placeholder="PDF password"
                             value={passwords[f.id] || ''}
                             onChange={(e) => setPasswords((prev) => ({ ...prev, [f.id]: e.target.value }))}
-                            style={{ height: 26, fontSize: 11, width: 130 }}
+                            size="xs" style={{ width: 130 }}
                           />
                         )}
                         <Button

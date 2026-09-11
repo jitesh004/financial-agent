@@ -20,6 +20,7 @@ import logging
 from typing import Any
 
 from ..config import config
+from . import keyring
 
 log = logging.getLogger(__name__)
 
@@ -27,10 +28,16 @@ log = logging.getLogger(__name__)
 OVERRIDE_KEYS = (
     "llm_provider",
     "llm_api_key",
+    #: A JSON array of {"label", "key"}. `llm_api_key` remains the single-key
+    #: form and is still honoured: a workspace that set one key keeps working
+    #: without touching anything, and the list simply extends it.
+    "llm_api_keys",
     "llm_base_url",
     "llm_model_fast",
     "llm_model_strong",
     "agent_profile",
+    #: Which price list applies to this account: 'free' or 'paid'.
+    "llm_pricing_tier",
 )
 
 #: What each provider needs, and a few models known to work with this app's
@@ -66,8 +73,10 @@ PROVIDERS: list[dict[str, Any]] = [
         "key_label": "Gemini API key",
         "key_hint": "Created at aistudio.google.com/apikey.",
         "default_base_url": "https://generativelanguage.googleapis.com/v1beta",
-        "suggested_fast": ["gemma-4-26b-a4b-it", "gemini-2.5-flash-lite", "gemini-2.5-flash"],
-        "suggested_strong": ["gemini-2.5-pro", "gemini-2.5-flash", "gemma-4-26b-a4b-it"],
+        "suggested_fast": ["gemini-3.5-flash-lite", "gemma-4-26b-a4b-it",
+                           "gemini-2.5-flash-lite", "gemini-2.5-flash"],
+        "suggested_strong": ["gemini-3.5-flash-lite", "gemini-2.5-pro",
+                             "gemini-2.5-flash", "gemma-4-26b-a4b-it"],
     },
     {
         "key": "azure",
@@ -168,12 +177,26 @@ def for_provider(name: str) -> dict[str, str]:
     """
     env = _env_for(name)
     if selected_provider() != name:
-        return env
+        return {**env, "api_keys": keyring.parse(env["api_key"])}
 
     over = _stored()
     spec = BY_KEY.get(name, {})
+
+    # The ring, in the order it will be tried: the list the user built,
+    # then the single-key field, then `.env`. Deduplicated, because the same
+    # secret appearing twice would have the rotation land back on a key that
+    # just failed and spend the request that rotating was meant to save.
+    ring = keyring.dedupe(
+        keyring.parse(over.get("llm_api_keys"))
+        + keyring.parse(over.get("llm_api_key"))
+        + keyring.parse(env["api_key"])
+    )
     return {
-        "api_key": over.get("llm_api_key") or env["api_key"],
+        # The first usable key. Kept so every existing caller reading
+        # `api_key` still gets a working credential; only the retry loop
+        # needs to know there are others.
+        "api_key": ring[0].secret if ring else "",
+        "api_keys": ring,
         "base_url": (over.get("llm_base_url") or env["base_url"]
                      or spec.get("default_base_url", "")),
         "model_fast": over.get("llm_model_fast") or env["model_fast"],
@@ -194,6 +217,10 @@ def effective() -> dict[str, str]:
         "llm_model_strong": live["model_strong"],
         "agent_profile": (over.get("agent_profile")
                           or config.AGENT_PROFILE or "auto").lower(),
+        # Free unless the holder says otherwise. Over-reporting a bill is
+        # the less useful error: a zero that should be a number prompts
+        # the question, a number that should be zero is simply believed.
+        "llm_pricing_tier": (over.get("llm_pricing_tier") or "free").lower(),
     }
 
 
@@ -237,8 +264,14 @@ def public() -> dict[str, Any]:
         "model_fast": live["llm_model_fast"],
         "model_strong": live["llm_model_strong"],
         "agent_profile": live["agent_profile"],
+        "pricing_tier": live.get("llm_pricing_tier") or "free",
         "has_api_key": bool(live["llm_api_key"]),
         "api_key_hint": mask(live["llm_api_key"]),
+        #: Every key on the ring, masked, with whether it is usable right
+        #: now. A key resting after a 429 or rejected outright is the thing
+        #: a user needs told - otherwise "I added three keys and it still
+        #: rate limits" has no visible explanation.
+        "api_keys": keyring.status(for_provider(live["llm_provider"])["api_keys"]),
         "api_key_from_env": bool(env["llm_api_key"]) and not over.get("llm_api_key"),
         #: Which fields the UI is currently deciding, so the screen can say
         #: "from .env" against the rest instead of implying the user set them.

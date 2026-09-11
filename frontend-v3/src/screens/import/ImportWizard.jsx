@@ -16,7 +16,7 @@ import {
   Badge, Button, Callout, Chip, ConfirmButton, Icon, Loading, Modal,
 } from '../../ui';
 import JobProgress from '../../ui/JobProgress';
-import { ChooseStep, ReadStep, ScanStep, SourceStep } from './steps';
+import { AiStep, ChooseStep, ReadStep, ScanStep, SourceStep } from './steps';
 import { BuildStep, ReviewStep } from './review';
 import { rowKey } from './useImport';
 
@@ -25,8 +25,15 @@ const STEPS = [
   { key: 'scanning', label: '2. Scan' },
   { key: 'choose', label: '3. Choose' },
   { key: 'parse', label: '4. Read' },
-  { key: 'review', label: '5. Review' },
-  { key: 'process', label: '6. Build' },
+  /* Between Read and Review on purpose. Reading is when a model is
+     consulted about a document's identity or its column layout, and Review
+     is where those answers start shaping what the user approves - so the
+     one place to see what was asked and what was believed belongs between
+     them, before any of it is accepted. Categorisation happens later, in
+     Build, and lands in the same list. */
+  { key: 'ai', label: '5. AI' },
+  { key: 'review', label: '6. Review' },
+  { key: 'process', label: '7. Build' },
 ];
 
 const STEP_FOR_STAGE = {
@@ -36,9 +43,11 @@ const STEP_FOR_STAGE = {
   downloading: 3,
   parsing: 3,
   interrupted: 3,
+  // Parsing has finished, so the inferences it made are now worth reading:
+  // the AI step is where a completed Read lands.
   staged: 4,
-  processing: 5,
-  done: 5,
+  processing: 6,
+  done: 6,
 };
 
 export default function ImportWizard({ mailbox, open, onClose, onImported }) {
@@ -368,6 +377,10 @@ export default function ImportWizard({ mailbox, open, onClose, onImported }) {
       )}
 
       {/* Step 5: Review */}
+      {view === 'ai' && (
+        <AiStep jobId={mailbox?.job?.id || ''} onRefresh={mailbox?.refresh} />
+      )}
+
       {view === 'review' && (
         <ReviewStep onChanged={setStaged} />
       )}

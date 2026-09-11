@@ -236,7 +236,15 @@ def test_a_run_calls_tools_and_reaches_an_answer(ledger):
     assert result.answer["findings"][0]["severity"] == "watch"
     # Two turns of the model, plus the opening facts fetched before the first.
     assert len(model.prompts) == 2
-    assert result.tool_calls == len(agent.opening) + 1
+    # `loans` is one of this agent's opening facts, so the model asking for
+    # it again costs nothing: it is served from the result already fetched.
+    # This used to be `len(agent.opening) + 1` - the extra one being a
+    # second, identical read of a tool whose answer cannot have changed.
+    assert "loans" in agent.opening
+    assert result.tool_calls == len(agent.opening)
+    repeated = [c for st in result.steps for c in st.calls
+                if c.get("repeat_of_step") is not None]
+    assert [c["tool"] for c in repeated] == ["loans"]
 
 
 def test_the_opening_facts_are_in_the_first_prompt(ledger):
@@ -340,6 +348,89 @@ def test_a_model_that_repeats_itself_is_stopped_early(ledger):
     # Stopped well inside the budget rather than burning all of it.
     assert len(result.steps) < agent.max_steps + 1
     assert "same data three times" in result.error
+
+
+def test_the_same_call_is_only_ever_run_once(ledger):
+    """The step-signature guard cannot see a tool re-read on its own.
+
+    That guard compares the WHOLE set a step asked for, so a model that
+    re-reads one tool while varying its companions never trips it. A real
+    run called `recurring({})` on four consecutive steps - the same 9,016
+    character result every time - and only the last pair matched, because
+    the first three came bundled with different tools. Three wasted reads
+    and 27,000 characters of duplicated transcript, which took that run's
+    prompt from 18,000 characters to 46,000.
+
+    Every agent tool is a read and nothing writes while a run is in
+    flight, so the second answer cannot differ from the first.
+    """
+    agent = catalogue.get("cashflow-sentinel")
+    tools = list(agent.tools)
+    assert len(tools) >= 2, "this test needs a companion tool to vary"
+
+    # `accounts` every time, with a different companion each step - the
+    # exact shape that slips past the signature check.
+    model = ScriptedModel(
+        {"thought": "First look.",
+         "calls": [{"tool": "accounts"}, {"tool": tools[1]}]},
+        {"thought": "Again, differently bundled.",
+         "calls": [{"tool": "accounts"}]},
+        {"thought": "Done.",
+         "answer": {"headline": "Nothing to report.", "findings": []}},
+    )
+
+    result = runner.run(agent, ledger, client=model)
+
+    # Asked for twice, executed once.
+    asked = [c for s in result.steps for c in s.calls if c["tool"] == "accounts"]
+    assert len(asked) >= 2, "the script should have asked twice"
+    assert asked[0]["repeat_of_step"] is None
+    assert asked[-1]["repeat_of_step"] is not None, (
+        "the second identical call should be marked as a repeat")
+    # Asked for twice by the model, executed once against the database.
+    executed = sum(1 for s in result.steps for c in s.calls
+                   if c["repeat_of_step"] is None)
+    assert result.tool_calls == executed, (result.tool_calls, executed)
+
+    # And the transcript says where it came from rather than carrying the
+    # whole payload a second time.
+    served = [r for s in result.steps for r in s.results
+              if r["tool"] == "accounts"]
+    assert served[0]["result"] == served[-1]["result"]
+
+
+def test_a_call_with_different_arguments_is_not_a_repeat(ledger):
+    """Two months of the same query are two questions, not one.
+
+    Memoising on the tool NAME alone would collapse them and hand back
+    January's figures for February - silently, and on the one path whose
+    whole job is to be checkable.
+    """
+    agent = catalogue.get("cashflow-sentinel")
+    assert "ledger_query" in agent.tools
+    model = ScriptedModel(
+        {"thought": "August.",
+         "calls": [{"tool": "ledger_query",
+                    "args": {"spec": {"months": ["2026-08"]}}}]},
+        {"thought": "September.",
+         "calls": [{"tool": "ledger_query",
+                    "args": {"spec": {"months": ["2026-09"]}}}]},
+        {"thought": "Done.",
+         "answer": {"headline": "Nothing to report.", "findings": []}},
+    )
+
+    result = runner.run(agent, ledger, client=model)
+    calls = [c for s in result.steps for c in s.calls
+             if c["tool"] == "ledger_query"]
+    assert len(calls) == 2
+    assert all(c["repeat_of_step"] is None for c in calls), (
+        "different arguments are different questions")
+    # Both actually RAN - without this the assertion above passes for the
+    # trivial reason that a refused tool never reaches the memo at all.
+    # Two distinct queries, both executed. Counted as a delta over the
+    # opening facts, which `tool_calls` also includes.
+    opening = len(result.steps[0].calls) if result.steps else 0
+    assert result.tool_calls - opening == 2, (result.tool_calls, opening)
 
 
 def test_the_last_turn_says_so(ledger):

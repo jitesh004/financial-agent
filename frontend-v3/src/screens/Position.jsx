@@ -443,7 +443,7 @@ function Mapping({ item, mappable, onSave }) {
         className="select"
         value={item.account_id || ''}
         onChange={(e) => onSave({ account_id: e.target.value || null })}
-        style={{ fontSize: 11, maxWidth: 160, height: 26, padding: '2px 6px' }}
+        size="xs" style={{ maxWidth: 160 }}
       >
         <option value="">No linked statement</option>
         {accounts.map((a) => (
@@ -458,7 +458,7 @@ function Mapping({ item, mappable, onSave }) {
           className="select"
           value={item.bureau_account_id || ''}
           onChange={(e) => onSave({ bureau_account_id: e.target.value || null })}
-          style={{ fontSize: 11, maxWidth: 160, height: 26, padding: '2px 6px' }}
+          size="xs" style={{ maxWidth: 160 }}
         >
           <option value="">Not in credit bureau</option>
           {bureau.map((b) => (
@@ -734,7 +734,7 @@ function HoldingTable({ items, mappable, onPatch, onReview, onRemove }) {
                   value={item.kind}
                   onChange={(v) => onPatch(item.id, { kind: v })}
                   options={[['account', 'Liquid Account'], ['investment', 'Investment'], ['other', 'Other']]}
-                  style={{ fontSize: 11, height: 26 }}
+                  size="xs"
                 />
               </td>
               <td style={{ textAlign: 'right' }}>

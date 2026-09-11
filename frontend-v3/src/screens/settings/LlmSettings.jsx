@@ -16,7 +16,8 @@ import {
 } from '../../ui';
 
 const BLANK = {
-  provider: '', api_key: '', base_url: '', model_fast: '', model_strong: '', agent_profile: '',
+  provider: '', api_key: '', base_url: '', model_fast: '', model_strong: '',
+  agent_profile: '', pricing_tier: '',
 };
 
 export default function LlmSettings() {
@@ -25,6 +26,13 @@ export default function LlmSettings() {
 
   const [draft, setDraft] = useState(BLANK);
   const [replaceKey, setReplaceKey] = useState(false);
+  /* The key ring, as the screen holds it. Secrets are never sent to the
+     browser, so an entry loaded from the server carries only a masked hint
+     and `key: ''` - which the server reads as "keep the one you have under
+     this label". A row the user types into carries the new secret. */
+  const [ring, setRing] = useState([]);
+  const [newKey, setNewKey] = useState({ label: '', key: '' });
+  const [ringDirty, setRingDirty] = useState(false);
   const [busy, setBusy] = useState(null);
   const [probe, setProbe] = useState(null);
 
@@ -39,8 +47,10 @@ export default function LlmSettings() {
       model_fast: conf.model_fast || '',
       model_strong: conf.model_strong || '',
       agent_profile: conf.agent_profile || 'auto',
+      pricing_tier: conf.pricing_tier || 'free',
     });
     setReplaceKey(!conf.has_api_key);
+    setRing((conf.api_keys || []).map((k) => ({ ...k, key: '' })));
   }, [conf]);
 
   const spec = useMemo(
@@ -85,14 +95,22 @@ export default function LlmSettings() {
         model_fast: draft.model_fast,
         model_strong: draft.model_strong,
         agent_profile: draft.agent_profile,
+        pricing_tier: draft.pricing_tier,
       };
       /* Only send the key when the user actually typed one: an empty string
          would clear a working key they never meant to touch. */
       if (replaceKey && draft.api_key.trim()) body.api_key = draft.api_key.trim();
+      /* Sent whenever the ring has been touched. Entries keep `key: ''`
+         unless the user typed a replacement, and the server resolves those
+         against what it already holds - so reordering or deleting one key
+         never round-trips the others through the browser. */
+      if (ringDirty) body.api_keys = ring.map((k) => ({ label: k.label, key: k.key || '' }));
       await api.saveLlmConfig(body);
       invalidate('llm-config', 'settings', 'agents');
       await refetch();
       setReplaceKey(false);
+      setRingDirty(false);
+      setNewKey({ label: '', key: '' });
       set({ api_key: '' });
       toast.ok('Model configuration saved', 'Every AI task in the app now uses it.');
     } catch (e) {
@@ -137,7 +155,8 @@ export default function LlmSettings() {
     || (conf.model_fast || '') !== draft.model_fast
     || (conf.model_strong || '') !== draft.model_strong
     || (conf.agent_profile || 'auto') !== draft.agent_profile
-    || (replaceKey && Boolean(draft.api_key.trim()));
+    || (replaceKey && Boolean(draft.api_key.trim()))
+    || ringDirty;
 
   const modelLabel = spec?.key === 'azure' ? 'deployment' : 'model';
 
@@ -203,6 +222,167 @@ export default function LlmSettings() {
                 </Button>
               </div>
             )}
+          </Field>
+
+          {/* Several keys for one provider.
+
+              A free tier does not run out of tokens, it runs out of
+              REQUESTS - 500 a day on this one, against 336 documents to
+              import - and no amount of waiting inside a request clears a
+              daily ceiling. Another key is the only thing that raises it,
+              and AI Studio issues one per project. */}
+          <Field
+            label="Additional API keys"
+            hint={'Tried in order. A key that hits its rate limit is stood down for a '
+                  + 'minute and the next one is used; a key the provider rejects is not '
+                  + 'tried again until restart.'}
+          >
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {ring.length === 0 && (
+                <span className="tiny muted">
+                  Only the single key above is in use.
+                </span>
+              )}
+
+              {/* Saving this list REPLACES it, so a partial save removes
+                  every key it did not mention - and a credential is the
+                  one thing here that cannot be regenerated from your own
+                  documents. The previous list is kept for exactly that. */}
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="tiny muted" style={{ flex: 1 }}>
+                  Saving replaces the whole list. If a key disappears, the
+                  previous list can be put back.
+                </span>
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  busy={busy === 'restore'}
+                  onClick={async () => {
+                    setBusy('restore');
+                    try {
+                      const r = await api.restoreLlmKeys();
+                      invalidate('llm-config');
+                      await refetch();
+                      toast.ok(`Restored ${r.restored} key${r.restored === 1 ? '' : 's'}`,
+                        r.labels.join(', '));
+                    } catch (e) {
+                      toast.fail('Nothing to restore', e.message);
+                    } finally {
+                      setBusy(null);
+                    }
+                  }}
+                >
+                  Restore previous list
+                </Button>
+              </div>
+
+              {ring.map((k, i) => (
+                <div key={`${k.label}-${i}`} className="flex items-center gap-2 flex-wrap">
+                  <input
+                    className="input"
+                    style={{ width: 150 }}
+                    value={k.label}
+                    placeholder="Label"
+                    onChange={(e) => {
+                      const next = [...ring];
+                      next[i] = { ...next[i], label: e.target.value };
+                      setRing(next); setRingDirty(true);
+                    }}
+                  />
+                  <input
+                    className="input"
+                    style={{ flex: 1, minWidth: 180 }}
+                    type="password"
+                    autoComplete="off"
+                    spellCheck={false}
+                    value={k.key}
+                    placeholder={k.hint ? `stored \u00b7 ${k.hint}` : 'Paste the key'}
+                    onChange={(e) => {
+                      const next = [...ring];
+                      next[i] = { ...next[i], key: e.target.value };
+                      setRing(next); setRingDirty(true);
+                    }}
+                  />
+                  <Badge
+                    size="sm"
+                    tone={k.state === 'rejected' ? 'neg'
+                      : k.state === 'resting' ? 'warn' : 'pos'}
+                    title={k.state === 'rejected'
+                      ? 'The provider refused this key. Check it and save again.'
+                      : k.state === 'resting'
+                        ? `Rate limited. Back in about ${k.resting_for}s.`
+                        : 'Ready to use.'}
+                  >
+                    {k.state === 'resting' ? `resting ${k.resting_for}s` : k.state || 'new'}
+                  </Badge>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      setRing(ring.filter((_, j) => j !== i)); setRingDirty(true);
+                    }}
+                  >
+                    Remove
+                  </Button>
+                </div>
+              ))}
+
+              <div className="flex items-center gap-2 flex-wrap">
+                <input
+                  className="input"
+                  style={{ width: 150 }}
+                  value={newKey.label}
+                  placeholder="Label (e.g. project 2)"
+                  onChange={(e) => setNewKey({ ...newKey, label: e.target.value })}
+                />
+                <input
+                  className="input"
+                  style={{ flex: 1, minWidth: 180 }}
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={newKey.key}
+                  placeholder="Paste another key"
+                  onChange={(e) => setNewKey({ ...newKey, key: e.target.value })}
+                />
+                <Button
+                  size="sm"
+                  disabled={!newKey.key.trim()}
+                  onClick={() => {
+                    setRing([...ring, {
+                      label: newKey.label.trim() || `Key ${ring.length + 1}`,
+                      key: newKey.key.trim(),
+                      state: 'new',
+                    }]);
+                    setNewKey({ label: '', key: '' });
+                    setRingDirty(true);
+                  }}
+                >
+                  Add key
+                </Button>
+              </div>
+            </div>
+          </Field>
+
+          {/* Which price list applies to this account.
+
+              The same model has two: the free tier is metered in requests
+              per day and costs nothing, the paid tier costs the published
+              rate. That is a fact about the ACCOUNT, not the model, so
+              nothing can infer it - and guessing wrong makes every figure
+              on the Model Usage screen wrong in the same direction. */}
+          <Field
+            label="Billing tier"
+            hint={'Decides how Model Usage costs each call. Free tier is metered in '
+                  + 'requests per day, not money; paid tier is charged at the '
+                  + 'model’s published rate in US dollars.'}
+          >
+            <Select
+              value={draft.pricing_tier || 'free'}
+              onChange={(v) => set({ pricing_tier: v })}
+              options={[['free', 'Free tier — no charge, metered in requests/day'],
+                ['paid', 'Paid tier — charged at the published USD rate']]}
+            />
           </Field>
 
           <Field

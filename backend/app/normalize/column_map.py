@@ -11,11 +11,20 @@ what the cells actually contain.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date
 
 from .parsers import parse_amount, parse_date
+
+log = logging.getLogger(__name__)
+
+#: What one column-mapping question may spend. Generous for the same reason
+#: every other budget here is: a reasoning model charges its thinking to
+#: this allowance, and a reply cut short costs a request and returns
+#: nothing. Requests are the scarce resource on the target tier, not tokens.
+COLUMN_MAP_MAX_TOKENS = 900
 
 #: Canonical role -> alias fragments (matched as substrings, lowercased).
 #: Order within a list is irrelevant; specificity is handled by scoring.
@@ -408,3 +417,257 @@ def is_header_text(text: str) -> bool:
         # and a real narration that short is common.
         return False
     return all(w in _ALIAS_WORDS or w in _HEADER_ONLY_WORDS for w in words)
+
+
+# --------------------------------------------------------------------------
+# The last resort: ask a model which column is which
+# --------------------------------------------------------------------------
+#
+# Reached only when every deterministic reader above has already failed -
+# the header did not score, the data did not classify, and the split-amount
+# repair produced nothing cleaner. The alternative at that point is not a
+# worse mapping; it is no mapping, and the whole table discarded.
+#
+# The model is asked for COLUMN INDICES and nothing else. It never sees a
+# figure it could transcribe wrongly, because it never reports a figure: it
+# answers "the date is column 0, the amount is column 4", and this module's
+# own `parse_date` and `parse_amount` then read those columns exactly as
+# they would have read a mapping that scored. A hallucinated index is
+# caught by `_answer_survives_the_data` below, which checks that the cells
+# the model pointed at actually contain what it claimed.
+
+#: What the model is allowed to name. Deliberately the same role vocabulary
+#: `COLUMN_ALIASES` uses, so an answer either maps onto the existing
+#: pipeline or is discarded - there is no third kind of mapping.
+_MODEL_ROLES = ("txn_date", "value_date", "description", "reference",
+                "debit", "credit", "amount", "balance")
+
+_MODEL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        role: {"type": ["integer", "null"]} for role in _MODEL_ROLES
+    },
+    "required": ["txn_date", "description"],
+    "additionalProperties": False,
+}
+
+#: How many rows of the table the model sees. Enough to show the shape;
+#: few enough that a wide statement still fits comfortably.
+_SAMPLE_ROWS = 6
+
+
+def _sample(header: list[str], rows: list[list[str]]) -> str:
+    """The table as the model sees it: indexed columns, a handful of rows."""
+    lines = []
+    if header:
+        lines.append("HEADER: " + " | ".join(
+            f"[{i}] {str(h or '').strip()}" for i, h in enumerate(header)))
+    for row in rows[:_SAMPLE_ROWS]:
+        lines.append("ROW:    " + " | ".join(
+            f"[{i}] {str(c or '').strip()[:32]}" for i, c in enumerate(row)))
+    return "\n".join(lines)
+
+
+def _answer_survives_the_data(mapping: "ColumnMapping",
+                              rows: list[list[str]],
+                              default_year: int | None) -> bool:
+    """Do the columns the model named actually contain what it said?
+
+    The guard that makes this safe to use at all. A model asked for indices
+    can still point "amount" at the narration, and nothing downstream would
+    notice - a date column full of merchant names simply yields no rows,
+    and a money column full of text yields zeroes. So its answer is checked
+    against the cells themselves, by the same parsers that would read them:
+    a claimed date column has to parse as dates, a claimed money column as
+    money, in most of the sample.
+
+    This is what keeps the constraint intact. The model contributes an
+    opinion about STRUCTURE; whether that opinion is accepted is decided by
+    deterministic code reading real cells.
+    """
+    body = [r for r in rows[:20] if any(str(c or "").strip() for c in r)]
+    if not body:
+        return False
+
+    def hit_rate(index: int, parses) -> float:
+        seen = 0
+        for row in body:
+            if index >= len(row):
+                continue
+            cell = str(row[index] or "").strip()
+            if cell and parses(cell):
+                seen += 1
+        return seen / len(body)
+
+    date_col = mapping.get("txn_date")
+    if date_col is None:
+        return False
+    if hit_rate(date_col, lambda c: parse_date(c, default_year=default_year)
+                is not None) < 0.6:
+        return False
+
+    money_roles = [r for r in ("debit", "credit", "amount")
+                   if mapping.get(r) is not None]
+    if not money_roles:
+        return False
+    # Any ONE money column carrying real amounts is enough: a split
+    # debit/credit layout leaves each of them empty on most rows by
+    # definition, so requiring all of them would reject the commonest shape
+    # this fallback exists to rescue.
+    best = max(hit_rate(mapping.get(role),
+                        lambda c: parse_amount(c).value is not None)
+               for role in money_roles)
+    return best >= 0.5
+
+
+
+def _has_a_date_column(rows: list[list[str]],
+                       default_year: int | None) -> bool:
+    """Is there any column a date could be read from?
+
+    The cheap pre-check that keeps the model from being asked a question
+    whose every answer gets rejected. Deliberately generous - one column
+    parsing as dates in a fifth of the sampled rows is enough, because the
+    point is only to tell "there is something here to map" apart from
+    "there is not".
+    """
+    body = [r for r in rows[:20] if any(str(c or "").strip() for c in r)]
+    if not body:
+        return False
+    width = max(len(r) for r in body)
+    for index in range(width):
+        hits = 0
+        for row in body:
+            if index >= len(row):
+                continue
+            cell = str(row[index] or "").strip()
+            if cell and parse_date(cell, default_year=default_year) is not None:
+                hits += 1
+        if hits / len(body) >= 0.2:
+            return True
+    return False
+
+def ask_model_for_columns(header: list[str], rows: list[list[str]],
+                          default_year: int | None = None,
+                          source_label: str = "") -> ColumnMapping | None:
+    """Which column is which, according to a model. None if unavailable.
+
+    Cached per TEMPLATE: the header text and column count identify a bank's
+    layout, and every statement that bank ever issues shares it. One
+    request answers for all of them.
+    """
+    from ..db import repository as repo
+
+    if not rows:
+        return None
+
+    # Do not spend a request on a question with no answer.
+    #
+    # `is_usable()` requires a `txn_date` column, and a model cannot invent
+    # one - so if no column in this table holds anything that reads as a
+    # date, the best possible reply is still rejected and the request is
+    # simply gone. Measured on a real import: three Bank of Baroda tables
+    # cost four requests each and every one came back with
+    # `"txn_date": null`, correctly, because the extractor had merged the
+    # date INTO the description ("39 22-05-2025 22-05-2025 SMS Cha"). That
+    # is a broken extraction, not a mislabelled column, and no amount of
+    # asking fixes it.
+    #
+    # Twelve requests out of a daily budget of five hundred, on one file,
+    # for an answer that could not have helped.
+    if not _has_a_date_column(rows, default_year):
+        log.info("no column in this table reads as dates; not asking a "
+                 "model to map it")
+        return None
+
+    sample = _sample(header, rows)
+    prompt = (
+        "A bank statement table was extracted from a PDF and its columns "
+        "could not be identified automatically. Say which column index "
+        "plays which role.\n\n"
+        "Answer with indices only - never copy a value. Use null for a "
+        "role this table does not have. 'debit' is money out and 'credit' "
+        "is money in when they are separate columns; use 'amount' instead "
+        "when one column carries both.\n\n" + sample
+    )
+
+    db = None
+    cached = None
+    try:
+        from ..db.database import get_db
+        db = get_db()
+        cached = repo.get_ai_inference(db, repo.AI_COLUMN_MAP, sample)
+    except Exception as exc:
+        log.debug("column-map cache unreadable: %s", exc)
+
+    answer = cached
+    if answer is None:
+        try:
+            from ..llm.client import get_client
+            client = get_client()
+            if not client.available:
+                return None
+            from ..llm import telemetry
+            with telemetry.purpose("column_map",
+                                   source_label or "(unnamed table)"):
+                answer = client.complete_json(
+                    prompt, system="You return JSON only.",
+                    max_tokens=COLUMN_MAP_MAX_TOKENS, schema=_MODEL_SCHEMA)
+        except Exception as exc:
+            log.warning("column mapping could not be read: %s", exc)
+            return None
+
+    if not isinstance(answer, dict):
+        return None
+
+    roles: dict[str, int] = {}
+    width = max((len(r) for r in rows[:20]), default=0)
+    for role in _MODEL_ROLES:
+        value = answer.get(role)
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        # An index outside the table is not an answer about this table.
+        if 0 <= value < width:
+            roles[role] = value
+
+    mapping = ColumnMapping(roles=roles, confidence=0.55,
+                            inferred_from_data=True)
+    mapping.split_amount_columns = ("debit" in roles and "credit" in roles)
+
+    if not mapping.is_usable():
+        log.info("model column mapping was not usable; table left unparsed")
+        _log(db, source_label, prompt, answer, {}, cached is not None, sample)
+        return None
+    if not _answer_survives_the_data(mapping, rows, default_year):
+        log.info("model column mapping did not match the cells it named; "
+                 "rejected")
+        _log(db, source_label, prompt, answer,
+             {"rejected": "columns did not contain what was claimed"},
+             cached is not None, sample)
+        return None
+
+    if db is not None and cached is None:
+        try:
+            repo.save_ai_inference(db, repo.AI_COLUMN_MAP, sample, answer,
+                                   prompt=prompt)
+        except Exception as exc:
+            log.debug("column mapping not cached: %s", exc)
+    _log(db, source_label, prompt, answer, roles, cached is not None, sample)
+    return mapping
+
+
+def _log(db, source_label: str, prompt: str, answer, applied: dict,
+         cached: bool, sample: str) -> None:
+    """Audit only - never let a missing line affect the parse."""
+    if db is None:
+        return
+    try:
+        from ..db import repository as repo
+        repo.log_ai_call(
+            db, kind=repo.AI_COLUMN_MAP,
+            source_label=source_label or "(table with no usable header)",
+            prompt=prompt, response=answer,
+            applied={"fields": applied, "source": "model"}, cached=cached,
+            cache_key=repo.cache_key_for(repo.AI_COLUMN_MAP, sample))
+    except Exception:                   # pragma: no cover - audit only
+        pass

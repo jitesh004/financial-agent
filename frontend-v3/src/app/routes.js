@@ -117,6 +117,13 @@ export const ROUTES = [
     load: () => import('../screens/Data'),
   },
   {
+    path: '/llm-usage', key: 'llm-usage', group: 'manage', label: 'Model Usage',
+    icon: 'sparkles',
+    title: 'Model Usage',
+    blurb: 'Every model request: tokens, cost, which key, and what failed.',
+    load: () => import('../screens/LlmUsage'),
+  },
+  {
     path: '/rules', key: 'rules', group: 'manage', label: 'Rules Engine', icon: 'book',
     title: 'Rules & Heuristics',
     blurb: 'Categorization rules, transfer detectors, and interactive rule tester.',

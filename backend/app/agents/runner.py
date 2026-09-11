@@ -363,6 +363,21 @@ def run(
     steps_allowed = min(agent.max_steps, budget.max_steps)
     transcript: list[str] = []
 
+    #: (tool, arguments) -> (step it was first answered on, its result).
+    #:
+    #: Every agent tool is a read, and nothing writes to the ledger while a
+    #: run is in flight - so the same call with the same arguments has the
+    #: same answer for the whole run, and asking twice buys nothing.
+    #:
+    #: The step-signature guard below cannot see this. It compares the
+    #: WHOLE set a step asked for, so a model that re-reads one tool while
+    #: varying its companions never trips it: a real run called
+    #: `recurring({})` on steps 0, 1, 2 and 3 - the same 9,016-character
+    #: result four times - and only the last pair matched. Three wasted
+    #: reads, and 27,000 characters of duplicated transcript, which is what
+    #: grew that run's prompt from 18,000 characters to 46,000.
+    answered: dict[tuple[str, str], tuple[int, Any]] = {}
+
     # The opening facts. Fetched before the first turn rather than left to the
     # model, because every agent's first call is the same obvious one and
     # spending a whole round trip on it buys nothing.
@@ -371,10 +386,17 @@ def run(
         opening = Step(index=0, thought="(opening facts, fetched for you)")
         for name in agent.opening:
             result = toolbelt.call(db, name, {})
-            opening.calls.append({"tool": name, "args": {}})
-            opening.results.append({"tool": name, "result": result})
+            opening.calls.append({"tool": name, "args": {},
+                                  "repeat_of_step": None})
+            opening.results.append({"tool": name, "result": result,
+                                    "repeat_of_step": None})
             verify.collect_figures(result, figures)
             run_record.tool_calls += 1
+            # Seeded, not just recorded. These are the obvious first calls -
+            # which is exactly why the model asks for them again on step
+            # one, and on the run that prompted this it did: `recurring`
+            # was fetched here and re-read three more times.
+            answered[(name, _dump({}, 400))] = (0, result)
         run_record.steps.append(opening)
         transcript.append(
             "Fetched for you before you started:\n"
@@ -388,6 +410,29 @@ def run(
     previous_signature: tuple[str, ...] = ()
     repeats = 0
 
+    def event(kind: str, text: str, *, detail: str = "", step: int = 0,
+              ok: bool = True) -> None:
+        """Report one thing happening, as it happens.
+
+        `on_progress` has always taken a bare string, and a bare string is
+        all the phase line needs. A reader watching a run needs more than a
+        phase: which tool, with what arguments, how long it took, and
+        whether the pause they are looking at is a model call or a query.
+
+        Passed as a dict to callers that accept one and flattened to the
+        old string for those that do not, so nothing that already listens
+        has to change.
+        """
+        if on_progress is None:
+            return
+        try:
+            on_progress({"kind": kind, "text": text, "detail": detail,
+                         "step": step, "ok": ok})
+        except TypeError:
+            on_progress(f"{text}{f' - {detail}' if detail else ''}")
+        except Exception:               # pragma: no cover - reporting only
+            pass
+
     for index in range(1, steps_allowed + 1):
         last_turn = index == steps_allowed
         progress(f"Thinking (step {index} of {steps_allowed})")
@@ -396,10 +441,27 @@ def run(
 
         prompt = _prompt(task, transcript, index, steps_allowed, last_turn)
         run_record.prompt_chars += len(system) + len(prompt)
+        # Said before the call, not after. A model call is the slowest thing
+        # in a run - ten to thirty seconds - and for all of it the screen
+        # used to read "Thinking (step 3 of 10)" with no indication that
+        # anything was in flight, which is indistinguishable from a hang.
+        event("model", f"Asking the model (step {index} of {steps_allowed})",
+              detail=f"{len(system) + len(prompt):,} characters of prompt")
         try:
-            reply = client.complete_json(
-                prompt, system=system, schema=REPLY_SCHEMA, max_tokens=8000)
+            # Named down to the STEP. "an agent called the model" is not a
+            # useful record when a single run makes ten calls of wildly
+            # different sizes - this run's prompt grew from 18,000
+            # characters to 46,000 across four steps, and the only way to
+            # see that is per step.
+            from ..llm import telemetry
+            with telemetry.purpose("agent",
+                                   f"{agent.key} · step {index}"):
+                reply = client.complete_json(
+                    prompt, system=system, schema=REPLY_SCHEMA,
+                    max_tokens=8000)
         except Exception as exc:
+            event("error", f"The model call failed on step {index}",
+                  detail=f"{type(exc).__name__}: {exc}")
             step.error = f"{type(exc).__name__}: {exc}"
             step.seconds = round(time.monotonic() - turn_started, 2)
             run_record.steps.append(step)
@@ -417,11 +479,18 @@ def run(
         step.thought = str(reply.get("thought") or "")[:400]
         answer = reply.get("answer")
         calls = reply.get("calls") or []
+        if step.thought:
+            # The model's own account of what it is about to do. The single
+            # most useful line in a run and it was only ever visible after
+            # the run had finished, behind a collapsed panel.
+            event("thought", step.thought, step=index)
 
         # An answer wins over calls in the same reply: a model that fills both
         # has decided, and running the calls it also asked for would only
         # produce results nothing reads.
         if isinstance(answer, dict) and answer.get("headline"):
+            event("answer", "The agent reached an answer",
+                  detail=str(answer.get("headline"))[:200], step=index)
             step.seconds = round(time.monotonic() - turn_started, 2)
             run_record.steps.append(step)
             run_record.answer = _clean_answer(answer)
@@ -447,18 +516,58 @@ def run(
                 continue
             name = str(requested.get("tool") or "")
             args = requested.get("args")
+            memo_key = (name, _dump(args, 400))
+            repeat_of = answered.get(memo_key)
+
             if name not in agent.tools:
                 result: Any = {
                     "error": f"{name!r} is not one of your tools.",
                     "your_tools": list(agent.tools)}
+                event("tool", f"Refused {name or '(unnamed)'}",
+                      detail="not one of this agent's tools", step=index,
+                      ok=False)
+            elif repeat_of is not None:
+                # Already answered this run. Not re-run, and - the part that
+                # actually costs - not re-appended to the transcript: the
+                # result is already in there once, and a second copy only
+                # crowds out the reasoning the model needs to see.
+                earlier, result = repeat_of
+                event("tool", f"{name}({_dump(args, 120)})",
+                      detail=f"already answered at step {earlier + 1}; "
+                             f"served from that result",
+                      step=index)
             else:
+                call_started = time.monotonic()
                 result = toolbelt.call(db, name, args)
                 verify.collect_figures(result, figures)
                 run_record.tool_calls += 1
-            step.calls.append({"tool": name, "args": args if isinstance(args, dict) else {}})
-            step.results.append({"tool": name, "result": result})
-            lines.append(f"{name}({_dump(args, 400)}) -> "
-                         f"{_dump(result, budget.max_result_chars)}")
+                answered[memo_key] = (index - 1, result)
+                # Named individually, with what it was asked and how long it
+                # took. "23 tool calls" at the end of a run says nothing
+                # about which of them was slow or which returned nothing.
+                event("tool", f"{name}({_dump(args, 120)})",
+                      detail=f"{_dump(result, 160)} "
+                             f"[{time.monotonic() - call_started:.2f}s]",
+                      step=index)
+
+            step.calls.append({"tool": name,
+                               "args": args if isinstance(args, dict) else {},
+                               # Recorded rather than hidden: the model DID
+                               # ask, and a transcript that quietly drops
+                               # the request misrepresents what it did.
+                               "repeat_of_step": (repeat_of[0] + 1
+                                                  if repeat_of else None)})
+            step.results.append({"tool": name, "result": result,
+                                 "repeat_of_step": (repeat_of[0] + 1
+                                                    if repeat_of else None)})
+            if repeat_of is not None:
+                lines.append(
+                    f"{name}({_dump(args, 400)}) -> you already have this "
+                    f"from step {repeat_of[0] + 1}; it has not changed. Use "
+                    f"that result rather than asking again.")
+            else:
+                lines.append(f"{name}({_dump(args, 400)}) -> "
+                             f"{_dump(result, budget.max_result_chars)}")
 
         step.seconds = round(time.monotonic() - turn_started, 2)
         run_record.steps.append(step)

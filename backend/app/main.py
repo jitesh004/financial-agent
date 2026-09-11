@@ -34,8 +34,9 @@ from fastapi.responses import JSONResponse
 from . import storage
 from .analytics import periods
 from .api import (admin_routes, agent_routes, auth_routes, files_routes,
-                  gmail_routes, job_routes, position_routes, query_routes,
-                  rules_routes, settings_routes, staging_routes, wealth_routes)
+                  gmail_routes, job_routes, llm_routes, position_routes,
+                  query_routes, rules_routes, settings_routes,
+                  staging_routes, wealth_routes)
 from .auth.session import AuthContextMiddleware
 from .api import serializers as ser
 from .db.database import CLEAR_SCOPES, get_db
@@ -128,6 +129,7 @@ app.include_router(files_routes.router)
 app.include_router(files_routes.coverage_router)
 app.include_router(query_routes.router)
 app.include_router(job_routes.router)
+app.include_router(llm_routes.router)
 app.include_router(wealth_routes.router)
 app.include_router(settings_routes.router)
 app.include_router(staging_routes.router)
@@ -1661,7 +1663,11 @@ PREVIEW_COLUMNS: dict[str, str] = {
     # Bought with real money.
     "agent_runs": "agent, status, started_at, seconds, steps, tool_calls",
     "merchant_categories": "merchant_key, category, hit_count, updated_at",
-    "ai_inferences": "cache_key, kind, provider, model, created_at, hit_count",
+    "ai_inferences": "cache_key, kind, institution, account_type, "
+                     "product_name, model, created_at, hit_count",
+    "ai_inference_log": "kind, source_label, cached, model, created_at",
+    "llm_calls": "created_at, purpose, subject, model, key_label, status, "
+                 "total_tokens, latency_ms",
     # Downloaded, and irreplaceable if the mail is gone.
     "source_files": "filename, size_bytes, parse_status, transaction_count",
     "staged_files": ("filename, kind, account_label, parse_status, row_count,"

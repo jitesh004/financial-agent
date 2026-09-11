@@ -2554,15 +2554,144 @@ def test_the_identity_cache_reads_the_columns_it_writes(tmp_db):
     """
     from app.db import repository as repo
 
-    assert repo.get_ai_inference(tmp_db, "no-such-hash") is None
-    repo.save_ai_inference(tmp_db, "hash-1",
+    head = "ICICI Bank Amazon Pay Credit Card Statement"
+    assert repo.get_ai_inference(tmp_db, repo.AI_IDENTITY, "nothing here") is None
+    repo.save_ai_inference(tmp_db, repo.AI_IDENTITY, head,
                            {"institution": "ICICI Bank",
                             "account_type": "credit_card"})
-    assert repo.get_ai_inference(tmp_db, "hash-1") == {
+    assert repo.get_ai_inference(tmp_db, repo.AI_IDENTITY, head) == {
         "institution": "ICICI Bank", "account_type": "credit_card"}
     # Writing the same key again must update rather than raise.
-    repo.save_ai_inference(tmp_db, "hash-1", {"institution": "ICICI Bank"})
-    assert repo.get_ai_inference(tmp_db, "hash-1") == {"institution": "ICICI Bank"}
+    repo.save_ai_inference(tmp_db, repo.AI_IDENTITY, head,
+                           {"institution": "ICICI Bank"})
+    assert repo.get_ai_inference(tmp_db, repo.AI_IDENTITY, head) == {
+        "institution": "ICICI Bank"}
+
+
+def test_one_question_cannot_read_another_questions_answer(tmp_db):
+    """`kind` has to be a namespace, not a label.
+
+    `save_ai_inference` hardcoded `statement_identity` whatever it was
+    storing, and the card-summary reader calls the same two helpers - so two
+    unrelated questions about the same document shared a key.
+    """
+    from app.db import repository as repo
+
+    text = "ICICI Bank Credit Card Statement"
+    repo.save_ai_inference(tmp_db, repo.AI_IDENTITY, text,
+                           {"institution": "ICICI Bank"})
+    assert repo.get_ai_inference(tmp_db, repo.AI_CARD_SUMMARY, text) is None
+
+
+def test_one_template_answers_for_every_month_of_it(tmp_db):
+    """Identity generalises across a template, so it must be cached that way.
+
+    The key was sha256 of the raw letterhead, which carries the statement
+    period, the masked account number and the closing balance - so twelve
+    monthly statements from one card were twelve cache misses and twelve
+    requests. Against a tier metered at 500 requests a DAY with 336
+    documents waiting, that decides whether an import finishes.
+    """
+    from app.db import repository as repo
+
+    august = ("ICICI Bank Amazon Pay Credit Card Statement "
+              "02/08/2026 to 01/09/2026 XXXX5001 Total Due 12,345.67")
+    september = ("ICICI Bank Amazon Pay Credit Card Statement "
+                 "02/09/2026 to 01/10/2026 XXXX5001 Total Due 8,901.23")
+
+    repo.save_ai_inference(tmp_db, repo.AI_IDENTITY, august,
+                           {"institution": "ICICI Bank",
+                            "account_type": "credit_card",
+                            "product_name": "Amazon Pay"})
+    # September was never asked about, and needs no request.
+    assert repo.get_ai_inference(tmp_db, repo.AI_IDENTITY, september) == {
+        "institution": "ICICI Bank", "account_type": "credit_card",
+        "product_name": "Amazon Pay"}
+
+    # A genuinely different template must NOT hit that answer.
+    hdfc = "HDFC Bank Tata Neu Credit Card Statement 02/08/2026 XXXX6885"
+    assert repo.get_ai_inference(tmp_db, repo.AI_IDENTITY, hdfc) is None
+
+
+def test_a_figure_is_never_answered_from_last_months_statement(tmp_db):
+    """Template-keying identity is right; template-keying a FIGURE is not.
+
+    A card summary slice differs from last month's only in its digits -
+    exactly what template normalisation removes. Cached that way, August's
+    total due would be served as September's: confidently, invisibly wrong.
+    """
+    from app.db import repository as repo
+
+    august = "Total Amount Due 12,345.67 Credit Limit 200000 Due 20/08/2026"
+    september = "Total Amount Due 8,901.23 Credit Limit 200000 Due 20/09/2026"
+
+    repo.save_ai_inference(tmp_db, repo.AI_CARD_SUMMARY, august,
+                           {"total_amount_due": "12345.67"})
+    assert repo.get_ai_inference(tmp_db, repo.AI_CARD_SUMMARY, september) is None
+    assert repo.get_ai_inference(tmp_db, repo.AI_CARD_SUMMARY, august) == {
+        "total_amount_due": "12345.67"}
+
+
+def test_an_issuers_product_answers_for_a_redesigned_statement(tmp_db):
+    """A layout change invalidates the template hash, not the answer.
+
+    "ICICI Bank / Amazon Pay is a credit card" was true last month and is
+    true now, so a statement whose issuer the deterministic reader could
+    name should not cost a request to type. Keyed per institution PER
+    PRODUCT: ICICI also issues a savings account and a personal loan, and
+    collapsing those to "ICICI" would file a card as a savings account.
+    """
+    from app.db import repository as repo
+
+    repo.save_ai_inference(
+        tmp_db, repo.AI_IDENTITY, "old ICICI Amazon Pay layout",
+        {"institution": "ICICI Bank", "account_type": "credit_card",
+         "product_name": "Amazon Pay"})
+    repo.save_ai_inference(
+        tmp_db, repo.AI_IDENTITY, "an ICICI savings layout",
+        {"institution": "ICICI Bank", "account_type": "savings",
+         "product_name": ""})
+
+    redesigned = repo.find_identity_for(tmp_db, "ICICI Bank", "Amazon Pay")
+    assert redesigned["account_type"] == "credit_card"
+
+    # The same issuer's other product is a different answer, not this one.
+    savings = repo.find_identity_for(tmp_db, "ICICI Bank", "")
+    assert savings["account_type"] == "savings"
+
+    assert repo.find_identity_for(tmp_db, "Bank Nobody Has Heard Of") is None
+
+
+def test_the_call_log_records_what_was_used_and_what_was_not(tmp_db):
+    """The cache holds one row per template; the wizard accounts per file.
+
+    Folding the two together loses either the per-file view or the
+    deduplication, and the import wizard's AI step needs both - including
+    the files whose answer arrived without a request being spent.
+    """
+    from app.db import repository as repo
+
+    repo.log_ai_call(
+        tmp_db, kind=repo.AI_IDENTITY, source_label="ICICI_Aug.pdf",
+        prompt="Extract the bank name...", response={"institution": "ICICI Bank"},
+        applied={"fields": {}, "source": "template cache"}, cached=True,
+        job_id="job-1")
+    repo.log_ai_call(
+        tmp_db, kind=repo.AI_IDENTITY, source_label="HDFC_Aug.pdf",
+        prompt="Extract the bank name...", response={"institution": "HDFC Bank"},
+        applied={"fields": {"institution": "HDFC Bank"}, "source": "model"},
+        cached=False, job_id="job-1")
+
+    rows = repo.get_ai_call_log(tmp_db, job_id="job-1")
+    assert len(rows) == 2
+    by_file = {r["source_label"]: r for r in rows}
+    # A cached answer is still reported: "no request was spent" is a fact
+    # the user is entitled to, not an absence.
+    assert by_file["ICICI_Aug.pdf"]["cached"] is True
+    assert by_file["ICICI_Aug.pdf"]["applied"]["fields"] == {}
+    assert by_file["HDFC_Aug.pdf"]["cached"] is False
+    assert by_file["HDFC_Aug.pdf"]["response"] == {"institution": "HDFC Bank"}
+    assert repo.get_ai_call_log(tmp_db, job_id="other") == []
 
 
 def test_a_page_dump_loses_to_a_real_ledger():

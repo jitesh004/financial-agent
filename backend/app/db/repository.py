@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import logging
 import uuid
 from dataclasses import dataclass
@@ -1913,50 +1914,398 @@ def get_confirmed_fingerprints(db) -> set:
         rows = conn.execute("SELECT l.fingerprint FROM settlement_group_legs l JOIN settlement_groups g ON l.group_id = g.id WHERE g.confirmed = 1").fetchall()
     return {r["fingerprint"] for r in rows}
 
-import json
 
-#: The one kind of inference these two helpers cache: "which bank issued this
-#: statement, and what sort of account is it?", keyed on the letterhead.
-_IDENTITY_KIND = "statement_identity"
+#: The questions this workspace asks a model about a document. A real
+#: namespace, not decoration: `save_ai_inference` used to stamp every row
+#: `statement_identity` whatever it was caching, so the card-summary reader
+#: and the letterhead reader shared one keyspace and the `kind` column named
+#: only one of them.
+AI_IDENTITY = "statement_identity"
+AI_CARD_SUMMARY = "card_summary"
+AI_COLUMN_MAP = "column_map"
+
+#: Everything that varies between two statements of the SAME template:
+#: digits, and therefore dates, amounts, masked numbers and reference ids.
+_VARYING = re.compile(r"\d+")
+_WHITESPACE = re.compile(r"\s+")
 
 
-def _identity_key(input_hash: str) -> str:
-    return hashlib.sha256(f"{_IDENTITY_KIND}|{input_hash}".encode()).hexdigest()
+#: Kinds whose answer is a property of the DOCUMENT, not of its template.
+#:
+#: The distinction decides the cache key and it is not cosmetic. "Which bank
+#: issued this?" has the same answer for every statement a template ever
+#: produces, so flattening the digits away is exactly right. "What is the
+#: total due?" has a DIFFERENT answer every month, and its slice differs
+#: from last month's only in the digits - so template-keying it would serve
+#: August's balance as September's and be confidently, invisibly wrong.
+#:
+#: Identity generalises; figures do not.
+_PER_DOCUMENT_KINDS = frozenset({AI_CARD_SUMMARY})
 
 
-def get_ai_inference(db, fingerprint: str) -> dict | None:
-    """A cached model answer about a statement's identity, if there is one.
+def cache_key_for(kind: str, text: str) -> str:
+    """The cache key for one question about one piece of text.
 
-    Both of these named a `fingerprint` column that this table has never had -
-    it stores `cache_key`, `kind` and `input_hash` - so every call raised
+    Per-template for questions whose answer generalises, per-document for
+    questions whose answer is a figure. See `_PER_DOCUMENT_KINDS`.
+    """
+    if kind in _PER_DOCUMENT_KINDS:
+        exact = _WHITESPACE.sub(" ", (text or "")).strip()
+        return hashlib.sha256(f"{kind}|exact|{exact}".encode()).hexdigest()
+    return template_hash(kind, text)
+
+
+def template_hash(kind: str, text: str) -> str:
+    """A key that identifies the TEMPLATE this text came from, not the file.
+
+    The old key was sha256 of the raw letterhead slice. A letterhead carries
+    the statement period, the masked account number and often the closing
+    balance, so the twelve monthly statements of one credit card produced
+    twelve different keys and cost twelve requests to answer one question.
+    Against a free tier metered at 500 requests a day, with 336 documents
+    waiting, that is the difference between an import that finishes and one
+    that stops halfway through.
+
+    Flattening every digit run to "#" removes precisely what varies and
+    keeps precisely what identifies: the issuer name, the product line, the
+    labels and the layout. August's ICICI Amazon Pay statement and
+    September's collapse to one string, and the second is free.
+
+    Two different templates cannot collide here: they would have to agree on
+    every non-digit character in the slice, which is what being the same
+    template means.
+    """
+    flattened = _VARYING.sub("#", (text or "").lower())
+    flattened = _WHITESPACE.sub(" ", flattened).strip()
+    return hashlib.sha256(f"{kind}|{flattened}".encode()).hexdigest()
+
+
+def get_ai_inference(db, kind: str, text: str) -> dict | None:
+    """A cached model answer to `kind` about a document like this one.
+
+    Both of these named a `fingerprint` column that this table has never had
+    - it stores `cache_key`, `kind` and `input_hash` - so every call raised
     OperationalError. Neither is wrapped in a try, and the caller is the
     identity fallback in `extract_metadata`, which runs precisely when the
-    deterministic reader could NOT identify a statement. So the path meant to
-    rescue an unrecognised statement was instead the one thing guaranteed to
-    fail its parse outright. The table has been empty this whole time.
+    deterministic reader could NOT identify a statement. So the path meant
+    to rescue an unrecognised statement was instead the one thing guaranteed
+    to fail its parse outright. The table has been empty this whole time.
     """
+    key = cache_key_for(kind, text)
     with db.connection() as conn:
         row = conn.execute(
-            "SELECT result_json FROM ai_inferences WHERE cache_key = ?",
-            (_identity_key(fingerprint),)).fetchone()
+            "SELECT result_json FROM ai_inferences"
+            " WHERE cache_key = ? AND kind = ?", (key, kind)).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE ai_inferences SET hit_count = hit_count + 1"
+                " WHERE cache_key = ? AND kind = ?", (key, kind))
     if not row:
         return None
     try:
         return json.loads(row["result_json"])
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError):
+        log.warning("cached inference %s is unreadable", key)
         return None
 
 
-def save_ai_inference(db, fingerprint: str, result: dict) -> None:
+def find_identity_for(db, institution: str, product_name: str = "") -> dict | None:
+    """A previous identity answer for this issuer and product.
+
+    The second chance, and the one that makes the cache mean what a person
+    means by it. A template hash misses whenever a bank changes its layout,
+    but the ANSWER for "ICICI Bank / Amazon Pay" has not changed - so a
+    statement whose issuer the deterministic reader could name, but whose
+    type it could not, is answerable from what was learned about that
+    issuer's product last month, with no request at all.
+
+    Keyed on institution AND product because one institution is many
+    accounts: ICICI issues a savings account, several different cards and a
+    personal loan, and collapsing those to "ICICI" would confidently file a
+    card statement as a savings account.
+    """
+    if not institution:
+        return None
+    with db.connection() as conn:
+        row = conn.execute(
+            "SELECT result_json FROM ai_inferences"
+            "  WHERE kind = ? AND lower(institution) = lower(?)"
+            "    AND lower(product_name) = lower(?)"
+            "  ORDER BY hit_count DESC, created_at DESC LIMIT 1",
+            (AI_IDENTITY, institution, product_name or "")).fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row["result_json"])
+    except (ValueError, TypeError):
+        return None
+
+
+def save_ai_inference(db, kind: str, text: str, result: dict, *,
+                      prompt: str = "", provider: str = "",
+                      model: str = "") -> None:
+    """Remember one answer, under the question it answers."""
+    key = cache_key_for(kind, text)
+    identity = result if isinstance(result, dict) else {}
     with db.connection() as conn:
         conn.execute(
-            "INSERT INTO ai_inferences (cache_key, kind, input_hash, result_json)"
-            " VALUES (?, ?, ?, ?)"
+            "INSERT INTO ai_inferences"
+            " (cache_key, kind, input_hash, result_json, prompt,"
+            "  provider, model, institution, account_type, product_name)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT (user_id, cache_key) DO UPDATE SET"
             "   result_json = excluded.result_json,"
             "   hit_count = ai_inferences.hit_count + 1",
-            (_identity_key(fingerprint), _IDENTITY_KIND, fingerprint,
-             json.dumps(result)))
+            (key, kind, key, json.dumps(result), (prompt or "")[:4000],
+             provider, model,
+             str(identity.get("institution") or ""),
+             str(identity.get("account_type") or ""),
+             str(identity.get("product_name") or "")))
+
+
+def log_ai_call(db, *, kind: str, source_label: str, prompt: str,
+                response: Any, applied: dict, cached: bool,
+                job_id: str = "", provider: str = "", model: str = "",
+                cache_key: str = "") -> None:
+    """Record that a question was asked about one file, and what came back.
+
+    Separate from the cache on purpose. The cache holds one row per
+    TEMPLATE, which is what makes it worth having; the import wizard has to
+    account for each FILE, including the ones answered without spending a
+    request. Folding the two together loses either the per-file view or the
+    deduplication, and both are load-bearing.
+
+    Never raises: a missing audit line must not fail a parse.
+    """
+    # The ambient job, unless the caller names one. A parse runs six frames
+    # below the route that started it, and threading an id through every
+    # signature to satisfy an audit log would be the worse trade.
+    if not job_id:
+        try:
+            from .engine import current_job
+            job_id = current_job()
+        except Exception:               # pragma: no cover - defensive
+            job_id = ""
+    try:
+        with db.connection() as conn:
+            conn.execute(
+                "INSERT INTO ai_inference_log"
+                " (id, job_id, kind, cache_key, source_label, prompt,"
+                "  response_json, applied_json, cached, provider, model)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (_new_id(), job_id, kind, cache_key, source_label,
+                 (prompt or "")[:4000], json.dumps(response, default=str),
+                 json.dumps(applied, default=str), int(bool(cached)),
+                 provider, model))
+    except Exception as exc:            # pragma: no cover - audit only
+        log.warning("could not log the %s inference: %s", kind, exc)
+
+
+def get_ai_call_log(db, job_id: str = "", limit: int = 200) -> list[dict]:
+    """What the model was asked and what it answered, newest first."""
+    sql = ("SELECT id, job_id, kind, source_label, prompt, response_json,"
+           "       applied_json, cached, provider, model, created_at"
+           "  FROM ai_inference_log")
+    params: list[Any] = []
+    if job_id:
+        sql += " WHERE job_id = ?"
+        params.append(job_id)
+    sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    params.append(limit)
+    out = []
+    with db.connection() as conn:
+        for row in conn.execute(sql, params).fetchall():
+            entry = dict(row)
+            for field in ("response_json", "applied_json"):
+                try:
+                    entry[field[:-5]] = json.loads(entry.pop(field) or "null")
+                except (ValueError, TypeError):
+                    entry.pop(field, None)
+                    entry[field[:-5]] = None
+            entry["cached"] = bool(entry.get("cached"))
+            out.append(entry)
+    return out
+
+
+
+# --------------------------------------------------------------------------
+# Model-call telemetry
+# --------------------------------------------------------------------------
+
+#: Columns `save_llm_calls` writes, in order. Named once so the INSERT and
+#: the row dicts cannot drift apart.
+_LLM_CALL_COLUMNS = (
+    "purpose", "subject", "job_id", "provider", "model", "tier", "reasoning",
+    "key_label", "key_hint", "group_id", "attempt", "status", "http_status",
+    "error", "input_tokens", "output_tokens", "total_tokens", "prompt_chars",
+    "response_chars", "latency_ms", "cost_micros", "cost_known",
+    "request_preview", "response_preview",
+)
+
+
+#: Which columns are numeric, so a missing key defaults to 0 rather than "".
+_LLM_CALL_BLANKS = {
+    "attempt": 0, "http_status": 0, "input_tokens": 0, "output_tokens": 0,
+    "total_tokens": 0, "prompt_chars": 0, "response_chars": 0,
+    "latency_ms": 0, "cost_micros": 0, "cost_known": 0,
+}
+
+
+def save_llm_calls(db: Database, rows: Sequence[dict]) -> int:
+    """Record model-call attempts. One row per attempt."""
+    if not rows:
+        return 0
+    columns = ", ".join(("id",) + _LLM_CALL_COLUMNS)
+    placeholders = ", ".join("?" * (len(_LLM_CALL_COLUMNS) + 1))
+    values = [
+        (_new_id(), *[row.get(c, "" if isinstance(
+            _LLM_CALL_BLANKS.get(c, ""), str) else 0)
+            for c in _LLM_CALL_COLUMNS])
+        for row in rows
+    ]
+    with db.connection() as conn:
+        conn.executemany(
+            f"INSERT INTO llm_calls ({columns}) VALUES ({placeholders})",
+            values)
+    return len(values)
+
+
+def _llm_window(since: str = "", until: str = "",
+                key_label: str = "", purpose: str = ""
+                ) -> tuple[str, list[Any]]:
+    """The WHERE shared by the summary and the detail list."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if since:
+        clauses.append("created_at >= ?")
+        params.append(since)
+    if until:
+        clauses.append("created_at <= ?")
+        params.append(until)
+    if key_label:
+        clauses.append("key_label = ?")
+        params.append(key_label)
+    if purpose:
+        clauses.append("purpose = ?")
+        params.append(purpose)
+    return (f" WHERE {' AND '.join(clauses)}" if clauses else ""), params
+
+
+def llm_usage_summary(db: Database, *, since: str = "", until: str = "",
+                      key_label: str = "") -> dict[str, Any]:
+    """Totals for the window, overall and per purpose.
+
+    Counted per ATTEMPT for requests and per successful attempt for tokens,
+    because that is what each actually measures: a rate-limited attempt
+    spent a request against the daily quota and produced no tokens, and
+    reporting it either way round hides one of the two.
+    """
+    where, params = _llm_window(since, until, key_label)
+    select = (
+        "SELECT COUNT(*) AS attempts,"
+        "       COUNT(DISTINCT group_id) AS requests,"
+        "       SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS succeeded,"
+        "       SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END) AS failed,"
+        "       COALESCE(SUM(input_tokens), 0)  AS input_tokens,"
+        "       COALESCE(SUM(output_tokens), 0) AS output_tokens,"
+        "       COALESCE(SUM(total_tokens), 0)  AS total_tokens,"
+        "       COALESCE(SUM(prompt_chars), 0)  AS prompt_chars,"
+        "       COALESCE(SUM(cost_micros), 0)   AS cost_micros,"
+        "       SUM(CASE WHEN cost_known = 0 AND status = 'ok'"
+        "                THEN 1 ELSE 0 END)     AS unpriced,"
+        "       COALESCE(MAX(latency_ms), 0)    AS slowest_ms,"
+        "       COALESCE(AVG(NULLIF(latency_ms, 0)), 0) AS average_ms"
+        "  FROM llm_calls")
+
+    with db.connection() as conn:
+        overall = dict(conn.execute(select + where, params).fetchone() or {})
+        by_purpose = [dict(r) for r in conn.execute(
+            select.replace("SELECT ", "SELECT purpose, ") + where
+            + " GROUP BY purpose ORDER BY attempts DESC", params).fetchall()]
+        # The models and keys actually used, so the screen states them as
+        # fact rather than echoing what is currently configured - those are
+        # different things the moment somebody changes a setting.
+        models = [dict(r) for r in conn.execute(
+            "SELECT model, provider, reasoning, COUNT(*) AS attempts,"
+            "       COALESCE(SUM(total_tokens), 0) AS total_tokens"
+            "  FROM llm_calls" + where
+            + " GROUP BY model, provider, reasoning"
+            "  ORDER BY attempts DESC", params).fetchall()]
+        keys = [dict(r) for r in conn.execute(
+            "SELECT key_label, key_hint, COUNT(*) AS attempts,"
+            "       SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END) AS failed"
+            "  FROM llm_calls" + where
+            + " GROUP BY key_label, key_hint ORDER BY attempts DESC",
+            params).fetchall()]
+
+    return {"overall": overall, "by_purpose": by_purpose,
+            "models": models, "keys": keys}
+
+
+def llm_calls(db: Database, *, since: str = "", until: str = "",
+              key_label: str = "", purpose: str = "",
+              status: str = "", limit: int = 200, offset: int = 0
+              ) -> dict[str, Any]:
+    """The calls themselves, newest first, with their retries attached.
+
+    Grouped by `group_id` so a retry is shown under the request it
+    retried. A failed attempt sitting on its own in a flat list reads as a
+    separate lost request, when in fact the next row down is the same
+    question answered on another key.
+    """
+    where, params = _llm_window(since, until, key_label, purpose)
+    if status == "failed":
+        where += (" AND " if where else " WHERE ") + "status <> 'ok'"
+    elif status == "ok":
+        where += (" AND " if where else " WHERE ") + "status = 'ok'"
+
+    with db.connection() as conn:
+        total = conn.execute(
+            "SELECT COUNT(DISTINCT group_id) c FROM llm_calls" + where,
+            params).fetchone()["c"]
+        groups = [r["group_id"] for r in conn.execute(
+            "SELECT group_id, MAX(created_at) AS last FROM llm_calls" + where
+            + " GROUP BY group_id ORDER BY last DESC, group_id DESC"
+            "  LIMIT ? OFFSET ?", [*params, limit, offset]).fetchall()]
+        if not groups:
+            return {"calls": [], "total": total}
+        marks = ",".join("?" for _ in groups)
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM llm_calls"
+            f" WHERE group_id IN ({marks})"
+            "  ORDER BY created_at ASC, attempt ASC", groups).fetchall()]
+
+    by_group: dict[str, list[dict]] = {}
+    for row in rows:
+        row.pop("user_id", None)
+        row["cost_known"] = bool(row.get("cost_known"))
+        by_group.setdefault(row["group_id"], []).append(row)
+
+    out = []
+    for group_id in groups:
+        tries = by_group.get(group_id) or []
+        if not tries:
+            continue
+        final = next((t for t in reversed(tries) if t["status"] == "ok"),
+                     tries[-1])
+        out.append({
+            "group_id": group_id,
+            # The attempt that actually answered, or the last one that
+            # tried. This is the row the list shows; the rest are the
+            # retries behind it.
+            **final,
+            "attempts": tries,
+            "retries": len(tries) - 1,
+            "outcome": final["status"],
+        })
+    return {"calls": out, "total": total}
+
+
+def clear_llm_calls(db: Database) -> int:
+    """Forget the telemetry. Costs nothing to rebuild - it only stops
+    accruing history nobody asked to keep."""
+    with db.connection() as conn:
+        return conn.execute("DELETE FROM llm_calls").rowcount
 
 
 def get_statement_period_by_id(db: Database) -> dict[str, tuple[Any, Any]]:
@@ -3018,6 +3367,16 @@ SETTING_DEFAULTS: dict[str, Any] = {
     "use_llm": False,
     "llm_provider": "",
     "llm_api_key": "",
+    #: A JSON array of {"label", "key"} - several credentials for one
+    #: provider, tried in turn. See `llm.keyring`.
+    "llm_api_keys": "",
+    #: The key list as it was before the last write. See `_KEEP_PREVIOUS`:
+    #: a credential is the one thing here that cannot be regenerated from
+    #: the user's own documents.
+    "llm_api_keys_previous": "",
+    #: 'free' or 'paid'. The same model has two prices and which applies is
+    #: a fact about the ACCOUNT, not the model - see llm.telemetry.PRICES.
+    "llm_pricing_tier": "",
     "llm_base_url": "",
     "llm_model_fast": "",
     "llm_model_strong": "",
@@ -3041,15 +3400,63 @@ def get_settings(db: Database) -> dict[str, Any]:
     return out
 
 
+#: Settings whose previous value is kept for one generation before being
+#: overwritten.
+#:
+#: The API-key list is the only thing in this app a user cannot regenerate
+#: from their own documents: statements re-import, categories re-derive,
+#: the whole ledger rebuilds - a revoked credential is gone. And the write
+#: is a full REPLACE, so any caller sending a partial list silently
+#: destroys the rest.
+#:
+#: That is not hypothetical. A cleanup command sending
+#: `{"api_keys": [{"label": "Default key"}]}` - intended to remove one test
+#: key - deleted three real ones, and nothing recorded that it had. They
+#: were recoverable only because Postgres had not yet recycled the WAL
+#: segment holding them, which is luck rather than a design.
+_KEEP_PREVIOUS = ("llm_api_keys",)
+
+
 def save_settings(db: Database, values: dict[str, Any]) -> dict[str, Any]:
     """Store only the keys this app knows about.
 
     Unknown keys are dropped rather than saved: a settings table that accepts
     anything becomes a place bugs hide, and there is no caller that needs it.
     """
+    # Stash the outgoing value of anything irreplaceable, so a mistaken
+    # overwrite is one click to undo rather than a trip to the provider
+    # to mint new credentials.
+    keepsakes: dict[str, str] = {}
+    watched = [k for k in values if k in _KEEP_PREVIOUS]
+    if watched:
+        with db.connection() as conn:
+            for key in watched:
+                row = conn.execute(
+                    "SELECT value FROM app_settings WHERE key = ?",
+                    (key,)).fetchone()
+                before = (row["value"] if row else "") or ""
+                after = str(values.get(key) or "")
+                if before and before != after:
+                    keepsakes[f"{key}_previous"] = before
+                    log.warning(
+                        "%s is being replaced (%d chars -> %d); the previous "
+                        "value is recoverable from %s_previous",
+                        key, len(before), len(after), key)
+
     with db.connection() as conn:
-        for key, value in values.items():
+        for key, value in {**values, **keepsakes}.items():
             if key not in SETTING_DEFAULTS:
+                # Dropped, but not in silence. A key missing from
+                # SETTING_DEFAULTS is a programmer error every time - and
+                # discarding it quietly means the write reports success,
+                # the caller reads the value straight back from its own
+                # request, and the setting is simply gone on the next page
+                # load. `llm_api_keys` was added to the override list and
+                # not to this one, and that is exactly how it presented:
+                # "I click save and everything resets".
+                log.warning(
+                    "refusing to store unknown setting %r - add it to "
+                    "SETTING_DEFAULTS if it is meant to persist", key)
                 continue
             # Parenthesised deliberately: written as one chained ternary
             # this read as `"1" if value else ("0" if bool else str(value))`,

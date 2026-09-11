@@ -292,6 +292,30 @@ def sections() -> dict[str, Any]:
     return {"sections": list(out.values())}
 
 
+@router.get("/inferences")
+def staged_inferences(job_id: str = "", limit: int = 200) -> dict[str, Any]:
+    """Every model call this import made, and what came of each one.
+
+    The import wizard's AI step. Three things per call, because a model
+    answering is not the same as the app believing it: what was SENT, what
+    came BACK, and which fields were actually USED - a model that names an
+    issuer the deterministic reader had already named contributes nothing,
+    and that is invisible unless it is said.
+
+    Cache hits are listed too. "No request was spent on this file" is a
+    fact the user is entitled to, not an absence, and it is the only way
+    the caching is visible at all.
+    """
+    rows = repo.get_ai_call_log(get_db(), job_id=job_id, limit=limit)
+    spent = sum(1 for r in rows if not r.get("cached"))
+    return {
+        "calls": rows,
+        "total": len(rows),
+        "requests_spent": spent,
+        "served_from_cache": len(rows) - spent,
+    }
+
+
 @router.get("/review")
 def review() -> dict[str, Any]:
     """What is staged, grouped by account and origin, files nested inside.

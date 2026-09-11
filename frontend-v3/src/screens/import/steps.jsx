@@ -1,8 +1,10 @@
 import React, { useMemo, useState } from 'react';
-import { useJobWatch } from '../../core/store';
+import { useJobWatch, useQuery } from '../../core/store';
+import { api } from '../../core/api';
 import { bytes, count, money } from '../../core/format';
 import {
-  Button, Callout, Chip, ConfirmButton, Empty, IconButton, PromptButton, Select, Badge,
+  Button, Callout, Chip, ConfirmButton, Empty, IconButton, Loading,
+  PromptButton, Select, Badge,
 } from '../../ui';
 import JobProgress from '../../ui/JobProgress';
 import Uploader from './Uploader';
@@ -120,7 +122,7 @@ export function SourceStep({
                     value={s.months}
                     onChange={(v) => onSetting(one.key, { months: v === '' ? null : Number(v) })}
                     options={periodsFor(periods, s.months).map((p) => [p.months ?? '', p.label])}
-                    style={{ fontSize: 11, height: 26 }}
+                    size="xs"
                   />
                 </div>
 
@@ -130,7 +132,7 @@ export function SourceStep({
                     value={s.maxMessages}
                     onChange={(v) => onSetting(one.key, { maxMessages: Number(v) })}
                     options={CAPS.map((cap) => [cap, `${cap} emails`])}
-                    style={{ fontSize: 11, height: 26 }}
+                    size="xs"
                   />
                 </div>
               </div>
@@ -452,6 +454,163 @@ export function ReadStep({
           </Group>
         );
       })}
+    </div>
+  );
+}
+
+
+/* ────────────────────────────────────────────────────────────── AI step ── */
+
+/* What a language model was asked during this import, and what the app did
+   with each answer.
+
+   Three things per call, because a model answering is not the same as the
+   app believing it. SENT is the exact prompt; RETURNED is the raw reply;
+   USED is the fields that actually changed the ledger - and a model that
+   names an issuer the deterministic reader had already named contributes
+   nothing at all, which is invisible unless it is said out loud.
+
+   Cache hits are listed alongside the requests. "No request was spent on
+   this file" is a fact the user is entitled to, and it is the only place
+   the caching is visible. */
+
+const KIND_LABEL = {
+  statement_identity: 'Letterhead identity',
+  card_summary: 'Card summary',
+  column_map: 'Column mapping',
+  merchant_category: 'Merchant categories',
+};
+
+function InferenceCard({ call }) {
+  const [open, setOpen] = useState(false);
+  const used = call.applied?.fields || {};
+  const usedKeys = Object.keys(used);
+  const rejected = call.applied?.rejected;
+
+  return (
+    <div
+      style={{
+        border: '1px solid var(--border-subtle)',
+        borderRadius: 'var(--radius-md)',
+        background: 'var(--surface-2)',
+        padding: '12px 14px',
+      }}
+    >
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div className="flex items-center gap-2 flex-wrap">
+          <strong style={{ fontSize: 13.5 }}>
+            {KIND_LABEL[call.kind] || call.kind}
+          </strong>
+          <span className="tiny muted">{call.source_label}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <Badge size="sm" tone={call.cached ? 'pos' : 'brand'}
+            title={call.cached
+              ? 'Answered from a previous inference. No request was spent.'
+              : 'A request was spent on this call.'}>
+            {call.cached ? 'from cache' : 'request spent'}
+          </Badge>
+          <Button size="xs" variant="ghost" onClick={() => setOpen(!open)}>
+            {open ? 'Hide' : 'Show'} detail
+          </Button>
+        </div>
+      </div>
+
+      <div className="tiny" style={{ marginTop: 6 }}>
+        {rejected ? (
+          <span style={{ color: 'var(--neg)' }}>
+            Rejected &mdash; {rejected}
+          </span>
+        ) : usedKeys.length ? (
+          <span>
+            <span className="muted">Used: </span>
+            {usedKeys.map((k) => (
+              <Chip key={k} size="sm" style={{ marginRight: 4 }}>
+                {k} = {String(used[k])}
+              </Chip>
+            ))}
+          </span>
+        ) : (
+          <span className="muted">
+            Nothing used &mdash; every field it answered was already known.
+          </span>
+        )}
+      </div>
+
+      {open && (
+        <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <Labelled label="Sent">{call.prompt}</Labelled>
+          <Labelled label="Returned">
+            {JSON.stringify(call.response, null, 2)}
+          </Labelled>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Labelled({ label, children }) {
+  return (
+    <div>
+      <div className="tiny muted" style={{ marginBottom: 3, letterSpacing: '.04em' }}>
+        {label.toUpperCase()}
+      </div>
+      <pre
+        style={{
+          margin: 0, padding: '8px 10px', fontSize: 11.5, lineHeight: 1.5,
+          background: 'var(--surface)', border: '1px solid var(--border-subtle)',
+          borderRadius: 'var(--radius-sm)', maxHeight: 220, overflow: 'auto',
+          whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+        }}
+      >
+        {children}
+      </pre>
+    </div>
+  );
+}
+
+export function AiStep({ jobId, onRefresh }) {
+  const { data, loading, refetch } = useQuery(
+    `staged-inferences:${jobId || 'all'}`,
+    () => api.stagedInferences(jobId),
+  );
+
+  const calls = data?.calls || [];
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+      <p className="lead" style={{ margin: 0 }}>
+        Every question put to a language model while reading these documents.
+        <strong> Nothing here decides an amount</strong> &mdash; a model may
+        identify an issuer, an account type or which column is which, and the
+        figures are always read by the deterministic parsers.
+      </p>
+
+      <div className="flex items-center gap-3 flex-wrap">
+        <Chip size="sm">{data?.total ?? 0} calls</Chip>
+        <Chip size="sm" title="Each of these cost one request against your daily quota.">
+          {data?.requests_spent ?? 0} requests spent
+        </Chip>
+        <Chip size="sm" title="Answered from a previous inference about the same statement template.">
+          {data?.served_from_cache ?? 0} from cache
+        </Chip>
+        <Button size="xs" variant="ghost" onClick={() => { refetch(); onRefresh?.(); }}>
+          Refresh
+        </Button>
+      </div>
+
+      {loading && <Loading message="Reading the inference log..." />}
+
+      {!loading && !calls.length && (
+        <Empty title="No model was consulted" icon="sparkle">
+          Every document so far was identified by the deterministic readers,
+          so nothing needed a model. This is the cheapest possible outcome.
+        </Empty>
+      )}
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
+        {calls.map((call) => <InferenceCard key={call.id} call={call} />)}
+      </div>
     </div>
   );
 }

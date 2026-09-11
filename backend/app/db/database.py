@@ -91,7 +91,8 @@ _TIER_STAGING = ("staged_files",)
 #: `agent_runs` belongs here rather than with the derived data. Re-parsing a
 #: statement should not throw away an analysis somebody paid a model to
 #: produce - and unlike a recurring series, no amount of CPU brings it back.
-_TIER_AI = ("agent_runs", "ai_inferences", "merchant_categories")
+_TIER_AI = ("agent_runs", "ai_inferences", "ai_inference_log",
+            "llm_calls", "merchant_categories")
 
 #: Authored by a human. Cannot be regenerated from any input at any price.
 #: `claims` is listed before `claim_settlements` and `transaction_splits`
@@ -173,6 +174,8 @@ TENANT_TABLES: tuple[str, ...] = (
     "source_files",
     "user_overrides",
     "ai_inferences",
+    "ai_inference_log",
+    "llm_calls",
     "claims",
     "claim_settlements",
     "transaction_splits",

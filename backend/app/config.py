@@ -167,8 +167,14 @@ class Config:
         or '').rstrip('/')
 
     #: Categorisation and letterhead lookups.
+    #:
+    #: Flash Lite because of the shape of its free tier rather than its
+    #: size: 250,000 tokens a minute against 15 requests a minute and 500 a
+    #: day. Tokens are effectively free and requests are the whole budget,
+    #: which is why the callers here batch hard and ask for generous
+    #: `max_tokens` - a reply cut short costs a request and returns nothing.
     GEMINI_MODEL_FAST = _env('GEMINI_MODEL_FAST',
-                             default='gemma-4-26b-a4b-it')
+                             default='gemini-3.5-flash-lite')
     #: The written narrative.
     GEMINI_MODEL_STRONG = _env('GEMINI_MODEL_STRONG',
                                default='gemma-4-26b-a4b-it')

@@ -45,7 +45,6 @@ than failing the parse around it.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
 from dataclasses import dataclass
@@ -55,6 +54,10 @@ from decimal import Decimal, InvalidOperation
 from .parsers import parse_date
 
 log = logging.getLogger(__name__)
+
+#: What one card-summary read may spend. See the note at the call site: the
+#: binding constraint on the target tier is requests per day, not tokens.
+SUMMARY_MAX_TOKENS = 1200
 
 #: How much of the document to show the model. The summary box is near the
 #: front on every issuer seen, and sending the whole statement would put a
@@ -127,6 +130,12 @@ def summary_slice(text: str) -> str:
     return (text or "")[begin:begin + _SLICE_CHARS]
 
 
+#: How a statement says a balance is in the holder's favour. Indian card
+#: statements mark it either way round, and both mean the same thing: the
+#: issuer owes the holder, not the other way about.
+_CREDIT_MARKER = re.compile(r"(?:^\s*-)|(?:\bCR\b\s*$)", re.IGNORECASE)
+
+
 def _amount(raw: object, bins: set) -> Decimal | None:
     """A money value out of the model's answer, or None.
 
@@ -134,9 +143,16 @@ def _amount(raw: object, bins: set) -> Decimal | None:
     prompt forbids returning one and the check stays anyway: the whole reason
     this module exists is that a card number sits where a limit belongs, and
     a rule that matters is enforced rather than requested.
+
+    The SIGN survives. Stripping to digits was losing it: "-500.00" and
+    "500.00 CR" both came back as 500, and a card statement uses both to
+    say the issuer owes the HOLDER. Read as a positive total due, a 500
+    credit balance became 500 of debt - the wrong side of the balance
+    sheet, on a figure that reaches Net Worth.
     """
     if not isinstance(raw, str) or not raw.strip():
         return None
+    negative = bool(_CREDIT_MARKER.search(raw.strip()))
     cleaned = re.sub(r"[^\d.]", "", raw)
     if not cleaned:
         return None
@@ -144,7 +160,9 @@ def _amount(raw: object, bins: set) -> Decimal | None:
         value = Decimal(cleaned)
     except InvalidOperation:
         return None
-    return None if value in bins else value
+    if value in bins:
+        return None
+    return -value if negative else value
 
 
 def _date(raw: object) -> date | None:
@@ -163,23 +181,29 @@ def read(text: str, *, bins: set | None = None) -> CardSummary | None:
     if not slice_text.strip():
         return None
     bins = bins or set()
-    fingerprint = hashlib.sha256(slice_text.encode()).hexdigest()
-
-    answer = _cached(fingerprint)
+    answer = _cached(slice_text)
     if answer is None:
         try:
             client = get_client()
             if not client.available:
                 return None
-            answer = client.complete_json(
-                _PROMPT + slice_text, system=_SYSTEM,
-                max_tokens=220, schema=_SCHEMA)
+            from ..llm import telemetry
+            with telemetry.purpose("card_summary", "credit card statement"):
+                answer = client.complete_json(
+                    _PROMPT + slice_text, system=_SYSTEM,
+                    # Generous on purpose. A reasoning model charges its
+                    # thinking against this same allowance, so a tight
+                    # budget does not save anything - it makes the call
+                    # come back empty and have to be spent again. Requests
+                    # are what this tier meters (500 a day); tokens run at
+                    # 250,000 a minute.
+                    max_tokens=SUMMARY_MAX_TOKENS, schema=_SCHEMA)
         except Exception as exc:
             log.warning("card summary could not be read: %s", exc)
             return None
         if not isinstance(answer, dict):
             return None
-        _remember(fingerprint, answer)
+        _remember(slice_text, answer)
 
     limit = _amount(answer.get("credit_limit"), bins)
     summary = CardSummary(
@@ -195,28 +219,35 @@ def read(text: str, *, bins: set | None = None) -> CardSummary | None:
     return None if summary.is_empty() else summary
 
 
-def _cached(fingerprint: str) -> dict | None:
+def _cached(slice_text: str) -> dict | None:
     """A previous answer for this exact text, if one was stored.
+
+    Exact, and the repository enforces it: a card summary is a figure, and
+    a figure is a property of one statement, not of the template it was
+    printed from. See `repository._PER_DOCUMENT_KINDS`.
 
     A broken cache must never cost a parse, so every failure here is a miss.
     """
     try:
         from ..db.database import get_db
-        from ..db.repository import get_ai_inference
+        from ..db.repository import AI_CARD_SUMMARY, get_ai_inference
 
-        return get_ai_inference(get_db(), fingerprint)
+        # Under its OWN kind. This reader and the letterhead reader used
+        # the same two helpers, and those helpers hardcoded one kind - so a
+        # card summary and a bank identity were stored in one keyspace.
+        return get_ai_inference(get_db(), AI_CARD_SUMMARY, slice_text)
     except Exception as exc:
         log.debug("card summary cache unreadable: %s", exc)
         return None
 
 
-def _remember(fingerprint: str, answer: dict) -> None:
+def _remember(slice_text: str, answer: dict) -> None:
     """Store an answer. Writing needs a signed-in user for row-level
     security, so a parse running outside a request simply does not cache."""
     try:
         from ..db.database import get_db
-        from ..db.repository import save_ai_inference
+        from ..db.repository import AI_CARD_SUMMARY, save_ai_inference
 
-        save_ai_inference(get_db(), fingerprint, answer)
+        save_ai_inference(get_db(), AI_CARD_SUMMARY, slice_text, answer)
     except Exception as exc:
         log.debug("card summary not cached: %s", exc)

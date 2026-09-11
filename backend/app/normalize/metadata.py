@@ -12,6 +12,7 @@ missing field degrades the analysis; a wrong field corrupts it.
 from __future__ import annotations
 
 import re
+from typing import Any
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -851,6 +852,47 @@ def _answered(value: object) -> str | None:
     return cleaned or None
 
 
+#: What the letterhead lookup is allowed to spend.
+#:
+#: Was 100, and that was the bug rather than the budget: Gemini 3.x flash
+#: thinks by default and charges its reasoning against the same allowance,
+#: so the whole 100 went on thinking and the call returned empty content and
+#: no institution. `providers` sets `reasoning_effort` low to hold that
+#: down, but a floor this tight leaves nothing for the answer either.
+#:
+#: Raised because tokens are not what is scarce here. The free tier this app
+#: targets meters 250,000 tokens a MINUTE against 500 requests a DAY - so a
+#: budget that makes a request come back empty, and therefore have to be
+#: spent again, costs the only thing that actually runs out.
+IDENTITY_MAX_TOKENS = 800
+
+
+def _log_identity(db, filename: str, prompt: str, response: Any,
+                  applied: dict, *, cached: bool, slice_text: str,
+                  note: str = "") -> None:
+    """Record one identity inference for the import wizard's AI step.
+
+    Audit only: a failure to write this line must never affect the parse it
+    describes, so everything is swallowed.
+    """
+    if db is None:
+        return
+    try:
+        from ..db import repository as _repo
+        _repo.log_ai_call(
+            db,
+            kind=_repo.AI_IDENTITY,
+            source_label=filename or "(unnamed document)",
+            prompt=prompt,
+            response=response,
+            applied={"fields": applied, "source": note or "model"},
+            cached=cached,
+            cache_key=_repo.cache_key_for(_repo.AI_IDENTITY, slice_text),
+        )
+    except Exception:                   # pragma: no cover - audit only
+        pass
+
+
 #: The identity fields the letterhead fallback asks a model for.
 #:
 #: `account_type` is an enum of what `AccountType` actually accepts, so a
@@ -868,6 +910,39 @@ _IDENTITY_SCHEMA = {
     "required": ["institution", "account_type"],
     "additionalProperties": False,
 }
+
+
+#: How far above its credit limit a card balance may plausibly sit.
+#:
+#: Over-limit happens - a standing instruction lands on a nearly-full card -
+#: but it runs to a few percent, never to a multiple. A "total due" well
+#: past the limit is the misread this module exists to catch: the limit
+#: itself, the cash limit, or a lakh figure lifted out of the interest
+#: worked example in the terms and conditions.
+_OVER_LIMIT_TOLERANCE = Decimal("1.5")
+
+
+def _implausible_due(due: "Decimal", limit: "Decimal | None") -> str:
+    """Why this total due cannot be believed, or "" if it can.
+
+    `credit_limit` had a floor - `_MIN_PLAUSIBLE_CREDIT_LIMIT` - and the
+    total due had no check of any kind, despite being the only figure here
+    that becomes an account balance and reaches Net Worth.
+
+    A floor is the wrong shape for a due: a real card bill is legitimately
+    zero, or fifty rupees. What a due CAN be checked against is the card's
+    own limit, which sits in the same summary box and is usually read
+    deterministically.
+    """
+    if due < 0:
+        # Not a refusal. A card in credit is a real state and the sign now
+        # survives `_amount`, so this is left to the caller to record.
+        return ""
+    if limit is not None and limit > 0 and due > limit * _OVER_LIMIT_TOLERANCE:
+        return (f"it is more than {_OVER_LIMIT_TOLERANCE}x this card's "
+                f"credit limit of {limit}, so it is far more likely to be "
+                f"another figure from the same box.")
+    return ""
 
 
 #: Below this, a "credit limit" is not one. Read off real statements: an
@@ -1275,12 +1350,30 @@ def extract_metadata(text: str, filename: str = "", sender: str = "",
             # the wide pass, never over the windowed one.
             if read.total_due is not None and (
                     meta.closing_balance is None or closing_from_whole):
-                if meta.closing_balance != read.total_due:
+                refusal = _implausible_due(read.total_due, meta.credit_limit)
+                if refusal:
                     meta.notes.append(
-                        f"Total due read from the summary box as "
-                        f"{read.total_due}, not {meta.closing_balance} "
-                        f"found elsewhere in the document.")
-                meta.closing_balance = read.total_due
+                        f"Ignored a total due of {read.total_due} read from "
+                        f"the summary box - {refusal}")
+                else:
+                    # Said whichever way it goes. This is the one figure
+                    # here that reaches the balance sheet, and it arrived
+                    # from a model: a holder is entitled to know that
+                    # without having to notice that some other number
+                    # changed. The message used to render "not None found
+                    # elsewhere" whenever there was nothing to replace,
+                    # which is the commonest case of the two.
+                    if meta.closing_balance is None:
+                        meta.notes.append(
+                            f"Total due read from the summary box as "
+                            f"{read.total_due}. Nothing elsewhere in the "
+                            f"document stated one.")
+                    elif meta.closing_balance != read.total_due:
+                        meta.notes.append(
+                            f"Total due read from the summary box as "
+                            f"{read.total_due}, not {meta.closing_balance} "
+                            f"found elsewhere in the document.")
+                    meta.closing_balance = read.total_due
             if meta.min_due is None:
                 meta.min_due = read.min_due
             if meta.statement_date is None:
@@ -1338,32 +1431,40 @@ def extract_metadata(text: str, filename: str = "", sender: str = "",
     # those sentinels the condition was never true once, so this fallback
     # had never run on any statement.
     if not meta.institution or meta.account_type in (None, AccountType.UNKNOWN):
+        from ..llm import telemetry
         from ..llm.client import get_client, LLMUnavailable
-        from ..db.repository import get_ai_inference, save_ai_inference
+        from ..db import repository as _repo
         # `app.api.dependencies` does not exist; the handle comes from the
         # database module, as it does everywhere else in the app. Reaching
         # this line at all used to raise ModuleNotFoundError - and from out
         # here, above the try, that would have failed the whole parse rather
         # than degrading the one field it fills.
         from ..db.database import get_db
-        import hashlib
-        
+
         # Only use the letterhead slice!
         slice_to_send = head if head else text[:1000]
-        
-        fingerprint = hashlib.sha256(slice_to_send.encode()).hexdigest()
-        
-        def fill_gaps(answer: dict) -> None:
-            """Fill only what is still missing.
+
+        applied: dict[str, Any] = {}
+
+        def fill_gaps(answer: dict) -> dict:
+            """Fill only what is still missing, and say what was taken.
 
             This block is entered when EITHER the institution or the account
             type is unknown, and it used to overwrite both. So a statement
             whose issuer had been read correctly but whose type had not could
             have its issuer replaced by a guess - the deterministic reader
             beaten by the model on a question it had already answered.
+
+            The returned dict is what the import wizard's AI step renders
+            under "used": a field the model answered and the app declined is
+            the interesting case, and it is invisible unless recorded.
             """
+            took: dict[str, Any] = {}
             if not meta.institution:
-                meta.institution = _answered(answer.get("institution"))
+                value = _answered(answer.get("institution"))
+                if value:
+                    meta.institution = value
+                    took["institution"] = value
             if meta.account_type in (None, AccountType.UNKNOWN):
                 try:
                     kind = AccountType(_answered(answer.get("account_type")))
@@ -1373,21 +1474,51 @@ def extract_metadata(text: str, filename: str = "", sender: str = "",
                 # it back would just relabel the gap as an answer.
                 if kind is not None and kind != AccountType.UNKNOWN:
                     meta.account_type = kind
+                    took["account_type"] = kind.value
             if not meta.product_name:
-                meta.product_name = _answered(answer.get("product_name"))
+                value = _answered(answer.get("product_name"))
+                if value:
+                    meta.product_name = value
+                    took["product_name"] = value
+            applied.update(took)
+            return took
 
         db = None
+        cached = None
+        source = ""
         try:
             db = get_db()
-            cached = get_ai_inference(db, fingerprint)
+            # 1. This exact template. Free, and right whenever the issuer
+            #    has not redesigned its statement.
+            cached = _repo.get_ai_inference(db, _repo.AI_IDENTITY, slice_to_send)
+            if cached:
+                source = "template cache"
+            elif meta.institution:
+                # 2. What was learned about this issuer's product before.
+                #    A layout change invalidates the template hash but not
+                #    the answer: "ICICI Bank / Amazon Pay is a credit card"
+                #    was true last month and is true now. This is the lookup
+                #    that makes the cache mean what a person means by it,
+                #    and it is keyed per institution PER PRODUCT because
+                #    ICICI also issues a savings account and a personal loan.
+                cached = _repo.find_identity_for(
+                    db, meta.institution, meta.product_name or "")
+                if cached:
+                    source = "issuer/product cache"
         except Exception as exc:  # a broken cache must not fail the parse
             import logging
             logging.getLogger(__name__).warning(
                 "could not read the identity cache: %s", exc)
             cached = None
 
+        prompt = ("Extract the bank name, account type and "
+                  "product name from this statement "
+                  f"letterhead.\nLetterhead: {slice_to_send}")
+
         if cached:
             fill_gaps(cached)
+            _log_identity(db, filename, prompt, cached, applied,
+                          cached=True, slice_text=slice_to_send, note=source)
         else:
             try:
                 client = get_client()
@@ -1397,15 +1528,21 @@ def extract_metadata(text: str, filename: str = "", sender: str = "",
                     # words it likes - "bank_name" instead of "institution",
                     # "Savings Account" instead of the enum member `savings`
                     # - and both are dropped silently here, so the call costs
-                    # a request and fills nothing. Worse, a small budget got
-                    # the template echoed back verbatim, which would have
-                    # stored "..." as the name of the bank.
-                    prompt = ("Extract the bank name, account type and "
-                              "product name from this statement "
-                              f"letterhead.\nLetterhead: {slice_to_send}")
-                    resp = client.complete_json(
-                        prompt, system="You return JSON only.",
-                        max_tokens=100, schema=_IDENTITY_SCHEMA)
+                    # a request and fills nothing.
+                    #
+                    # The budget is deliberately generous. It was 100 tokens,
+                    # and Gemini 3.x flash spends its thinking against the
+                    # same allowance - so the whole budget went on reasoning
+                    # and the call returned empty content and no institution.
+                    # Tokens are not the scarce resource on this tier
+                    # (250K/minute against 500 requests/DAY); a request that
+                    # comes back empty and has to be repeated is.
+                    with telemetry.purpose("letterhead",
+                                           filename or "(unnamed document)"):
+                        resp = client.complete_json(
+                            prompt, system="You return JSON only.",
+                            max_tokens=IDENTITY_MAX_TOKENS,
+                            schema=_IDENTITY_SCHEMA)
                     if isinstance(resp, dict):
                         # Fill first, cache second, and never let the second
                         # cost the first. Writing to ai_inferences needs a
@@ -1414,9 +1551,13 @@ def extract_metadata(text: str, filename: str = "", sender: str = "",
                         # with the save ahead of the fill, that refusal threw
                         # away an identity the model had already answered.
                         fill_gaps(resp)
+                        _log_identity(db, filename, prompt, resp, applied,
+                                      cached=False, slice_text=slice_to_send)
                         if db is not None:
                             try:
-                                save_ai_inference(db, fingerprint, resp)
+                                _repo.save_ai_inference(
+                                    db, _repo.AI_IDENTITY, slice_to_send, resp,
+                                    prompt=prompt)
                             except Exception as exc:
                                 import logging
                                 logging.getLogger(__name__).warning(

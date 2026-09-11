@@ -116,6 +116,18 @@ def start_run(key: str, background: BackgroundTasks,
     return {"job_id": job.id, "agent": agent.key}
 
 
+#: How each kind of event reads on the job feed. The distinction the user
+#: actually wants is "is it waiting on a model or on the database?" - those
+#: have very different durations and very different reasons to be slow.
+_EVENT_LABEL = {
+    "model": "AI call",
+    "thought": "Reasoning",
+    "tool": "Tool",
+    "answer": "Answer",
+    "error": "Error",
+}
+
+
 def _run_agent(job_id: str, key: str, question: str) -> None:
     """The job body: run the agent, store the run, report it."""
     job = jobs.get(job_id)
@@ -134,12 +146,39 @@ def _run_agent(job_id: str, key: str, question: str) -> None:
         # progress rather than sitting at zero until it finishes.
         seen = {"steps": 0}
 
-        def on_progress(label: str) -> None:
-            if label.startswith("Thinking"):
-                seen["steps"] += 1
-                progress.advance(min(seen["steps"], agent.max_steps), label)
-            else:
-                progress.phase(label)
+        def on_progress(event) -> None:
+            """One line on the job for everything the agent does.
+
+            The runner now reports structured events - a model call, the
+            thought behind it, each tool with its arguments and how long it
+            took - and each becomes a job item, which is what the screen
+            streams. Before this a run showed "Thinking (step 3 of 10)" for
+            thirty seconds at a time and nothing else, so a slow model call
+            and a hang looked identical.
+
+            Still accepts a plain string: `progress()` inside the runner
+            reports phases that way and there is no reason to change them.
+            """
+            if isinstance(event, str):
+                if event.startswith("Thinking"):
+                    seen["steps"] += 1
+                    progress.advance(min(seen["steps"], agent.max_steps), event)
+                else:
+                    progress.phase(event)
+                return
+
+            kind = event.get("kind", "")
+            text = event.get("text", "")
+            detail = event.get("detail", "")
+            if kind == "model":
+                progress.phase(text, detail)
+            progress.item(
+                f"{_EVENT_LABEL.get(kind, kind)}: {text}"[:300],
+                status="done" if event.get("ok", True) else "failed",
+                detail=detail[:400],
+                advance=False,
+                key=f"{kind}:{event.get('step', 0)}:{len(text)}:{text[:40]}",
+            )
 
         result = runner.run(agent, db, question=question,
                             on_progress=on_progress)

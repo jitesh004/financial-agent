@@ -164,7 +164,8 @@ def normalize(
     period = (meta.period_start, meta.period_end)
 
     examples = sum(1 for t in extraction.tables if _is_worked_example(t))
-    candidates = _rank_tables(extraction.tables, default_year=default_year)
+    candidates = _rank_tables(extraction.tables, default_year=default_year,
+                              source_label=filename)
     if examples:
         statement.parse_warnings.append(
             f"Ignored {examples} table(s) that the document itself labels as "
@@ -312,6 +313,7 @@ def _is_worked_example(table: ExtractedTable) -> bool:
 
 def _rank_tables(
     tables: list[ExtractedTable], default_year: int | None = None,
+    source_label: str = "",
 ) -> list[tuple[ColumnMapping, ExtractedTable, list[list[str]]]]:
     """Score every extracted table and return the usable ones, best first.
 
@@ -340,7 +342,8 @@ def _rank_tables(
             # point of the reconciliation gate.
             log.debug("skipping a worked example table")
             continue
-        mapping, body = _resolve_mapping(table, default_year=default_year)
+        mapping, body = _resolve_mapping(
+            table, default_year=default_year, source_label=source_label)
         if mapping is None or not mapping.is_usable():
             continue
         parseable = _count_parseable(body, mapping, default_year=default_year)
@@ -428,6 +431,7 @@ def _rank_tables(
 
 def _resolve_mapping(
     table: ExtractedTable, default_year: int | None = None,
+    source_label: str = "",
 ) -> tuple[ColumnMapping | None, list[list[str]]]:
     """Find this table's column mapping and return its data rows (header removed).
 
@@ -493,6 +497,24 @@ def _resolve_mapping(
     if inferred.is_usable():
         body = rows[1:] if looks_like_header(rows[0], default_year=default_year) else rows
         return inferred, body
+
+    # Nothing deterministic could read this table. The choice here is not
+    # between a good mapping and a worse one - it is between a mapping and
+    # discarding the table, so this is where a model earns its request.
+    #
+    # It is asked for column INDICES, never for values, and its answer is
+    # then checked against the cells it named: a claimed date column has to
+    # parse as dates, a claimed money column as money. So the model
+    # contributes an opinion about structure and `parse_date`/`parse_amount`
+    # still decide whether that opinion survives contact with the data. No
+    # figure in this ledger ever comes from a language model.
+    from .column_map import ask_model_for_columns
+    asked = ask_model_for_columns(table.header or [], rows,
+                                  default_year=default_year,
+                                  source_label=source_label)
+    if asked is not None:
+        body = rows[1:] if looks_like_header(rows[0], default_year=default_year) else rows
+        return asked, body
 
     return None, rows
 

@@ -166,6 +166,15 @@ export const api = {
      The API key is write-only: reads return a masked hint, never the key. */
   llmConfig: () => get('/api/settings/llm'),
   saveLlmConfig: (body) => put('/api/settings/llm', body),
+  restoreLlmKeys: () => post('/api/settings/llm/keys/restore'),
+  llmUsage: (period = 'all', key = '') =>
+    get(`/api/llm/usage?period=${encodeURIComponent(period)}&key=${encodeURIComponent(key)}`),
+  llmCalls: ({ period = 'all', key = '', purpose = '', status = '', limit = 100, offset = 0 } = {}) =>
+    get(`/api/llm/calls?period=${encodeURIComponent(period)}&key=${encodeURIComponent(key)}`
+      + `&purpose=${encodeURIComponent(purpose)}&status=${encodeURIComponent(status)}`
+      + `&limit=${limit}&offset=${offset}`),
+  stagedInferences: (jobId) =>
+    get(`/api/staging/inferences${jobId ? `?job_id=${jobId}` : ''}`),
   resetLlmConfig: () => del('/api/settings/llm'),
   testLlmConfig: () => post('/api/settings/llm/test'),
   runCategorize: () => post('/api/settings/categorize'),

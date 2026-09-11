@@ -8,7 +8,8 @@ import { Button, Chip, ProgressBar, Spinner } from './index';
 
 const TONE = { done: 'pos', skipped: 'warn', failed: 'neg', active: 'acc', pending: '' };
 
-export default function JobProgress({ job, title, onCancel, trace = true }) {
+export default function JobProgress({ job, title, onCancel, trace = true,
+                                      traceHeight = 180 }) {
   const traceRef = useRef(null);
 
   useEffect(() => {
@@ -64,7 +65,8 @@ export default function JobProgress({ job, title, onCancel, trace = true }) {
       {job.message && <div className="text-sm text-2">{job.message}</div>}
 
       {trace && job.items?.length > 0 && (
-        <div className="trace-box" ref={traceRef} style={{ maxHeight: 180, overflowY: 'auto' }}>
+        <div className="trace-box" ref={traceRef}
+          style={{ maxHeight: traceHeight, overflowY: 'auto' }}>
           {job.items.map((item, i) => (
             <div className="trace-row flex items-center gap-2 py-1 text-xs" key={i}>
               <span className="beacon-live" style={{

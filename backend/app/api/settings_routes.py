@@ -16,6 +16,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import json
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -95,6 +97,10 @@ def _settings_payload() -> dict[str, Any]:
     # rest of a user's settings, so a blanket spread would hand it back on
     # every GET; the masked hint is served by /api/settings/llm instead.
     stored.pop("llm_api_key", None)
+    # Same reasoning for the multi-key ring. /api/settings/llm serves the
+    # masked hints and each key's state instead.
+    stored.pop("llm_api_keys", None)
+    stored.pop("llm_api_keys_previous", None)
     return {**stored, **_llm_status(),
             "uncategorized_count": pending}
 
@@ -473,10 +479,56 @@ class LlmConfig(BaseModel):
     #: "leave whatever is stored alone".
     provider: str | None = None
     api_key: str | None = None
+    #: Several credentials for one provider, tried in turn. A free tier runs
+    #: out of REQUESTS, not tokens - 500 a day against 336 documents to
+    #: import - and more keys is the only thing that raises that ceiling.
+    #: Each entry is {"label", "key"}; an entry whose key is blank keeps the
+    #: secret already stored under that label, so the screen can reorder and
+    #: rename without ever sending the secrets back.
+    api_keys: list[dict] | None = None
     base_url: str | None = None
     model_fast: str | None = None
     model_strong: str | None = None
     agent_profile: str | None = None
+    #: 'free' or 'paid'. Decides which published rate the Model Usage
+    #: screen costs a call at - the same model has both.
+    pricing_tier: str | None = None
+
+
+@router.post("/llm/keys/restore")
+def restore_api_keys() -> dict[str, Any]:
+    """Put back the key list as it was before the last write.
+
+    A key list is a full REPLACE, so one partial save removes every key it
+    did not mention - and a credential is the only thing in this app that
+    cannot be regenerated from the user's own documents. `save_settings`
+    keeps the outgoing value for exactly this.
+    """
+    from ..llm import keyring
+    from ..llm import settings as llm_settings
+
+    db = get_db()
+    stored = repo.get_settings(db)
+    previous = (stored.get("llm_api_keys_previous") or "").strip()
+    if not previous:
+        raise HTTPException(
+            404, "There is no earlier key list to restore - nothing has "
+                 "replaced the current one yet.")
+
+    recovered = keyring.parse(previous)
+    if not recovered:
+        raise HTTPException(400, "The stored earlier list is unreadable.")
+
+    # The restore is itself a write, so it stashes what it replaced - which
+    # makes the undo symmetrical: restore, decide it was wrong, restore back.
+    repo.save_settings(db, {"llm_api_keys": previous})
+    keyring.forget_all()
+
+    from ..llm.client import reset_clients
+    reset_clients()
+    return {"restored": len(recovered),
+            "labels": [k.label for k in recovered],
+            **llm_settings.public(), **_llm_status()}
 
 
 @router.get("/llm")
@@ -503,13 +555,47 @@ def write_llm_config(payload: LlmConfig) -> dict[str, Any]:
                 400, f"Unknown agent budget {payload.agent_profile!r}. Choose "
                      f"one of: {', '.join(sorted(llm_settings.AGENT_PROFILE_KEYS))}.")
 
+    api_keys_json = None
+    if payload.api_keys is not None:
+        from ..llm import keyring
+
+        # The screen only ever HAS masked hints, so a key it sends back
+        # blank means "the one already stored under this label". Resolving
+        # against the stored list is what lets someone add a fourth key, or
+        # delete the second, without the other three round-tripping through
+        # a browser that must never see them.
+        # Every secret this workspace already holds, by the label it is
+        # shown under. The stored LIST is not enough on its own: before the
+        # first multi-key save there is no list, and the key the screen is
+        # displaying came from the single `llm_api_key` field or from
+        # `.env`. Resolving against the list alone dropped that row on the
+        # very first save - the user adds a second key and the first one
+        # disappears.
+        from ..llm import settings as _llm_settings
+        existing = {k.label: k.secret
+                    for k in _llm_settings.for_provider(
+                        _llm_settings.selected_provider())["api_keys"]}
+        merged = []
+        for i, entry in enumerate(payload.api_keys):
+            label = str(entry.get("label") or "").strip() or f"Key {i + 1}"
+            secret = str(entry.get("key") or "").strip() or existing.get(label, "")
+            if secret:
+                merged.append({"label": label, "key": secret})
+        api_keys_json = json.dumps(merged) if merged else ""
+        # A changed ring invalidates every cooldown: a key the user just
+        # removed should not still be resting, and one just added should
+        # not inherit a rest recorded against a different secret.
+        keyring.forget_all()
+
     changes = {
         "llm_provider": payload.provider,
         "llm_api_key": payload.api_key,
+        "llm_api_keys": api_keys_json,
         "llm_base_url": payload.base_url,
         "llm_model_fast": payload.model_fast,
         "llm_model_strong": payload.model_strong,
         "agent_profile": payload.agent_profile,
+        "llm_pricing_tier": payload.pricing_tier,
     }
     # A field left out of the request keeps its stored value; a field sent
     # empty clears the override. Both are useful, and only `None` is silent.

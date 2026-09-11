@@ -108,7 +108,16 @@ export default function Agents() {
 
       {runningKey && job && (
         <GlassCard pad title={agents.find((a) => a.key === runningKey)?.name || 'Agent Execution'}>
-          <JobProgress job={job} title={job.phase || 'Thinking...'} trace={false} />
+          {/* The feed, not just the phase.
+
+              This was `trace={false}`, so a run showed one line -
+              "Thinking (step 3 of 10)" - and held it for the thirty
+              seconds a model call takes. A slow call and a hung one looked
+              identical, and which tool was being run, with what arguments,
+              was visible only after the run had finished. The runner now
+              reports each of those as it happens. */}
+          <JobProgress job={job} title={job.phase || 'Thinking...'} trace
+            traceHeight={280} />
         </GlassCard>
       )}
 
@@ -302,23 +311,34 @@ function AgentAnswer({ run, onBack }) {
                     </div>
                   )}
 
+                  {/* Arguments on the row, not in a tooltip.
+
+                      "get_transactions" says nothing on its own - the
+                      question is always which months, which account, which
+                      category, and that was hidden behind a `title`
+                      attribute that no one hovers and a phone cannot show
+                      at all. */}
                   {step.calls?.length > 0 && (
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 6 }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 6 }}>
                       {step.calls.map((call, ci) => (
-                        <Chip key={ci} tone="brand" size="sm" title={JSON.stringify(call.args || {})}>
-                          {call.tool}
-                        </Chip>
+                        <div key={ci} className="flex items-baseline gap-2 flex-wrap">
+                          <Chip tone="brand" size="sm">{call.tool}</Chip>
+                          {call.args && Object.keys(call.args).length > 0 && (
+                            <code className="tiny text-3" style={{ overflowWrap: 'anywhere' }}>
+                              {Object.entries(call.args)
+                                .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+                                .join('  ')}
+                            </code>
+                          )}
+                        </div>
                       ))}
                     </div>
                   )}
 
                   {step.results?.length > 0 && (
-                    <div className="trace-box">
+                    <div className="flex-col gap-1">
                       {step.results.map((res, ri) => (
-                        <div key={ri} className="trace-row">
-                          <strong style={{ flexShrink: 0 }}>{res.tool}</strong>
-                          <span>{summarise(res.result ?? res.error)}</span>
-                        </div>
+                        <ToolResult key={ri} result={res} />
                       ))}
                     </div>
                   )}
@@ -333,6 +353,51 @@ function AgentAnswer({ run, onBack }) {
     </div>
   );
 }
+
+/* One tool result, short by default and openable in full.
+
+   A 400-character truncation is the right default - most results are large
+   nested objects and nobody wants them all at once - but it was also the
+   ONLY option, so a figure the agent quoted could not always be traced to
+   the result it came from. That is the whole point of keeping a
+   transcript. */
+function ToolResult({ result }) {
+  const [open, setOpen] = React.useState(false);
+  const payload = result.result ?? result.error;
+  const full = typeof payload === 'object' && payload !== null
+    ? JSON.stringify(payload, null, 2)
+    : String(payload ?? '\u2014');
+  const long = full.length > 400;
+
+  return (
+    <div style={{
+      background: 'var(--surface)',
+      border: '1px solid var(--border-subtle)',
+      borderRadius: 'var(--radius-sm)',
+      padding: '6px 8px',
+      fontSize: 11.5,
+    }}>
+      <div className="flex items-center gap-2">
+        <strong style={{ flexShrink: 0 }}>{result.tool}</strong>
+        {result.error && <Chip tone="neg" size="sm">error</Chip>}
+        <span style={{ flex: 1 }} />
+        {long && (
+          <Button size="xs" variant="ghost" onClick={() => setOpen(!open)}>
+            {open ? 'Collapse' : `Full result (${full.length.toLocaleString()} chars)`}
+          </Button>
+        )}
+      </div>
+      <pre style={{
+        margin: '4px 0 0', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+        maxHeight: open ? 360 : 64, overflow: 'auto', lineHeight: 1.45,
+        color: 'var(--text-2)',
+      }}>
+        {open || !long ? full : `${full.slice(0, 400)}\u2026`}
+      </pre>
+    </div>
+  );
+}
+
 
 /* Tool results are large nested objects; show a readable one-liner. */
 function summarise(value) {

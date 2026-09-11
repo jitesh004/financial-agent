@@ -27,7 +27,17 @@ from ..rules import instalments
 
 log = logging.getLogger(__name__)
 
+from ..llm import telemetry
+
 BATCH_SIZE = 40
+
+#: Room for forty answers AND the reasoning a thinking model spends getting
+#: there. This was left at the client's 4096 default, which is enough for
+#: the answers alone - so a batch that thought its way to a good result ran
+#: out mid-array, and `_answers_from` discarded the whole reply as
+#: malformed. A truncated batch is not a cheap batch: it costs the request
+#: and returns nothing, and forty merchants stay uncategorised.
+BATCH_MAX_TOKENS = 12000
 
 SYSTEM = """You categorize bank and credit-card transaction descriptions.
 
@@ -269,9 +279,16 @@ def categorize_with_llm(
         ]
 
         try:
-            reply = client.complete_json(
-                _prompt(items, allowed_names), system=SYSTEM,
-                schema=_response_schema(allowed_names))
+            # Labelled so the statistics screen can say which work
+            # spent the quota. The subject names the batch, because "40
+            # merchants" and "3 merchants" cost the same request and that
+            # is the whole argument for batching.
+            with telemetry.purpose("categorization",
+                                   f"{len(batch)} merchants"):
+                reply = client.complete_json(
+                    _prompt(items, allowed_names), system=SYSTEM,
+                    schema=_response_schema(allowed_names),
+                    max_tokens=BATCH_MAX_TOKENS)
         except Exception as exc:
             # One failed batch must not lose the batches that succeeded.
             log.warning("LLM categorization batch failed: %s", exc)
